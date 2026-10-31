@@ -10,6 +10,7 @@ import { cardOutline } from '../utils/cardLodAppearance';
 export interface CardImageCanvasProps {
   cardId?: string;
   thumbnailUrl?: string | null;
+  blurPlaceholderUrl?: string | null;
   imageUrl?: string | null;
   originalImageUrl?: string | null;
   showOriginal?: boolean;
@@ -35,6 +36,7 @@ export interface CardImageCanvasProps {
 export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(function CardImageCanvas({
   cardId,
   thumbnailUrl,
+  blurPlaceholderUrl,
   imageUrl,
   originalImageUrl,
   showOriginal = false,
@@ -61,6 +63,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
   const propsRef = useRef({
     cardId,
     thumbnailUrl,
+    blurPlaceholderUrl,
     imageUrl,
     originalImageUrl,
     showOriginal,
@@ -74,6 +77,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
   propsRef.current = {
     cardId,
     thumbnailUrl,
+    blurPlaceholderUrl,
     imageUrl,
     originalImageUrl,
     showOriginal,
@@ -122,6 +126,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     const {
       cardId,
       thumbnailUrl,
+      blurPlaceholderUrl,
       imageUrl,
       originalImageUrl,
       showOriginal,
@@ -178,9 +183,10 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = isGestureActive ? 'low' : 'high';
 
-    // 1. Check loaded states for Micro, Full, and Original
-    const microImg = thumbnailUrl
-      ? getOrLoadThumbImage(thumbnailUrl, scheduleDraw)
+    // 1. Check loaded states for Placeholder (prefer pre-baked blur), Micro, Full, and Original
+    const placeholderUrl = blurPlaceholderUrl || thumbnailUrl;
+    const placeholderImg = placeholderUrl
+      ? getOrLoadThumbImage(placeholderUrl, scheduleDraw)
       : null;
 
     // Always initiate loading for the full-resolution preview image
@@ -209,9 +215,9 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
 
     const fullImgReady = Boolean(fullImg && fullImg.complete && fullImg.naturalWidth > 0);
 
-    // 2. Base Tier: Render Micro / Thumbnail if full image is not yet ready
-    if (!fullImgReady && microImg && microImg.complete && microImg.naturalWidth > 0) {
-      drawCover(microImg, 1);
+    // 2. Base Tier: Render Pre-baked Blurred Placeholder if full image is not yet ready
+    if (!fullImgReady && placeholderImg && placeholderImg.complete && placeholderImg.naturalWidth > 0) {
+      drawCover(placeholderImg, 1);
     }
 
     // 3. Middle Tier: Render Full standard preview
@@ -263,11 +269,11 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     if (!hasMedia) {
       isPainted = true;
     } else {
-      const microImgComplete = microImg && microImg.complete && microImg.naturalWidth > 0;
+      const placeholderImgComplete = placeholderImg && placeholderImg.complete && placeholderImg.naturalWidth > 0;
       const fullImgComplete = fullImg && fullImg.complete && fullImg.naturalWidth > 0;
       const origImgComplete = effectiveShowOriginal && origImg && origImg.complete && origImg.naturalWidth > 0;
       
-      if (microImgComplete || fullImgComplete || origImgComplete) {
+      if (placeholderImgComplete || fullImgComplete || origImgComplete) {
         isPainted = true;
       }
     }
@@ -312,6 +318,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
   }, [
     cardId,
     thumbnailUrl,
+    blurPlaceholderUrl,
     imageUrl,
     originalImageUrl,
     showOriginal,
@@ -354,7 +361,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     };
   }, []);
 
-  const fallbackBgUrl = thumbnailUrl || imageUrl;
+  const fallbackBgUrl = blurPlaceholderUrl || thumbnailUrl || imageUrl;
 
   return (
     <canvas

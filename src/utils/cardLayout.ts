@@ -34,9 +34,13 @@
  * Maximum Panel Height (max prompt 300px, 1 row refs) = 103 + 56 + 300 = 459px
  */
 
+const promptLinesCache = new Map<string, number>();
+
 export function calculatePromptLines(promptText: string | undefined | null): number {
   if (!promptText) return 1;
-  return promptText.split('\n').reduce((acc, line) => {
+  const cached = promptLinesCache.get(promptText);
+  if (cached !== undefined) return cached;
+  const result = promptText.split('\n').reduce((acc, line) => {
     if (!line) return acc + 1;
     let weight = 0;
     for (let i = 0; i < line.length; i++) {
@@ -45,6 +49,11 @@ export function calculatePromptLines(promptText: string | undefined | null): num
     }
     return acc + Math.max(1, Math.ceil(weight / 32));
   }, 0);
+  if (promptLinesCache.size >= 512) {
+    promptLinesCache.delete(promptLinesCache.keys().next().value!);
+  }
+  promptLinesCache.set(promptText, result);
+  return result;
 }
 
 export function getPromptAreaHeight(promptText: string | undefined | null): number {

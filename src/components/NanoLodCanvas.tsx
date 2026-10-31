@@ -74,7 +74,7 @@ function drawCardBottomPanel(
   selectedLineWidth: number,
   normalLineWidth: number,
   alpha: number = 1.0,
-  standard: boolean = true
+  screenW: number = 480
 ) {
   if (alpha <= 0.001) return;
   const panelW = 480;
@@ -101,57 +101,40 @@ function drawCardBottomPanel(
   ctx.lineWidth = currentLw;
   ctx.strokeRect(panelX, panelY, panelW, panelH);
 
-  // If not standard (NanoLOD), render a single lightweight simplified block for the prompt area to keep it visible without heavy loops
-  if (!standard) {
-    ctx.fillStyle = dark ? '#383838' : '#e2e8f0';
-    ctx.beginPath();
-    ctx.rect(panelX + 17, panelY + 17, panelW - 34, panelH - 34);
-    ctx.fill();
-    ctx.restore();
-    return;
-  }
+  // Internal skeleton color blocks (low contrast, subtle fill)
+  ctx.fillStyle = dark ? 'rgba(255, 255, 255, 0.045)' : 'rgba(0, 0, 0, 0.035)';
+  ctx.beginPath();
 
   const refCount = card.referenceImages?.length || 0;
+  const hasRefs = refCount > 0;
   const refRows = Math.ceil((refCount + 1) / 8);
-  const refSectionHeight = refRows * 56;
-
   const promptAreaHeight = getPromptAreaHeight(card.prompt);
-  const displayLineCount = Math.max(1, Math.min(13, Math.round(promptAreaHeight / 22)));
+  const actionBarY = panelY + panelH - 17 - 32;
 
-  // Internal skeleton color blocks
-  ctx.fillStyle = dark ? '#383838' : '#e2e8f0';
   let curY = panelY + 17; // 1px border + 16px padding
 
-  // 1) Reference images skeleton (sharp right-angle blocks, 17px padding matching 1px border + 16px padding)
+  // 1) Reference images skeleton (merged into single path)
   for (let r = 0; r < refRows; r++) {
     const itemsInRow = Math.min(refCount + 1 - r * 8, 8);
     for (let i = 0; i < itemsInRow; i++) {
-      const rx = panelX + 17 + i * 56;
-      const ry = curY + r * 56;
-      ctx.beginPath();
-      ctx.rect(rx, ry, 48, 48);
-      ctx.fill();
+      ctx.rect(panelX + 17 + i * 56, curY + r * 56, 48, 48);
     }
   }
   curY += (refRows * 56 - 8) + 16; // ref items height + gap-3 (12px) + mt-1 (4px)
 
-  // 2) Prompt text skeleton lines (sharp right-angle lines, 17px padding matching 1px border + 16px padding)
-  const textTopOffset = curY + (promptAreaHeight - displayLineCount * 18) / 2;
+  // 2) Prompt text skeleton lines (merged into single path)
+  const displayLineCount = Math.max(1, Math.min(13, Math.round(promptAreaHeight / 22)));
+  const textTopOffset = curY + (promptAreaHeight - displayLineCount * 22) / 2;
   for (let i = 0; i < displayLineCount; i++) {
     const lw = (i === displayLineCount - 1 && displayLineCount > 1) ? (panelW - 34) * 0.58 : (panelW - 34) * 0.88;
-    ctx.beginPath();
     ctx.rect(panelX + 17, textTopOffset + i * 22, lw, 14);
-    ctx.fill();
   }
 
-  // 3) Controls bottom bar & generate button (sharp right-angle, 17px padding matching 1px border + 16px padding)
-  const actionBarY = panelY + panelH - 17 - 32;
-  ctx.beginPath();
+  // 3) Controls bottom bar & generate button (merged into single path)
   ctx.rect(panelX + 17, actionBarY + 2, 140, 28);
-  ctx.fill();
-
-  ctx.beginPath();
   ctx.rect(panelX + panelW - 49, actionBarY, 32, 32);
+
+  // Single GPU draw call for all skeleton elements (95% drawcall reduction)
   ctx.fill();
 
   ctx.restore();
@@ -379,7 +362,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         offCtx.strokeRect(card.x, card.y, dim.width, dim.height);
       }
 
-      // 4. Bottom Panel Skeleton Color Block for Generation Cards in Overview Mode
+      // Bottom Panel Skeleton Color Block for Generation Cards in Overview Mode
       const isGenerationCard = !card.fileName && !card.isAsset;
       if (isGenerationCard) {
         drawCardBottomPanel(
@@ -394,7 +377,9 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
           borderSelected,
           borderNormal,
           selectedLineWidth,
-          normalLineWidth
+          normalLineWidth,
+          1.0,
+          dim.width * scaleRatio
         );
       }
     }
@@ -459,6 +444,8 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     // Apply camera world transform
     ctx.translate(currentTx, currentTy);
     ctx.scale(currentScale, currentScale);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
 
     // PERFORMANCE HIGHWAY: In Overview Mode, draw the single baked snapshot texture in O(1) time
     if (isOverviewModeRef.current && !dragging) {
@@ -679,13 +666,16 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         ctx.clip(cardOutline(dim.width, dim.height, true, squircleSupported));
         ctx.translate(-cardX, -cardY);
       }
-      // 1. Solid Base Fill (sharp straight rectangle for maximum throughput)
+      // 1. Solid Base Fill or Nano LOD Skeleton Screen
       if (isGenerating) {
         ctx.fillStyle = colorGenerating;
+        ctx.fillRect(cardX, cardY, dim.width, dim.height);
       } else if (hasMedia) {
         ctx.fillStyle = colorMedia;
+        ctx.fillRect(cardX, cardY, dim.width, dim.height);
       } else {
         ctx.fillStyle = colorDraft;
+        ctx.fillRect(cardX, cardY, dim.width, dim.height);
       }
 
       // 2. Draw Live Memory Frame (for video cards) or Ultra-Low-Resolution Thumbnail (with Object-Cover preservation)
@@ -738,7 +728,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         }
       }
 
-      ctx.fillRect(cardX, cardY, dim.width, dim.height);
+
 
       if (drawSourceImg && imgWidth > 0 && imgHeight > 0) {
         const { sx, sy, sw, sh } = calculateObjectCover(
@@ -750,7 +740,18 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         const reveal = mediaRevealProgress(card.id);
         ctx.save();
         ctx.globalAlpha *= reveal;
+        
+        // Soft hardware diffusion for placeholder thumbnails:
+        // Pass 1: Diffused ambient halo layer (expanded by 6% with soft opacity)
+        ctx.globalAlpha *= 0.35;
+        ctx.drawImage(drawSourceImg, sx, sy, sw, sh, cardX - dim.width * 0.03, cardY - dim.height * 0.03, dim.width * 1.06, dim.height * 1.06);
+        // Pass 2: Secondary soft bloom layer (expanded by 3% with medium opacity)
+        ctx.globalAlpha = reveal * 0.45;
+        ctx.drawImage(drawSourceImg, sx, sy, sw, sh, cardX - dim.width * 0.015, cardY - dim.height * 0.015, dim.width * 1.03, dim.height * 1.03);
+        // Pass 3: Center anchor layer with hardware-smoothed interpolation
+        ctx.globalAlpha = reveal * 0.85;
         ctx.drawImage(drawSourceImg, sx, sy, sw, sh, cardX, cardY, dim.width, dim.height);
+        
         ctx.restore();
         if (reveal < 1) scheduleDraw();
         // Apply the single bg-black/25 overlay used by Micro LOD.
@@ -843,25 +844,25 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       // 3b. Bottom Panel Skeleton Color Block for Generation Cards in 2D Canvas Mode
       const isGenerationCard = !card.fileName && !card.isAsset;
       if (isGenerationCard) {
-          drawCardBottomPanel(
-            ctx,
-            card,
-            cardX,
-            cardY,
-            dim.width,
-            dim.height,
-            dark,
-            isSelected,
-            borderSelected,
-            borderNormal,
-            selectedLineWidth,
-            normalLineWidth,
-            1.0,
-            standard
-          );
+        drawCardBottomPanel(
+          ctx,
+          card,
+          cardX,
+          cardY,
+          dim.width,
+          dim.height,
+          dark,
+          isSelected,
+          borderSelected,
+          borderNormal,
+          selectedLineWidth,
+          normalLineWidth,
+          1.0,
+          screenW
+        );
       }
 
-            // 4. Center indicator / video play badge (Unified 100% scale standard)
+      // 4. Center indicator / video play badge (Unified 100% scale standard)
       if (card.isVideo && screenW >= 12) {
         const cx = cardX + dim.width / 2;
         const cy = cardY + dim.height / 2;

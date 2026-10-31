@@ -376,6 +376,7 @@ export interface CardData {
   currentTime?: number;
   videoPosterUrl?: string; // Native-resolution still; imageUrl remains the playable video.
   thumbnailUrl?: string;
+  blurPlaceholderUrl?: string; // Pre-baked gaussian blurred placeholder (64px) for elegant LOD transition
   microLodThumbnailUrl?: string; // 64px max edge
   fullDetailThumbnailUrl?: string; // 128px max edge
   closeupThumbnailUrl?: string; // 256px max edge
@@ -5511,6 +5512,7 @@ export const GenerationCard = React.memo(function GenerationCard({
               <CardImageCanvas
                 cardId={id}
                 thumbnailUrl={effectiveThumbnailUrl}
+                blurPlaceholderUrl={data.blurPlaceholderUrl}
                 imageUrl={imageUrl}
                 originalImageUrl={data.originalImageUrl || imageUrl}
                 showOriginal={showOriginal}
@@ -5673,10 +5675,10 @@ export const GenerationCard = React.memo(function GenerationCard({
           marginLeft: (w - CARD_PANEL_WIDTH) / 2,
           // Interactive content can expand for reference previews and errors.
           // Only the absolute bitmap surfaces need a fixed loading height.
-          height: showNativePromptPanel ? 'auto' : getBottomPanelHeight(localPrompt, refList.length),
+          height: 'auto',
           minHeight: getBottomPanelHeight(localPrompt, refList.length),
-          opacity: hasPresentedPanel || showNativePromptPanel ? 1 : 0,
-          pointerEvents: hasPresentedPanel || showNativePromptPanel ? undefined : 'none',
+          opacity: 1,
+          pointerEvents: undefined,
         }}
       >
         {/* Perf: same static-shadow-layer treatment as the card body above. */}
@@ -5708,35 +5710,10 @@ export const GenerationCard = React.memo(function GenerationCard({
             }
           }}
         />
-        <div className="absolute inset-0" style={{ visibility: showNativePromptPanel ? 'hidden' : 'visible' }}
-          aria-hidden={showNativePromptPanel} inert={showNativePromptPanel}>
-        <PromptPanelCanvas
-          suspended={useNativePromptPanel}
-          surfaceRevision={surfaceRevision}
-          renderKey={panelRenderKey} onReady={setPanelBitmapReady}
-          height={getBottomPanelHeight(localPrompt, refList.length)} references={refList}
-          controls={panelControls} scale={scale} generating={state === 'generating'} canGenerate={Boolean(localPrompt.trim())}
-          onGenerate={handleGenerate} cardId={id}
-          onReference={index => setHoveredRefUrl(refList[index].url)}
-          onMention={index => insertMention({ ...refList[index], name: refList[index].name || `图 ${index + 1}` })}
-          onRemove={removeReferenceImage} onAdd={() => setOpenMenu({ type: 'ref', ownerId: 'user' })}
-        >
-          <div className="generation-prompt-area absolute" style={getPromptSurfaceLayout(localPrompt, refList.length)}>
-            <PromptCanvas text={localPrompt || ''} height={getPromptAreaHeight(localPrompt)}
-              suspended={useNativePromptPanel}
-              cardId={id} surfaceRevision={surfaceRevision}
-              renderKey={panelRenderKey} onReady={setPromptBitmapReady}
-              mentionNames={allMentionItems.flatMap(item => [item.name, referenceDisplayName(item.name)])} scale={scale}
-              editing={false} scrollTop={promptScrollTop}
-              targetId={`prompt-input-${id}`} onEdit={activatePromptEditor} disabled={state === 'generating'} />
-          </div>
-        </PromptPanelCanvas>
-        </div>
-        {showNativePromptPanel && <>
+
         {/* High-LOD Interactive Prompt Component: Base Layer directly rendered underneath with full layout */}
         <div
           className="generation-card-bottom-panel-content relative z-0 flex flex-col gap-3 w-full"
-          style={{ pointerEvents: useNativePromptPanel ? undefined : 'none' }}
         >
         {/* Top: Reference & Actions */}
         <div className="flex items-start justify-between relative" ref={refMenuContainerRef}>
@@ -6316,8 +6293,7 @@ export const GenerationCard = React.memo(function GenerationCard({
             <ArrowUp className="w-4 h-4 stroke-[3]" />
           </button>
         </div>
-        </div>
-        </>}
+      </div>
       </div>
       )}
       </div>

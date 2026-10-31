@@ -21,6 +21,7 @@ export async function yieldToMain(): Promise<void> {
 
 export interface MultiLodResult {
   microLodThumbnailUrl: string;
+  blurPlaceholderUrl?: string; // Pre-baked gaussian blurred placeholder (64px) for elegant LOD transition
   fullDetailThumbnailUrl: string;
   closeupThumbnailUrl: string;
   videoPosterUrl?: string;
@@ -29,6 +30,9 @@ export interface MultiLodResult {
 
 // In-memory string cache for thumbnail Data URLs (media/card id -> DataURL)
 export const thumbCache = new Map<string, string>();
+
+// In-memory string cache for pre-baked gaussian blurred placeholder Data URLs
+export const blurPlaceholderCache = new Map<string, string>();
 
 // In-memory HTMLImageElement cache for instantaneous Canvas 2D ctx.drawImage
 export const thumbImageCache = new Map<string, HTMLImageElement>();
@@ -127,7 +131,8 @@ export function getThumbnailDimensions(
 export async function generateImageThumbnail(
   imageSource: string | Blob,
   maxEdge: number = MAX_THUMBNAIL_EDGE,
-  quality: number = 0.90
+  quality: number = 0.90,
+  blurRadius: number = 0
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -178,7 +183,14 @@ export async function generateImageThumbnail(
           return reject(new Error('2D context unavailable'));
         }
 
+        if (blurRadius > 0) {
+          ctx.filter = `blur(${blurRadius}px)`;
+        }
         drawImageHighQuality(ctx, img, tw, th);
+        if (blurRadius > 0) {
+          ctx.filter = 'none';
+        }
+
         let dataUrl = '';
         try {
           dataUrl = canvas.toDataURL('image/webp', quality);
@@ -624,12 +636,16 @@ export async function generateMultiLodThumbnails(
   await yieldToMain();
 
   let microLodThumbnailUrl = '';
+  let blurPlaceholderUrl = '';
   let fullDetailThumbnailUrl = '';
   let closeupThumbnailUrl = '';
 
   try {
     const targetSource = displayBlob || sampleSource;
     microLodThumbnailUrl = await generateImageThumbnail(targetSource, 128, 0.80);
+    await yieldToMain();
+    // Pre-baked gaussian blurred placeholder (64px, blur 4px) for beautiful zero-cost placeholder
+    blurPlaceholderUrl = await generateImageThumbnail(targetSource, 64, 0.80, 4);
     await yieldToMain();
     fullDetailThumbnailUrl = await generateImageThumbnail(targetSource, 480, 0.88);
     await yieldToMain();
@@ -640,6 +656,7 @@ export async function generateMultiLodThumbnails(
 
   return {
     microLodThumbnailUrl,
+    blurPlaceholderUrl,
     fullDetailThumbnailUrl,
     closeupThumbnailUrl,
     videoPosterUrl,

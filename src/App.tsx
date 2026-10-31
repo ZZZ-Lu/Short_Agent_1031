@@ -273,13 +273,17 @@ const blobToDataUrl = (blob: Blob): Promise<string> => new Promise((resolve, rej
   reader.readAsDataURL(blob);
 });
 
-const generateImportThumbnail = async (source: Blob, maxEdge: number): Promise<string> => {
+const generateImportThumbnail = async (source: Blob, maxEdge: number, blurRadius: number = 0): Promise<string> => {
   try {
+    if (blurRadius > 0) {
+      // Use direct canvas for pre-baked blur placeholder
+      return generateImageThumbnail(source, maxEdge, 0.85, blurRadius);
+    }
     // Reuse the resize worker so large-image downscaling never blocks the canvas thread.
     return await blobToDataUrl(await resizeImageOffThread(source, maxEdge, 0.9));
   } catch {
     // Preserve compatibility with browsers that do not support the worker path.
-    return generateImageThumbnail(source, maxEdge);
+    return generateImageThumbnail(source, maxEdge, 0.9, blurRadius);
   }
 };
 
@@ -2547,6 +2551,7 @@ export default function App() {
 
       const processedFileUrl = URL.createObjectURL(processedFile);
       let thumbnailUrl: string | undefined;
+      let blurPlaceholderUrl: string | undefined;
       let microLodThumbnailUrl: string | undefined;
       let fullDetailThumbnailUrl: string | undefined;
       let closeupThumbnailUrl: string | undefined;
@@ -2570,6 +2575,9 @@ export default function App() {
           await yieldToMain();
           microLodThumbnailUrl = await generateImportThumbnail(posterBlob, 64);
           await yieldToMain();
+          // Pre-baked gaussian blurred placeholder (64px, blur 4px) for beautiful zero-cost placeholder
+          blurPlaceholderUrl = await generateImportThumbnail(posterBlob, 64, 4);
+          await yieldToMain();
           fullDetailThumbnailUrl = await generateImportThumbnail(posterBlob, 128);
         } else {
           await yieldToMain();
@@ -2585,6 +2593,9 @@ export default function App() {
           await yieldToMain();
           await yieldToMain();
           microLodThumbnailUrl = await generateImportThumbnail(processedFile, 64);
+          await yieldToMain();
+          // Pre-baked gaussian blurred placeholder (64px, blur 4px) for beautiful zero-cost placeholder
+          blurPlaceholderUrl = await generateImportThumbnail(processedFile, 64, 4);
           await yieldToMain();
           fullDetailThumbnailUrl = await generateImportThumbnail(processedFile, 128);
         }
@@ -2602,6 +2613,7 @@ export default function App() {
         originalImageUrl,
         trueOriginalImageUrl,
         thumbnailUrl,
+        blurPlaceholderUrl,
         microLodThumbnailUrl,
         fullDetailThumbnailUrl,
         closeupThumbnailUrl,
