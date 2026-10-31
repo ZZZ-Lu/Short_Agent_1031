@@ -63,10 +63,10 @@ interface BakedSnapshot {
 function drawCardBottomPanel(
   ctx: CanvasRenderingContext2D,
   card: CardData,
-  cardX: number,
-  cardY: number,
-  cardW: number,
-  cardH: number,
+  cardXBase: number,
+  cardYBase: number,
+  origW: number,
+  origH: number,
   dark: boolean,
   isSelected: boolean,
   borderSelected: string,
@@ -77,65 +77,80 @@ function drawCardBottomPanel(
   screenW: number = 480
 ) {
   if (alpha <= 0.001) return;
-  const panelW = 480;
+  const basePanelW = 480;
+  const origPanelH = getBottomPanelHeight(card.prompt, card.referenceImages?.length);
 
-  // Get unified panel height matching Full Detail & MicroLOD exactly
-  const panelH = getBottomPanelHeight(card.prompt, card.referenceImages?.length);
-  const panelX = cardX + (cardW - panelW) / 2;
-  const panelY = cardY + cardH + 12; // 12px gap matching flex flex-col gap-3 in DOM
+  const scaleFactor = isSelected ? 1.05 : 1.0;
+  const panelW = basePanelW * scaleFactor;
+  const panelH = origPanelH * scaleFactor;
+
+  // Exact 1:1 mathematical match with DOM card-selection-scaler transform-origin: 50% 120px
+  const panelX = isSelected ? cardXBase + (origW - panelW) / 2 : cardXBase + (origW - basePanelW) / 2;
+  const panelY = isSelected ? cardYBase + origH * 1.05 + 6.6 : cardYBase + origH + 12;
 
   ctx.save();
   if (alpha < 1.0) {
     ctx.globalAlpha = (ctx.globalAlpha || 1.0) * alpha;
   }
 
-  // Background fill (sharp right-angle corners for low LOD style)
+  const currentLw = isSelected ? selectedLineWidth : normalLineWidth;
+
+  // Background fill matching DOM border-box
   ctx.fillStyle = dark ? '#262626' : '#f3f4f6';
   ctx.beginPath();
   ctx.rect(panelX, panelY, panelW, panelH);
   ctx.fill();
 
-  // Border (matching card and panel perimeter bounds)
+  // Border matching CSS border-box (inset by half stroke width to align outer edge with bounds)
   ctx.strokeStyle = isSelected ? borderSelected : borderNormal;
-  const currentLw = isSelected ? selectedLineWidth : normalLineWidth;
   ctx.lineWidth = currentLw;
-  ctx.strokeRect(panelX, panelY, panelW, panelH);
+  ctx.strokeRect(
+    panelX + currentLw / 2,
+    panelY + currentLw / 2,
+    Math.max(0, panelW - currentLw),
+    Math.max(0, panelH - currentLw)
+  );
 
-  // Internal skeleton color blocks (low contrast, subtle fill)
+  // Internal skeleton color blocks (scaled smoothly from panel origin)
+  ctx.save();
+  ctx.translate(panelX, panelY);
+  if (isSelected) {
+    ctx.scale(1.05, 1.05);
+  }
+
   ctx.fillStyle = dark ? 'rgba(255, 255, 255, 0.045)' : 'rgba(0, 0, 0, 0.035)';
   ctx.beginPath();
 
   const refCount = card.referenceImages?.length || 0;
-  const hasRefs = refCount > 0;
   const refRows = Math.ceil((refCount + 1) / 8);
   const promptAreaHeight = getPromptAreaHeight(card.prompt);
-  const actionBarY = panelY + panelH - 17 - 32;
+  const actionBarY = origPanelH - 17 - 32;
 
-  let curY = panelY + 17; // 1px border + 16px padding
+  let curY = 17; // 1px border + 16px padding
 
-  // 1) Reference images skeleton (merged into single path)
+  // 1) Reference images skeleton
   for (let r = 0; r < refRows; r++) {
     const itemsInRow = Math.min(refCount + 1 - r * 8, 8);
     for (let i = 0; i < itemsInRow; i++) {
-      ctx.rect(panelX + 17 + i * 56, curY + r * 56, 48, 48);
+      ctx.rect(17 + i * 56, curY + r * 56, 48, 48);
     }
   }
-  curY += (refRows * 56 - 8) + 16; // ref items height + gap-3 (12px) + mt-1 (4px)
+  curY += (refRows * 56 - 8) + 16;
 
-  // 2) Prompt text skeleton lines (merged into single path)
+  // 2) Prompt text skeleton lines
   const displayLineCount = Math.max(1, Math.min(13, Math.round(promptAreaHeight / 22)));
   const textTopOffset = curY + (promptAreaHeight - displayLineCount * 22) / 2;
   for (let i = 0; i < displayLineCount; i++) {
-    const lw = (i === displayLineCount - 1 && displayLineCount > 1) ? (panelW - 34) * 0.58 : (panelW - 34) * 0.88;
-    ctx.rect(panelX + 17, textTopOffset + i * 22, lw, 14);
+    const lw = (i === displayLineCount - 1 && displayLineCount > 1) ? (basePanelW - 34) * 0.58 : (basePanelW - 34) * 0.88;
+    ctx.rect(17, textTopOffset + i * 22, lw, 14);
   }
 
-  // 3) Controls bottom bar & generate button (merged into single path)
-  ctx.rect(panelX + 17, actionBarY + 2, 140, 28);
-  ctx.rect(panelX + panelW - 49, actionBarY, 32, 32);
+  // 3) Controls bottom bar & generate button
+  ctx.rect(17, actionBarY + 2, 140, 28);
+  ctx.rect(basePanelW - 49, actionBarY, 32, 32);
 
-  // Single GPU draw call for all skeleton elements (95% drawcall reduction)
   ctx.fill();
+  ctx.restore();
 
   ctx.restore();
 }
@@ -571,6 +586,8 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
 
     const renderCard = (card: CardData) => {
       let dim = getCardSize(card);
+      const origW = dim.width;
+      const origH = dim.height;
 
       // --- CALCULATE REALTIME NANO DRAGGING OFFSET ---
       let cardX = card.x;
@@ -584,6 +601,9 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
           cardY += dragging.dy;
         }
       }
+
+      const cardXBase = cardX;
+      const cardYBase = cardY;
 
       const isSelected = selectedIds.includes(card.id);
       if (isSelected) {
@@ -740,18 +760,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         const reveal = mediaRevealProgress(card.id);
         ctx.save();
         ctx.globalAlpha *= reveal;
-        
-        // Soft hardware diffusion for placeholder thumbnails:
-        // Pass 1: Diffused ambient halo layer (expanded by 6% with soft opacity)
-        ctx.globalAlpha *= 0.35;
-        ctx.drawImage(drawSourceImg, sx, sy, sw, sh, cardX - dim.width * 0.03, cardY - dim.height * 0.03, dim.width * 1.06, dim.height * 1.06);
-        // Pass 2: Secondary soft bloom layer (expanded by 3% with medium opacity)
-        ctx.globalAlpha = reveal * 0.45;
-        ctx.drawImage(drawSourceImg, sx, sy, sw, sh, cardX - dim.width * 0.015, cardY - dim.height * 0.015, dim.width * 1.03, dim.height * 1.03);
-        // Pass 3: Center anchor layer with hardware-smoothed interpolation
-        ctx.globalAlpha = reveal * 0.85;
         ctx.drawImage(drawSourceImg, sx, sy, sw, sh, cardX, cardY, dim.width, dim.height);
-        
         ctx.restore();
         if (reveal < 1) scheduleDraw();
         // Apply the single bg-black/25 overlay used by Micro LOD.
@@ -847,10 +856,10 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         drawCardBottomPanel(
           ctx,
           card,
-          cardX,
-          cardY,
-          dim.width,
-          dim.height,
+          cardXBase,
+          cardYBase,
+          origW,
+          origH,
           dark,
           isSelected,
           borderSelected,

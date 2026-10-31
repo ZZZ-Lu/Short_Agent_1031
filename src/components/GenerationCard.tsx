@@ -4836,7 +4836,7 @@ export const GenerationCard = React.memo(function GenerationCard({
           className="card-selection-scaler w-full flex flex-col gap-3 items-start relative transition-transform duration-200 ease-[cubic-bezier(0.16,1,0.3,1)]"
           style={{
             transform: isSelected ? 'scale(1.05)' : 'scale(1)',
-            transformOrigin: '50% 120px',
+            transformOrigin: `${w / 2}px 120px`,
           }}
         >
         {/* Ambient (idle) shadow — upstream renders this at rest. Also moved off the scaler
