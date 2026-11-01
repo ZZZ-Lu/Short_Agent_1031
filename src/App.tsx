@@ -6869,15 +6869,23 @@ export default function App() {
       const targetScale = 0.1;
       const targetTx = cursorX - worldX * targetScale;
       const targetTy = cursorY - worldY * targetScale;
-
-      targetTransform.current = { x: targetTx, y: targetTy, scale: targetScale };
-
+      const destination = { x: targetTx, y: targetTy, scale: targetScale };
+      targetTransform.current = destination;
       clearTimeout(zoomTimeoutRef.current);
-      zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, CANVAS_IDLE_MS);
-
-      animate(tScale, targetScale, { type: 'tween', duration: 0.40, ease: [0.16, 1, 0.3, 1] });
-      animate(tx, targetTx, { type: 'tween', duration: 0.40, ease: [0.16, 1, 0.3, 1] });
-      animate(ty, targetTy, { type: 'tween', duration: 0.40, ease: [0.16, 1, 0.3, 1] });
+      const transition = { type: 'tween' as const, duration: 0.40, ease: [0.16, 1, 0.3, 1] as [number, number, number, number] };
+      void Promise.all([
+        animate(tScale, targetScale, transition),
+        animate(tx, targetTx, transition),
+        animate(ty, targetTy, transition),
+      ]).then(() => {
+        if (targetTransform.current !== destination) return;
+        if (getCanvasLoadingMode() === 'lazy') {
+          lastCameraChangeRef.current = performance.now();
+          zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, CANVAS_IDLE_MS);
+        } else {
+          restoreCanvasStyles();
+        }
+      });
     } else {
       // Zoom directly into 100% anchored at the exact mouse cursor position
       const targetScale = 1.0;
