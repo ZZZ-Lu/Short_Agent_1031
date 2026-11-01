@@ -93,7 +93,7 @@ export function AgentRuntimeTracePanel({ traces }: AgentRuntimeTracePanelProps) 
             const toolCount = item.parsedResult?.toolCalls?.length || 0;
             return <button key={item.id} onClick={() => setSelectedTurnId(item.id)} className={`w-full rounded-xl border p-3 text-left transition ${active ? 'border-violet-400 bg-violet-50/80 dark:border-violet-500 dark:bg-violet-950/40' : 'border-slate-200 bg-gray-100 hover:border-slate-300 dark:border-white/10 dark:bg-white/[.03]'}`}>
               <div className="flex items-center justify-between gap-2"><span className="text-xs font-semibold">第 {item.turn} 轮</span><span className="text-[10px] text-slate-400">{duration(item)}</span></div>
-              <p className="mt-1 text-[11px] text-slate-500">{item.requireTool ? 'Runtime 要求继续调用工具' : '正常唤醒'}</p>
+              <p className="mt-1 text-[11px] text-slate-500">{item.transport?.request.context ? `${item.transport.request.context.level} 级 · ${item.transport.request.context.tools.length} 个注入工具 · ${item.transport.request.context.prompts.length} 个提示词模块` : (item.requireTool ? 'Runtime 要求继续调用工具' : '正常唤醒')}</p>
               <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px] text-slate-400">
                 <span className="flex items-center gap-1"><Wrench size={11} />{toolCount} 个工具</span>
                 {item.stateNodeTrace && (
@@ -140,6 +140,7 @@ export function AgentRuntimeTracePanel({ traces }: AgentRuntimeTracePanelProps) 
           {!turn && <div className="grid h-full place-items-center text-sm text-slate-400">等待第一轮模型请求。</div>}
           {turn && detailTab === 'prompt' && <div className="flex min-h-0 flex-1 flex-col space-y-3">
             <TraceNotice icon={<Eye size={15} />} title="这是服务端实际组装后发送给模型的内容" text="可据此检查 userMessage、task、history、System Prompt、工具定义分别如何进入本轮请求。API Key 已排除。" />
+            {turn.transport?.request.context && <JsonBlock title="本轮实际注入的层级、工具和提示词模块" value={turn.transport.request.context} />}
             {turn.transport ? (
               <JsonBlock 
                 className="flex min-h-0 flex-1 flex-col"

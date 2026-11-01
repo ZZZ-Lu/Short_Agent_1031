@@ -30,6 +30,7 @@ export interface AgentRuntimeTrace {
 /** A render-safe task copy for the debugging UI. */
 export const snapshotRuntimeTask = (task: RuntimeTask): RuntimeTask => ({
   ...task,
+  context: task.context ? { ...task.context, tools: [...task.context.tools], prompts: [...task.context.prompts] } : { level: 0, tools: [], prompts: [] },
   plan: task.plan.map(item => ({ ...item })),
   history: task.history.map(item => ({ ...item })),
   observations: task.observations.map(item => ({ ...item })),

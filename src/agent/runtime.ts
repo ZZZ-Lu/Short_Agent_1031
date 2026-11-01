@@ -1,4 +1,5 @@
 import type { AgentHistoryItem, AgentToolCall, AgentTurnResult } from './protocol';
+import { initialAgentContext, validateSelection, type AgentContextSelection } from './contextPolicy';
 
 export type RuntimeTaskStatus = 'planning' | 'waiting_tools' | 'waiting_user' | 'completed' | 'failed' | 'cancelled' | 'paused';
 export type RuntimeToolStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
@@ -19,6 +20,7 @@ export interface RuntimeEvent {
 }
 
 export interface RuntimeTask {
+  context: AgentContextSelection;
   id: string;
   sessionId: string;
   goal: string;
@@ -42,6 +44,7 @@ export interface RuntimeTask {
 }
 
 export interface AgentRuntimeOptions {
+  enabledTools?: () => readonly string[];
   requestTurn: (task: RuntimeTask, requireTool: boolean, signal?: AbortSignal) => Promise<AgentTurnResult>;
   executeTool: (call: AgentToolCall, task: RuntimeTask, signal?: AbortSignal) => Promise<unknown>;
   updateStateNode?: (task: RuntimeTask, result: AgentTurnResult, signal?: AbortSignal) => Promise<void>;
@@ -71,6 +74,7 @@ export class AgentRuntime {
 
   createTask(input: { id: string; sessionId: string; goal: string; images?: string[]; cardContext?: Record<string, any> }): RuntimeTask {
     const task: RuntimeTask = {
+      context: initialAgentContext(),
       id: input.id,
       sessionId: input.sessionId,
       goal: '',
@@ -286,6 +290,20 @@ export class AgentRuntime {
     this.addEvent(task, { turnId, type: 'tool', text: `调用中：${call.name}`, toolName: call.name, callId: call.id, status: 'queued', input: call.arguments });
     this.updateLastTool(task, call.id, 'running', `调用中：${call.name}`);
     
+    if (call.name === 'sys.selectContext') {
+      try {
+        const selection = validateSelection(call.arguments, this.options.enabledTools?.() ?? []);
+        task.context = selection;
+        this.updateLastTool(task, call.id, 'succeeded', '已选择下一轮上下文', { output: selection });
+        task.observations.push({ role: 'tool', content: { callId: call.id, name: call.name, status: 'succeeded', output: selection } });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '上下文选择失败';
+        this.updateLastTool(task, call.id, 'failed', `失败：${call.name} · ${message}`, { error: message });
+        task.observations.push({ role: 'tool', content: { callId: call.id, name: call.name, status: 'failed', error: message } });
+      }
+      return;
+    }
+
     if (call.name === 'sys.updateState') {
       if (typeof call.arguments.progress === 'string') task.progress = call.arguments.progress;
       if (typeof call.arguments.subGoal === 'string') task.subGoal = call.arguments.subGoal;

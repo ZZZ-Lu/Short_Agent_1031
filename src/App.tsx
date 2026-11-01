@@ -1,4 +1,5 @@
 import { EntryBlurOverlay } from './components/EntryBlurOverlay';
+import { executeProjectReadTool } from './agent/projectTools';
 import { registerCardEntries, requestCardEntries, stageCardEntry, startCardEntry, startMediaReveal, mediaRevealProgress, MEDIA_REVEAL_MS, CARD_ENTRY_MS, isNewCardAwaitingLod } from './utils/cardEntrance';
 import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
 import { AgentCursor, buildDynamicSelectionPrompt, HudContextMessage } from './components/AgentCursor';
@@ -37,6 +38,7 @@ import { assetExtractionService } from './services/assetExtractionService';
 import { getActiveMcpKey, getActiveMcpTokenSync, getMcpConfig } from './utils/mcpStorage';
 import { CanvasLineageOverlay } from './components/CanvasLineageOverlay';
 import { AGENT_TOOL_REGISTRY, getAgentToolConfig } from './agent/toolRegistry';
+import { initialAgentContext } from './agent/contextPolicy';
 import { getPageComponentDefinition, type MouseActionName } from './agent/pageComponentRegistry';
 import { buildAutoInjectedCardContext, buildMultiCardInjectedContext } from './agent/cardContextBuilder';
 import { agentFocusManager, type AgentFocusSnapshot } from './agent/agentFocusManager';
@@ -666,6 +668,8 @@ export default function App() {
     scriptText: typeof rawProject.scriptText === 'string' ? rawProject.scriptText : '',
     universe: { ...DEFAULT_PROJECT.universe, ...(rawProject.universe || {}) },
   }), [rawProject]);
+  const currentProjectRef = useRef(currentProject);
+  currentProjectRef.current = currentProject;
 
   const [isScriptDrawerOpen, setIsScriptDrawerOpen] = useState(false);
   const [isScriptTocOpen, setIsScriptTocOpen] = useState(false);
@@ -1628,6 +1632,7 @@ export default function App() {
           const now = Date.now();
           const standaloneTaskId = taskId || `qc_${Date.now().toString(36)}`;
           const standaloneTask: RuntimeTask = {
+            context: initialAgentContext(),
             id: standaloneTaskId,
             sessionId: standaloneTaskId,
             goal: `自主质检查看卡片【${freshCard.id}】`,
@@ -5051,6 +5056,9 @@ export default function App() {
 
   const executeAgentTool = useCallback(async (call: AgentToolCall, task: RuntimeTask, signal?: AbortSignal) => {
     if (signal?.aborted) return { aborted: true };
+    if (call.name === 'script.directory' || call.name === 'script.read' || call.name === 'script.search' || call.name === 'asset.list') {
+      return executeProjectReadTool(call.name, call.arguments, currentProjectRef.current);
+    }
     const rememberObservation = (page: Awaited<ReturnType<typeof inspectPage>>) => {
       observedTargetsByTaskRef.current.set(task.id, new Set(page.components.map(component => component.id)));
       return page;
@@ -5855,6 +5863,7 @@ export default function App() {
         taskId = `task_${Date.now().toString(36)}`;
         activeTaskIdRef.current = taskId;
         runtime = new AgentRuntime({
+          enabledTools: () => AGENT_TOOL_REGISTRY.filter(tool => getAgentToolConfig()[tool.id]).map(tool => tool.id),
           requestTurn: async (task: RuntimeTask, requireTool, signal) => {
             const turnId = `${task.id}:turn:${task.turn}`;
             const startedAt = Date.now();
@@ -5884,7 +5893,8 @@ export default function App() {
               cardContext: task.cardContext || effectiveCardContext,
               apiKey: savedKey, 
               modelType: agentModel, 
-              enabledTools, 
+              enabledTools: AGENT_TOOL_REGISTRY.filter(tool => getAgentToolConfig()[tool.id]).map(tool => tool.id),
+              contextSelection: task.context,
               requireTool,
               jsonAdapterModel,
               jsonAdapterKey,
@@ -6242,7 +6252,7 @@ export default function App() {
         });
         updateAgentRuntimeTrace(task);
         // Auto inspect if enabled
-        if (localStorage.getItem('auto_inspect_on_launch') !== 'false') {
+        if (localStorage.getItem('auto_inspect_on_launch') === 'true') {
           try {
             const initObservation = await inspectPage({ scope: 'overview' });
             observedTargetsByTaskRef.current.set(task.id, new Set(initObservation.components.map(component => component.id)));

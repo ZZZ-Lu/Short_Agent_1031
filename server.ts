@@ -4,6 +4,7 @@ import { createServer as createViteServer } from "vite";
 import fs from "fs";
 import dotenv from "dotenv";
 import { AGENT_TOOL_REGISTRY } from './src/agent/toolRegistry';
+import { initialAgentContext, PROMPT_MODULES, resolveContext, type AgentContextSelection } from './src/agent/contextPolicy';
 import { mcpRouter } from './src/server/mcpRouter';
 dotenv.config();
 const defaultPromptFilePath = path.join(process.cwd(), "src/agent/systemPrompt.txt");
@@ -64,6 +65,11 @@ const parametersForTool = (toolId: string) => {
   const target = { type: 'string', description: '来自最近一次 page.inspect 的 visible components 的 targetId。' };
   const observationProperties = { scope: { type: 'string', description: 'overview 返回主要入口概览（默认，剧本正文不直接展开注入）；填可见组件 ID（如 "script.text"）申请查看该区域的可见内容。' }, offset: { type: 'integer', minimum: 0, description: '同一可见区域的返回分页偏移，不会滚动页面。' }, limit: { type: 'integer', minimum: 1, maximum: 100 } };
   const schemas: Record<string, { properties: Record<string, unknown>; required?: string[] }> = {
+    'sys.selectContext': { properties: { level: { type: 'integer', enum: [0, 1] }, tools: { type: 'array', items: { type: 'string' } }, prompts: { type: 'array', items: { type: 'string' } } }, required: ['level', 'tools', 'prompts'] },
+    'script.directory': { properties: { query: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 200 } } },
+    'script.read': { properties: { offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 200 } } },
+    'script.search': { properties: { query: { type: 'string' } }, required: ['query'] },
+    'asset.list': { properties: { type: { type: 'string', enum: ['characters', 'locations', 'props'] }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 100 } } },
     'ui.actAndObserve': { properties: { targetId: target, action: { type: 'string', enum: ['mouse.move', 'mouse.click', 'mouse.doubleClick', 'mouse.longPress', 'mouse.hover', 'mouse.drag', 'mouse.scroll', 'mouse.type', 'mouse.keyPress'] }, arguments: { type: 'object', description: '鼠标动作的附加参数。例如：mouse.scroll 可传 { delta: number }（正数向下，负数向上）；mouse.type 可传 { text: string, clear?: boolean }（输入文本，clear 为 true 时先清空原有内容）；mouse.keyPress 可传 { key: string, shiftKey?: boolean }（如 key="Enter"）' }, observe: { type: 'object', properties: observationProperties } }, required: ['targetId', 'action'] },
     'page.inspect': { properties: observationProperties },
     'guide.lookup': { properties: { query: { type: 'string' } }, required: ['query'] },
@@ -709,6 +715,7 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
         apiKey, 
         modelType = 'deepseek-v4-flash', 
         enabledTools, 
+        contextSelection,
         requireTool = false, 
         images = [], 
         cardContext,
@@ -720,14 +727,21 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
       if (!userMessage || typeof userMessage !== 'string') return res.status(400).json({ error: '缺少用户消息。' });
 
       const allToolIds = new Set<string>(AGENT_TOOL_REGISTRY.map((tool) => tool.id));
-      const enabledToolIds = new Set(Array.isArray(enabledTools)
+      const configuredToolIds = Array.isArray(enabledTools)
         ? enabledTools.filter((tool): tool is string => typeof tool === 'string' && allToolIds.has(tool))
-        : AGENT_TOOL_REGISTRY.map((tool) => tool.id));
+        : AGENT_TOOL_REGISTRY.map((tool) => tool.id);
+      const rawContext = contextSelection && (contextSelection.level === 0 || contextSelection.level === 1) && Array.isArray(contextSelection.tools) && Array.isArray(contextSelection.prompts)
+        ? contextSelection as AgentContextSelection : initialAgentContext();
+      const turnContext = resolveContext(rawContext, configuredToolIds);
+      const enabledToolIds = new Set<string>(turnContext.tools);
       const toolPrompt = AGENT_TOOL_REGISTRY
         .filter((tool) => enabledToolIds.has(tool.id))
         .map((tool) => `【${tool.id}】\n  描述：${tool.description}\n  支持的参数：${tool.input}\n  调用示例：{{调用 ${tool.id}, ${tool.input}}}`)
         .join('\n\n');
-      const systemPrompt = getSystemPrompt().replace('{toolPrompt}', toolPrompt);
+      const toolCatalog = turnContext.catalog.map(tool => `${tool.id}：${tool.description.slice(0, 65)}`).join('\n');
+      const promptCatalog = Object.entries(PROMPT_MODULES).map(([id, module]) => `${id}：${module.label}`).join('\n');
+      const selectedPrompts = turnContext.prompts.map(id => `【${PROMPT_MODULES[id].label}】\n${PROMPT_MODULES[id].content}`).join('\n\n');
+      const contextHeader = `【本轮上下文】思考层级：${turnContext.level}（0 全局规划，1 局部执行）。已注入工具：${turnContext.tools.join('、')}。已注入提示词：${turnContext.prompts.join('、') || '无'}。\n仅可调用本轮已注入工具。通过 sys.selectContext 选择下一轮的 level、tools、prompts；例如 {{调用 sys.selectContext, {"level":1,"tools":["script.read"],"prompts":["script"]}}。选择替换上一轮并在下一轮生效；可随时切换回 0 级。\n【可选工具目录】\n${toolCatalog}\n【可选提示词目录】\n${promptCatalog}\n【已选择的提示词】\n${selectedPrompts || '无'}\n`;
 
             const formatObservations = (obsList: any[]) => {
         let pageObs: string[] = [];
@@ -900,7 +914,8 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         }
       }
 
-      const finalPrompt = (cardContextInjection + getSystemPrompt())
+      const basePrompt = getSystemPrompt();
+      const finalPrompt = (contextHeader + cardContextInjection + basePrompt + (basePrompt.includes('{{toolPrompt}}') ? '' : `\n【本轮可调用工具】\n${toolPrompt}\n`))
         .replace('{{taskTitle}}', task.title || '尚未命名')
         .replace('{{taskGoal}}', cleanUserGoalText(task.goal) || '尚未设定')
         .replace('{{taskSubGoal}}', task.subGoal || '暂未设定')
@@ -1175,8 +1190,8 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         } catch { return []; }
       });
 
-      const hasEndTask = toolCalls.some(c => c.name === 'sys.endTask');
-      const isComplete = hasEndTask || parsed.complete === true;
+      // Let the runtime execute sys.endTask so its completion/pause result is recorded.
+      const isComplete = parsed.complete === true && toolCalls.length === 0;
 
       if (requireTool && toolCalls.length === 0 && !isComplete) {
         console.warn('Agent required a tool call but returned none:', JSON.stringify({ content: message.content }));
@@ -1204,6 +1219,8 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
           request: {
             model: actualModel,
             messages,
+            tools: turnContext.tools,
+            context: { level: turnContext.level, tools: turnContext.tools, prompts: turnContext.prompts },
           },
           response: {
             content: message.content ?? null,

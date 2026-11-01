@@ -1,6 +1,6 @@
 import type { AgentToolName } from './protocol';
 
-export type ToolCategory = '页面观察' | '页面交互' | '操作知识' | '系统控制';
+export type ToolCategory = '剧本与资产' | '页面观察' | '页面交互' | '操作知识' | '系统控制';
 
 export type ToolRisk = '只读' | '交互动作' | '内部状态';
 
@@ -15,6 +15,11 @@ export interface AgentToolDefinition {
 }
 
 export const AGENT_TOOL_REGISTRY: AgentToolDefinition[] = [
+  { id: 'sys.selectContext', category: '系统控制', description: '选择下一轮思考层级、注入工具和提示词模块；提交后下一轮生效，当前轮只可调用已注入工具。', input: '{ level: 0 | 1, tools: string[], prompts: string[] }', output: '下一轮上下文选择', mouse: false, risk: '内部状态' },
+  { id: 'script.directory', category: '剧本与资产', description: '分页读取当前项目的剧本分集目录，可按标题筛选。', input: '{ query?: string, offset?: number, limit?: number }', output: '当前项目分集目录', mouse: false, risk: '只读' },
+  { id: 'script.read', category: '剧本与资产', description: '按行分页读取当前项目的剧本正文。', input: '{ offset?: number, limit?: number }', output: '正文、行数及下一页位置', mouse: false, risk: '只读' },
+  { id: 'script.search', category: '剧本与资产', description: '在当前项目剧本中搜索关键词。', input: '{ query: string }', output: '匹配行和位置', mouse: false, risk: '只读' },
+  { id: 'asset.list', category: '剧本与资产', description: '按类型分页读取当前项目的角色、场景和道具资产。', input: '{ type?: "characters" | "locations" | "props", offset?: number, limit?: number }', output: '资产列表及分页信息', mouse: false, risk: '只读' },
   { id: 'guide.lookup', category: '操作知识', description: '查询应用的操作说明；只说明如何通过界面查找信息，不提供当前项目隐藏数据。', input: '{ query }', output: '操作路径与注意事项', mouse: false, risk: '只读' },
   { id: 'page.inspect', category: '页面观察', description: '默认返回页面入口概览，正文不直接展开注入；指定 scope 为可见组件 ID（如 script.text）时申请查看该区域的可见内容。动作集合去重，不返回坐标或隐藏数据；分页截断明确提示。', input: '{ scope?: "overview" | 组件ID, offset?: number, limit?: number }', output: '区域可见事实、组件、动作集合、分页及页面提示', mouse: true, risk: '只读' },
   { id: 'card.inspect', category: '页面观察', description: '深入探针查看指定的卡片，可选择性地调取高清生成图像、生成提示词、输入参考图集合及其他元参数（如画幅比例、渲染状态、模型等）。支持在复刻、对照时精细索取图片，节省全局Token并极大提高分析纯度。', input: '{ cardId: string, includeImage?: boolean, includePrompt?: boolean, includeReference?: boolean, includeParameters?: boolean }', output: '请求的卡片属性、文件资源或高清图像视觉反馈', mouse: true, risk: '只读' },
@@ -35,7 +40,7 @@ export const DEFAULT_AGENT_TOOL_CONFIG: AgentToolConfig = Object.fromEntries(
 export const getAgentToolConfig = (): AgentToolConfig => {
   try {
     const saved = localStorage.getItem('agent_tool_config');
-    return { ...DEFAULT_AGENT_TOOL_CONFIG, ...(saved ? JSON.parse(saved) : {}) };
+    return { ...DEFAULT_AGENT_TOOL_CONFIG, ...(saved ? JSON.parse(saved) : {}), 'sys.selectContext': true };
   } catch {
     return { ...DEFAULT_AGENT_TOOL_CONFIG };
   }

@@ -1012,7 +1012,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
 
       <footer className="flex h-7 shrink-0 items-center border-t border-slate-200 bg-gray-100 px-4 text-[10px] text-slate-400 dark:border-white/10 dark:bg-[#151517]">
         <span className="flex items-center gap-1.5"><span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />调试服务就绪</span>
-        <span className="ml-4">{settingsSection === 'architecture' ? '架构基线：Full Theater Mode V1' : settingsSection === 'tools' ? '工具源：src/agent/toolRegistry.ts' : settingsSection === 'runtime' ? '追踪源：AgentRuntime 与 /api/agent/turn 的真实请求' : 'Prompt 源：src/constants/prompts.ts'}</span>
+        <span className="ml-4">{settingsSection === 'architecture' ? '架构基线：后台工具优先' : settingsSection === 'tools' ? '工具源：src/agent/toolRegistry.ts' : settingsSection === 'runtime' ? '追踪源：AgentRuntime 与 /api/agent/turn 的真实请求' : 'Prompt 源：src/constants/prompts.ts'}</span>
         <span className="ml-auto">{settingsSection === 'debug' ? 'Ctrl/⌘ + Enter 运行 · Esc 关闭' : 'Esc 关闭'}</span>
       </footer>
 

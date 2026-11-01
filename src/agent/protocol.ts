@@ -1,4 +1,9 @@
 export type AgentToolName =
+  | 'sys.selectContext'
+  | 'script.directory'
+  | 'script.read'
+  | 'script.search'
+  | 'asset.list'
   | 'guide.lookup'
   | 'page.inspect'
   | 'card.inspect'
@@ -43,6 +48,7 @@ export interface AgentTurnDebugSnapshot {
     model: string;
     messages: Array<{ role: string; content: unknown }>;
     tools: unknown[];
+    context?: { level: number; tools: string[]; prompts: string[] };
   };
   response: {
     content: unknown;

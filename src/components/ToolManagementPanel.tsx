@@ -3,13 +3,13 @@ import { Check, ChevronDown, ChevronRight, Copy, MousePointer2, Power, RotateCcw
 import { AGENT_TOOL_REGISTRY, DEFAULT_AGENT_TOOL_CONFIG, getAgentToolConfig, saveAgentToolConfig, type AgentToolConfig, type ToolCategory } from '../agent/toolRegistry';
 import { PAGE_COMPONENT_REGISTRY } from '../agent/pageComponentRegistry';
 
-const categories: ToolCategory[] = ['操作知识', '页面观察', '页面交互', '系统控制'];
+const categories: ToolCategory[] = ['剧本与资产', '操作知识', '页面观察', '页面交互', '系统控制'];
 
 export function ToolManagementPanel() {
   const [config, setConfig] = useState<AgentToolConfig>(getAgentToolConfig);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
-  const [autoInspect, setAutoInspect] = useState(() => localStorage.getItem("auto_inspect_on_launch") !== "false");
+  const [autoInspect, setAutoInspect] = useState(() => localStorage.getItem("auto_inspect_on_launch") === "true");
 
   const handleCopy = (text: string, key: string, e?: React.MouseEvent) => {
     e?.stopPropagation();
@@ -24,6 +24,7 @@ export function ToolManagementPanel() {
   };
   const grouped = useMemo(() => categories.map((category) => ({ category, tools: AGENT_TOOL_REGISTRY.filter((tool) => tool.category === category) })), []);
   const setEnabled = (id: keyof AgentToolConfig, enabled: boolean) => {
+    if (id === 'sys.selectContext') return;
     const next = { ...config, [id]: enabled };
     setConfig(next);
     saveAgentToolConfig(next);
@@ -73,6 +74,7 @@ export function ToolManagementPanel() {
                       <div className="flex items-start sm:items-center gap-3 px-4 py-3">
                         <button
                           onClick={() => setEnabled(tool.id, !config[tool.id])}
+                          disabled={tool.id === 'sys.selectContext'}
                           className={`mt-1 sm:mt-0 grid h-6 w-10 shrink-0 place-items-center rounded-full transition ${config[tool.id] ? 'bg-violet-600' : 'bg-slate-200 dark:bg-white/10'}`}
                           aria-label={`${config[tool.id] ? '禁用' : '启用'} ${tool.id}`}
                         >
