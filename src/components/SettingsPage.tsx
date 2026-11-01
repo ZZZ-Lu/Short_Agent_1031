@@ -687,19 +687,34 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
           {/* Canvas Batch Loading Mode Toggle Button */}
           <button
             type="button"
-            role="switch"
-            aria-checked={loadingMode === 'immediate'}
-            onClick={() => setCanvasLoadingMode(loadingMode === 'immediate' ? 'lazy' : 'immediate')}
+            onClick={() => {
+              const nextMode = loadingMode === 'hybrid' ? 'immediate' : loadingMode === 'immediate' ? 'lazy' : 'hybrid';
+              setCanvasLoadingMode(nextMode);
+            }}
             className={`flex h-8 items-center gap-1.5 rounded-lg border px-2.5 text-xs transition cursor-pointer ${
-              loadingMode === 'immediate'
-                ? 'border-violet-500/40 bg-violet-50 text-violet-700 dark:border-violet-500/40 dark:bg-violet-950/40 dark:text-violet-300 font-medium'
-                : 'border-slate-200 text-slate-500 hover:bg-slate-50 dark:border-white/10 dark:text-slate-400 dark:hover:bg-white/10'
+              loadingMode === 'hybrid'
+                ? 'border-emerald-500/40 bg-emerald-50 text-emerald-700 dark:border-emerald-500/40 dark:bg-emerald-950/40 dark:text-emerald-300 font-medium'
+                : loadingMode === 'immediate'
+                  ? 'border-violet-500/40 bg-violet-50 text-violet-700 dark:border-violet-500/40 dark:bg-violet-950/40 dark:text-violet-300 font-medium'
+                  : 'border-slate-200 text-slate-500 hover:bg-slate-50 dark:border-white/10 dark:text-slate-400 dark:hover:bg-white/10'
             }`}
-            aria-label="即时分批加载"
-            title="点击切换加载模式。即时模式在缩放、拖拽时分批加载；懒加载模式在停止操作 300ms 后分批加载。"
+            aria-label="画布加载模式"
+            title="点击切换：混合焦圈模式（鼠标焦圈即时+外围懒载） / 即时分批加载 / 懒加载模式"
           >
-            <Zap size={13} className={loadingMode === 'immediate' ? 'text-violet-600 dark:text-violet-400' : 'text-slate-400'} />
-            <span>{loadingMode === 'immediate' ? '即时分批加载（开启）' : '懒分批加载（开启）'}</span>
+            {loadingMode === 'hybrid' ? (
+              <Eye size={13} className="text-emerald-600 dark:text-emerald-400" />
+            ) : loadingMode === 'immediate' ? (
+              <Zap size={13} className="text-violet-600 dark:text-violet-400" />
+            ) : (
+              <Clock3 size={13} className="text-slate-400" />
+            )}
+            <span>
+              {loadingMode === 'hybrid'
+                ? '🎯 混合焦圈模式'
+                : loadingMode === 'immediate'
+                  ? '⚡ 即时分批加载'
+                  : '💤 懒加载模式'}
+            </span>
           </button>
 
           {settingsSection === 'debug' && <select

@@ -2,7 +2,8 @@
 export const NANO_LOD_THRESHOLD = 0.40;
 export const NANO_LOD_ENTER_HIGH_THRESHOLD = 0.40;
 export const NANO_LOD_EXIT_HIGH_THRESHOLD = 0.34;
-export const CARD_CORNER_RADIUS = 20;
+export const CARD_CORNER_RADIUS = 20; // Radius for Squircle (超椭圆 20px)
+export const CARD_FALLBACK_CORNER_RADIUS = 12; // Radius for Fallback RoundRect (普通圆角降级 12px)
 export const CARD_PANEL_WIDTH = 480;
 export const cardCornerStyle = { '--card-corner-radius': `${CARD_CORNER_RADIUS}px` };
 export const isStandardCardLod = (scale: number) => scale >= NANO_LOD_EXIT_HIGH_THRESHOLD;
@@ -29,8 +30,9 @@ export function cardOutline(width: number, height: number, standard: boolean, sq
   if (cached) return cached;
   const path = new Path2D();
   const r = Math.min(CARD_CORNER_RADIUS, width / 2, height / 2);
+  const rFallback = Math.min(CARD_FALLBACK_CORNER_RADIUS, width / 2, height / 2);
   if (!standard) path.rect(0, 0, width, height);
-  else if (!squircle) path.roundRect(0, 0, width, height, r);
+  else if (!squircle) path.roundRect(0, 0, width, height, rFallback);
   else {
     path.moveTo(r, 0);
     for (let corner = 0; corner < 4; corner++) {

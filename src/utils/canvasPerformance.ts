@@ -3,13 +3,19 @@ import { createRecoveryPacer } from './canvasRecoveryPolicy';
 // Shared idle interval for gesture effects and high-resolution image restoration.
 export const CANVAS_IDLE_MS = 300;
 
-export type CanvasLoadingMode = 'immediate' | 'lazy';
+export type CanvasLoadingMode = 'immediate' | 'lazy' | 'hybrid';
 const loadingModeKey = 'canvas_loading_mode';
 export const CANVAS_LOADING_MODE_EVENT = 'canvas-loading-mode-change';
-let loadingMode: CanvasLoadingMode = 'immediate';
+export const MOUSE_FOCUS_RADIUS_WORLD = 450;
+
+let loadingMode: CanvasLoadingMode = 'hybrid'; // Default to Hybrid Spatial Priority Mode!
 try {
-  if (localStorage.getItem(loadingModeKey) === 'lazy') loadingMode = 'lazy';
+  const saved = localStorage.getItem(loadingModeKey);
+  if (saved === 'lazy' || saved === 'immediate' || saved === 'hybrid') {
+    loadingMode = saved;
+  }
 } catch { /* A disabled preference store must not prevent rendering. */ }
+
 export function getCanvasLoadingMode() { return loadingMode; }
 export function setCanvasLoadingMode(mode: CanvasLoadingMode) {
   loadingMode = mode;
@@ -23,9 +29,33 @@ export function subscribeCanvasLoadingMode(listener: () => void) {
 if (typeof window !== 'undefined') {
   window.addEventListener('storage', event => {
     if (event.key !== loadingModeKey && event.key !== null) return;
-    loadingMode = event.newValue === 'lazy' ? 'lazy' : 'immediate';
-    window.dispatchEvent(new Event(CANVAS_LOADING_MODE_EVENT));
+    const val = event.newValue;
+    if (val === 'lazy' || val === 'immediate' || val === 'hybrid') {
+      loadingMode = val;
+      window.dispatchEvent(new Event(CANVAS_LOADING_MODE_EVENT));
+    }
   });
+}
+
+/** Check if card center is within the mouse cursor focus radius in world coordinates */
+export function isCardInMouseFocusZone(cardX: number, cardY: number, cardW: number, cardH: number, tx: number, ty: number, scale: number): boolean {
+  if (typeof window === 'undefined') return true;
+  const mouse = (window as any).__lastMousePos;
+  if (!mouse || mouse.x === undefined || mouse.y === undefined) return true;
+
+  // Transform screen mouse pos to world coordinates
+  const mouseWorldX = (mouse.x - tx) / scale;
+  const mouseWorldY = (mouse.y - ty) / scale;
+
+  // Card center in world coordinates
+  const cardCenterX = cardX + cardW / 2;
+  const cardCenterY = cardY + cardH / 2;
+
+  const dx = cardCenterX - mouseWorldX;
+  const dy = cardCenterY - mouseWorldY;
+  const distSq = dx * dx + dy * dy;
+
+  return distSq <= MOUSE_FOCUS_RADIUS_WORLD * MOUSE_FOCUS_RADIUS_WORLD;
 }
 
 // Rendering policy only: camera pan and zoom may load proxies progressively.

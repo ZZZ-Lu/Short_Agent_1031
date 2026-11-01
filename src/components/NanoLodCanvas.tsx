@@ -422,16 +422,18 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     if (!ctx) return;
 
     const currentScale = scale.get();
-    const workspace = document.getElementById('canvas-workspace');
-    const lazyGesture = getCanvasLoadingMode() === 'lazy' &&
-      ['data-gesture', 'data-panning', 'data-zooming'].some(name => workspace?.getAttribute(name) === 'true');
+    const workspace = typeof document !== 'undefined' ? document.getElementById('canvas-workspace') : null;
+    const isGestureActive = Boolean(
+      (window as any).__nanoDragging ||
+      (workspace && ['data-gesture', 'data-panning', 'data-zooming'].some(name => workspace.getAttribute(name) === 'true')) ||
+      (typeof window !== 'undefined' && (window as any).isDraggingCard)
+    );
+    const useSquircle = squircleSupported && !isGestureActive;
+    const lazyGesture = getCanvasLoadingMode() === 'lazy' && isGestureActive;
     const currentTx = tx.get();
     const currentTy = ty.get();
     const width = window.innerWidth;
     const height = window.innerHeight;
-    // This is a full-viewport canvas that is cleared and repainted on every gesture frame.
-    // At DPR 2 on a 2560x1440 window the backing store alone is ~14.7M pixels, which is
-    // pure per-frame fill cost. Cap it instead of trusting devicePixelRatio blindly.
     const dpr = getCappedDpr(width, height, 1.5);
 
     // Adjust canvas resolution if viewport size changed
@@ -683,7 +685,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       if (standard) {
         ctx.save();
         ctx.translate(cardX, cardY);
-        ctx.clip(cardOutline(dim.width, dim.height, true, squircleSupported));
+        ctx.clip(cardOutline(dim.width, dim.height, true, useSquircle));
         ctx.translate(-cardX, -cardY);
       }
       // 1. Solid Base Fill or Nano LOD Skeleton Screen
@@ -794,7 +796,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
 
       if (standard) ctx.restore();
       const strokeOutline = (x = cardX, y = cardY, width = dim.width, height = dim.height) =>
-        strokeCardOutline(ctx, x, y, width, height, standard, squircleSupported);
+        strokeCardOutline(ctx, x, y, width, height, standard, useSquircle);
       const focusItem = agentFocusMapRef.current?.[card.id];
       const targetIds = agentTargetCardIdsRef.current;
       const isAgentTargetInSet = Boolean(

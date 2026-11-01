@@ -2,16 +2,18 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 @utility squircle {
-  border-radius: var(--card-corner-radius, 20px);
+  border-radius: 12px;
   corner-shape: squircle;
+  border-radius: var(--card-corner-radius, 20px);
   overflow: hidden;
   backface-visibility: hidden;
   -webkit-font-smoothing: antialiased;
 }
 
 @utility corner-squircle {
-  border-radius: var(--card-corner-radius, 20px);
+  border-radius: 12px;
   corner-shape: squircle;
+  border-radius: var(--card-corner-radius, 20px);
   overflow: hidden;
   backface-visibility: hidden;
   -webkit-font-smoothing: antialiased;
