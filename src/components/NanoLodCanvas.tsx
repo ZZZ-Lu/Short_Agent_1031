@@ -1,7 +1,7 @@
 import { cardEntryFrame, waitForEntryDom, mediaRevealProgress } from '../utils/cardEntrance';
 import { calculateVideoPlayButtonDimensions, getPlayIconPath2D } from "../utils/videoPlayButton";
 import { getLiveVideoFrame } from '../utils/videoFrameBus';
-import { getCanvasLoadingMode } from '../utils/canvasPerformance';
+import { getCanvasLoadingMode, isHybridCardNear } from '../utils/canvasPerformance';
 import { getCappedDpr } from '../utils/devicePixelBudget';
 import React, { useEffect, useRef } from 'react';
 import { readyPromptPanels } from '../utils/promptSurfaceCache';
@@ -679,9 +679,8 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       const isGenerating = card.state === 'generating';
       // Keep the lightweight preview throughout a lazy camera gesture; otherwise
       // crossing 34% would upgrade every visible canvas card in the same frame.
-      const standard = getCanvasLoadingMode() === 'lazy'
-        ? currentScale >= getNanoLodThreshold() && !lazyGesture
-        : isStandardCardLod(currentScale);
+      const deferForGesture = isGestureActive && (getCanvasLoadingMode() === 'lazy' || (getCanvasLoadingMode() === 'hybrid' && !isHybridCardNear(card.id)));
+      const standard = isStandardCardLod(currentScale) && !deferForGesture;
       if (standard) {
         ctx.save();
         ctx.translate(cardX, cardY);

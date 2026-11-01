@@ -13,8 +13,8 @@ import { fastGetImageDimensions } from './utils/imageHeader';
 import { resizeImageOffThread } from './utils/imageResize';
 import { yieldToMain } from './utils/yieldToMain';
 import { getOrLoadCanvasImage } from './utils/imageTextureCache';
-import { isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold, CARD_DENSITY_HIGH_THRESHOLD, HIGH_RENDER_WEIGHT_THRESHOLD, calculateTotalRenderWeight, FRAME_BUDGET_MS } from './utils/viewportCulling';
-import { CANVAS_IDLE_MS, scheduleCanvasSurface, canLoadDuringCameraGesture, subscribeCanvasLoadingMode, getCanvasLoadingMode } from './utils/canvasPerformance';
+import { getCardWorldBounds, isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold, CARD_DENSITY_HIGH_THRESHOLD, HIGH_RENDER_WEIGHT_THRESHOLD, calculateTotalRenderWeight, FRAME_BUDGET_MS } from './utils/viewportCulling';
+import { getHybridPointer, setHybridProximityProvider, isHybridCardNear, CANVAS_IDLE_MS, scheduleCanvasSurface, canLoadDuringCameraGesture, subscribeCanvasLoadingMode, getCanvasLoadingMode } from './utils/canvasPerformance';
 import { readyPromptPanels } from './utils/promptSurfaceCache';
 import { createCardMountStore, ProgressiveGenerationCard } from './components/ProgressiveGenerationCard';
 import { canRetireDomForNano, type LodFrame } from './utils/lodHandoff';
@@ -7501,6 +7501,11 @@ export default function App() {
           return;
         }
 
+        if (getCanvasLoadingMode() === 'hybrid' && canLoadDuringCameraGesture()) {
+          const nextIndex = sortedQueue.findIndex((card, index) => index >= currentIndex && isHybridCardNear(card.id));
+          if (nextIndex < 0) { await new Promise<void>(resolve => requestAnimationFrame(() => resolve())); continue; }
+          [sortedQueue[currentIndex], sortedQueue[nextIndex]] = [sortedQueue[nextIndex], sortedQueue[currentIndex]];
+        }
         const batchToMount: CardData[] = [];
         const batchLimit = 1;
 
@@ -7516,6 +7521,12 @@ export default function App() {
           await new Promise<void>(resolve => {
             const cancel = scheduleCanvasSurface(() => {
               abortToken.cancel = undefined;
+              if (!abortToken.aborted && getCanvasLoadingMode() === 'hybrid' && canLoadDuringCameraGesture() && !isHybridCardNear(batchToMount[0].id)) {
+                currentIndex--;
+                batchToMount.length = 0;
+                resolve();
+                return;
+              }
               if (!abortToken.aborted) {
                 setRenderedCardIds(prev => {
                   const next = new Set(prev);
@@ -7599,6 +7610,40 @@ export default function App() {
     visibleCardsRef.current = visibleCards;
     runCenterOutMountQueue();
   }, [visibleCards, runCenterOutMountQueue, mountEpoch]);
+
+  useEffect(() => {
+    let cache: { cards: typeof visibleCardsRef.current; x: number; y: number; scale: number; tx: number; ty: number; radius: number } | undefined;
+    return setHybridProximityProvider((id, radius) => {
+      const cards = visibleCardsRef.current;
+      const pointer = getHybridPointer();
+      const scale = tScale.get(), cameraX = tx.get(), cameraY = ty.get();
+      if (!Number.isFinite(pointer.x) || !Number.isFinite(pointer.y) || scale <= 0) return false;
+      const distance = (bounds: ReturnType<typeof getCardWorldBounds>) => {
+        const dx = Math.max(bounds.minX * scale + cameraX - pointer.x, 0, pointer.x - (bounds.maxX * scale + cameraX));
+        const dy = Math.max(bounds.minY * scale + cameraY - pointer.y, 0, pointer.y - (bounds.maxY * scale + cameraY));
+        return dx * dx + dy * dy;
+      };
+      if (!cache || cache.cards !== cards || cache.x !== pointer.x || cache.y !== pointer.y || cache.scale !== scale || cache.tx !== cameraX || cache.ty !== cameraY) {
+        let nearest = Infinity, nearestCenter = Infinity, shortSide = 200;
+        for (const card of cards) {
+          const bounds = getCardWorldBounds(card);
+          const d = distance(bounds);
+          const center = Math.hypot((bounds.minX + bounds.maxX) * scale / 2 + cameraX - pointer.x, (bounds.minY + bounds.maxY) * scale / 2 + cameraY - pointer.y);
+          if (d < nearest || (d === nearest && center < nearestCenter)) {
+            nearest = d; nearestCenter = center;
+            const size = getCardSize(card);
+            shortSide = Math.min(size.width, size.height) * scale;
+          }
+        }
+        // Diameter spans about 1.2 short card sides, bounded in screen pixels.
+        cache = { cards, x: pointer.x, y: pointer.y, scale, tx: cameraX, ty: cameraY, radius: Math.max(80, Math.min(180, shortSide * 0.6)) };
+      }
+      const card = cards.find(card => card.id === id);
+      if (!card) return false;
+      const effectiveRadius = cache.radius * radius / 300;
+      return distance(getCardWorldBounds(card)) <= effectiveRadius * effectiveRadius;
+    });
+  }, [tScale, tx, ty]);
 
   useEffect(() => subscribeCanvasLoadingMode(() => {
     updateCircularCulling();

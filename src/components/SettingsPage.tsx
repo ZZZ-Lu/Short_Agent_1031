@@ -687,19 +687,18 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
           {/* Canvas Batch Loading Mode Toggle Button */}
           <button
             type="button"
-            role="switch"
-            aria-checked={loadingMode === 'immediate'}
-            onClick={() => setCanvasLoadingMode(loadingMode === 'immediate' ? 'lazy' : 'immediate')}
+            role="button"
+            onClick={() => setCanvasLoadingMode(loadingMode === 'immediate' ? 'lazy' : loadingMode === 'lazy' ? 'hybrid' : 'immediate')}
             className={`flex h-8 items-center gap-1.5 rounded-lg border px-2.5 text-xs transition cursor-pointer ${
               loadingMode === 'immediate'
                 ? 'border-violet-500/40 bg-violet-50 text-violet-700 dark:border-violet-500/40 dark:bg-violet-950/40 dark:text-violet-300 font-medium'
                 : 'border-slate-200 text-slate-500 hover:bg-slate-50 dark:border-white/10 dark:text-slate-400 dark:hover:bg-white/10'
             }`}
-            aria-label="即时分批加载"
-            title="点击切换加载模式。即时模式在缩放、拖拽时分批加载；懒加载模式在停止操作 300ms 后分批加载。"
+            aria-label="切换画布加载模式"
+            title="点击切换加载模式。即时模式在缩放、拖拽时分批加载；懒模式停止后加载；混合模式优先加载鼠标附近自适应焦圈内的卡片，远处停止后加载。"
           >
             <Zap size={13} className={loadingMode === 'immediate' ? 'text-violet-600 dark:text-violet-400' : 'text-slate-400'} />
-            <span>{loadingMode === 'immediate' ? '即时分批加载（开启）' : '懒分批加载（开启）'}</span>
+            <span>{loadingMode === 'immediate' ? '即时分批加载（开启）' : loadingMode === 'lazy' ? '懒分批加载（开启）' : '混合分批加载（开启）'}</span>
           </button>
 
           {settingsSection === 'debug' && <select

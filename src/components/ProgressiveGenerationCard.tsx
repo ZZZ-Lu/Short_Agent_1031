@@ -1,6 +1,6 @@
 import { isNewCardAwaitingLod } from '../utils/cardEntrance';
 import { getNanoLodThreshold } from '../utils/viewportCulling';
-import { getCanvasLoadingMode } from '../utils/canvasPerformance';
+import { getCanvasLoadingMode, isHybridCardNear } from '../utils/canvasPerformance';
 import React, { useCallback, useRef, useState, useSyncExternalStore } from 'react';
 import { GenerationCard } from './GenerationCard';
 
@@ -44,7 +44,7 @@ export const ProgressiveGenerationCard = React.memo(function ProgressiveGenerati
   }, [id, isSelected, mountStore]);
   const snapshot = useCallback(() => {
     const workspace = document.getElementById('canvas-workspace');
-    const paused = getCanvasLoadingMode() === 'lazy' &&
+    const paused = (getCanvasLoadingMode() === 'lazy' || (getCanvasLoadingMode() === 'hybrid' && !isHybridCardNear(id))) &&
       ['data-gesture', 'data-panning', 'data-zooming'].some(name => workspace?.getAttribute(name) === 'true');
     if (paused && isSelected && !admittedDom.current) return false;
     return Boolean(mountStore.ids.has(id) || (isSelected && (admittedDom.current || !paused)));

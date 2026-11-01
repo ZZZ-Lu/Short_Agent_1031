@@ -3,12 +3,13 @@ import { createRecoveryPacer } from './canvasRecoveryPolicy';
 // Shared idle interval for gesture effects and high-resolution image restoration.
 export const CANVAS_IDLE_MS = 300;
 
-export type CanvasLoadingMode = 'immediate' | 'lazy';
+export type CanvasLoadingMode = 'immediate' | 'lazy' | 'hybrid';
 const loadingModeKey = 'canvas_loading_mode';
 export const CANVAS_LOADING_MODE_EVENT = 'canvas-loading-mode-change';
 let loadingMode: CanvasLoadingMode = 'immediate';
 try {
-  if (localStorage.getItem(loadingModeKey) === 'lazy') loadingMode = 'lazy';
+  const saved = localStorage.getItem(loadingModeKey);
+  if (saved === 'lazy' || saved === 'hybrid') loadingMode = saved;
 } catch { /* A disabled preference store must not prevent rendering. */ }
 export function getCanvasLoadingMode() { return loadingMode; }
 export function setCanvasLoadingMode(mode: CanvasLoadingMode) {
@@ -23,7 +24,7 @@ export function subscribeCanvasLoadingMode(listener: () => void) {
 if (typeof window !== 'undefined') {
   window.addEventListener('storage', event => {
     if (event.key !== loadingModeKey && event.key !== null) return;
-    loadingMode = event.newValue === 'lazy' ? 'lazy' : 'immediate';
+    loadingMode = event.newValue === 'hybrid' ? 'hybrid' : event.newValue === 'lazy' ? 'lazy' : 'immediate';
     window.dispatchEvent(new Event(CANVAS_LOADING_MODE_EVENT));
   });
 }
@@ -35,6 +36,35 @@ export function canLoadDuringCameraGesture() {
   return (workspace?.getAttribute('data-panning') === 'true' ||
     workspace?.getAttribute('data-zooming') === 'true') &&
     !(window as any).isDraggingCard && !(window as any).__nanoDragging;
+}
+
+// Renderer-local policy: only plain coordinates and a live camera adapter.
+let pointer = { x: -Infinity, y: -Infinity };
+let proximity: (id: string, radius: number) => boolean = () => false;
+const nearby = new Set<string>();
+export function setHybridProximityProvider(provider: typeof proximity) {
+  proximity = provider;
+  nearby.clear();
+  return () => { if (proximity === provider) { proximity = () => false; nearby.clear(); } };
+}
+export function getHybridPointer() { return pointer; }
+if (typeof window !== 'undefined') {
+  window.addEventListener('pointermove', event => { pointer = { x: event.clientX, y: event.clientY }; });
+  window.addEventListener('blur', () => { pointer = { x: -Infinity, y: -Infinity }; nearby.clear(); });
+}
+export function isHybridCardNear(id: string) {
+  const near = proximity(id, nearby.has(id) ? 380 : 300);
+  if (near) nearby.add(id); else nearby.delete(id);
+  return near;
+}
+export function canRunHybridSurface(label?: string) {
+  if (loadingMode !== 'hybrid') return true;
+  // High-resolution originals retain the existing idle-only restoration policy.
+  if (!label || label.startsWith('original:')) return false;
+  // Admission jobs recheck live distance in their callback so they cannot block nearer mounts.
+  if (label.startsWith('mount:')) return true;
+  const id = label.slice(label.indexOf(':') + 1);
+  return isHybridCardNear(id);
 }
 
 // Mounting and drawing share this adaptive, render-only queue.
@@ -85,10 +115,12 @@ function pumpSurfaces(frameTime: number) {
       framesSinceJob = 0;
       // Finish already-mounted prompt surfaces before admitting another card.
       // Still execute just one job at the existing adaptive frame cadence.
-      let next = surfaceJobs.entries().next().value!;
-      for (const entry of surfaceJobs) {
+      const candidates = [...surfaceJobs.entries()].filter(([, job]) => !cameraMoving || canRunHybridSurface(job.options.label));
+      let next = candidates[0];
+      for (const entry of candidates) {
         if (entry[1].options.priority === 'prompt') { next = entry; break; }
       }
+      if (!next) { scheduleSurfaceFrame(); return; }
       const [key, job] = next;
       surfaceJobs.delete(key);
       const start = performance.now();

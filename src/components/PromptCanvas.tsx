@@ -128,7 +128,7 @@ export const PromptCanvas = React.memo(function PromptCanvas({
     cacheSurfaceBitmap(bitmapKey, canvas);
     publishCardSurface(cardId, 'text', surfaceRevision, bitmapKey);
     readyRef.current?.(renderKey || '');
-    }, { priority: 'prompt', label: `prompt-text:${targetId}` });
+    }, { priority: 'prompt', label: `prompt-text:${cardId}` });
   }, [text, height, width, resolution, mentionKey, scrollTop, themeEpoch, renderKey, cardId, surfaceRevision, suspended]);
 
   return <canvas ref={canvasRef}
