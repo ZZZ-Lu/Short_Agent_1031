@@ -14,6 +14,7 @@ try {
 export function getCanvasLoadingMode() { return loadingMode; }
 export function setCanvasLoadingMode(mode: CanvasLoadingMode) {
   loadingMode = mode;
+  if (deferredSurfaceTimer !== null) { clearTimeout(deferredSurfaceTimer); deferredSurfaceTimer = null; scheduleSurfaceFrame(); }
   try { localStorage.setItem(loadingModeKey, mode); } catch { /* Session preference still applies. */ }
   window.dispatchEvent(new Event(CANVAS_LOADING_MODE_EVENT));
 }
@@ -75,6 +76,7 @@ const surfaceTimings: { label: string; waitMs: number; runMs: number }[] = [];
 export function getCanvasSurfaceTimings() { return surfaceTimings.map(timing => ({ ...timing })); }
 const pacer = createRecoveryPacer();
 let surfaceFrame: number | null = null;
+let deferredSurfaceTimer: ReturnType<typeof setTimeout> | null = null;
 let previousFrame: number | null = null;
 let framesSinceJob = 0;
 let wasMoving = false;
@@ -120,7 +122,10 @@ function pumpSurfaces(frameTime: number) {
       for (const entry of candidates) {
         if (entry[1].options.priority === 'prompt') { next = entry; break; }
       }
-      if (!next) { scheduleSurfaceFrame(); return; }
+      if (!next) {
+        deferredSurfaceTimer = setTimeout(() => { deferredSurfaceTimer = null; scheduleSurfaceFrame(); }, 100);
+        return;
+      }
       const [key, job] = next;
       surfaceJobs.delete(key);
       const start = performance.now();

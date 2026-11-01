@@ -7408,6 +7408,7 @@ export default function App() {
 
   const runCenterOutMountQueue = useCallback(() => {
     if (!isDomCardsActive) {
+      abortMountQueue();
       if (!isDomCardsActive) {
         setRenderedCardIds(prev => {
           const selectedSet = new Set(selectedCardIdsRef.current);
@@ -7503,7 +7504,12 @@ export default function App() {
 
         if (getCanvasLoadingMode() === 'hybrid' && canLoadDuringCameraGesture()) {
           const nextIndex = sortedQueue.findIndex((card, index) => index >= currentIndex && isHybridCardNear(card.id));
-          if (nextIndex < 0) { await new Promise<void>(resolve => requestAnimationFrame(() => resolve())); continue; }
+          if (nextIndex < 0) { await new Promise<void>(resolve => {
+            const timer = setTimeout(resolve, 100);
+            abortToken.cancel = () => { clearTimeout(timer); resolve(); };
+          });
+          abortToken.cancel = undefined;
+          continue; }
           [sortedQueue[currentIndex], sortedQueue[nextIndex]] = [sortedQueue[nextIndex], sortedQueue[currentIndex]];
         }
         const batchToMount: CardData[] = [];
