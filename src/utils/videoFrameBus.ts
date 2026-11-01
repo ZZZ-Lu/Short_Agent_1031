@@ -18,9 +18,13 @@ export function captureLiveVideoFrame(cardId: string, video: HTMLVideoElement): 
     canvas = document.createElement('canvas');
     liveFrameCanvases.set(cardId, canvas);
   }
-  if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
+  // Nano LOD only needs a small display proxy; retaining a 4K frame per card wastes GPU memory. Get dimensions from the video, never from the DOM layout.
+  const scale = Math.min(1, 256 / Math.max(video.videoWidth, video.videoHeight));
+  const width = Math.max(1, Math.round(video.videoWidth * scale));
+  const height = Math.max(1, Math.round(video.videoHeight * scale));
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
   }
   const ctx = canvas.getContext('2d');
   if (ctx) {
