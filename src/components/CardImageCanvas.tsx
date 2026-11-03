@@ -53,9 +53,10 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
   const paintedNoticeFrameRef = useRef<number | null>(null);
   const paintedNoticeCardRef = useRef<string | null>(null);
 
-  // Cross-fade animation progress states
-  const fullAlphaRef = useRef<number>(1);
-  const originalAlphaRef = useRef<number>(0);
+  // Image transition refs for smooth double-buffered cross-fade when imageUrl changes
+  const prevImgRef = useRef<{ url: string; img: HTMLImageElement } | null>(null);
+  const transitionRef = useRef<{ prevImg: HTMLImageElement; fadeStart: number } | null>(null);
+  const lastLoadedUrlRef = useRef<string | null>(null);
   const fadeStartTimeRef = useRef<number | null>(null);
   const isFadingOriginalRef = useRef<boolean>(false);
 
@@ -215,30 +216,60 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
 
     const fullImgReady = Boolean(fullImg && fullImg.complete && fullImg.naturalWidth > 0);
 
-    // 2. Base Tier: Render Pre-baked Blurred Placeholder if full image is not yet ready
-    if (!fullImgReady && placeholderImg && placeholderImg.complete && placeholderImg.naturalWidth > 0) {
+    // Track image URL transition for seamless double-buffered image switching
+    if (imageUrl && imageUrl !== lastLoadedUrlRef.current) {
+      if (fullImgReady && fullImg) {
+        if (prevImgRef.current && prevImgRef.current.url !== imageUrl && prevImgRef.current.img) {
+          transitionRef.current = {
+            prevImg: prevImgRef.current.img,
+            fadeStart: performance.now(),
+          };
+        }
+        lastLoadedUrlRef.current = imageUrl;
+        prevImgRef.current = { url: imageUrl, img: fullImg };
+      }
+    }
+
+    // 2. Base / Underlay Rendering (Keep rendering previous image at 100% opacity while new image loads)
+    if (!fullImgReady && !transitionRef.current && prevImgRef.current?.img) {
+      drawCover(prevImgRef.current.img, 1);
+    } else if (!fullImgReady && placeholderImg && placeholderImg.complete && placeholderImg.naturalWidth > 0) {
       drawCover(placeholderImg, 1);
     }
 
-    // 3. Middle Tier: Render Full standard preview
+    // 3. New Image Rendering (Bottom Layer - 100% Opaque)
     if (fullImgReady && fullImg) {
       if (isGenerating && !imageUrl) {
-        // Generating placeholder filter
         ctx.filter = 'blur(12px) brightness(0.95)';
         drawCover(fullImg, 1);
         ctx.filter = 'none';
       } else {
         drawCover(fullImg, 1);
       }
+      prevImgRef.current = { url: imageUrl!, img: fullImg };
     }
 
-    // 4. Top Tier: Render Original High-Res (Intent-Driven Lazy Restoration)
+    // 4. Image Transition Cross-Fade (Top Layer: Previous Image fades out 1.0 -> 0.0 over 500ms)
+    if (transitionRef.current) {
+      const now = performance.now();
+      const elapsed = now - transitionRef.current.fadeStart;
+      const FADE_DURATION = 500;
+      const progress = Math.min(1, elapsed / FADE_DURATION);
+      const fadeAlpha = 1 - progress;
+
+      if (fadeAlpha > 0) {
+        drawCover(transitionRef.current.prevImg, fadeAlpha);
+        scheduleDraw();
+      } else {
+        transitionRef.current = null;
+      }
+    }
+
+    // 5. Top Tier: Render Original High-Res (Intent-Driven Lazy Restoration)
     if (effectiveShowOriginal && origImg && origImg.complete && origImg.naturalWidth > 0) {
       if (zooming) {
-        // During active zoom/pan, instantly draw full opacity with 0ms transition
         drawCover(origImg, 1);
       } else {
-        // Smooth cross-fade into high-resolution original
         const now = performance.now();
         if (!isFadingOriginalRef.current) {
           isFadingOriginalRef.current = true;
@@ -246,18 +277,16 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
         }
 
         const elapsed = now - (fadeStartTimeRef.current || now);
-        const fadeDuration = 150; // 150ms smooth transition matching original spec
+        const fadeDuration = 150;
         const progress = Math.min(1, elapsed / fadeDuration);
 
         drawCover(origImg, progress);
 
         if (progress < 1) {
-          // Continue animation until fully opaque
           scheduleDraw();
         }
       }
     } else {
-      // Reset original fade state when not showing original
       isFadingOriginalRef.current = false;
       fadeStartTimeRef.current = null;
     }
@@ -268,14 +297,13 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
 
     if (!hasMedia) {
       isPainted = true;
+    } else if (imageUrl) {
+      const fullImgDone = Boolean(fullImg && fullImg.complete);
+      const origImgDone = Boolean(effectiveShowOriginal && origImg && origImg.complete);
+      isPainted = fullImgDone || origImgDone;
     } else {
-      const placeholderImgComplete = placeholderImg && placeholderImg.complete && placeholderImg.naturalWidth > 0;
-      const fullImgComplete = fullImg && fullImg.complete && fullImg.naturalWidth > 0;
-      const origImgComplete = effectiveShowOriginal && origImg && origImg.complete && origImg.naturalWidth > 0;
-      
-      if (placeholderImgComplete || fullImgComplete || origImgComplete) {
-        isPainted = true;
-      }
+      const placeholderImgDone = Boolean(placeholderImg && placeholderImg.complete);
+      isPainted = placeholderImgDone;
     }
 
     if (isPainted) {

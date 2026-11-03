@@ -120,6 +120,11 @@ export interface ScriptProject {
   characters: ScriptCharacter[];
   locations: ScriptLocation[];
   props: ScriptProp[];
+  bible?: {
+    characters?: ScriptCharacter[];
+    locations?: ScriptLocation[];
+    props?: ScriptProp[];
+  };
   // NEW: Scene-based backend storage
   sceneItems?: SceneItem[]; // Strict scene separation
   activeMilestoneId?: string;

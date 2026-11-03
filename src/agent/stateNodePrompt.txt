@@ -8,6 +8,9 @@
 - 当前进度: {{taskProgress}}
 - 当前计划: {{taskPlan}}
 - 重点笔记: {{taskNotes}}
+- 思考层级: {{thinkingLevel}}
+- 领域上下文: {{domain}}
+- 已装载工具分类: {{requestedCategories}}
 
 【最新对话与 Agent 主模型发言】
 - 用户指令/回复: {{userMessage}}
@@ -22,5 +25,8 @@
   "progress": "当前最新进度描述（如：已完成xxx，准备处理xxx）",
   "notes": "提取关键笔记文本",
   "notesMode": "append 或 overwrite",
+  "thinkingLevel": 0 或 1（0: 宏观战略规划, 1: 战术微观执行）,
+  "domain": "当前关注的领域名称，如 '剧本分析'、'分镜创作'、'资产提取'、'界面观察'",
+  "requestedCategories": ["script", "card", "asset", "ui", "system"]（下一轮需要注入的受限工具分类数组）,
   "plan": [{"id": "1", "title": "步骤标题", "status": "pending | completed"}]
 }

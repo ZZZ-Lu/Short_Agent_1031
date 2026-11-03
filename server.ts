@@ -69,7 +69,59 @@ const parametersForTool = (toolId: string) => {
     'script.directory': { properties: { query: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 200 } } },
     'script.read': { properties: { offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 200 } } },
     'script.search': { properties: { query: { type: 'string' } }, required: ['query'] },
-    'asset.list': { properties: { type: { type: 'string', enum: ['characters', 'locations', 'props'] }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 100 } } },
+    'asset.list': {
+      properties: {
+        type: { type: 'string', enum: ['characters', 'locations', 'props'], description: '资产分类：characters（角色）、locations（场景）、props（道具）；若不填则返回全部' },
+        query: { type: 'string', description: '按资产名称或描述进行关键词搜索' },
+        offset: { type: 'integer', minimum: 0 },
+        limit: { type: 'integer', minimum: 1, maximum: 100 }
+      }
+    },
+    'asset.create': {
+      properties: {
+        type: { type: 'string', enum: ['characters', 'locations', 'props'], description: '资产类型（必填）：characters（角色）、locations（场景）、props（道具）' },
+        name: { type: 'string', description: '资产名称（如"Vivian"、"晚礼服造型"、"餐车车厢"、"机械钥匙"）' },
+        role: { type: 'string', description: '角色身份设定（角色适用，如"女主/列车掌权者"）' },
+        appearance: { type: 'string', description: '外貌、服装穿搭与细节特征（角色适用）' },
+        age: { type: 'string', description: '角色年龄' },
+        gender: { type: 'string', description: '角色性别' },
+        personality: { type: 'string', description: '性格特征与心理状态' },
+        performanceNotes: { type: 'string', description: '镜头表演与情绪重点' },
+        locationType: { type: 'string', enum: ['INT', 'EXT'], description: '场景类型（场景适用）：INT（内景）、EXT（外景）' },
+        timeOfDay: { type: 'string', description: '时间氛围（场景适用，如"雨夜"、"黄昏"、"日景"）' },
+        atmosphere: { type: 'string', description: '空间氛围与光影影调（场景适用）' },
+        visualDetails: { type: 'string', description: '空间结构、建筑材质与美术细节（场景适用）' },
+        owner: { type: 'string', description: '道具所属角色（道具适用）' },
+        materialAndState: { type: 'string', description: '材质与物理状态（道具适用）' },
+        storySignificance: { type: 'string', description: '剧情关键作用与特写重点（道具适用）' },
+        sourceScenes: { type: 'array', items: { type: 'string' }, description: '该资产在剧本中出现的位置/场次出处列表（如 ["第1集第1场", "第2集第3场"]）' },
+        items: { type: 'array', items: { type: 'object' }, description: '批量创建资产对象列表（每个对象可包含 name, sourceScenes 及各分类属性）' }
+      },
+      required: ['type']
+    },
+    'asset.update': {
+      properties: {
+        id: { type: 'string', description: '要修改的目标资产 ID（如 "char_xxx", "loc_xxx", "prop_xxx"）' },
+        type: { type: 'string', enum: ['characters', 'locations', 'props'], description: '资产类型（可选）' },
+        updates: { type: 'object', description: '待更新的属性键值对（如 name, appearance, role, sourceScenes 等）' },
+        name: { type: 'string', description: '直接修改资产名称' },
+        role: { type: 'string', description: '直接修改角色身份' },
+        appearance: { type: 'string', description: '直接修改角色外貌/服装' },
+        atmosphere: { type: 'string', description: '直接修改场景氛围' },
+        visualDetails: { type: 'string', description: '直接修改场景细节' },
+        materialAndState: { type: 'string', description: '直接修改道具材质状态' },
+        storySignificance: { type: 'string', description: '直接修改道具剧情作用' },
+        sourceScenes: { type: 'array', items: { type: 'string' }, description: '直接更新或补充资产出现的位置/场次出处列表' }
+      },
+      required: ['id']
+    },
+    'asset.delete': {
+      properties: {
+        id: { type: 'string', description: '待删除的目标资产 ID' },
+        ids: { type: 'array', items: { type: 'string' }, description: '待批量删除的资产 ID 列表' },
+        type: { type: 'string', enum: ['characters', 'locations', 'props'], description: '资产类型（可选）' }
+      }
+    },
     'ui.actAndObserve': { properties: { targetId: target, action: { type: 'string', enum: ['mouse.move', 'mouse.click', 'mouse.doubleClick', 'mouse.longPress', 'mouse.hover', 'mouse.drag', 'mouse.scroll', 'mouse.type', 'mouse.keyPress'] }, arguments: { type: 'object', description: '鼠标动作的附加参数。例如：mouse.scroll 可传 { delta: number }（正数向下，负数向上）；mouse.type 可传 { text: string, clear?: boolean }（输入文本，clear 为 true 时先清空原有内容）；mouse.keyPress 可传 { key: string, shiftKey?: boolean }（如 key="Enter"）' }, observe: { type: 'object', properties: observationProperties } }, required: ['targetId', 'action'] },
     'page.inspect': { properties: observationProperties },
     'guide.lookup': { properties: { query: { type: 'string' } }, required: ['query'] },
@@ -141,7 +193,7 @@ const parametersForTool = (toolId: string) => {
     },
     'card.generate': { properties: { name: { type: 'string', description: '卡片名称（尽可能简短、辨识度高）' }, targetCardId: { type: 'string', description: '目标卡片 ID（"new" 表示新建衍生生图卡片，或已有卡片 ID）' }, prompt: { type: 'string', description: '正向生图提示词' }, aspectRatio: { type: 'string', description: '画幅比例，如 16:9, 9:16, 1:1 等' }, referenceCardIds: { type: 'array', items: { type: 'string' }, description: '参考图卡片 ID 列表' }, autoStart: { type: 'boolean', description: '是否直接排队启动生成（默认为 true）' }, forceOverwrite: { type: 'boolean', description: '是否强制在原卡片覆盖（慎用，默认已出图卡片会触发 Fork 衍生）' } }, required: ['name'] },
     'sys.updateState': { properties: { taskTitle: { type: 'string' }, goal: { type: 'string' }, subGoal: { type: 'string' }, progress: { type: 'string' }, notes: { type: 'string' }, notesMode: { type: 'string', enum: ['append', 'overwrite'], description: '重点笔记模式：append（追加，默认）或 overwrite（重写替换现有笔记）' }, plan: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, title: { type: 'string' }, status: { type: 'string' } } } } } },
-    'sys.endTask': { properties: { success: { type: 'boolean' }, finalResponse: { type: 'string' }, waitForUser: { type: 'string' }, paused: { type: 'boolean', description: '若任务属于等待后台异步生图/排队渲染，设置为 true 挂起任务等待出图事件唤醒' } }, required: ['success', 'finalResponse'] },
+    'sys.endTask': { properties: { success: { type: 'boolean' }, waitForUser: { type: 'string' }, paused: { type: 'boolean', description: '若任务属于等待后台异步生图/排队渲染，设置为 true 挂起任务等待出图事件唤醒' } } },
     'user.ask': { properties: { question: { type: 'string' } }, required: ['question'] },
   };
   const schema = schemas[toolId] || { properties: {} };
@@ -156,6 +208,18 @@ function robustParseJson<T = any>(str: string): T | null {
   const mdMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
   if (mdMatch) {
     cleaned = mdMatch[1].trim();
+  }
+
+  // First direct try
+  try {
+    return JSON.parse(cleaned);
+  } catch {}
+
+  const autoRepairSuffixes = ['}', ']', '}]', '}]}', '"}]}', '"]}', '"}', '"'];
+  for (const s of autoRepairSuffixes) {
+    try {
+      return JSON.parse(cleaned + s);
+    } catch {}
   }
 
   // 2. Find boundaries of outer JSON structure ({ ... } or [ ... ])
@@ -180,10 +244,15 @@ function robustParseJson<T = any>(str: string): T | null {
     }
   }
 
-  // First direct try
   try {
     return JSON.parse(cleaned);
   } catch {}
+
+  for (const s of autoRepairSuffixes) {
+    try {
+      return JSON.parse(cleaned + s);
+    } catch {}
+  }
 
   // 3. Repair common LLM JSON formatting defects:
   let repaired = cleaned;
@@ -207,6 +276,12 @@ function robustParseJson<T = any>(str: string): T | null {
   try {
     return JSON.parse(repaired);
   } catch {}
+
+  for (const s of autoRepairSuffixes) {
+    try {
+      return JSON.parse(repaired + s);
+    } catch {}
+  }
 
   // 4. Fallback: extract tool_calls using regex if it's a tool_calls payload
   try {
@@ -736,7 +811,7 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
       const enabledToolIds = new Set<string>(turnContext.tools);
       const toolPrompt = AGENT_TOOL_REGISTRY
         .filter((tool) => enabledToolIds.has(tool.id))
-        .map((tool) => `【${tool.id}】\n  描述：${tool.description}\n  支持的参数：${tool.input}\n  调用示例：{{调用 ${tool.id}, ${tool.input}}}`)
+        .map((tool) => `【${tool.id}】\n  描述：${tool.description}\n  支持的参数：${tool.input}`)
         .join('\n\n');
       const toolCatalog = turnContext.catalog.map(tool => `${tool.id}：${tool.description.slice(0, 65)}`).join('\n');
       const promptCatalog = Object.entries(PROMPT_MODULES).map(([id, module]) => `${id}：${module.label}`).join('\n');
@@ -915,7 +990,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       }
 
       const basePrompt = getSystemPrompt();
-      const finalPrompt = (contextHeader + cardContextInjection + basePrompt + (basePrompt.includes('{{toolPrompt}}') ? '' : `\n【本轮可调用工具】\n${toolPrompt}\n`))
+      let finalPrompt = (contextHeader + cardContextInjection + basePrompt + (basePrompt.includes('{{toolPrompt}}') ? '' : `\n【本轮可调用工具】\n${toolPrompt}\n`))
         .replace('{{taskTitle}}', task.title || '尚未命名')
         .replace('{{taskGoal}}', cleanUserGoalText(task.goal) || '尚未设定')
         .replace('{{taskSubGoal}}', task.subGoal || '暂未设定')
@@ -927,6 +1002,10 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         .replace('{{toolPrompt}}', toolPrompt)
         .replace('{{pageObservations}}', formattedObs.pageObservations)
         .replace('{{toolResults}}', formattedObs.toolResults);
+
+      if (requireTool) {
+        finalPrompt += `\n\n【⚠️ 系统重要提示：本轮必须调用工具】上一轮未检测到任何 {{调用 ...}} 工具指令，当前任务尚未结束。请在【状态检查】与【思考】后，务必直接输出具体的 {{调用 工具名, {参数}}} 指令推进任务。若所有目标已确实完成，请显式调用 {{调用 sys.endTask}}，结束汇报直接写在【用户沟通】中。严禁在【思考】后遗漏工具调用！\n`;
+      }
 
       const allImages: string[] = [
         ...(Array.isArray(images) ? images : []),
@@ -1031,13 +1110,13 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         // 1. Match short version: 对用户说的话（简版） or 对用户说的话(简版)
         const shortMatch = fullContent.match(/(?:-|\*|\+)?\s*对用户说的话\s*[（(]\s*简版\s*[）)]\s*[:：]\s*[“"']?([\s\S]*?)[”"']?(?=(?:(?:-|\*|\+)?\s*对用户说的话\s*[（(]\s*完整版\s*[）)]|\{\{|$))/i);
         if (shortMatch && shortMatch[1]) {
-          speakText = shortMatch[1].replace(/^[“"'\s]+|[”"'\s]+$/g, '').trim();
+          speakText = shortMatch[1].replace(/^[“"'\s{]+|[”"'\s}]+$/g, '').trim();
         }
 
         // 2. Match full version: 对用户说的话（完整版） or 对用户说的话(完整版)
         const fullMatch = fullContent.match(/(?:-|\*|\+)?\s*对用户说的话\s*[（(]\s*完整版\s*[）)]\s*[:：]\s*[“"']?([\s\S]*?)[”"']?(?=(?:(?:-|\*|\+)?\s*对用户说的话\s*[（(]\s*简版\s*[）)]|\{\{|$))/i);
         if (fullMatch && fullMatch[1]) {
-          fullAnswerText = fullMatch[1].replace(/^[“"'\s]+|[”"'\s]+$/g, '').trim();
+          fullAnswerText = fullMatch[1].replace(/^[“"'\s{]+|[”"'\s}]+$/g, '').trim();
         }
 
         // 3. Fallback for legacy format: 对用户说的话：...
@@ -1078,117 +1157,295 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         }
       }
       
-      let parsed: any = { narration, speak: speakText, response: fullAnswerText, fullAnswer: message.content || '' };
+      let parsed: any = { narration, speak: speakText, response: message.content || fullAnswerText || '', fullAnswer: message.content || fullAnswerText || '' };
       const allowedTools = enabledToolIds;
       const toolNameByFunction = new Map(AGENT_TOOL_REGISTRY.map((tool) => [functionNameForTool(tool.id), tool.id]));
       
-      const adapterToolPrompt = AGENT_TOOL_REGISTRY
-        .filter((tool) => enabledToolIds.has(tool.id))
-        .map((tool) => JSON.stringify({ name: tool.id, description: tool.description, parameters: parametersForTool(tool.id) }))
-        .join('\n');
-
-      let parsedToolCalls: any[] = [];
-      let jsonAdapterTrace: any = null;
-
-      if (typeof message.content === 'string') {
-        const matches = [...message.content.matchAll(/\{\{([\s\S]*?)\}\}/g)];
-        let actionDesc = matches.length > 0 ? matches.map(m => m[0]).join('\n') : null;
-        
-        // Fallback: if no {{ }} but text contains tool call keywords, pseudo-code or endTask intent, pass to adapter
-        if (!actionDesc) {
-          const contentLower = message.content.toLowerCase();
-          const hasKnownTool = message.content.includes('调用') ||
-            AGENT_TOOL_REGISTRY.some(tool => 
-              message.content.includes(tool.id) || message.content.includes(functionNameForTool(tool.id))
-            ) || /endtask|end_task|sys\.endtask|sys_endtask|结束任务|完成任务|挂起任务|标注|生图|卡片|检测|观察|actAndObserve|inspect|generate|landmarks|annotate/i.test(message.content);
-          if (hasKnownTool) {
-            actionDesc = message.content;
-          }
-        }
-
-        if (actionDesc) {
-          try {
-            const adapterModelType = jsonAdapterModel || 'deepseek-v4-flash';
-            const adapterKeyToUse = jsonAdapterKey || keyToUse;
-            const { endpoint: adapterEndpoint, actualModel: adapterActualModel, apiKey: adapterApiKey } = getModelConfig(adapterModelType, adapterKeyToUse);
-
-            const systemPromptTemplate = customJsonAdapterPrompt || getPrompt('jsonAdapter') || `你是一个极其精准的工具 JSON 转换与转译节点。你的任务是将 Agent 主循环输出的不标准 JSON、JS 对象结构、伪代码、自然语言动作指令或任务完成/挂起宣告，严格转译为符合对应工具 Schema 的标准 JSON 参数。\n\n【转换与纠错规则】\n1. 提取参数与 ID：\n   - 对于 sys.endTask（任务结束/挂起指令）：\n     * 无论是 endTask、end_task、sys_end_task、sys.endTask、结束任务或完成任务，统一提取为 name: "sys.endTask"。\n     * 精准提取 finalResponse（给用户的完整总结或对话），若有简版对话与完整版，必须保留原样全量填入 finalResponse！\n     * 精准提取 waitForUser（若需要等待用户回复或继续操作）。\n     * 提取 paused（布尔值，后台渲染或异步等待时为 true）与 success（布尔值，默认 true）。\n   - 对于 card.detectLandmarks / card.annotateElements（画面元素标注节点）：\n     * 精准提取目标卡片 ID cardId（如 "card_xxx" 或 "canvas.card.xxx"）。\n     * 精准提取操作动作 action：可选值为 "detect"（默认，调用大模型检测标注）、"list"（查看已有标注列表）、"update"（修改指定标注）、"delete"（删除指定 ID 标注）、"clear"（清空所有标注）。\n     * 提取具体标注要求 requirement（支持任意自然语言要求，如"标注主要角色手持的长剑与腰间玉佩"、"识别所有光源与反光表面"等，不限部位、不限数量；若输入写作 prompt，统一映射为 requirement）。\n     * 提取合并模式 mode：可选值为 "append"（在卡片已有标注基础上追加新标注）或 "overwrite"（覆写已有标注，默认）。\n     * 提取更新数据 updates：对象数组，每一项包含 id，可选包含 label、description、category、point ({x, y})、box ([ymin, xmin, ymax, xmax])。\n     * 提取删除 ID 数组 deleteIds：如 ["elem_1", "elem_2"]。\n     * 提取 force 标识（布尔值，是否强制重新检测）。\n   - 对于 card.inspect，精准提取目标卡片 ID cardId 及 includeImage / includePrompt / includeReference / includeParameters 布尔开关。\n   - 对于 card.generate，必须精准提取卡片名称 name（规范：尽可能简短、辨识度高，如"金发女郎晚礼服"；若原输入缺失则根据 prompt 提炼 4~8 字短名）、参考卡片 ID 数组 referenceCardIds（如 ["rshuewfmu", "yow33r73x"]）和 targetCardId（如 "new" 表示新建生图卡片）、完整的 prompt 文本（保留全部句子与逗号，不得截断）及 aspectRatio 等属性。绝不能将字段名误当作卡片 ID！\n2. 修复非标格式：遇到未加双引号的 Key（如 cardId: "xxx"）或单引号文本，一律重写纠正为标准合法 JSON。\n3. 数值转化 (特别是 mouse.scroll)：严禁输出方向字符串。必须将滚动意图转换为 delta 像素数值。\n4. 状态提取：对于 sys.updateState，准确提取对应字段（如 taskTitle, goal, subGoal, progress, notes, notesMode, plan 等）。\n\n可用工具的 JSON Schema：\n{{adapterToolPrompt}}\n\n请输出严格的 JSON 格式，格式如下：\n{ "tool_calls": [{ "name": "工具名称", "arguments": { "参数名": "参数值" } }] }`;
-
-            const finalAdapterPrompt = systemPromptTemplate.includes('{{adapterToolPrompt}}')
-              ? systemPromptTemplate.replace('{{adapterToolPrompt}}', adapterToolPrompt)
-              : systemPromptTemplate + `\n\n可用工具的 JSON Schema：\n${adapterToolPrompt}`;
-
-            const parseResponse = await fetch(adapterEndpoint, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adapterApiKey}` },
-              body: JSON.stringify({
-                model: adapterActualModel,
-                response_format: { type: 'json_object' },
-                thinking: { type: 'disabled' },
-                extra_body: { thinking: { type: 'disabled' } },
-                messages: [
-                  { 
-                    role: 'system', 
-                    content: finalAdapterPrompt
-                  },
-                  { role: 'user', content: actionDesc }
-                ]
-              })
-            });
-            if (parseResponse.ok) {
-              const parseBody = await parseResponse.json();
-              const rawContent = parseBody.choices?.[0]?.message?.content || '{}';
-              const parsedResult = robustParseJson(rawContent) || {};
-              if (Array.isArray(parsedResult.tool_calls)) {
-                parsedToolCalls = parsedResult.tool_calls;
-              }
-              jsonAdapterTrace = {
-                mode: 'llm_adapter_node',
-                description: '工具 JSON 转译节点 LLM 语义转译（移除本地解析器，统一大模型结构化提取）',
-                rawInput: actionDesc,
-                adapterModel: adapterActualModel,
-                parsedOutput: parsedToolCalls,
-              };
-            } else {
-              console.warn('Failed to parse natural language tool call. Status:', parseResponse.status);
-            }
-          } catch (e) {
-            console.warn('Failed to parse natural language tool call:', e);
-          }
-        }
-      }
+      // ==========================================
+      // 🚀 脚本直接校验与拦截引擎 (Script-Based Deterministic Validator)
+      // 彻底移除中转转译大模型节点，Agent 主循环直接输出指令
+      // 由纯 TypeScript 脚本执行 0ms 语法、权限与 Schema 校验
+      // 正确就执行，有疑点或错误就拦截并报错反馈给主循环让其下一轮自愈调整
+      // ==========================================
+      const systemToolIds = new Set<string>([
+        'sys.selectContext',
+        'sys.updateState',
+        'sys.endTask',
+        'user.ask',
+        'sys.setThinkingLevel'
+      ]);
+      const allKnownToolIds = new Set<string>([
+        ...AGENT_TOOL_REGISTRY.map((t) => t.id),
+        ...systemToolIds,
+        'script.readMetadata',
+        'script.readDirectory',
+        'script.readEpisode',
+        'asset.extractElements',
+        'card.batchCreate'
+      ]);
 
       const resolveNormalizedToolName = (rawName: string): string => {
         if (!rawName || typeof rawName !== 'string') return rawName;
-        const trimmed = rawName.trim();
-        if (allowedTools.has(trimmed)) return trimmed;
+        const trimmed = rawName.trim().replace(/^[`'"]+|[`'"]+$/g, '');
+        if (allKnownToolIds.has(trimmed)) return trimmed;
         if (toolNameByFunction.has(trimmed)) return toolNameByFunction.get(trimmed)!;
-        
+
         const norm = trimmed.toLowerCase().replaceAll('_', '').replaceAll('.', '');
-        if (norm === 'endtask' || norm === 'sysendtask' || norm === 'endtaskinstructions' || norm === 'finish' || norm === 'completetask') {
-          if (allowedTools.has('sys.endTask')) return 'sys.endTask';
+        if (norm === 'endtask' || norm === 'sysendtask' || norm === 'finish' || norm === 'completetask') {
+          return 'sys.endTask';
+        }
+        if (norm === 'selectcontext' || norm === 'sysselectcontext') {
+          return 'sys.selectContext';
         }
         if (norm === 'updatestate' || norm === 'sysupdatestate') {
-          if (allowedTools.has('sys.updateState')) return 'sys.updateState';
+          return 'sys.updateState';
         }
-        for (const toolId of allowedTools) {
+        if (norm === 'userask' || norm === 'ask') {
+          return 'user.ask';
+        }
+        for (const toolId of allKnownToolIds) {
           const toolNorm = toolId.toLowerCase().replaceAll('_', '').replaceAll('.', '');
           if (norm === toolNorm) return toolId;
         }
         return trimmed;
       };
 
-      const toolCalls = parsedToolCalls.flatMap((call: any, index: number) => {
-        let name = resolveNormalizedToolName(call?.name);
-        
-        if (!name || !allowedTools.has(name)) return [];
-        try {
-          const arguments_ = typeof call.arguments === 'object' ? call.arguments : (robustParseJson(call.arguments || '{}') || {});
-          if (!arguments_ || typeof arguments_ !== 'object') return [];
-          const id = call.id || `call_${Date.now()}_${index}`;
-          return [{ id, name, arguments: arguments_ }];
-        } catch { return []; }
-      });
+      const rawExtractedCalls: Array<{ rawName: string; rawArgs: string; rawSpan: string }> = [];
+
+      if (typeof message.content === 'string' && message.content.includes('{{')) {
+        const text = message.content;
+        let pos = 0;
+        while (pos < text.length) {
+          const startIdx = text.indexOf('{{', pos);
+          if (startIdx === -1) break;
+
+          let cursor = startIdx + 2;
+          let curlyDepth = 0;
+          let inString = false;
+          let stringQuote = '';
+          let escaped = false;
+          let blockEnd = -1;
+
+          while (cursor < text.length) {
+            const char = text[cursor];
+
+            if (escaped) {
+              escaped = false;
+              cursor++;
+              continue;
+            }
+
+            if (char === '\\' && inString) {
+              escaped = true;
+              cursor++;
+              continue;
+            }
+
+            if (inString) {
+              if (char === stringQuote) {
+                inString = false;
+              }
+              cursor++;
+              continue;
+            }
+
+            if (char === '"' || char === "'") {
+              inString = true;
+              stringQuote = char;
+              cursor++;
+              continue;
+            }
+
+            if (char === '{') {
+              curlyDepth++;
+              cursor++;
+              continue;
+            }
+
+            if (char === '}') {
+              if (curlyDepth > 0) {
+                curlyDepth--;
+                cursor++;
+                continue;
+              } else if (text.startsWith('}}', cursor)) {
+                blockEnd = cursor + 2;
+                break;
+              }
+            }
+
+            cursor++;
+          }
+
+          let inner = '';
+          let rawSpan = '';
+
+          if (blockEnd !== -1) {
+            rawSpan = text.slice(startIdx, blockEnd);
+            inner = text.slice(startIdx + 2, blockEnd - 2).trim();
+            pos = blockEnd;
+          } else {
+            // Fallback for non-closed {{ block
+            const matchFallback = text.slice(startIdx).match(/^\{\{([\s\S]*?)\}\}/);
+            if (matchFallback) {
+              rawSpan = matchFallback[0];
+              inner = matchFallback[1].trim();
+              pos = startIdx + rawSpan.length;
+            } else {
+              pos = startIdx + 2;
+            }
+          }
+
+          if (inner) {
+            const callMatch = inner.match(/^(?:调用|call)\s*([a-zA-Z0-9_.]+)(?:[\s,，]+([\s\S]*))?$/i);
+            if (callMatch) {
+              rawExtractedCalls.push({
+                rawName: callMatch[1].trim(),
+                rawArgs: (callMatch[2] || '').trim(),
+                rawSpan,
+              });
+            } else {
+              const directMatch = inner.match(/^([a-zA-Z0-9_.]+)(?:[\s,，]+([\s\S]*))?$/);
+              if (directMatch) {
+                const possibleName = resolveNormalizedToolName(directMatch[1]);
+                if (allKnownToolIds.has(possibleName)) {
+                  rawExtractedCalls.push({
+                    rawName: directMatch[1].trim(),
+                    rawArgs: (directMatch[2] || '').trim(),
+                    rawSpan,
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Run deterministic 4-stage validation on every extracted command
+      const validationErrors: Array<{ name: string; error: string; rawArgs?: string }> = [];
+      const toolCalls: any[] = [];
+
+      for (let i = 0; i < rawExtractedCalls.length; i++) {
+        const item = rawExtractedCalls[i];
+        const callId = `call_${Date.now()}_${i}`;
+        const normalizedName = resolveNormalizedToolName(item.rawName);
+
+        // 1. Tool Existence Check
+        if (!allKnownToolIds.has(normalizedName)) {
+          const err = `【工具不存在】系统不存在名为 "${item.rawName}" 的工具。可用工具请参考本轮上下文中的可用工具列表或可选工具目录。`;
+          validationErrors.push({ name: item.rawName, error: err });
+          toolCalls.push({ id: callId, name: item.rawName, arguments: {}, validationError: err });
+          continue;
+        }
+
+        // 2. Context Injection / Permission Check
+        const isSystemTool = systemToolIds.has(normalizedName);
+        if (!isSystemTool && !enabledToolIds.has(normalizedName)) {
+          const err = `【未在当前上下文注入】工具 "${normalizedName}" 尚未在当前思考层级（Level ${turnContext.level}）中注入。当前轮次可用工具：${[...enabledToolIds].join('、')}。如需使用该工具，请先调用 sys.selectContext 注入该工具。`;
+          validationErrors.push({ name: normalizedName, error: err });
+          toolCalls.push({ id: callId, name: normalizedName, arguments: {}, validationError: err });
+          continue;
+        }
+
+        // 3. Arguments Syntax Parsing
+        let argsObj: Record<string, any> = {};
+        if (item.rawArgs) {
+          const cleanedArgs = item.rawArgs.trim();
+          if (cleanedArgs && cleanedArgs !== '{}') {
+            const parsed = robustParseJson(cleanedArgs);
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              argsObj = parsed;
+            } else if (parsed && Array.isArray(parsed)) {
+              argsObj = { items: parsed };
+            } else {
+              const err = `【参数语法错误】工具调用参数必须为合法的 JSON 对象格式 {"参数名": "参数值"}。当前输入的内容无法解析为对象：${cleanedArgs.slice(0, 100)}。请按 Schema 规范重构参数。`;
+              validationErrors.push({ name: normalizedName, error: err, rawArgs: cleanedArgs });
+              toolCalls.push({ id: callId, name: normalizedName, arguments: {}, validationError: err });
+              continue;
+            }
+          }
+        }
+
+        // 4. Semantic Schema & Constraint Validation
+        let schemaError: string | null = null;
+
+        if (normalizedName === 'sys.selectContext') {
+          if (argsObj.level !== 0 && argsObj.level !== 1) {
+            schemaError = '【参数校验错误】sys.selectContext 必需参数 "level" 必须为数字 0（全局规划）或 1（局部执行）。';
+          } else if (argsObj.tools && !Array.isArray(argsObj.tools)) {
+            schemaError = '【参数校验错误】sys.selectContext 参数 "tools" 必须为字符串数组，如 ["script.directory", "script.read"]。';
+          } else if (argsObj.prompts && !Array.isArray(argsObj.prompts)) {
+            schemaError = '【参数校验错误】sys.selectContext 参数 "prompts" 必须为提示词模块字符串数组。';
+          }
+        } else if (normalizedName === 'sys.endTask') {
+          delete argsObj.finalResponse;
+          if (argsObj.success === undefined) {
+            argsObj.success = true;
+          }
+        } else if (normalizedName === 'asset.create') {
+          if (Array.isArray(argsObj.items)) {
+            if (argsObj.items.length === 0) {
+              schemaError = '【参数校验错误】asset.create 批量新增参数 "items" 数组不能为空。';
+            }
+          } else {
+            const validTypes = ['characters', 'locations', 'props'];
+            if (!argsObj.type || !validTypes.includes(String(argsObj.type))) {
+              schemaError = '【参数校验错误】asset.create 缺少或无效参数 "type"，可选值必须为 "characters"（角色）、"locations"（场景）或 "props"（道具）之一。';
+            } else if (!argsObj.name || typeof argsObj.name !== 'string' || !argsObj.name.trim()) {
+              schemaError = '【参数校验错误】asset.create 缺少必需参数 "name"（资产名称）。';
+            }
+          }
+        } else if (normalizedName === 'asset.update') {
+          if (!argsObj.id || typeof argsObj.id !== 'string' || !argsObj.id.trim()) {
+            schemaError = '【参数校验错误】asset.update 缺少必需参数 "id"（要修改的目标资产 ID）。';
+          }
+        } else if (normalizedName === 'asset.delete') {
+          if (!argsObj.id && (!Array.isArray(argsObj.ids) || argsObj.ids.length === 0)) {
+            schemaError = '【参数校验错误】asset.delete 缺少必需参数：请传入目标资产 "id"（单个）或 "ids"（批量删除数组）。';
+          }
+        } else if (normalizedName === 'script.search') {
+          if (!argsObj.query || typeof argsObj.query !== 'string' || !argsObj.query.trim()) {
+            schemaError = '【参数校验错误】script.search 缺少必需参数 "query"（检索关键词）。';
+          }
+        } else if (normalizedName === 'card.inspect') {
+          if (!argsObj.cardId || typeof argsObj.cardId !== 'string' || !argsObj.cardId.trim()) {
+            schemaError = '【参数校验错误】card.inspect 缺少必需参数 "cardId"（目标卡片 ID）。';
+          }
+        } else if (normalizedName === 'card.generate') {
+          if (!argsObj.prompt && !argsObj.name) {
+            schemaError = '【参数校验错误】card.generate 缺少必需参数：请至少提供卡片名称 "name" 或生图提示词 "prompt"。';
+          }
+        } else if (normalizedName === 'card.detectLandmarks' || normalizedName === 'card.annotateElements') {
+          if (!argsObj.cardId || typeof argsObj.cardId !== 'string' || !argsObj.cardId.trim()) {
+            schemaError = `【参数校验错误】${normalizedName} 缺少必需参数 "cardId"（目标卡片 ID）。`;
+          }
+        } else if (normalizedName === 'ui.actAndObserve') {
+          if (!argsObj.targetId || typeof argsObj.targetId !== 'string' || !argsObj.targetId.trim()) {
+            schemaError = '【参数校验错误】ui.actAndObserve 缺少必需参数 "targetId"（可见组件 ID）。';
+          } else if (!argsObj.action || typeof argsObj.action !== 'string' || !argsObj.action.trim()) {
+            schemaError = '【参数校验错误】ui.actAndObserve 缺少必需参数 "action"（鼠标动作名称）。';
+          }
+        }
+
+        if (schemaError) {
+          validationErrors.push({ name: normalizedName, error: schemaError, rawArgs: item.rawArgs });
+          toolCalls.push({ id: callId, name: normalizedName, arguments: argsObj, validationError: schemaError });
+          continue;
+        }
+
+        // Passed all 4 checks!
+        toolCalls.push({ id: callId, name: normalizedName, arguments: argsObj });
+      }
+
+      const scriptValidatorTrace = {
+        mode: 'script_validator',
+        description: '命令脚本确定性校验器（纯 TypeScript 脚本，0ms 解析主模型返回文本，无二次 LLM 转译节点）',
+        mainModelRawOutput: message.content,
+        rawInputNote: '【说明】rawInput 是主 AI 模型（Main LLM）本轮返回的原始文本。主模型按 System Prompt 协议在输出工具指令前编写了【状态检查】与【思考】段落。脚本校验器以 0ms 纯代码提取其中的 {{调用 ...}} 指令。',
+        rawInput: message.content,
+        parsedOutput: toolCalls.map(c => ({ name: c.name, arguments: c.arguments, validationError: c.validationError })),
+        validationErrors: validationErrors.length > 0 ? validationErrors : undefined,
+        missingToolsWarning: (requireTool && toolCalls.length === 0) ? '【系统干预】本轮要求输出工具指令，但主模型未输出任何 {{调用 ...}} 指令' : undefined,
+      };
 
       // Let the runtime execute sys.endTask so its completion/pause result is recorded.
       const isComplete = parsed.complete === true && toolCalls.length === 0;
@@ -1202,13 +1459,15 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         fullAnswer: typeof parsed.fullAnswer === 'string' ? parsed.fullAnswer : undefined,
         taskTitle: typeof parsed.taskTitle === 'string' ? parsed.taskTitle : undefined,
         goal: typeof parsed.goal === 'string' ? parsed.goal : undefined,
+        subGoal: typeof parsed.subGoal === 'string' ? parsed.subGoal : undefined,
         progress: typeof parsed.progress === 'string' ? parsed.progress : undefined,
         failureSummaries: Array.isArray(parsed.failureSummaries) ? parsed.failureSummaries.filter((item: unknown) => typeof item === 'string' && item.trim()) : undefined,
         plan: Array.isArray(parsed.plan) ? parsed.plan.flatMap((item: any) => item && typeof item.id === 'string' && typeof item.title === 'string'
           ? [{ id: item.id, title: item.title, status: item.status === 'completed' ? 'completed' : 'pending' }]
           : []) : undefined,
         toolCalls,
-        jsonAdapterTrace,
+        scriptValidatorTrace,
+        jsonAdapterTrace: scriptValidatorTrace,
         response: typeof parsed.response === 'string' ? parsed.response : undefined,
         waitForUser: typeof parsed.waitForUser === 'string' ? parsed.waitForUser : undefined,
         complete: isComplete,
@@ -1224,7 +1483,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
           },
           response: {
             content: message.content ?? null,
-            toolCalls: parsedToolCalls,
+            toolCalls: toolCalls,
           },
         },
       });
@@ -1353,7 +1612,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         .map((tool) => JSON.stringify({ name: tool.id, description: tool.description, parameters: parametersForTool(tool.id) }))
         .join('\n');
 
-      const systemPromptTemplate = systemPrompt || getPrompt('jsonAdapter') || `你是一个极其精准的工具 JSON 转译节点。你的任务是将输入的伪代码、自然语言或非标指令，严格转译为符合 Schema 的标准 JSON 参数。\n\n【转译与提取准则】\n1. 完整保留对话与结束指令（核心）：\n   - 当输入包含 sys.endTask、endTask、end_task、结束任务或完成任务意图时，统一转换为 name: "sys.endTask"。\n   - 若输入中包含“用户沟通”或“对用户说的话”（含【完整版】与【简版】），转译 sys.endTask 时必须将完整版与简版文本原样保留填入 finalResponse，严禁遗漏简版！\n2. Schema 自动对齐：依据【可用工具 Schema】自动映射参数（如 endTask/end_task 映射为 sys.endTask，cardId, requirement, action），修复缺失引号、单引号或语法错误。\n3. 纯 JSON 输出：直接输出格式 {"tool_calls": [{"name": "工具名", "arguments": {...}}]}，严禁 Markdown 或多余文字。\n\n可用工具的 JSON Schema：\n{{adapterToolPrompt}}\n\n请输出严格的 JSON 格式，格式如下：\n{ "tool_calls": [{ "name": "工具名称", "arguments": { "参数名": "参数值" } }] }`;
+      const systemPromptTemplate = systemPrompt || getPrompt('jsonAdapter') || `你是一个极其精准的工具 JSON 转译节点。你的任务是将输入的伪代码、自然语言或非标指令，严格转译为符合 Schema 的标准 JSON 参数。\n\n【转译与提取准则】\n1. 完整保留对话与结束指令（核心）：\n   - 仅当输入明确包含 sys.endTask、endTask、end_task 等工具调用指令时，统一转换为 name: "sys.endTask"；严禁根据“完成任务意图”或普通对话语气自行生成 sys.endTask。\n   - 转译 sys.endTask 时直接输出 name: "sys.endTask"（无需 finalResponse 参数，结束信息在用户沟通中呈现）。\n2. Schema 自动对齐：依据【可用工具 Schema】自动映射参数（如 cardId, requirement, action），修复缺失引号、单引号或语法错误。\n3. 纯 JSON 输出：直接输出格式 {"tool_calls": [{"name": "工具名", "arguments": {...}}]}，严禁 Markdown 或多余文字。\n\n可用工具的 JSON Schema：\n{{adapterToolPrompt}}\n\n请输出严格的 JSON 格式，格式如下：\n{ "tool_calls": [{ "name": "工具名称", "arguments": { "参数名": "参数值" } }] }`;
 
       const finalPrompt = systemPromptTemplate.includes('{{adapterToolPrompt}}')
         ? systemPromptTemplate.replace('{{adapterToolPrompt}}', adapterToolPrompt)

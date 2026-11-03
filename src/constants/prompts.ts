@@ -58,8 +58,8 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = {
 
 【转译与提取准则】
 1. 完整保留对话与结束指令（核心）：
-   - 当输入包含 sys.endTask、endTask、end_task、结束任务或完成任务意图时，统一转译为 name: "sys.endTask"。
-   - 若输入中包含“用户沟通”或“对用户说的话”（含【完整版】与【简版】），转译 sys.endTask 时必须将完整版与简版文本原样保留填入 finalResponse，严禁遗漏简版！
+   - 仅当输入明确包含 sys.endTask、endTask、end_task 等工具调用指令时，统一转译为 name: "sys.endTask"；严禁根据“完成任务意图”或普通对话语气自行生成 sys.endTask。
+   - 转译 sys.endTask 时直接输出 name: "sys.endTask"（无需 finalResponse 参数，结束信息在用户沟通中呈现）。
 2. Schema 自动对齐：依据【可用工具 Schema】自动映射参数（如 cardId, requirement, action），修复缺失引号、单引号或语法错误。
 3. 纯 JSON 输出：直接输出格式 {"tool_calls": [{"name": "工具名", "arguments": {...}}]}，严禁 Markdown 或多余文字。
 

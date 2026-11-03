@@ -5504,9 +5504,6 @@ export const GenerationCard = React.memo(function GenerationCard({
               style={{
                 width: w,
                 height: h,
-                backgroundImage: cardPlaceholderUrl ? `url(${cardPlaceholderUrl})` : undefined,
-                backgroundSize: 'cover',
-                backgroundPosition: 'center',
               }}
             >
               <CardImageCanvas

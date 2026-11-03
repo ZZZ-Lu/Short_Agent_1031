@@ -4,6 +4,9 @@ import type { RuntimeTask } from './runtime';
 export interface AgentTurnTrace {
   id: string;
   turn: number;
+  thinkingLevel?: 0 | 1;
+  domain?: string;
+  requestedCategories?: string[];
   requireTool: boolean;
   startedAt: number;
   completedAt?: number;

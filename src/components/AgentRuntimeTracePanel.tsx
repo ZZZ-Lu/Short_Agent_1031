@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Braces, Check, CheckCircle2, CircleAlert, Clock3, Copy, Cpu, Eye, MousePointer2, Send, TerminalSquare, Wrench, Zap } from 'lucide-react';
+import { Braces, Check, CheckCircle2, CircleAlert, Clock3, Copy, Cpu, Eye, MousePointer2, Send, ShieldCheck, TerminalSquare, Wrench } from 'lucide-react';
 import type { AgentRuntimeTrace, AgentTurnTrace } from '../agent/debugTrace';
 import type { RuntimeEvent } from '../agent/runtime';
 
@@ -7,7 +7,7 @@ interface AgentRuntimeTracePanelProps {
   traces: AgentRuntimeTrace[];
 }
 
-type DetailTab = 'prompt' | 'output' | 'tools' | 'task' | 'stateNode' | 'jsonAdapter';
+type DetailTab = 'prompt' | 'output' | 'tools' | 'task' | 'stateNode' | 'scriptValidator';
 
 const json = (value: unknown) => JSON.stringify(value, null, 2);
 const clock = (value?: number) => value ? new Date(value).toLocaleTimeString('zh-CN', { hour12: false }) : '进行中';
@@ -84,13 +84,31 @@ export function AgentRuntimeTracePanel({ traces }: AgentRuntimeTracePanelProps) 
 
       <aside className="flex w-72 shrink-0 flex-col border-r border-slate-200 bg-gray-100 dark:border-white/10 dark:bg-[#151517]">
         <div className="border-b border-slate-200 px-4 py-3 dark:border-white/10">
-          <p className="truncate text-xs font-semibold">{trace.task.title || trace.goal}</p>
+          <div className="flex items-center justify-between gap-2">
+            <p className="truncate text-xs font-semibold">{trace.task.title || trace.goal}</p>
+            {turns.length > 0 && (
+              <span className="shrink-0 text-[10px] font-medium text-slate-400">
+                {(() => {
+                  const start = turns[0].startedAt;
+                  const lastTurn = turns[turns.length - 1];
+                  const end = lastTurn.completedAt || Date.now();
+                  const diff = Math.max(0, end - start);
+                  if (diff < 1000) return `${diff} ms`;
+                  if (diff < 60000) return `${(diff / 1000).toFixed(1)} s`;
+                  const mins = Math.floor(diff / 60000);
+                  const secs = Math.floor((diff % 60000) / 1000);
+                  return `${mins}分 ${secs}秒`;
+                })()}
+              </span>
+            )}
+          </div>
           <p className="mt-1 text-[11px] text-slate-400">最终目标：{trace.goal}</p>
         </div>
         <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3">
           {turns.map(item => {
             const active = item.id === turn?.id;
             const toolCount = item.parsedResult?.toolCalls?.length || 0;
+            const validatorTrace = item.parsedResult?.scriptValidatorTrace || item.parsedResult?.jsonAdapterTrace;
             return <button key={item.id} onClick={() => setSelectedTurnId(item.id)} className={`w-full rounded-xl border p-3 text-left transition ${active ? 'border-violet-400 bg-violet-50/80 dark:border-violet-500 dark:bg-violet-950/40' : 'border-slate-200 bg-gray-100 hover:border-slate-300 dark:border-white/10 dark:bg-white/[.03]'}`}>
               <div className="flex items-center justify-between gap-2"><span className="text-xs font-semibold">第 {item.turn} 轮</span><span className="text-[10px] text-slate-400">{duration(item)}</span></div>
               <p className="mt-1 text-[11px] text-slate-500">{item.transport?.request.context ? `${item.transport.request.context.level} 级 · ${item.transport.request.context.tools.length} 个注入工具 · ${item.transport.request.context.prompts.length} 个提示词模块` : (item.requireTool ? 'Runtime 要求继续调用工具' : '正常唤醒')}</p>
@@ -99,21 +117,21 @@ export function AgentRuntimeTracePanel({ traces }: AgentRuntimeTracePanelProps) 
                 {item.stateNodeTrace && (
                   <span 
                     onClick={(e) => { e.stopPropagation(); setSelectedTurnId(item.id); setDetailTab('stateNode'); }}
-                    className="inline-flex items-center gap-1 rounded bg-violet-100 px-1.5 py-0.5 font-medium text-violet-700 hover:bg-violet-200 dark:bg-violet-900/60 dark:text-violet-300 dark:hover:bg-violet-800/80"
+                    className="inline-flex items-center gap-1 rounded bg-violet-100 px-1.5 py-0.5 font-medium text-violet-700 hover:bg-violet-200 dark:bg-violet-900/60 dark:text-violet-300 dark:hover:bg-violet-800/80 cursor-pointer"
                     title="点击查看此轮状态提取节点 Prompt 与输出"
                   >
                     <Cpu size={10} />
                     状态节点
                   </span>
                 )}
-                {item.parsedResult?.jsonAdapterTrace && (
+                {validatorTrace && (
                   <span 
-                    onClick={(e) => { e.stopPropagation(); setSelectedTurnId(item.id); setDetailTab('jsonAdapter'); }}
-                    className="inline-flex items-center gap-1 rounded bg-amber-100 px-1.5 py-0.5 font-medium text-amber-700 hover:bg-amber-200 dark:bg-amber-900/60 dark:text-amber-300 dark:hover:bg-amber-800/80"
-                    title="点击查看此轮工具 JSON 转译节点记录"
+                    onClick={(e) => { e.stopPropagation(); setSelectedTurnId(item.id); setDetailTab('scriptValidator'); }}
+                    className="inline-flex items-center gap-1 rounded bg-emerald-100 px-1.5 py-0.5 font-medium text-emerald-700 hover:bg-emerald-200 dark:bg-emerald-900/60 dark:text-emerald-300 dark:hover:bg-emerald-800/80 cursor-pointer"
+                    title="点击查看此轮命令脚本校验器 0ms 执行记录"
                   >
-                    <Zap size={10} />
-                    JSON转译
+                    <ShieldCheck size={10} />
+                    脚本校验
                   </span>
                 )}
                 {item.error && <span className="text-red-500">· 请求失败</span>}
@@ -130,7 +148,7 @@ export function AgentRuntimeTracePanel({ traces }: AgentRuntimeTracePanelProps) 
             ['output', Send, '模型输出'],
             ['tools', Wrench, '工具与组件'],
             ['stateNode', Cpu, '认知状态提取节点'],
-            ['jsonAdapter', Zap, 'JSON 转译节点'],
+            ['scriptValidator', ShieldCheck, '命令脚本校验器'],
             ['task', CheckCircle2, '任务快照'],
           ] as const).map(([key, Icon, label]) => <button key={key} onClick={() => setDetailTab(key)} className={`flex h-8 items-center gap-1.5 rounded-lg px-3 text-xs ${detailTab === key ? 'bg-slate-100 font-medium text-slate-900 dark:bg-white/10 dark:text-white' : 'text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'}`}><Icon size={13} />{label}</button>)}
           <div className="ml-auto text-[10px] text-slate-400">{turn ? `${clock(turn.startedAt)} · ${duration(turn)}` : ''}</div>
@@ -139,8 +157,20 @@ export function AgentRuntimeTracePanel({ traces }: AgentRuntimeTracePanelProps) 
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-4">
           {!turn && <div className="grid h-full place-items-center text-sm text-slate-400">等待第一轮模型请求。</div>}
           {turn && detailTab === 'prompt' && <div className="flex min-h-0 flex-1 flex-col space-y-3">
-            <TraceNotice icon={<Eye size={15} />} title="这是服务端实际组装后发送给模型的内容" text="可据此检查 userMessage、task、history、System Prompt、工具定义分别如何进入本轮请求。API Key 已排除。" />
-            {turn.transport?.request.context && <JsonBlock title="本轮实际注入的层级、工具和提示词模块" value={turn.transport.request.context} />}
+            {turn.transport?.request.context && (
+              <details className="rounded-xl border border-slate-200 bg-gray-100 p-3 dark:border-white/10 dark:bg-white/[.03] shrink-0">
+                <summary className="flex cursor-pointer list-none items-center justify-between text-xs font-semibold text-slate-700 dark:text-slate-200">
+                  <span className="flex items-center gap-2">
+                    <span className="h-1.5 w-1.5 rounded-full bg-violet-500" />
+                    本轮实际注入的层级、工具和提示词模块
+                  </span>
+                  <span className="text-[10px] font-normal text-slate-400">点击展开/收起</span>
+                </summary>
+                <div className="mt-3 border-t border-slate-200 pt-3 dark:border-white/10">
+                  <JsonBlock title="" value={turn.transport.request.context} />
+                </div>
+              </details>
+            )}
             {turn.transport ? (
               <JsonBlock 
                 className="flex min-h-0 flex-1 flex-col"
@@ -173,16 +203,16 @@ export function AgentRuntimeTracePanel({ traces }: AgentRuntimeTracePanelProps) 
               <PendingBlock text="本轮尚未产生状态节点更新数据。" />
             )}
           </div>}
-          {turn && detailTab === 'jsonAdapter' && <div className="flex min-h-0 flex-1 flex-col space-y-3">
+          {turn && detailTab === 'scriptValidator' && <div className="flex min-h-0 flex-1 flex-col space-y-3">
             <TraceNotice
-              icon={<Zap size={15} />}
-              title="工具 JSON 转译节点（/api/agent/turn）"
-              text="当主模型输出非标 JSON、JS 对象语法或自然语言时触发。0毫秒极速模式优先修复语法，若不符合规范则唤醒转译 LLM 节点重构标准参数。"
+              icon={<ShieldCheck size={15} />}
+              title="命令脚本确定性校验器（纯 TypeScript 代码 · 0ms 延迟）"
+              text="【无次级模型节点】主模型（Main LLM）生成响应时按协议会在文本中包含【状态检查】与【思考】段落。脚本校验器直接读取主模型返回的这段原始文本（rawInput），在 0ms 内使用纯 TypeScript 语法正则提取 {{调用 ...}} 命令，校验参数及权限后直接执行。"
             />
-            {turn.parsedResult?.jsonAdapterTrace ? (
-              <JsonBlock className="flex min-h-0 flex-1 flex-col" title="转译节点运行模式与数据追踪" value={turn.parsedResult.jsonAdapterTrace} />
+            {(turn.parsedResult?.scriptValidatorTrace || turn.parsedResult?.jsonAdapterTrace) ? (
+              <JsonBlock className="flex min-h-0 flex-1 flex-col" title="命令脚本校验模式与数据追踪" value={turn.parsedResult?.scriptValidatorTrace || turn.parsedResult?.jsonAdapterTrace} />
             ) : (
-              <PendingBlock text="本轮主模型已直接输出标准 JSON，无需唤醒转译节点。" />
+              <PendingBlock text="本轮主模型未输出指令或尚未产生脚本校验追踪记录。" />
             )}
           </div>}
           {turn && detailTab === 'task' && <div className="flex min-h-0 flex-1 flex-col space-y-3">

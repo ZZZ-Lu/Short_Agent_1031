@@ -141,9 +141,7 @@
   will-change: transform !important;
   transform: translateZ(0) !important;
   transition: none !important;
-  corner-shape: unset !important;
   box-shadow: none !important;
-  border-radius: 12px !important;
 }
 
 #canvas-workspace[data-zooming="true"] .generation-card-bottom-panel *,
@@ -161,9 +159,7 @@
 #canvas-workspace[data-panning="true"] .asset-card,
 #canvas-workspace[data-gesture="true"] .asset-card,
 .drag-degraded.generation-card-body {
-  corner-shape: unset !important;
   box-shadow: none !important;
-  border-radius: 12px !important;
 }
 
 #canvas-workspace[data-zooming="true"] .ref-thumb-tag,

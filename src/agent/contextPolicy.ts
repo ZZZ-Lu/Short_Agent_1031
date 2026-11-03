@@ -6,7 +6,7 @@ export interface AgentContextSelection { level: ThinkingLevel; tools: AgentToolN
 
 export const PROMPT_MODULES: Record<string, { label: string; content: string }> = {
   script: { label: '剧本读取与分析', content: '剧本内容按需读取。目录中的集号可能跳号或重复，集数应按实际条目统计。长文本通过分页读取；基于工具返回内容回答。' },
-  assets: { label: '项目资产', content: '角色、场景和道具属于当前项目资产，先查询所需类型，依据实际返回的资产信息工作。' },
+  assets: { label: '项目资产', content: '角色、场景和道具属于当前项目资产。支持 asset.list（查询）、asset.create（创建）、asset.update（修改）、asset.delete（删除）全套增删查改能力；依据剧本分析出的角色造型、场景或关键道具应及时沉淀保存到资产清单中。' },
   image: { label: '图像生成与卡片', content: '禁止覆盖资产卡片或已出图卡片；重新生成应使用现有复刻机制。只有工具返回 generating 才能宣称生成已启动；默认使用 Hy Image3.5 preview，并给 card.generate 提供简短名称。' },
   ui: { label: '页面观察与操作', content: '仅在需要演示或检查页面时使用页面操作。page.inspect 只描述可见界面；ui.actAndObserve 只能操作已观察的目标。' },
 };

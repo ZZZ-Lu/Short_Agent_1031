@@ -670,13 +670,8 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
       onWheel={(event) => event.stopPropagation()}
       className="fixed inset-0 z-[100] flex flex-col overflow-hidden bg-[#f7f7f8] text-slate-900 select-text dark:bg-[#0d0d0f] dark:text-slate-100"
     >
-      <header className="flex h-14 shrink-0 items-center gap-3 border-b border-slate-200 bg-gray-100 px-4 dark:border-white/10 dark:bg-[#151517]">
-        <div className="grid h-8 w-8 place-items-center rounded-lg bg-violet-600 text-white"><ListTree size={16} /></div>
-        <div className="min-w-0">
-          <h1 className="text-sm font-semibold">节点调试台</h1>
-          <p className="truncate text-[11px] text-slate-400">{currentProject?.name || '未命名项目'} · Prompt 来自代码，页面修改仅当前会话有效</p>
-        </div>
-        <nav className="ml-3 flex h-8 items-center rounded-lg bg-slate-100 p-0.5 dark:bg-white/[.06]" aria-label="设置页面">
+      <header className="flex h-14 shrink-0 items-center gap-4 border-b border-slate-200 bg-gray-100 px-4 dark:border-white/10 dark:bg-[#151517]">
+        <nav className="flex h-8 items-center rounded-lg bg-slate-100 p-0.5 dark:bg-white/[.06]" aria-label="设置页面">
           <button onClick={() => setSettingsSection('debug')} className={`h-7 rounded-md px-3 text-xs transition ${settingsSection === 'debug' ? 'bg-gray-100 font-medium text-slate-900 shadow-sm dark:bg-white/10 dark:text-white' : 'text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'}`}>节点调试</button>
           <button onClick={() => setSettingsSection('runtime')} className={`h-7 rounded-md px-3 text-xs transition ${settingsSection === 'runtime' ? 'bg-gray-100 font-medium text-slate-900 shadow-sm dark:bg-white/10 dark:text-white' : 'text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'}`}>运行追踪</button>
           <button onClick={() => setSettingsSection('tools')} className={`h-7 rounded-md px-3 text-xs transition ${settingsSection === 'tools' ? 'bg-gray-100 font-medium text-slate-900 shadow-sm dark:bg-white/10 dark:text-white' : 'text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'}`}>工具管理</button>

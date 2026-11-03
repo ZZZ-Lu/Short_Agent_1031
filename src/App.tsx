@@ -1,5 +1,5 @@
 import { EntryBlurOverlay } from './components/EntryBlurOverlay';
-import { executeProjectReadTool } from './agent/projectTools';
+import { executeProjectReadTool, executeProjectAssetMutation } from './agent/projectTools';
 import { registerCardEntries, requestCardEntries, stageCardEntry, startCardEntry, startMediaReveal, mediaRevealProgress, MEDIA_REVEAL_MS, CARD_ENTRY_MS, isNewCardAwaitingLod } from './utils/cardEntrance';
 import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
 import { AgentCursor, buildDynamicSelectionPrompt, HudContextMessage } from './components/AgentCursor';
@@ -30,7 +30,7 @@ import { getDrafts, saveDraft, deleteDraft } from './utils/draftDb';
 import { McpKeyButton } from './components/McpKeyButton';
 import { ProjectScriptBible } from './components/ProjectScriptBible';
 import { ScriptProject, DEFAULT_PROJECT } from './types/script';
-import { ScriptView } from './agent/scriptTools';
+import { ScriptView, readScriptMetadata, readScriptDirectory, readScriptEpisode, searchScript } from './agent/scriptTools';
 import type { AgentToolCall, AgentTurnResult } from './agent/protocol';
 import { AgentRuntime, type RuntimeTask } from './agent/runtime';
 import { snapshotRuntimeTask, type AgentRuntimeTrace } from './agent/debugTrace';
@@ -671,14 +671,31 @@ export default function App() {
   const currentProjectRef = useRef(currentProject);
   currentProjectRef.current = currentProject;
 
-  const [isScriptDrawerOpen, setIsScriptDrawerOpen] = useState(false);
-  const [isScriptTocOpen, setIsScriptTocOpen] = useState(false);
+  const [isScriptDrawerOpen, setIsScriptDrawerOpen] = useState<boolean>(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('is_script_drawer_open');
+      if (saved !== null) return saved === 'true';
+    }
+    return false;
+  });
+  const [isScriptTocOpen, setIsScriptTocOpen] = useState<boolean>(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('is_script_toc_open') === 'true';
+    }
+    return false;
+  });
   const [isScriptTocAtBottom, setIsScriptTocAtBottom] = useState(false);
   const [tocScrollRequest, setTocScrollRequest] = useState<{ id: number; delta: number } | null>(null);
   const [scriptViewRequest, setScriptViewRequest] = useState<ScriptView>('script');
   const [requestedTocItemId, setRequestedTocItemId] = useState<string | null>(null);
   const [scriptSelection, setScriptSelection] = useState<ScriptSelection>(null);
-  const scriptViewRef = useRef({ drawerOpen: false, tocOpen: false, tocAtBottom: false, activeView: 'script' as ScriptView, activeEpisodeId: null as string | null });
+  const scriptViewRef = useRef({
+    drawerOpen: typeof window !== 'undefined' && localStorage.getItem('is_script_drawer_open') === 'true',
+    tocOpen: typeof window !== 'undefined' && localStorage.getItem('is_script_toc_open') === 'true',
+    tocAtBottom: false,
+    activeView: 'script' as ScriptView,
+    activeEpisodeId: null as string | null
+  });
   const [agentTask, setAgentTask] = useState<AgentTaskLog | null>(null);
   const agentTaskScrollRef = useRef<HTMLDivElement>(null);
   const [isTaskChatOpen, setIsTaskChatOpen] = useState(false);
@@ -735,15 +752,24 @@ export default function App() {
   const setDrawerOpen = useCallback((open: boolean) => {
     scriptViewRef.current.drawerOpen = open;
     setIsScriptDrawerOpen(open);
+    try {
+      localStorage.setItem('is_script_drawer_open', String(open));
+    } catch {}
     if (!open) {
       scriptViewRef.current.tocOpen = false;
       setIsScriptTocOpen(false);
+      try {
+        localStorage.setItem('is_script_toc_open', 'false');
+      } catch {}
       setScriptSelection(null);
     }
   }, []);
   const setTocOpen = useCallback((open: boolean) => {
     scriptViewRef.current.tocOpen = open;
     setIsScriptTocOpen(open);
+    try {
+      localStorage.setItem('is_script_toc_open', String(open));
+    } catch {}
   }, []);
   const setTocAtBottom = useCallback((atBottom: boolean) => {
     scriptViewRef.current.tocAtBottom = atBottom;
@@ -972,7 +998,28 @@ export default function App() {
     placeholder?: string;
     focusTrigger?: number;
     onAskResolve?: (answer: string) => void;
-  } | null>(null);
+  } | null>(() => ({
+    isOpen: true,
+    targetId: null,
+    placeholder: "输入你的想法...",
+  }));
+  // Keep Agent input box ALWAYS visible by default and sync targetId with card selections
+  useEffect(() => {
+    setAgentQuickInput(prev => ({
+      isOpen: true,
+      x: prev?.x,
+      y: prev?.y,
+      canvasX: prev?.canvasX,
+      canvasY: prev?.canvasY,
+      lastReply: prev?.lastReply,
+      placeholder: prev?.placeholder || "输入你的想法...",
+      focusTrigger: prev?.focusTrigger,
+      onAskResolve: prev?.onAskResolve,
+      targetId: selectedCardIds.length > 0 ? selectedCardIds[0] : null,
+      targetIds: selectedCardIds.length > 0 ? selectedCardIds : undefined,
+    }));
+  }, [selectedCardIds]);
+
   const [cardDrafts, setCardDrafts] = useState<Record<string, string>>({});
   const [globalChatHistory, setGlobalChatHistory] = useState<Array<{
     id: string;
@@ -1055,8 +1102,8 @@ export default function App() {
     const shortBuffer: string[] = [];
     const fullBuffer: string[] = [];
 
-    const shortStartRegex = /(?:简版|对用户说的话\s*[\(（]简版[\)）])\s*[:：]\s*(.*)/i;
-    const fullStartRegex = /(?:完整版|对用户说的话\s*[\(（]完整版[\)）])\s*[:：]\s*(.*)/i;
+    const shortStartRegex = /^[-\*]?\s*(?:简版回答|简版|对用户说的话\s*[\(（]简版[\)）])\s*[:：]\s*(.*)/i;
+    const fullStartRegex = /^[-\*]?\s*(?:完整版回答|完整版|对用户说的话\s*[\(（]完整版[\)）])\s*[:：]\s*(.*)/i;
 
     for (const line of lines) {
       const trimmedLine = line.trim();
@@ -1071,14 +1118,14 @@ export default function App() {
       if (isShortStart) {
         activeMode = 'short';
         const match = line.match(shortStartRegex);
-        if (match) {
+        if (match && match[1]) {
           shortBuffer.push(match[1]);
         }
         continue;
       } else if (isFullStart) {
         activeMode = 'full';
         const match = line.match(fullStartRegex);
-        if (match) {
+        if (match && match[1]) {
           fullBuffer.push(match[1]);
         }
         continue;
@@ -1106,13 +1153,13 @@ export default function App() {
     // --- FALLBACKS ---
     // 1. Regex fallback just in case lines are joined or on a single line
     if (!shortText) {
-      const shortMatch = rawText.match(/(?:简版|对用户说的话\s*[\(（]简版[\)）])\s*[:：]\s*[“"「]?([^"\r\n”」]+)/i);
+      const shortMatch = rawText.match(/(?:简版回答|简版|对用户说的话\s*[\(（]简版[\)）])\s*[:：]\s*[“"`「]?([^"\r\n”`」]+)/i);
       if (shortMatch) {
         shortText = shortMatch[1].trim().replace(/^[“"「‘]/, '').replace(/[”"」’]$/, '').trim();
       }
     }
     if (!fullText) {
-      const fullMatch = rawText.match(/(?:完整版|对用户说的话\s*[\(（]完整版[\)）])\s*[:：]\s*[“"「]?([^”」｝}]+)/i);
+      const fullMatch = rawText.match(/(?:完整版回答|完整版|对用户说的话\s*[\(（]完整版[\)）])\s*[:：]\s*[“"`「]?([^”`」｝}]+)/i);
       if (fullMatch) {
         fullText = fullMatch[1].trim().replace(/^[“"「‘]/, '').replace(/[”"」’]$/, '').trim();
       }
@@ -1122,9 +1169,17 @@ export default function App() {
       fullText = rawText;
     }
 
-    // 2. Fallback: If转译节点没有输出简版回答，兜底直接显示完整版回答
+    // 2. Smart Short Fallback: If no explicit shortText was parsed, generate a concise summary
+    // (first sentence or first 48 chars) instead of dumping the entire fullText into the floating HUD.
     if (!shortText) {
-      shortText = fullText || rawText;
+      const cleanFull = fullText.replace(/^[“"「‘]/, '').replace(/[”"」’]$/, '').trim();
+      const firstLine = cleanFull.split(/[\r\n]+/)[0] || cleanFull;
+      const firstSentenceMatch = firstLine.match(/^[^。！？\n.!?]+[。！？.!?]?/);
+      let candidate = firstSentenceMatch ? firstSentenceMatch[0] : firstLine;
+      if (candidate.length > 48) {
+        candidate = candidate.slice(0, 46) + '...';
+      }
+      shortText = candidate || cleanFull;
     }
 
     return { shortText, fullText };
@@ -5059,10 +5114,79 @@ export default function App() {
     if (call.name === 'script.directory' || call.name === 'script.read' || call.name === 'script.search' || call.name === 'asset.list') {
       return executeProjectReadTool(call.name, call.arguments, currentProjectRef.current);
     }
+    if (call.name === 'asset.create' || call.name === 'asset.update' || call.name === 'asset.delete') {
+      const { updatedProject, output } = executeProjectAssetMutation(call.name, call.arguments, currentProjectRef.current);
+      handleUpdateCurrentProject(updatedProject);
+      return output;
+    }
     const rememberObservation = (page: Awaited<ReturnType<typeof inspectPage>>) => {
       observedTargetsByTaskRef.current.set(task.id, new Set(page.components.map(component => component.id)));
       return page;
     };
+    if (call.name === 'script.readMetadata') {
+      const text = currentProject.scriptText || '';
+      return readScriptMetadata(text, currentProject.name, currentProject.updatedAt || Date.now());
+    }
+    if (call.name === 'script.readDirectory') {
+      const text = currentProject.scriptText || '';
+      const range = Array.isArray(call.arguments?.range) ? call.arguments.range as [number, number] : undefined;
+      const query = typeof call.arguments?.query === 'string' ? call.arguments.query : undefined;
+      const tailOnly = Boolean(call.arguments?.tailOnly);
+      return readScriptDirectory(text, { range, query, tailOnly });
+    }
+    if (call.name === 'script.readEpisode') {
+      const text = currentProject.scriptText || '';
+      const episodeId = String(call.arguments?.episodeId || '');
+      const mode = (call.arguments?.mode as 'full' | 'excerpt') || 'excerpt';
+      const lineRange = Array.isArray(call.arguments?.lineRange) ? call.arguments.lineRange as [number, number] : undefined;
+      return readScriptEpisode(text, episodeId, { mode, lineRange });
+    }
+    if (call.name === 'asset.extractElements') {
+      const episodeId = typeof call.arguments?.episodeId === 'string' ? call.arguments.episodeId : undefined;
+      let text = typeof call.arguments?.text === 'string' ? call.arguments.text : '';
+      if (!text && episodeId) {
+        const ep = readScriptEpisode(currentProject.scriptText || '', episodeId, { mode: 'full' });
+        text = ep.content;
+      }
+      const result = await assetExtractionService.extractAssetsFromScript(currentProject.id, text);
+      const project = (result?.project || {}) as ScriptProject;
+      const chars = project.bible?.characters || [];
+      const locs = project.bible?.locations || [];
+      const props = project.bible?.props || [];
+      return {
+        episodeId,
+        extractedCount: chars.length + locs.length + props.length,
+        characters: chars,
+        locations: locs,
+        props: props,
+      };
+    }
+    if (call.name === 'card.batchCreate') {
+      const cardsList = Array.isArray(call.arguments?.cards) ? call.arguments.cards : [];
+      const createdResults: Array<{ id: string; name: string; status: string }> = [];
+      for (const cardItem of cardsList) {
+        const name = String(cardItem.name || '未命名节点');
+        const prompt = String(cardItem.prompt || '');
+        const newCardId = `card_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+        const count = cardsRef.current.length;
+        const x = 100 + (count % 4) * 360;
+        const y = 100 + Math.floor(count / 4) * 400;
+        const newCard: CardData = {
+          id: newCardId,
+          name,
+          prompt,
+          ratio: '16:9',
+          res: '2K',
+          imageUrl: null,
+          state: 'draft',
+          x,
+          y,
+        };
+        setCards(prev => [...prev, newCard], true);
+        createdResults.push({ id: newCardId, name, status: 'draft' });
+      }
+      return { success: true, count: createdResults.length, cards: createdResults };
+    }
     if (call.name === 'page.inspect') {
       agentFocusManager.setCursorMode('inspect');
       const scope = typeof call.arguments?.scope === 'string' && call.arguments.scope !== 'overview'
@@ -5863,6 +5987,7 @@ export default function App() {
         taskId = `task_${Date.now().toString(36)}`;
         activeTaskIdRef.current = taskId;
         runtime = new AgentRuntime({
+          maxTurns: Infinity,
           enabledTools: () => AGENT_TOOL_REGISTRY.filter(tool => getAgentToolConfig()[tool.id]).map(tool => tool.id),
           requestTurn: async (task: RuntimeTask, requireTool, signal) => {
             const turnId = `${task.id}:turn:${task.turn}`;
@@ -5874,6 +5999,9 @@ export default function App() {
               events: task.events,
               observations: task.observations,
               project: { id: currentProject.id, name: currentProject.name },
+              thinkingLevel: task.thinkingLevel ?? 0,
+              domain: task.domain,
+              requestedCategories: task.requestedCategories,
               task: { 
                 id: task.id, 
                 goal: task.goal, 
@@ -5882,6 +6010,9 @@ export default function App() {
                 progress: task.progress, 
                 subGoal: task.subGoal, 
                 notes: task.notes, 
+                thinkingLevel: task.thinkingLevel ?? 0,
+                domain: task.domain,
+                requestedCategories: task.requestedCategories,
                 turn: task.turn, 
                 pendingCallIds: task.pendingCallIds,
                 negotiationLog: task.negotiationLog,
@@ -5904,6 +6035,9 @@ export default function App() {
               turns: [...trace.turns.filter(turn => turn.id !== turnId), {
                 id: turnId,
                 turn: task.turn,
+                thinkingLevel: task.thinkingLevel ?? 0,
+                domain: task.domain,
+                requestedCategories: task.requestedCategories,
                 requireTool,
                 startedAt,
                 taskBefore: snapshotRuntimeTask(task),
@@ -5923,6 +6057,16 @@ export default function App() {
               const body = await res.json().catch(() => ({}));
               if (!res.ok) throw new Error(body.error || 'Agent 轮次失败');
               const result = body as AgentTurnResult;
+
+              if (result.thinkingLevel === 0 || result.thinkingLevel === 1) {
+                task.thinkingLevel = result.thinkingLevel;
+              }
+              if (result.domain) {
+                task.domain = result.domain;
+              }
+              if (result.requestedCategories) {
+                task.requestedCategories = result.requestedCategories;
+              }
 
               // Immediately notify agentFocusManager with the validated tool calls from the JSON adapter node
               if (Array.isArray(result.toolCalls) && result.toolCalls.length > 0) {
@@ -5944,10 +6088,13 @@ export default function App() {
               }));
               
               const endTaskCall = Array.isArray(result.toolCalls) ? result.toolCalls.find(call => call.name === 'sys.endTask') : undefined;
-              const endTaskSpeech = endTaskCall?.arguments?.finalResponse || endTaskCall?.arguments?.waitForUser;
-              const rawSpeech = result.speak || result.fullAnswer || (typeof endTaskSpeech === 'string' ? endTaskSpeech : undefined) || (Array.isArray(result.narration) && result.narration.length > 0 ? result.narration[result.narration.length - 1] : undefined);
+              const endTaskSpeech = endTaskCall?.arguments?.waitForUser;
+              const directSpeak = result.speak && result.speak.trim() && !isThinkingOrLoadingPhrase(result.speak) ? result.speak : undefined;
+              const rawSpeech = result.response || result.fullAnswer || (typeof endTaskSpeech === 'string' ? endTaskSpeech : undefined) || result.speak || (Array.isArray(result.narration) && result.narration.length > 0 ? result.narration[result.narration.length - 1] : undefined);
 
-              if (rawSpeech && rawSpeech.trim() && !isThinkingOrLoadingPhrase(rawSpeech)) {
+              if (directSpeak) {
+                setAgentState(prev => ({ ...prev, speak: directSpeak, visible: true }));
+              } else if (rawSpeech && rawSpeech.trim() && !isThinkingOrLoadingPhrase(rawSpeech)) {
                 const parsed = parseAgentCommunication(rawSpeech);
                 const parsedShort = parsed.shortText || parsed.fullText || rawSpeech;
                 setAgentState(prev => ({ ...prev, speak: parsedShort, visible: true }));
@@ -6079,6 +6226,9 @@ export default function App() {
                     progress: task.progress,
                     plan: task.plan,
                     notes: task.notes,
+                    thinkingLevel: task.thinkingLevel ?? 0,
+                    domain: task.domain,
+                    requestedCategories: task.requestedCategories,
                   },
                   userMessage: lastUserMessage,
                   lastTurnOutput: {
@@ -6102,6 +6252,9 @@ export default function App() {
                 if (responseData.goal) task.goal = responseData.goal;
                 if (responseData.subGoal) task.subGoal = responseData.subGoal;
                 if (responseData.progress) task.progress = responseData.progress;
+                if (responseData.thinkingLevel === 0 || responseData.thinkingLevel === 1) task.thinkingLevel = responseData.thinkingLevel;
+                if (responseData.domain) task.domain = responseData.domain;
+                if (Array.isArray(responseData.requestedCategories)) task.requestedCategories = responseData.requestedCategories;
                 if (Array.isArray(responseData.plan)) task.plan = responseData.plan;
                 if (typeof responseData.notes === 'string' && responseData.notes.trim()) {
                   if (responseData.notesMode === 'overwrite') {
@@ -8168,7 +8321,11 @@ export default function App() {
                     const currentKey = agentQuickInput.targetId || 'global';
                     setCardDrafts(prev => ({ ...prev, [currentKey]: '' }));
                     deleteDraft(currentKey);
-                    setAgentQuickInput(null);
+                    setAgentQuickInput(prev => ({
+                      isOpen: true,
+                      targetId: prev?.targetId || null,
+                      placeholder: "输入你的想法...",
+                    }));
                     if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
                     isAgentRunningRef.current = true;
                     setIsAgentThinking(true);
@@ -8187,7 +8344,11 @@ export default function App() {
                   const currentKey = currentTarget || 'global';
                   setCardDrafts(prev => ({ ...prev, [currentKey]: '' }));
                   deleteDraft(currentKey); // Delete draft from IndexedDB on submit
-                  setAgentQuickInput(null);
+                  setAgentQuickInput(prev => ({
+                    isOpen: true,
+                    targetId: currentTarget,
+                    placeholder: "输入你的想法...",
+                  }));
                   if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
                   isAgentRunningRef.current = true;
                   setIsAgentThinking(true);
@@ -8248,14 +8409,14 @@ export default function App() {
                     const currentKey = agentQuickInput.targetId || 'global';
                     setCardDrafts(prev => ({ ...prev, [currentKey]: '' }));
                     deleteDraft(currentKey);
-                    setAgentQuickInput(null);
+                    setAgentQuickInput(prev => ({ isOpen: true, targetId: prev?.targetId || null, placeholder: "输入你的想法..." }));
                     askResolver('');
                     return;
                   }
                   const currentTarget = agentQuickInput.targetId || 'global';
                   setCardDrafts(prev => ({ ...prev, [currentTarget]: '' }));
                   deleteDraft(currentTarget); // Delete draft from IndexedDB on close
-                  setAgentQuickInput(null);
+                  setAgentQuickInput(prev => ({ isOpen: true, targetId: prev?.targetId || null, placeholder: "输入你的想法..." }));
                   setAgentState(prev => {
                     if (!prev.speak || prev.speak.startsWith('选了') || prev.speak === '我能帮什么忙？' || prev.speak === '选中了这组内容，要调整什么？') {
                       return { ...prev, speak: undefined };

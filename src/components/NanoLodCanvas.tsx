@@ -179,6 +179,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
   const squircleSupported = useRef(CSS.supports('corner-shape', 'squircle')).current;
   const rafIdRef = useRef<number | null>(null);
   const cardPanelFadeMapRef = useRef<Map<string, number>>(new Map());
+  const lodTransitionMap = useRef<Map<string, { alpha: number; startTime: number; startAlpha: number; targetAlpha: number }>>(new Map());
   const pendingThumbGenRef = useRef<Set<string>>(new Set());
   const bakedSnapshotRef = useRef<BakedSnapshot | null>(null);
   const quadTreeRef = useRef<QuadTree<CardData> | null>(null);
@@ -617,17 +618,47 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         cardY -= shiftY;
         dim = { width: dim.width * scaleFactor, height: dim.height * scaleFactor };
       }
-      // At standard scale, hand off only to DOM cards that are mounted and painted.
       const renderedSet = renderedIdsRef.current;
       const paintedSet = typeof window !== 'undefined' ? (window as any).__paintedCardIds : null;
       const isPainted = Boolean(paintedSet?.has(card.id));
       const panelReady = Boolean(card.fileName || card.isAsset) || readyPromptPanels.has(card.id);
       const isCardReadyInDom = currentScale >= getNanoLodThreshold() && Boolean(renderedSet?.has(card.id) && isPainted && panelReady);
 
-      // Instant seamless handoff: if card is rendered and painted in DOM, DOM handles rendering directly!
-      if (isCardReadyInDom) {
+      const targetAlpha = isCardReadyInDom ? 0 : 1;
+      let transitionState = lodTransitionMap.current.get(card.id);
+      const now = performance.now();
+
+      if (!transitionState) {
+        transitionState = { alpha: targetAlpha, startTime: now, startAlpha: targetAlpha, targetAlpha };
+        lodTransitionMap.current.set(card.id, transitionState);
+      } else if (transitionState.targetAlpha !== targetAlpha) {
+        transitionState.startAlpha = transitionState.alpha;
+        transitionState.targetAlpha = targetAlpha;
+        transitionState.startTime = now;
+      }
+
+      if (transitionState.alpha !== targetAlpha) {
+        const elapsed = now - transitionState.startTime;
+        const duration = 500; // Exact 500ms smooth cross-fade duration as requested
+        const progress = Math.min(1, elapsed / duration);
+        // Smooth quadratic ease-out curve
+        const eased = 1 - Math.pow(1 - progress, 2);
+        transitionState.alpha = transitionState.startAlpha + (targetAlpha - transitionState.startAlpha) * eased;
+        if (progress < 1) {
+          scheduleDraw();
+        } else {
+          transitionState.alpha = targetAlpha;
+        }
+      }
+
+      const alpha = transitionState.alpha;
+
+      if (alpha <= 0.001 && isCardReadyInDom) {
         return;
       }
+
+      ctx.save();
+      ctx.globalAlpha *= alpha;
 
 
       // If we are in High LOD (scale >= threshold), and the card is currently being dragged in DOM,
@@ -639,6 +670,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
           const isThisDragging = (card.id === draggingCardId) || 
             (selectedIds.includes(draggingCardId) && selectedIds.includes(card.id));
           if (isThisDragging) {
+            ctx.restore();
             return;
           }
         }
@@ -736,6 +768,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
               // Leave the old DOM image visible until this replacement is ready.
               nanoHandoffReady = false;
               if (standard) ctx.restore();
+              ctx.restore();
               return;
             }
           }
@@ -979,6 +1012,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         ctx.textBaseline = 'middle';
         ctx.fillText("当前目标", badgeX + w/2, badgeY + h/2 + (1/currentScale));
       }
+      ctx.restore();
     };
 
     let animating = false;

@@ -41,6 +41,9 @@ export interface RuntimeTask {
   lastUserInputAt: number;
   images?: string[];
   cardContext?: Record<string, any>;
+  thinkingLevel?: 0 | 1;
+  domain?: string;
+  requestedCategories?: string[];
 }
 
 export interface AgentRuntimeOptions {
@@ -69,7 +72,7 @@ export class AgentRuntime {
   private readonly options: Required<Pick<AgentRuntimeOptions, 'maxTurns'>> & AgentRuntimeOptions;
 
   constructor(options: AgentRuntimeOptions) {
-    this.options = { ...options, maxTurns: options.maxTurns ?? 12 };
+    this.options = { ...options, maxTurns: options.maxTurns ?? Infinity };
   }
 
   createTask(input: { id: string; sessionId: string; goal: string; images?: string[]; cardContext?: Record<string, any> }): RuntimeTask {
@@ -147,8 +150,20 @@ export class AgentRuntime {
 
     try {
       let recoveryCount = 0;
+      let emptyToolCount = 0;
+      const MAX_EMPTY_TOOL_RETRIES = 2;
+
       while (!terminal.has(task.status) && (task.status as RuntimeTaskStatus) !== 'paused' && (task.status as RuntimeTaskStatus) !== 'waiting_user' && !signal.aborted) {
         task.turn += 1;
+        if (Number.isFinite(this.options.maxTurns) && this.options.maxTurns > 0 && task.turn > this.options.maxTurns) {
+          task.status = 'waiting_user';
+          const limitMsg = `任务已达到最大轮次限制（${this.options.maxTurns} 轮），已暂停等待用户指导。`;
+          task.summary = limitMsg;
+          this.addEvent(task, { turnId: `${task.id}:turn:${task.turn}`, type: 'system', text: limitMsg });
+          this.publish(task);
+          break;
+        }
+
         task.status = 'planning';
         const turnId = `${task.id}:turn:${task.turn}`;
         this.publish(task);
@@ -165,9 +180,26 @@ export class AgentRuntime {
         // Results are delivered once. Only explicit failure lessons persist.
         task.observations = [];
         result.narration.forEach(text => this.addEvent(task, { turnId, type: 'thought', text }));
-        const fullAnswer = result.fullAnswer || result.response || result.speak;
+        const fullAnswer = result.response || result.speak || result.fullAnswer;
         if (fullAnswer) {
           this.addEvent(task, { turnId, type: 'answer', text: fullAnswer });
+        }
+
+        // Sync cognitive state fields if returned in the turn result
+        if (result.plan && Array.isArray(result.plan) && result.plan.length > 0) {
+          task.plan = result.plan.map(item => ({ ...item, status: item.status || 'pending' }));
+        }
+        if (result.taskTitle && typeof result.taskTitle === 'string') {
+          task.title = result.taskTitle;
+        }
+        if (result.subGoal && typeof result.subGoal === 'string') {
+          task.subGoal = result.subGoal;
+        }
+        if (result.progress && typeof result.progress === 'string') {
+          task.progress = result.progress;
+        }
+        if (result.goal && typeof result.goal === 'string') {
+          task.goal = result.goal;
         }
 
         // Dedicated State Node: Automatically extract and update cognitive state after every turn's output
@@ -187,6 +219,51 @@ export class AgentRuntime {
         }
 
         if (result.toolCalls.length === 0 && !this.isInterrupted(task, signal)) {
+          // Check if this task is an active multi-step autonomous task with unfinished work
+          const planList = Array.isArray(task.plan) && task.plan.length > 0 ? task.plan : (Array.isArray(result.plan) && result.plan.length > 0 ? result.plan : []);
+          const hasPendingPlan = planList.some(p => p && p.status !== 'completed');
+          const hasActiveSubGoal = Boolean(task.subGoal && task.subGoal.trim() && task.subGoal !== '暂未设定');
+          const isAutonomousMode = task.thinkingLevel === 1;
+          const hasActiveGoal = Boolean(task.goal && task.goal.trim() && task.goal !== '尚未设定');
+          const hasExecutedTools = task.events.some(e => e.type === 'tool' && e.status === 'succeeded');
+
+          const isUnfinishedTask = hasPendingPlan || hasActiveSubGoal || (isAutonomousMode && hasActiveGoal) || (hasActiveGoal && hasExecutedTools);
+
+          if (isUnfinishedTask && emptyToolCount < MAX_EMPTY_TOOL_RETRIES) {
+            emptyToolCount++;
+            recoveryCount++;
+            const nudgeCallId = `nudge_${Date.now()}`;
+            const nudgeMsg = '【系统提示】检测到本轮未输出任何 {{调用 ...}} 工具指令，当前任务尚未结束（未调用 sys.endTask）。请紧接上一轮的【状态检查】与【思考】，直接输出具体的工具调用指令（如读取数据、修改资产或在任务完全结束时显式调用 sys.endTask 结束任务）。';
+
+            task.observations.push({
+              role: 'tool',
+              content: {
+                callId: nudgeCallId,
+                name: 'sys.nudge',
+                status: 'failed',
+                error: nudgeMsg,
+              },
+            });
+            this.addEvent(task, {
+              turnId,
+              type: 'system',
+              text: `【系统干预】第 ${emptyToolCount} 次检测到本轮未输出工具指令，当前任务尚未结束，正在引导 Agent 继续执行...`,
+            });
+            this.publish(task);
+            continue;
+          }
+
+          if (isUnfinishedTask) {
+            task.status = 'waiting_user';
+            const pauseMsg = result.speak
+              ? `${result.speak}（任务已暂停：Agent 未输出后续执行指令，等待用户指导）`
+              : '任务已暂停：Agent 未输出后续执行指令，已暂停等待用户指导。';
+            task.summary = pauseMsg;
+            this.addEvent(task, { turnId, type: 'system', text: pauseMsg });
+            this.publish(task);
+            break;
+          }
+
           task.status = 'completed';
           if (result.speak) task.summary = result.speak;
           this.publish(task);
@@ -197,6 +274,7 @@ export class AgentRuntime {
           break;
         }
 
+        emptyToolCount = 0;
         recoveryCount = 0;
         task.status = 'waiting_tools';
         task.pendingCallIds = result.toolCalls.map(call => call.id);
@@ -287,6 +365,14 @@ export class AgentRuntime {
   }
 
   private async runTool(task: RuntimeTask, turnId: string, call: AgentToolCall, signal?: AbortSignal) {
+    if (call.validationError) {
+      const errMsg = call.validationError;
+      this.addEvent(task, { turnId, type: 'tool', text: `调用拦截：${call.name}`, toolName: call.name, callId: call.id, status: 'failed', input: call.arguments, error: errMsg });
+      task.history.push({ role: 'tool', content: { callId: call.id, name: call.name, status: 'failed', error: errMsg } });
+      task.observations.push({ role: 'tool', content: { callId: call.id, name: call.name, status: 'failed', error: errMsg } });
+      return;
+    }
+
     this.addEvent(task, { turnId, type: 'tool', text: `调用中：${call.name}`, toolName: call.name, callId: call.id, status: 'queued', input: call.arguments });
     this.updateLastTool(task, call.id, 'running', `调用中：${call.name}`);
     
@@ -334,9 +420,27 @@ export class AgentRuntime {
       return;
     }
 
+    if (call.name === 'sys.setThinkingLevel') {
+      const levelVal = Number(call.arguments.level);
+      if (levelVal === 0 || levelVal === 1) {
+        task.thinkingLevel = levelVal as 0 | 1;
+      }
+      if (typeof call.arguments.domain === 'string') {
+        task.domain = call.arguments.domain;
+      }
+      if (Array.isArray(call.arguments.requestedCategories)) {
+        task.requestedCategories = call.arguments.requestedCategories.filter((c: any) => typeof c === 'string');
+      }
+      const statusMsg = `思考层级调整为 Level ${task.thinkingLevel ?? 0} (${task.domain || '通用领域'})，装载分类: [${(task.requestedCategories || []).join(', ') || '全局'}]`;
+      this.updateLastTool(task, call.id, 'succeeded', `已完成：${call.name}`, { output: statusMsg });
+      task.observations.push({ role: 'tool', content: { callId: call.id, name: call.name, status: 'succeeded', output: statusMsg } });
+      return;
+    }
+
     if (call.name === 'sys.endTask') {
-      const responseText = typeof call.arguments.finalResponse === 'string' ? call.arguments.finalResponse : '';
-      const responseSuggestsPending = /后台|渲染|排队|稍候|生成中|等待生成|正在生成|提交生成/i.test(responseText);
+      const existingAnswer = task.events.find(e => e.turnId === turnId && e.type === 'answer');
+      const communicationText = existingAnswer?.text || '';
+      const responseSuggestsPending = /后台|渲染|排队|稍候|生成中|等待生成|正在生成|提交生成/i.test(communicationText);
 
       // Check if recent observations or tool calls in this task contain active pending card.generate
       const hasRecentPendingGeneration = task.observations.some(obs => {
@@ -350,48 +454,34 @@ export class AgentRuntime {
       }) || task.events.some(e => e.toolName === 'card.generate' && (e.status === 'succeeded' || e.status === 'running'));
 
       const isPaused = Boolean(
-        call.arguments.paused ||
-        call.arguments.isPaused ||
-        call.arguments.status === 'paused' ||
+        call.arguments?.paused ||
+        call.arguments?.isPaused ||
+        call.arguments?.status === 'paused' ||
         hasRecentPendingGeneration ||
         responseSuggestsPending
       );
 
-      if (typeof call.arguments.waitForUser === 'string' && call.arguments.waitForUser) {
+      if (typeof call.arguments?.waitForUser === 'string' && call.arguments.waitForUser) {
         task.status = 'waiting_user';
         const waitForUserText = call.arguments.waitForUser;
-        const textToPublish = responseText || waitForUserText;
-        const existingAnswer = task.events.find(e => e.turnId === turnId && e.type === 'answer');
-        if (existingAnswer) {
-          if (responseText && responseText !== existingAnswer.text) {
-            existingAnswer.text = responseText;
-          }
-        } else {
-          this.addEvent(task, { turnId, type: 'answer', text: textToPublish });
+        if (!existingAnswer) {
+          this.addEvent(task, { turnId, type: 'answer', text: waitForUserText });
         }
-        task.summary = textToPublish || task.summary;
+        task.summary = communicationText || waitForUserText || task.summary;
       } else if (isPaused) {
         task.status = 'paused';
-        const response = responseText || '任务已挂起暂停，等待后台事件唤醒。';
-        const existingAnswer = task.events.find(e => e.turnId === turnId && e.type === 'answer');
-        if (existingAnswer) {
-          if (responseText && responseText !== existingAnswer.text) {
-            existingAnswer.text = responseText;
-          }
-        } else {
-          this.addEvent(task, { turnId, type: 'answer', text: response });
+        const pauseMsg = communicationText || '任务已挂起暂停，等待后台事件唤醒。';
+        if (!existingAnswer) {
+          this.addEvent(task, { turnId, type: 'answer', text: pauseMsg });
         }
-        task.summary = response || task.summary;
+        task.summary = pauseMsg || task.summary;
       } else {
         task.status = 'completed';
-        const response = responseText || '任务完成。';
-        const existingAnswer = task.events.find(e => e.turnId === turnId && e.type === 'answer');
+        const finalMsg = communicationText || '任务完成。';
         if (!existingAnswer) {
-          this.addEvent(task, { turnId, type: 'answer', text: response });
-        } else if (response && response !== '任务完成。') {
-          existingAnswer.text = response;
+          this.addEvent(task, { turnId, type: 'answer', text: finalMsg });
         }
-        task.summary = response || task.summary;
+        task.summary = finalMsg || task.summary;
       }
       this.updateLastTool(task, call.id, 'succeeded', `已完成：${call.name}`, { output: '任务已结束' });
       this.publish(task);

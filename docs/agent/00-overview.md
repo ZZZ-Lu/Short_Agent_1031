@@ -7,8 +7,8 @@ Mira 是应用中唯一拥有自主决策循环的 Agent。用户提出目标后
 ## 基本原则
 
 - Agent 只有一个；工具与专家不拥有自主循环。
-- 对 UI 型任务，Agent 的项目事实只能来自用户此刻可见的页面；项目数据层只驱动界面渲染，不能直接作为 Agent 上下文。
-- 每次界面动作都由 Agent 鼠标执行并反馈；动作完成后，再读取新的真实页面观察，而不是后台数据。
+- **双模执行模式**：生产与计算型任务默认采用后台直接数据工具（Direct Mode），0 延迟、0 渲染阻塞、高能省 Token；界面教学、引导与调试场景采用 UI 视觉演示模式（Visual Demo Mode）。
+- 对 UI 型演示任务，Agent 的项目事实来自用户此刻可见的页面；项目数据层驱动界面渲染。
 - 工具结果是下一轮 Agent 的上下文，不插入或篡改已经发出的模型请求。
 - 每个任务独立运行；任务可以只读查询其他已发布任务的产物，但不能干扰它们。
 - 文档与数据均应可序列化、可被 Git 版本管理，且不依赖具体渲染技术。
@@ -42,4 +42,7 @@ Mira 是应用中唯一拥有自主决策循环的 Agent。用户提出目标后
 
 本目录是 Agent 设计的唯一文档源。设置页面未来读取并展示这些 Markdown；页面本身不保存设计副本。
 
-`03-human-path-execution-contract.md` 是所有工具与 Runtime 修改必须遵守的最高优先级行为契约。
+- `03-human-path-execution-contract.md` 是所有 UI 演示类工具与 Runtime 修改必须遵守的最高优先级行为契约。
+- `07-dual-mode-execution-architecture.md` 规定了后台直接数据操作 (Direct Mode) 与 UI 演示模式 (Visual Demo Mode) 的双模架构契约。
+- `08-hierarchical-thinking-and-dynamic-tool-pruning.md` 规定了 Level 0 宏观战略层与 Level 1 微观执行层分层思考及动态工具剪枝契约。
+
