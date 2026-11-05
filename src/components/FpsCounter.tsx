@@ -138,7 +138,7 @@ export const FpsCounter: React.FC<FpsCounterProps> = ({ hasActiveTask = false, n
       {/* PERSISTENT MORPHING PRIMARY CAPSULE SHELL */}
       <motion.div
         style={{ width: primaryWidth ?? undefined }}
-        className="relative overflow-hidden flex items-center justify-center px-3.5 h-[36px] bg-gray-100/90 dark:bg-neutral-800/90 backdrop-blur-md border border-gray-200/80 dark:border-[#404040]/80 shadow-md rounded-2xl corner-squircle text-[11px] font-bold select-none pointer-events-auto transition-[width] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)] will-change-[width] whitespace-nowrap"
+        className="relative overflow-hidden flex items-center justify-center px-3.5 h-[36px] bg-gray-100/90 dark:bg-neutral-800/90 backdrop-blur-md border border-gray-300 dark:border-[#404040]/80 shadow-md rounded-2xl corner-squircle text-[11px] font-bold select-none pointer-events-auto transition-[width] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)] will-change-[width] whitespace-nowrap"
       >
         {primaryNotice ? (
             <motion.div
@@ -197,7 +197,7 @@ export const FpsCounter: React.FC<FpsCounterProps> = ({ hasActiveTask = false, n
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: -8, scale: 0.95 }}
             transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
-            className="relative overflow-hidden flex items-center justify-center gap-2 px-3.5 h-[36px] bg-gray-100/90 dark:bg-neutral-800/90 backdrop-blur-md border border-gray-200/80 dark:border-[#404040]/80 shadow-md rounded-2xl corner-squircle text-[11px] font-bold font-sans text-gray-800 dark:text-neutral-100 whitespace-nowrap pointer-events-auto"
+            className="relative overflow-hidden flex items-center justify-center gap-2 px-3.5 h-[36px] bg-gray-100/90 dark:bg-neutral-800/90 backdrop-blur-md border border-gray-300 dark:border-[#404040]/80 shadow-md rounded-2xl corner-squircle text-[11px] font-bold font-sans text-gray-800 dark:text-neutral-100 whitespace-nowrap pointer-events-auto"
           >
             {typeof notice.progress === "number" && notice.progress > 0 && (
               <div

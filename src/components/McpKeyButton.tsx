@@ -20,7 +20,7 @@ export const McpKeyButton: React.FC = () => {
         className={`h-[36px] px-2.5 rounded-2xl corner-squircle border shadow-md flex items-center gap-1.5 text-xs font-semibold transition-all cursor-pointer ${
           hasKey
             ? 'bg-blue-50/90 dark:bg-blue-950/40 border-blue-200 dark:border-blue-900/60 text-blue-700 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-900/50'
-            : 'bg-gray-100 dark:bg-neutral-800 border-gray-200/80 dark:border-[#404040]/80 text-gray-700 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-700'
+            : 'bg-gray-100 dark:bg-neutral-800 border-gray-300 dark:border-[#404040]/80 text-gray-700 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-700'
         }`}
         title={
           hasKey

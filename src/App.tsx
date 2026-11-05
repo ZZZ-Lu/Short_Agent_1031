@@ -155,8 +155,8 @@ const getVisibleTextareaSnapshot = (textarea: HTMLTextAreaElement) => {
 type AgentTaskLog = {
   id: string;
   title: string;
-  status: 'running' | 'completed' | 'failed' | 'waiting_user' | 'paused' | 'cancelled';
-  events: Array<{ id: string; text: string; kind: 'work' | 'tool' | 'answer' }>;
+  status: 'running' | 'completed' | 'failed' | 'waiting_user' | 'paused' | 'cancelled' | 'planning' | 'waiting_tools';
+  events: Array<{ id: string; text: string; kind: 'work' | 'tool' | 'answer' | 'user' }>;
   cardContext?: Record<string, any>;
 };
 
@@ -381,7 +381,7 @@ const ZoomControlGroup: React.FC<{
       transition={{ duration: 0.24, ease: [0.22, 1, 0.36, 1] }}
       aria-hidden={isScriptPanelOpen}
       style={{ pointerEvents: isScriptPanelOpen ? 'none' : 'auto' }}
-      className="fixed bottom-4 left-4 z-50 flex items-center bg-gray-100/90 dark:bg-neutral-800/90 backdrop-blur-md border border-gray-200/80 dark:border-[#404040]/80 shadow-md rounded-[20px] corner-squircle p-1.5 gap-1 select-none"
+      className="fixed bottom-4 left-4 z-50 flex items-center bg-gray-100/90 dark:bg-neutral-800/90 backdrop-blur-md border border-gray-300 dark:border-[#404040]/80 shadow-md rounded-[20px] corner-squircle p-1.5 gap-1 select-none"
       onPointerDown={e => e.stopPropagation()}
     >
       <button
@@ -835,6 +835,7 @@ export default function App() {
   };
 
   const handleUpdateCurrentProject = (updated: Partial<ScriptProject>) => {
+    currentProjectRef.current = { ...currentProjectRef.current, ...updated, updatedAt: Date.now() };
     setProjects(prev => prev.map(p => p.id === currentProject.id ? { ...p, ...updated, updatedAt: Date.now() } : p));
   };
 
@@ -916,6 +917,74 @@ export default function App() {
   const agentStateRef = useRef(agentState);
   agentStateRef.current = agentState;
 
+  const [verifyingAssetIds, setVerifyingAssetIds] = useState<string[]>([]);
+  const [activeTaskBadgeNumber, setActiveTaskBadgeNumber] = useState<number | undefined>(undefined);
+  const activeTaskBadgeNumberRef = useRef<number | undefined>(undefined);
+  activeTaskBadgeNumberRef.current = activeTaskBadgeNumber;
+  const taskBadgeCounterRef = useRef(0);
+  const taskBadgeMapRef = useRef<Map<string, number>>(new Map());
+  type ConcurrentTaskCursorState = {
+    taskId: string;
+    badgeNumber: number;
+    x: number;
+    y: number;
+    visible: boolean;
+    isActive: boolean;
+    isMoving: boolean;
+    isRunning: boolean;
+    isThinking: boolean;
+    speak?: string;
+    cursorMode?: 'default' | 'inspect' | 'working' | 'interact';
+    targetId?: string | null;
+  };
+  const [concurrentTaskCursors, setConcurrentTaskCursors] = useState<Record<string, ConcurrentTaskCursorState>>({});
+  const concurrentTaskCursorsRef = useRef<Record<string, ConcurrentTaskCursorState>>(concurrentTaskCursors);
+  concurrentTaskCursorsRef.current = concurrentTaskCursors;
+
+  const detachActiveTaskToConcurrentCursor = useCallback(() => {
+    const runningTaskId = activeTaskIdRef.current;
+    if (!runningTaskId) return;
+    const runningTask = runtimeRef.current?.getTask(runningTaskId);
+    if (runningTask && (runningTask.status === 'waiting_user' || runningTask.pendingAskCallId)) return;
+    const isTaskStillActive = Boolean(
+      isAgentRunningRef.current ||
+      (runningTask && ['planning', 'waiting_tools', 'running'].includes(runningTask.status as string))
+    );
+    if (!isTaskStillActive) return;
+
+    const badge = taskBadgeMapRef.current.get(runningTaskId) || activeTaskBadgeNumberRef.current || 1;
+    const currentCursor = agentStateRef.current;
+    const targetId = currentCursor.lastPromptTargetId || agentFocusManager.getSnapshot().primaryCardId || null;
+
+    setConcurrentTaskCursors(prev => {
+      const next = {
+        ...prev,
+        [runningTaskId]: {
+          taskId: runningTaskId,
+          badgeNumber: badge,
+          x: currentCursor.x,
+          y: currentCursor.y,
+          visible: true,
+          isActive: currentCursor.isActive,
+          isMoving: false,
+          isRunning: true,
+          isThinking: true,
+          speak: currentCursor.speak || '正在操作...',
+          cursorMode: currentCursor.cursorMode || 'working',
+          targetId,
+        },
+      };
+      concurrentTaskCursorsRef.current = next;
+      return next;
+    });
+
+    activeTaskIdRef.current = null;
+    isAgentRunningRef.current = false;
+    setIsAgentRunning(false);
+    setIsAgentThinking(false);
+    setActiveTaskBadgeNumber(undefined);
+  }, []);
+
   const isThinkingOrLoadingPhrase = useCallback((s?: string) => {
     if (!s) return false;
     const clean = s.trim();
@@ -960,8 +1029,12 @@ export default function App() {
 
   // 🛡️ Bulletproof Reset Function & Safety Net Effect for Agent State & Cursor Mode
   const resetAgentStateToDefault = useCallback(() => {
+    const currentTask = activeTaskIdRef.current ? runtimeRef.current?.getTask(activeTaskIdRef.current) : undefined;
+    const isWaitingForUser = Boolean(currentTask && (currentTask.status === 'waiting_user' || currentTask.pendingAskCallId));
     agentFocusManager.setCursorMode('default');
-    agentFocusManager.clearAll(0);
+    if (!isWaitingForUser) {
+      agentFocusManager.clearAll(0);
+    }
     setAgentState(prev => {
       const needsSpeakReset = isThinkingOrLoadingPhrase(prev.speak);
       if (needsSpeakReset || prev.cursorMode !== 'default' || prev.isActive || prev.isMoving || prev.lastPrompt || prev.lastPromptTargetId) {
@@ -1354,8 +1427,259 @@ export default function App() {
     setAgentSelectionBox(null);
   }, []);
 
+  const buildUiTargetFocusInfo = useCallback((rawTargetId: string): {
+    targetId: string;
+    speak: string;
+    title: string;
+    contextSummary: string;
+  } => {
+    const proj = currentProjectRef.current;
+    let targetId = rawTargetId;
+    if (rawTargetId === 'script.panel' || rawTargetId === 'script.scene.indicator' || rawTargetId === 'script.tab.script') {
+      targetId = 'script.text';
+    }
+
+    if (targetId.startsWith('assets.item.character.')) {
+      const charId = targetId.slice('assets.item.character.'.length);
+      let char: any = proj.characters?.find(c => c.id === charId);
+      let parentChar: any = null;
+      if (!char && Array.isArray(proj.characters)) {
+        for (const c of proj.characters) {
+          const ver = Array.isArray(c.versions) ? c.versions.find((v: any) => v.id === charId) : null;
+          if (ver) {
+            char = ver;
+            parentChar = c;
+            break;
+          }
+        }
+      }
+      const name = parentChar ? `${parentChar.name}（${char?.name || charId}）` : (char?.name || charId);
+      const summaryLines = [
+        `【当前聚焦的剧本角色资产】`,
+        `- 目标ID: ${targetId}`,
+        `- 角色ID: ${charId}`,
+        parentChar ? `- 所属主角色: ${parentChar.name} (${parentChar.id})` : '',
+        `- 角色名: ${name}`,
+        char?.description ? `- 资产识别描述: ${char.description}` : '',
+        char?.role || parentChar?.role ? `- 身份/定位: ${char?.role || parentChar?.role}` : '',
+        char?.appearance ? `- 外貌与服装特征: ${char.appearance}` : '',
+        char?.personality ? `- 性格特征: ${char.personality}` : '',
+        char?.sourceScenes?.length ? `- 出场场次: ${char.sourceScenes.join('、')}` : '',
+      ].filter(Boolean);
+      return {
+        targetId,
+        speak: `选了角色【${name}】，需要我做什么？`,
+        title: `角色资产：${name}`,
+        contextSummary: summaryLines.join('\n'),
+      };
+    }
+
+    if (targetId.startsWith('assets.item.location.')) {
+      const locId = targetId.slice('assets.item.location.'.length);
+      let loc: any = proj.locations?.find(l => l.id === locId);
+      let parentLoc: any = null;
+      if (!loc && Array.isArray(proj.locations)) {
+        for (const l of proj.locations) {
+          const ver = Array.isArray(l.versions) ? l.versions.find((v: any) => v.id === locId) : null;
+          if (ver) {
+            loc = ver;
+            parentLoc = l;
+            break;
+          }
+        }
+      }
+      const name = parentLoc ? `${parentLoc.name}（${loc?.name || locId}）` : (loc?.name || locId);
+      const summaryLines = [
+        `【当前聚焦的剧本场景资产】`,
+        `- 目标ID: ${targetId}`,
+        `- 场景ID: ${locId}`,
+        parentLoc ? `- 所属主场景: ${parentLoc.name} (${parentLoc.id})` : '',
+        `- 场景名: ${name}`,
+        loc?.description ? `- 资产识别描述: ${loc.description}` : '',
+        loc?.type || parentLoc?.type ? `- 内外景: ${loc?.type || parentLoc?.type}` : '',
+        loc?.timeOfDay ? `- 时间段: ${loc.timeOfDay}` : '',
+        loc?.atmosphere ? `- 环境氛围: ${loc.atmosphere}` : '',
+        loc?.visualDetails ? `- 视觉细节: ${loc.visualDetails}` : '',
+        loc?.sourceScenes?.length ? `- 出场场次: ${loc.sourceScenes.join('、')}` : '',
+      ].filter(Boolean);
+      return {
+        targetId,
+        speak: `选了场景【${name}】，需要我做什么？`,
+        title: `场景资产：${name}`,
+        contextSummary: summaryLines.join('\n'),
+      };
+    }
+
+    if (targetId.startsWith('assets.item.prop.')) {
+      const propId = targetId.slice('assets.item.prop.'.length);
+      let prop: any = proj.props?.find(p => p.id === propId);
+      let parentProp: any = null;
+      if (!prop && Array.isArray(proj.props)) {
+        for (const p of proj.props) {
+          const ver = Array.isArray(p.versions) ? p.versions.find((v: any) => v.id === propId) : null;
+          if (ver) {
+            prop = ver;
+            parentProp = p;
+            break;
+          }
+        }
+      }
+      const name = parentProp ? `${parentProp.name}（${prop?.name || propId}）` : (prop?.name || propId);
+      const summaryLines = [
+        `【当前聚焦的剧本道具资产】`,
+        `- 目标ID: ${targetId}`,
+        `- 道具ID: ${propId}`,
+        parentProp ? `- 所属主道具: ${parentProp.name} (${parentProp.id})` : '',
+        `- 道具名: ${name}`,
+        prop?.description ? `- 资产识别描述: ${prop.description}` : '',
+        prop?.owner || parentProp?.owner ? `- 归属者: ${prop?.owner || parentProp?.owner}` : '',
+        prop?.materialAndState ? `- 材质与状态: ${prop.materialAndState}` : '',
+        prop?.storySignificance ? `- 剧情辨识信息: ${prop.storySignificance}` : '',
+        prop?.sourceScenes?.length ? `- 出场场次: ${prop.sourceScenes.join('、')}` : '',
+      ].filter(Boolean);
+      return {
+        targetId,
+        speak: `选了道具【${name}】，需要我做什么？`,
+        title: `道具资产：${name}`,
+        contextSummary: summaryLines.join('\n'),
+      };
+    }
+
+    if (targetId === 'script.text') {
+      const selText = scriptSelection?.text?.trim();
+      if (selText) {
+        const snippet = selText.length > 16 ? `${selText.slice(0, 16)}...` : selText;
+        return {
+          targetId: 'script.text',
+          speak: `选了剧本片段「${snippet}」，需要我做什么？`,
+          title: `剧本选中片段`,
+          contextSummary: [
+            `【当前聚焦的剧本正文片段】`,
+            `- 目标ID: script.text`,
+            `- 选中文本范围: [${scriptSelection?.start ?? 0}, ${scriptSelection?.end ?? selText.length}]`,
+            `- 选中剧本内容:`,
+            selText,
+          ].join('\n'),
+        };
+      }
+      const preview = (proj.scriptText || '').slice(0, 1200);
+      return {
+        targetId: 'script.text',
+        speak: '选了剧本正文，需要我做什么？',
+        title: `剧本正文：${proj.name || '当前项目'}`,
+        contextSummary: [
+          `【当前聚焦目标：剧本正文 (script.text)】`,
+          `- 项目名称: ${proj.name || '未命名项目'}`,
+          `- 剧本总字数: ${(proj.scriptText || '').length}`,
+          preview ? `- 剧本开头节选:\n${preview}` : '',
+        ].filter(Boolean).join('\n'),
+      };
+    }
+
+    if (targetId.startsWith('script.toc.item.')) {
+      const tocId = targetId.slice('script.toc.item.'.length);
+      return {
+        targetId,
+        speak: '选了剧本章节，需要我做什么？',
+        title: `剧本目录章节 (${tocId})`,
+        contextSummary: `【当前聚焦目标：剧本目录章节 (${targetId})】`,
+      };
+    }
+
+    if (targetId === 'assets.panel' || targetId.startsWith('assets.filter.') || targetId === 'script.tab.assets') {
+      return {
+        targetId: 'assets.panel',
+        speak: '选了资产清单，需要我做什么？',
+        title: '资产清单面板',
+        contextSummary: [
+          `【当前聚焦目标：资产清单面板 (assets.panel)】`,
+          `- 角色数量: ${proj.characters?.length || 0}`,
+          `- 场景数量: ${proj.locations?.length || 0}`,
+          `- 道具数量: ${proj.props?.length || 0}`,
+        ].join('\n'),
+      };
+    }
+
+    return {
+      targetId,
+      speak: `选了界面组件【${targetId}】，需要我做什么？`,
+      title: `界面目标：${targetId}`,
+      contextSummary: `【当前聚焦目标：${targetId}】`,
+    };
+  }, [scriptSelection]);
+
+  const resolveAgentUiTargetAtPoint = useCallback((clientX: number, clientY: number) => {
+    if (typeof document === 'undefined') return null;
+    const rawElements = typeof document.elementsFromPoint === 'function'
+      ? document.elementsFromPoint(clientX, clientY)
+      : [document.elementFromPoint(clientX, clientY)].filter((el): el is Element => Boolean(el));
+
+    // Skip elements belonging to AgentCursor itself
+    const elements = rawElements.filter(el => !el.closest('[data-agent-cursor-root="true"]'));
+    if (elements.length === 0) return null;
+
+    const overlayPanelEl = elements
+      .map(el => el.closest('[data-prevent-canvas-wheel="true"]'))
+      .find((el): el is Element => Boolean(el));
+
+    for (const el of elements) {
+      // If we're over a floating Script/Asset panel, never walk into background canvas elements below it
+      if (overlayPanelEl && !overlayPanelEl.contains(el) && !el.contains(overlayPanelEl)) {
+        continue;
+      }
+      const targetEl = el.closest('[data-agent-target]');
+      if (!targetEl) continue;
+      const targetId = targetEl.getAttribute('data-agent-target');
+      if (!targetId || targetId === 'canvas.viewport') continue;
+      // Ignore canvas card targets when the pointer is over a floating panel
+      if (overlayPanelEl && targetId.startsWith('canvas.card.')) continue;
+      // Only handle non-canvas-card UI targets here (script / assets / UI panels)
+      if (!targetId.startsWith('canvas.card.')) {
+        return buildUiTargetFocusInfo(targetId);
+      }
+      break;
+    }
+
+    // Fallback: if pointer is inside a floating panel (Script or Assets) without a more specific child target
+    if (overlayPanelEl) {
+      const panelTarget = overlayPanelEl.getAttribute('data-agent-target') || 'script.text';
+      return buildUiTargetFocusInfo(panelTarget);
+    }
+
+    return null;
+  }, [buildUiTargetFocusInfo]);
+
   const handleDragAgentEnd = useCallback((finalCanvasX: number, finalCanvasY: number, screenX: number, screenY: number) => {
-    // Perform hit test on cards using pure data layer (reverse order for top-most z-index)
+    // 1. Precise Hit-Test: Check both the Agent cursor arrow tip and release pointer position
+    const tipScreenX = finalCanvasX * tScale.get() + tx.get();
+    const tipScreenY = finalCanvasY * tScale.get() + ty.get();
+    const uiTarget = resolveAgentUiTargetAtPoint(tipScreenX, tipScreenY) || resolveAgentUiTargetAtPoint(screenX, screenY);
+
+    if (uiTarget) {
+      setContextMenus(prev => { const next = { ...prev }; delete next['user']; return next; });
+      agentFocusManager.setPrimaryFocus(uiTarget.targetId, 'inspect', 'drag_agent');
+      setAgentState(prev => ({
+        ...prev,
+        x: finalCanvasX,
+        y: finalCanvasY,
+        speak: uiTarget.speak,
+        isMoving: false,
+        visible: true
+      }));
+      setAgentQuickInput({
+        isOpen: true,
+        x: tipScreenX,
+        y: tipScreenY,
+        canvasX: finalCanvasX,
+        canvasY: finalCanvasY,
+        targetId: uiTarget.targetId,
+        targetIds: [uiTarget.targetId],
+        focusTrigger: Date.now()
+      });
+      return;
+    }
+
+    // 2. Perform hit test on cards using pure data layer (reverse order for top-most z-index)
     const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
     let hitCard: CardData | null = null;
     for (let i = allCards.length - 1; i >= 0; i--) {
@@ -1439,7 +1763,7 @@ export default function App() {
         focusTrigger: Date.now()
       });
     }
-  }, [cards]);
+  }, [cards, resolveAgentUiTargetAtPoint, tScale, tx, ty]);
 
   // Click on Agent pointer to toggle hide/show
   const handleClickAgentPointer = useCallback(() => {
@@ -1455,6 +1779,30 @@ export default function App() {
 
       setAgentQuickInput(null);
     } else {
+      const screenX = agentState.x * tScale.get() + tx.get();
+      const screenY = agentState.y * tScale.get() + ty.get();
+      const uiTarget = resolveAgentUiTargetAtPoint(screenX, screenY);
+      if (uiTarget) {
+        agentFocusManager.setPrimaryFocus(uiTarget.targetId, 'inspect', 'pointer_click');
+        setAgentState(prev => ({
+          ...prev,
+          speak: uiTarget.speak,
+          isMoving: false,
+          visible: true
+        }));
+        setAgentQuickInput({
+          isOpen: true,
+          x: screenX,
+          y: screenY,
+          canvasX: agentState.x,
+          canvasY: agentState.y,
+          targetId: uiTarget.targetId,
+          targetIds: [uiTarget.targetId],
+          focusTrigger: Date.now()
+        });
+        return;
+      }
+
       // If HUD is hidden, clicking restores it
       const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
       let hitCard: CardData | null = null;
@@ -1466,9 +1814,6 @@ export default function App() {
           break;
         }
       }
-
-      const screenX = agentState.x * tScale.get() + tx.get();
-      const screenY = agentState.y * tScale.get() + ty.get();
 
       if (hitCard) {
         const currentSelection = selectedCardIdsRef.current;
@@ -1536,7 +1881,7 @@ export default function App() {
         });
       }
     }
-  }, [agentState.speak, agentState.x, agentState.y, agentQuickInput?.isOpen, cards, tScale, tx, ty]);
+  }, [agentState.speak, agentState.x, agentState.y, agentQuickInput?.isOpen, cards, resolveAgentUiTargetAtPoint, tScale, tx, ty]);
 
   // Canvas Reference Picker Session State
   const [pickerSession, setPickerSession] = useState<{
@@ -4389,6 +4734,56 @@ export default function App() {
     const cursorY = e.clientY - rect.top;
     const canvasX = (cursorX - tx.get()) / tScale.get();
     const canvasY = (cursorY - ty.get()) / tScale.get();
+
+    const isAgentBusy = Boolean(
+      isAgentRunningRef.current ||
+      isAgentRunning ||
+      isAgentThinking ||
+      isProcessingInspectQueueRef.current ||
+      inspectQueueRef.current.length > 0 ||
+      (activeTaskIdRef.current && runtimeRef.current?.getTask(activeTaskIdRef.current)?.status === 'running')
+    );
+
+    // 1. First check if right-click is on any Script / Asset / UI panel target
+    const uiTarget = resolveAgentUiTargetAtPoint(e.clientX, e.clientY);
+    if (uiTarget) {
+      const ownerId = e.nativeEvent.isTrusted ? 'user' : 'agent';
+      // Never show blank-canvas creation menu when right-clicking Script/Asset UI panels
+      setContextMenus(prev => {
+        const next = { ...prev };
+        delete next[ownerId];
+        return next;
+      });
+      if (isAgentBusy && ownerId === 'user') {
+        detachActiveTaskToConcurrentCursor();
+      }
+
+      if (ownerId === 'user') {
+        agentFocusManager.setPrimaryFocus(uiTarget.targetId, 'inspect', 'context_menu');
+        setAgentQuickInput({
+          isOpen: true,
+          x: e.clientX,
+          y: e.clientY,
+          canvasX: canvasX,
+          canvasY: canvasY,
+          targetId: uiTarget.targetId,
+          targetIds: [uiTarget.targetId],
+          focusTrigger: Date.now()
+        });
+        setAgentState(prev => ({
+          ...prev,
+          x: canvasX,
+          y: canvasY,
+          speak: uiTarget.speak,
+          isMoving: true,
+          visible: true
+        }));
+        setTimeout(() => {
+          setAgentState(prev => ({ ...prev, isMoving: false }));
+        }, 400);
+      }
+      return;
+    }
     
     const cardElement = (e.target as Element).closest('[data-card-id]');
     let targetId = cardElement ? cardElement.getAttribute('data-card-id') : null;
@@ -4405,38 +4800,29 @@ export default function App() {
         }
       }
     }
-    
-    const isAgentBusy = Boolean(
-      isAgentRunningRef.current ||
-      isAgentRunning ||
-      isAgentThinking ||
-      isProcessingInspectQueueRef.current ||
-      inspectQueueRef.current.length > 0 ||
-      (activeTaskIdRef.current && runtimeRef.current?.getTask(activeTaskIdRef.current)?.status === 'running')
-    );
 
-    // 当 Agent 正在某卡片上执行任务时，严禁被右键召唤到其它卡片或位置
     if (isAgentBusy) {
       if (!targetId) {
         // 在空白画布右键时，仅弹出普通创建卡片上下文菜单，不打扰也不移动正在工作的 Agent
         const menuWidth = 260;
         const clampedX = typeof window !== 'undefined' ? Math.max(12, Math.min(e.clientX, window.innerWidth - menuWidth - 20)) : e.clientX;
-        const clampedY = typeof window !== 'undefined' ? Math.max(50, Math.min(e.clientY, window.innerHeight - 340)) : e.clientY;
-        const clampedCanvasX = (clampedX - tx.get()) / tScale.get();
-        const clampedCanvasY = (clampedY - ty.get()) / tScale.get();
+        const clampedY = typeof window !== 'undefined' ? Math.max(12, Math.min(e.clientY, window.innerHeight - 155)) : e.clientY;
         const ownerId = e.nativeEvent.isTrusted ? 'user' : 'agent';
         setContextMenus(prev => ({
           ...prev,
           [ownerId]: {
             x: clampedX,
             y: clampedY,
-            canvasX: clampedCanvasX,
-            canvasY: clampedCanvasY,
+            canvasX: canvasX,
+            canvasY: canvasY,
             targetId: null
           }
         }));
+        return;
       }
-      return;
+      if (e.nativeEvent.isTrusted) {
+        detachActiveTaskToConcurrentCursor();
+      }
     }
 
     // Determine the target IDs for the Agent.
@@ -4453,7 +4839,7 @@ export default function App() {
     }
 
     const ownerId = e.nativeEvent.isTrusted ? 'user' : 'agent';
-    if (ownerId === 'user' && !isAgentRunning) {
+    if (ownerId === 'user') {
       const hitCard = targetId ? cardsRef.current.find(c => c.id === targetId) : undefined;
       const lastReplyObj = hitCard && hitCard.chatHistory && hitCard.chatHistory.length > 0
         ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant' && !m.text.includes('生好了，我先看下'))
@@ -4488,19 +4874,35 @@ export default function App() {
     }
 
     const menuWidth = 260;
+    const menuHeight = 135;
+    const hudHeight = 80;
+
     const clampedX = typeof window !== 'undefined' ? Math.max(12, Math.min(e.clientX, window.innerWidth - menuWidth - 20)) : e.clientX;
-    const clampedY = typeof window !== 'undefined' ? Math.max(50, Math.min(e.clientY, window.innerHeight - 340)) : e.clientY;
-    const clampedCanvasX = (clampedX - tx.get()) / tScale.get();
-    const clampedCanvasY = (clampedY - ty.get()) / tScale.get();
+    
+    // When opening on blank canvas, cascade menu down below the Agent cursor and HUD so they don't overlap
+    let menuY = e.clientY + hudHeight;
+    if (typeof window !== 'undefined') {
+      if (menuY + menuHeight > window.innerHeight - 16) {
+        if (e.clientY - menuHeight - 12 >= 16) {
+          menuY = e.clientY - menuHeight - 12;
+        } else {
+          menuY = Math.max(12, window.innerHeight - menuHeight - 16);
+        }
+      }
+    }
     
     if (!targetId) {
+      // Clear global draft so quick input starts fresh at this new canvas location
+      setCardDrafts(prev => ({ ...prev, global: '' }));
+      deleteDraft('global');
+
       setContextMenus(prev => ({
         ...prev,
         [ownerId]: {
           x: clampedX,
-          y: clampedY,
-          canvasX: clampedCanvasX,
-          canvasY: clampedCanvasY,
+          y: menuY,
+          canvasX: canvasX,
+          canvasY: canvasY,
           targetId: null
         }
       }));
@@ -4512,7 +4914,7 @@ export default function App() {
       });
     }
 
-    if (ownerId === 'user' && !isAgentRunning) {
+    if (ownerId === 'user') {
       const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
       const targetCardObj = targetId ? allCards.find(c => c.id === targetId) : null;
       const targetCards = targetId 
@@ -4521,11 +4923,10 @@ export default function App() {
             : (targetCardObj ? [targetCardObj] : []))
         : [];
       const promptText = buildDynamicSelectionPrompt(targetCards);
-      const yOffset = targetId ? 40 : 82;
       setAgentState(prev => ({
         ...prev,
-        x: clampedCanvasX - 8 / tScale.get(), // Aligned to the top-left of the menu
-        y: clampedCanvasY - yOffset / tScale.get(), // Comfortably lifted based on whether context menu is present
+        x: canvasX,
+        y: canvasY,
         speak: promptText,
         isMoving: true,
         visible: true
@@ -5111,12 +5512,18 @@ export default function App() {
 
   const executeAgentTool = useCallback(async (call: AgentToolCall, task: RuntimeTask, signal?: AbortSignal) => {
     if (signal?.aborted) return { aborted: true };
-    if (call.name === 'script.directory' || call.name === 'script.read' || call.name === 'script.search' || call.name === 'asset.list') {
+    if (call.name === 'script.directory' || call.name === 'script.read' || call.name === 'script.search' || call.name === 'asset.list' || call.name === 'asset.searchProvenanceCandidates') {
       return executeProjectReadTool(call.name, call.arguments, currentProjectRef.current);
     }
-    if (call.name === 'asset.create' || call.name === 'asset.update' || call.name === 'asset.delete') {
+    if (call.name === 'asset.create' || call.name === 'asset.update' || call.name === 'asset.delete' || call.name === 'asset.commitProvenance') {
       const { updatedProject, output } = executeProjectAssetMutation(call.name, call.arguments, currentProjectRef.current);
       handleUpdateCurrentProject(updatedProject);
+      if (call.name === 'asset.commitProvenance') {
+        const committedAssetId = String(call.arguments?.assetId || (output as any)?.assetId || '').trim();
+        if (committedAssetId) {
+          setVerifyingAssetIds(prev => prev.filter(id => id !== committedAssetId));
+        }
+      }
       return output;
     }
     const rememberObservation = (page: Awaited<ReturnType<typeof inspectPage>>) => {
@@ -5680,8 +6087,6 @@ export default function App() {
       const hasValidCurrentSpeak = currentSpeak && !isThinkingOrLoadingPhrase(currentSpeak) && currentSpeak !== '正在思考...' && currentSpeak !== '正在操作...';
       const displayQuestion = hasValidCurrentSpeak ? currentSpeak : fallbackQuestion;
 
-      task.negotiationLog.push({ role: 'agent', content: displayQuestion, timestamp: Date.now() });
-
       if (!hasValidCurrentSpeak) {
         setAgentState(prev => ({
           ...prev,
@@ -5692,21 +6097,20 @@ export default function App() {
 
       const targetCardId = task.cardContext?.cardId || task.cardContext?.targetId || agentFocus.primaryCardId || null;
 
-      return new Promise<string>((resolve) => {
-        setAgentQuickInput({
-          isOpen: true,
-          targetId: targetCardId,
-          placeholder: '输入你的回答...',
-          lastReply: displayQuestion,
-          focusTrigger: Date.now(),
-          onAskResolve: (answer: string) => {
-            const finalAnswer = answer || '（用户未回答）';
-            task.negotiationLog.push({ role: 'user', content: finalAnswer, timestamp: Date.now() });
-            task.lastUserInputAt = Date.now();
-            resolve(finalAnswer);
-          },
-        });
-      });
+      setAgentQuickInput(prev => ({
+        ...prev,
+        isOpen: true,
+        targetId: targetCardId,
+        placeholder: '输入你的回答...',
+        lastReply: displayQuestion,
+        focusTrigger: Date.now(),
+        onAskResolve: undefined,
+      }));
+
+      return {
+        question: displayQuestion,
+        status: 'waiting_user',
+      };
     }
     throw new Error(`未注册工具：${call.name}`);
   }, [animateMouseAction, applyPageCommand, inspectPage]);
@@ -5916,24 +6320,51 @@ export default function App() {
   const handleRunAgent = async (
     overrideMessage?: string,
     overrideImages?: string[],
-    cardContext?: Record<string, any>
+    cardContext?: Record<string, any>,
+    spawnOptions?: {
+      detachedCursor?: {
+        x: number;
+        y: number;
+        targetId?: string | null;
+        speak?: string;
+      };
+      forceNewTask?: boolean;
+      onFinally?: () => void;
+    }
   ) => {
     const rawMessage = overrideMessage !== undefined ? overrideMessage : agentPrompt;
     if (!rawMessage.trim()) return;
-    if (isAgentRunning || isAgentThinking) return;
     const userMessage = rawMessage.trim();
     if (overrideMessage === undefined) {
       setAgentPrompt('');
     }
-    isAgentRunningRef.current = true;
-    setIsAgentThinking(true);
-    setIsAgentRunning(true);
+
+    // If an active primary task is currently running and this new request is not explicitly detached,
+    // detach the existing primary task to its own concurrent cursor first so both run in parallel.
+    const currentPrimaryTaskId = activeTaskIdRef.current;
+    const currentPrimaryTask = currentPrimaryTaskId ? runtimeRef.current?.getTask(currentPrimaryTaskId) : undefined;
+    const isPrimaryTaskWaitingUser = Boolean(
+      currentPrimaryTask && (currentPrimaryTask.status === 'waiting_user' || Boolean(currentPrimaryTask.pendingAskCallId))
+    );
+    const isPrimaryTaskStillRunning = Boolean(
+      currentPrimaryTask && !isPrimaryTaskWaitingUser && ['planning', 'waiting_tools'].includes(currentPrimaryTask.status)
+    );
+    if (!spawnOptions?.detachedCursor && isPrimaryTaskStillRunning) {
+      detachActiveTaskToConcurrentCursor();
+    }
+
+    const useDetached = Boolean(spawnOptions?.detachedCursor);
+    if (!useDetached) {
+      isAgentRunningRef.current = true;
+      setIsAgentThinking(true);
+      setIsAgentRunning(true);
+    }
 
     // If cardContext not provided but an agent-targeted card is active, enrich context with lineage
     let effectiveCardContext = cardContext;
     let effectiveImages = overrideImages;
 
-    const agentFocusedTargetId = agentQuickInput?.targetId || agentFocus.primaryCardId;
+    const agentFocusedTargetId = spawnOptions?.detachedCursor?.targetId || agentQuickInput?.targetId || agentFocus.primaryCardId;
     if (!effectiveCardContext && agentFocusedTargetId) {
       const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
       const targetCard = allCards.find(c => c.id === agentFocusedTargetId);
@@ -5951,54 +6382,133 @@ export default function App() {
         } catch (e) {
           console.warn('Auto card context generation failed:', e);
         }
+      } else {
+        const uiInfo = buildUiTargetFocusInfo(agentFocusedTargetId);
+        effectiveCardContext = {
+          targetId: uiInfo.targetId,
+          title: uiInfo.title,
+          markdownSummary: uiInfo.contextSummary,
+        };
       }
     }
 
+    let launchedTaskId: string | null = null;
+
     try {
-      const nodeModels = assetExtractionService.getNodeModels();
-      const agentModel = nodeModels.agentModel;
-      const isArkModel = agentModel.includes('doubao') || agentModel.includes('seed-2-1') || agentModel.includes('seed-2.1') || agentModel.includes('ark') || agentModel.includes('volces');
-      const isDashscopeModel = agentModel.startsWith('qwen') || agentModel.includes('glm') || agentModel.includes('ZHIPU') || agentModel.includes('zhipu');
-      const savedKey = isArkModel
-        ? (localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || localStorage.getItem('deepseek_api_key') || localStorage.getItem('qwen_api_key'))
-        : isDashscopeModel
-        ? (localStorage.getItem('qwen_api_key') || localStorage.getItem('glm_api_key') || localStorage.getItem('deepseek_api_key'))
-        : localStorage.getItem('deepseek_api_key');
-
-      const jsonAdapterModel = nodeModels.jsonAdapterModel || 'deepseek-v4-flash';
-      const isArkAdapter = jsonAdapterModel.includes('doubao') || jsonAdapterModel.includes('seed-2-1') || jsonAdapterModel.includes('seed-2.1') || jsonAdapterModel.includes('ark') || jsonAdapterModel.includes('volces');
-      const isDashscopeAdapter = jsonAdapterModel.startsWith('qwen') || jsonAdapterModel.includes('glm') || jsonAdapterModel.includes('ZHIPU') || jsonAdapterModel.includes('zhipu');
-      const jsonAdapterKey = isArkAdapter
-        ? (localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || localStorage.getItem('deepseek_api_key') || localStorage.getItem('qwen_api_key'))
-        : isDashscopeAdapter
-        ? (localStorage.getItem('qwen_api_key') || localStorage.getItem('glm_api_key') || localStorage.getItem('deepseek_api_key'))
-        : localStorage.getItem('deepseek_api_key');
-
-      const toolConfig = getAgentToolConfig();
-      const enabledTools = AGENT_TOOL_REGISTRY.filter((tool) => toolConfig[tool.id]).map((tool) => tool.id);
-
       let runtime = runtimeRef.current;
       let isNewTask = false;
-      let taskId = activeTaskIdRef.current;
+      let taskId = useDetached ? null : activeTaskIdRef.current;
 
       const existingTask = runtime && taskId ? runtime.getTask(taskId) : undefined;
-      if (!runtime || !taskId || !existingTask || ['cancelled', 'failed', 'completed'].includes(existingTask.status) || Boolean(cardContext)) {
+      const isResumingWaitingUser = Boolean(
+        !useDetached &&
+        !spawnOptions?.forceNewTask &&
+        existingTask &&
+        (existingTask.status === 'waiting_user' || Boolean(existingTask.pendingAskCallId))
+      );
+      if (
+        !isResumingWaitingUser && (
+          useDetached ||
+          Boolean(spawnOptions?.forceNewTask) ||
+          !runtime ||
+          !taskId ||
+          !existingTask ||
+          ['cancelled', 'failed', 'completed', 'planning', 'waiting_tools'].includes(existingTask.status) ||
+          Boolean(cardContext)
+        )
+      ) {
         isNewTask = true;
-        taskId = `task_${Date.now().toString(36)}`;
-        activeTaskIdRef.current = taskId;
+        taskId = `task_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`;
+
+        const activeConcurrentCount = (Object.values(concurrentTaskCursorsRef.current) as ConcurrentTaskCursorState[]).filter(c => c.isRunning).length;
+        const hasAnyRunningTask = activeConcurrentCount > 0 || Boolean(
+          activeTaskIdRef.current &&
+          runtimeRef.current?.getTask(activeTaskIdRef.current) &&
+          ['planning', 'waiting_tools'].includes(runtimeRef.current.getTask(activeTaskIdRef.current)!.status)
+        );
+        if (!hasAnyRunningTask) {
+          taskBadgeCounterRef.current = 0;
+        }
+        taskBadgeCounterRef.current += 1;
+        const badgeNumber = taskBadgeCounterRef.current;
+        taskBadgeMapRef.current.set(taskId, badgeNumber);
+
+        if (useDetached && spawnOptions?.detachedCursor) {
+          const initCursor = spawnOptions.detachedCursor;
+          setConcurrentTaskCursors(prev => {
+            const next = {
+              ...prev,
+              [taskId!]: {
+                taskId: taskId!,
+                badgeNumber,
+                x: initCursor.x,
+                y: initCursor.y,
+                visible: true,
+                isActive: false,
+                isMoving: true,
+                isRunning: true,
+                isThinking: true,
+                speak: initCursor.speak || '正在思考...',
+                cursorMode: 'working' as const,
+                targetId: initCursor.targetId ?? null,
+              },
+            };
+            concurrentTaskCursorsRef.current = next;
+            return next;
+          });
+          setTimeout(() => {
+            setConcurrentTaskCursors(prev => {
+              if (!prev[taskId!]) return prev;
+              const next = { ...prev, [taskId!]: { ...prev[taskId!], isMoving: false } };
+              concurrentTaskCursorsRef.current = next;
+              return next;
+            });
+          }, 380);
+        } else {
+          activeTaskIdRef.current = taskId;
+          setActiveTaskBadgeNumber(badgeNumber);
+        }
+      }
+
+      launchedTaskId = taskId;
+
+      if (!runtime) {
         runtime = new AgentRuntime({
           maxTurns: Infinity,
           enabledTools: () => AGENT_TOOL_REGISTRY.filter(tool => getAgentToolConfig()[tool.id]).map(tool => tool.id),
           requestTurn: async (task: RuntimeTask, requireTool, signal) => {
             const turnId = `${task.id}:turn:${task.turn}`;
             const startedAt = Date.now();
-            const latestUserMsg = task.negotiationLog?.filter(l => l.role === 'user').slice(-1)[0]?.content || userMessage;
+            const isDetachedTask = Boolean(concurrentTaskCursorsRef.current[task.id]);
+            const isPrimaryTask = task.id === activeTaskIdRef.current && !isDetachedTask;
+
+            const nodeModels = assetExtractionService.getNodeModels();
+            const agentModel = nodeModels.agentModel;
+            const isArkModel = agentModel.includes('doubao') || agentModel.includes('seed-2-1') || agentModel.includes('seed-2.1') || agentModel.includes('ark') || agentModel.includes('volces');
+            const isDashscopeModel = agentModel.startsWith('qwen') || agentModel.includes('glm') || agentModel.includes('ZHIPU') || agentModel.includes('zhipu');
+            const savedKey = isArkModel
+              ? (localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || localStorage.getItem('deepseek_api_key') || localStorage.getItem('qwen_api_key'))
+              : isDashscopeModel
+              ? (localStorage.getItem('qwen_api_key') || localStorage.getItem('glm_api_key') || localStorage.getItem('deepseek_api_key'))
+              : localStorage.getItem('deepseek_api_key');
+
+            const jsonAdapterModel = nodeModels.jsonAdapterModel || 'deepseek-v4-flash';
+            const isArkAdapter = jsonAdapterModel.includes('doubao') || jsonAdapterModel.includes('seed-2-1') || jsonAdapterModel.includes('seed-2.1') || jsonAdapterModel.includes('ark') || jsonAdapterModel.includes('volces');
+            const isDashscopeAdapter = jsonAdapterModel.startsWith('qwen') || jsonAdapterModel.includes('glm') || jsonAdapterModel.includes('ZHIPU') || jsonAdapterModel.includes('zhipu');
+            const jsonAdapterKey = isArkAdapter
+              ? (localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || localStorage.getItem('deepseek_api_key') || localStorage.getItem('qwen_api_key'))
+              : isDashscopeAdapter
+              ? (localStorage.getItem('qwen_api_key') || localStorage.getItem('glm_api_key') || localStorage.getItem('deepseek_api_key'))
+              : localStorage.getItem('deepseek_api_key');
+
+            const proj = currentProjectRef.current;
+            const latestUserMsg = task.negotiationLog?.filter(l => l.role === 'user').slice(-1)[0]?.content || task.goal;
             const requestBody = {
               userMessage: latestUserMsg,
               history: task.history,
               events: task.events,
               observations: task.observations,
-              project: { id: currentProject.id, name: currentProject.name },
+              project: { id: proj.id, name: proj.name },
               thinkingLevel: task.thinkingLevel ?? 0,
               domain: task.domain,
               requestedCategories: task.requestedCategories,
@@ -6018,10 +6528,10 @@ export default function App() {
                 negotiationLog: task.negotiationLog,
                 lastGoalUpdatedAt: task.lastGoalUpdatedAt,
                 lastUserInputAt: task.lastUserInputAt,
-                cardContext: task.cardContext || effectiveCardContext,
+                cardContext: task.cardContext,
               },
-              images: task.images || overrideImages,
-              cardContext: task.cardContext || effectiveCardContext,
+              images: task.images,
+              cardContext: task.cardContext,
               apiKey: savedKey, 
               modelType: agentModel, 
               enabledTools: AGENT_TOOL_REGISTRY.filter(tool => getAgentToolConfig()[tool.id]).map(tool => tool.id),
@@ -6044,9 +6554,18 @@ export default function App() {
               }],
             }));
             try {
-              setIsAgentThinking(true);
-              if (!isProcessingInspectQueueRef.current) {
-                setAgentState(prev => ({ ...prev, speak: '...', visible: true }));
+              if (isDetachedTask) {
+                setConcurrentTaskCursors(prev => {
+                  if (!prev[task.id]) return prev;
+                  const next = { ...prev, [task.id]: { ...prev[task.id], isThinking: true, speak: '...', visible: true } };
+                  concurrentTaskCursorsRef.current = next;
+                  return next;
+                });
+              } else if (isPrimaryTask) {
+                setIsAgentThinking(true);
+                if (!isProcessingInspectQueueRef.current) {
+                  setAgentState(prev => ({ ...prev, speak: '...', visible: true }));
+                }
               }
               const res = await fetch('/api/agent/turn', {
                 method: 'POST',
@@ -6073,7 +6592,7 @@ export default function App() {
                 result.toolCalls.forEach(call => {
                   agentFocusManager.handleJsonNodeToolCall(call);
                 });
-              } else if (result.complete && !isProcessingInspectQueueRef.current) {
+              } else if (result.complete && isPrimaryTask && !isProcessingInspectQueueRef.current) {
                 agentFocusManager.setCursorMode('default');
               }
 
@@ -6092,27 +6611,52 @@ export default function App() {
               const directSpeak = result.speak && result.speak.trim() && !isThinkingOrLoadingPhrase(result.speak) ? result.speak : undefined;
               const rawSpeech = result.response || result.fullAnswer || (typeof endTaskSpeech === 'string' ? endTaskSpeech : undefined) || result.speak || (Array.isArray(result.narration) && result.narration.length > 0 ? result.narration[result.narration.length - 1] : undefined);
 
+              let nextSpeak: string | undefined;
               if (directSpeak) {
-                setAgentState(prev => ({ ...prev, speak: directSpeak, visible: true }));
+                nextSpeak = directSpeak;
               } else if (rawSpeech && rawSpeech.trim() && !isThinkingOrLoadingPhrase(rawSpeech)) {
                 const parsed = parseAgentCommunication(rawSpeech);
-                const parsedShort = parsed.shortText || parsed.fullText || rawSpeech;
-                setAgentState(prev => ({ ...prev, speak: parsedShort, visible: true }));
-              } else if (isAgentRunningRef.current) {
-                const hasPendingToolCalls = Array.isArray(result.toolCalls) && result.toolCalls.length > 0;
-                setAgentState(prev => ({ 
-                  ...prev, 
-                  speak: hasPendingToolCalls ? "正在操作..." : "正在思考...", 
-                  visible: true 
-                }));
+                nextSpeak = parsed.shortText || parsed.fullText || rawSpeech;
               } else {
-                setAgentState(prev => (isThinkingOrLoadingPhrase(prev.speak) ? { ...prev, speak: undefined } : prev));
+                const hasPendingToolCalls = Array.isArray(result.toolCalls) && result.toolCalls.length > 0;
+                nextSpeak = hasPendingToolCalls ? "正在操作..." : "正在思考...";
               }
-              
-              setIsAgentThinking(false);
+
+              if (Boolean(concurrentTaskCursorsRef.current[task.id])) {
+                setConcurrentTaskCursors(prev => {
+                  if (!prev[task.id]) return prev;
+                  const next = {
+                    ...prev,
+                    [task.id]: {
+                      ...prev[task.id],
+                      isThinking: false,
+                      speak: nextSpeak,
+                      visible: true,
+                    },
+                  };
+                  concurrentTaskCursorsRef.current = next;
+                  return next;
+                });
+              } else if (task.id === activeTaskIdRef.current) {
+                if (directSpeak || (rawSpeech && rawSpeech.trim() && !isThinkingOrLoadingPhrase(rawSpeech)) || isAgentRunningRef.current) {
+                  setAgentState(prev => ({ ...prev, speak: nextSpeak, visible: true }));
+                } else {
+                  setAgentState(prev => (isThinkingOrLoadingPhrase(prev.speak) ? { ...prev, speak: undefined } : prev));
+                }
+                setIsAgentThinking(false);
+              }
               return result;
             } catch (error) {
-              setIsAgentThinking(false);
+              if (Boolean(concurrentTaskCursorsRef.current[task.id])) {
+                setConcurrentTaskCursors(prev => {
+                  if (!prev[task.id]) return prev;
+                  const next = { ...prev, [task.id]: { ...prev[task.id], isThinking: false } };
+                  concurrentTaskCursorsRef.current = next;
+                  return next;
+                });
+              } else if (task.id === activeTaskIdRef.current) {
+                setIsAgentThinking(false);
+              }
               if (signal?.aborted || (error instanceof Error && error.name === 'AbortError')) {
                 return { narration: [], toolCalls: [], complete: false };
               }
@@ -6122,7 +6666,16 @@ export default function App() {
                 ? '⚠️ API Key 余额不足，请在设置中更新 Key'
                 : rawMsg;
 
-              setAgentState(prev => ({ ...prev, speak: displayMsg, visible: true }));
+              if (Boolean(concurrentTaskCursorsRef.current[task.id])) {
+                setConcurrentTaskCursors(prev => {
+                  if (!prev[task.id]) return prev;
+                  const next = { ...prev, [task.id]: { ...prev[task.id], speak: displayMsg, visible: true } };
+                  concurrentTaskCursorsRef.current = next;
+                  return next;
+                });
+              } else if (task.id === activeTaskIdRef.current) {
+                setAgentState(prev => ({ ...prev, speak: displayMsg, visible: true }));
+              }
 
               updateAgentRuntimeTrace(task, trace => ({
                 ...trace,
@@ -6132,7 +6685,12 @@ export default function App() {
             }
           },
           executeTool: async (call, task, signal) => {
-            setIsAgentThinking(false);
+            const isDetachedTask = Boolean(concurrentTaskCursorsRef.current[task.id]);
+            const isPrimaryTask = task.id === activeTaskIdRef.current && !isDetachedTask;
+
+            if (isPrimaryTask) {
+              setIsAgentThinking(false);
+            }
 
             // Synchronize active operation text during tool execution
             let actionSpeak = '正在操作...';
@@ -6142,30 +6700,43 @@ export default function App() {
               actionSpeak = '正在生成新卡片...';
             } else if (call.name === 'card.inspect' || call.name === 'page.inspect') {
               actionSpeak = '正在观察画面...';
+            } else if (call.name === 'asset.searchProvenanceCandidates') {
+              actionSpeak = '正在检索剧本候选片段...';
+            } else if (call.name === 'asset.commitProvenance') {
+              actionSpeak = '正在提交出处核验结果...';
             } else if (call.name === 'ui.actAndObserve' || call.name.startsWith('mouse.')) {
               actionSpeak = '正在操作界面...';
             }
 
             if (call.name !== 'user.ask') {
-              setAgentState(prev => {
-                if (!prev.speak || isThinkingOrLoadingPhrase(prev.speak) || prev.speak === '正在思考...') {
-                  return { ...prev, speak: actionSpeak, visible: true };
-                }
-                return prev;
-              });
+              if (isDetachedTask) {
+                setConcurrentTaskCursors(prev => {
+                  if (!prev[task.id]) return prev;
+                  const cur = prev[task.id];
+                  if (!cur.speak || isThinkingOrLoadingPhrase(cur.speak) || cur.speak === '正在思考...') {
+                    const next = { ...prev, [task.id]: { ...cur, isThinking: false, speak: actionSpeak, visible: true } };
+                    concurrentTaskCursorsRef.current = next;
+                    return next;
+                  }
+                  return prev;
+                });
+              } else if (isPrimaryTask) {
+                setAgentState(prev => {
+                  if (!prev.speak || isThinkingOrLoadingPhrase(prev.speak) || prev.speak === '正在思考...') {
+                    return { ...prev, speak: actionSpeak, visible: true };
+                  }
+                  return prev;
+                });
+              }
             }
 
             const output = await executeAgentTool(call, task, signal);
             if (signal?.aborted) return output;
 
-            // 🛡️ Output-Driven Action Resolver (基于工具输出的动作解析器)
-            // 契约：凡是依赖执行结果产出/实例化实体对象的工具（如 card.generate 产出具体的 cardId），
-            // 一旦监测到工具产生有效输出，系统第一时间截获并解析 output.cardId，
-            // 立即驱动 Agent 聚焦锁定并调度鼠标毫秒级飞赴新卡片执行下压手势！
             if (call.name === 'card.generate' && output && typeof output === 'object') {
               const outputCardId = (output as any).cardId;
               const outMsg = (output as any).message || `生图卡片【${outputCardId}】已成功创建并进入排队渲染。`;
-              if (typeof outputCardId === 'string' && outputCardId) {
+              if (typeof outputCardId === 'string' && outputCardId && isPrimaryTask) {
                 agentFocusManager.setCursorMode('working');
                 agentFocusManager.setPrimaryFocus(outputCardId, 'working', 'card.generate');
                 await animateMoveToTarget('canvas.card.' + outputCardId);
@@ -6174,24 +6745,31 @@ export default function App() {
                 setAgentState(prev => ({ ...prev, isActive: false }));
               }
 
-              // 🚀 Optimization 1: 乐观即时状态汇报 (Optimistic Instant Feedback)
-              // 无需等待第二轮大模型漫长的 4 秒推理，在工具返回的第 0 毫秒立即将进展注入事件流与 HUD
               if (runtimeRef.current) {
                 runtimeRef.current.addFeedback(task.id, outMsg, 'answer');
               }
               const shortText = parseAgentCommunication(outMsg).shortText || `卡片【${outputCardId}】已启动排队渲染...`;
-              setAgentState(prev => ({
-                ...prev,
-                speak: shortText,
-                visible: true,
-              }));
+              if (isDetachedTask) {
+                setConcurrentTaskCursors(prev => {
+                  if (!prev[task.id]) return prev;
+                  const next = { ...prev, [task.id]: { ...prev[task.id], speak: shortText, visible: true } };
+                  concurrentTaskCursorsRef.current = next;
+                  return next;
+                });
+              } else if (isPrimaryTask) {
+                setAgentState(prev => ({
+                  ...prev,
+                  speak: shortText,
+                  visible: true,
+                }));
+              }
             }
 
             return output;
           },
           requireVisibleInteraction: false,
           isParallelSafe: (call) => {
-            if (call.name === 'guide.lookup') return true;
+            if (call.name === 'guide.lookup' || call.name === 'asset.searchProvenanceCandidates') return true;
             if (call.name === 'page.inspect') {
               const scope = typeof call.arguments?.scope === 'string' ? call.arguments.scope : 'overview';
               return !scope || scope === 'overview';
@@ -6214,14 +6792,19 @@ export default function App() {
                 ? (localStorage.getItem('qwen_api_key') || localStorage.getItem('glm_api_key') || localStorage.getItem('deepseek_api_key') || '')
                 : (localStorage.getItem('deepseek_api_key') || '');
 
-              const lastUserMessage = task.negotiationLog?.[task.negotiationLog.length - 1]?.content || task.goal;
+              const userLogs = (task.negotiationLog || []).filter(l => l.role === 'user' && l.content?.trim());
+              const firstUserMsg = task.initialGoal || userLogs[0]?.content || task.goal;
+              const latestUserMsg = userLogs[userLogs.length - 1]?.content || firstUserMsg;
+              const stateNodeUserMessage = userLogs.length > 1 && latestUserMsg !== firstUserMsg
+                ? `【初始任务总目标】：${firstUserMsg}\n【用户最新补充/回复】：${latestUserMsg}`
+                : (latestUserMsg || task.goal);
               const res = await fetch('/api/agent/update-state-node', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                   currentTask: {
                     title: task.title,
-                    goal: task.goal,
+                    goal: task.goal || firstUserMsg,
                     subGoal: task.subGoal,
                     progress: task.progress,
                     plan: task.plan,
@@ -6230,7 +6813,7 @@ export default function App() {
                     domain: task.domain,
                     requestedCategories: task.requestedCategories,
                   },
-                  userMessage: lastUserMessage,
+                  userMessage: stateNodeUserMessage,
                   lastTurnOutput: {
                     narration: lastTurnResult.narration,
                     speak: lastTurnResult.speak,
@@ -6248,8 +6831,17 @@ export default function App() {
               }
 
               if (res.ok && responseData && !responseData.error) {
-                if (responseData.taskTitle) task.title = responseData.taskTitle;
-                if (responseData.goal) task.goal = responseData.goal;
+                const hasExistingTitle = Boolean(task.title && task.title !== '尚未命名');
+                if (responseData.taskTitle && (!hasExistingTitle || userLogs.length <= 1)) {
+                  task.title = responseData.taskTitle;
+                }
+                if (responseData.goal) {
+                  if (userLogs.length > 1 && firstUserMsg && responseData.goal.trim() === latestUserMsg.trim()) {
+                    task.goal = `${firstUserMsg}（用户补充：${latestUserMsg}）`;
+                  } else {
+                    task.goal = responseData.goal;
+                  }
+                }
                 if (responseData.subGoal) task.subGoal = responseData.subGoal;
                 if (responseData.progress) task.progress = responseData.progress;
                 if (responseData.thinkingLevel === 0 || responseData.thinkingLevel === 1) task.thinkingLevel = responseData.thinkingLevel;
@@ -6291,6 +6883,9 @@ export default function App() {
           onTaskChange: (task) => {
             updateAgentRuntimeTrace(task);
             const status = task.status;
+            const isDetachedTask = Boolean(concurrentTaskCursorsRef.current[task.id]);
+            const isPrimaryTask = task.id === activeTaskIdRef.current && !isDetachedTask;
+
             setAgentTask({
               id: task.id,
               title: task.title,
@@ -6299,41 +6894,101 @@ export default function App() {
               events: task.events.slice(-16).map(event => ({
                 id: event.id,
                 text: event.type === 'answer' ? parseAgentCommunication(event.text || '').fullText : event.text,
-                kind: event.type === 'tool' ? 'tool' : event.type === 'answer' ? 'answer' : 'work',
+                kind: event.type === 'tool' ? 'tool' : event.type === 'answer' ? 'answer' : event.type === 'user' ? 'user' : 'work',
               })),
             });
 
-            // Live speech synchronization for Agent Pointer HUD
-            // Only update speech if not currently protected by active card inspection queue
-            if (!isProcessingInspectQueueRef.current) {
-              const latestAnswer = [...task.events].reverse().find(e => e.type === 'answer' && e.text && e.text.trim());
-              if (latestAnswer) {
-                const parsed = parseAgentCommunication(latestAnswer.text);
-                const shortSpeech = parsed.shortText || parsed.fullText;
-                if (shortSpeech) {
-                  if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
-                  setAgentState(prev => ({
-                    ...prev,
-                    speak: shortSpeech,
-                    visible: true,
-                  }));
-                }
-              }
-            }
+            const latestAnswer = [...task.events].reverse().find(e => e.type === 'answer' && e.text && e.text.trim());
+            const parsedLatest = latestAnswer ? parseAgentCommunication(latestAnswer.text) : null;
+            const shortSpeech = parsedLatest ? (parsedLatest.shortText || parsedLatest.fullText) : undefined;
 
-            if (status === 'completed' || status === 'paused' || status === 'cancelled' || status === 'failed') {
-              if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
-              if (!isProcessingInspectQueueRef.current && inspectQueueRef.current.length === 0) {
-                resetAgentStateToDefault();
-                setAgentState(prev => {
-                  if (!prev.speak || isThinkingOrLoadingPhrase(prev.speak)) {
-                    const latestAnswer = [...task.events].reverse().find(e => e.type === 'answer' && e.text && e.text.trim() && !isThinkingOrLoadingPhrase(e.text));
-                    const parsed = latestAnswer ? parseAgentCommunication(latestAnswer.text) : null;
-                    const speech = parsed ? (parsed.shortText || parsed.fullText) : undefined;
-                    return { ...prev, speak: speech };
-                  }
-                  return prev;
+            if (isDetachedTask) {
+              if (shortSpeech) {
+                setConcurrentTaskCursors(prev => {
+                  if (!prev[task.id]) return prev;
+                  const next = {
+                    ...prev,
+                    [task.id]: {
+                      ...prev[task.id],
+                      speak: shortSpeech,
+                      visible: true,
+                    },
+                  };
+                  concurrentTaskCursorsRef.current = next;
+                  return next;
                 });
+              }
+              if (status === 'waiting_user') {
+                setConcurrentTaskCursors(prev => {
+                  if (!prev[task.id]) return prev;
+                  const next = {
+                    ...prev,
+                    [task.id]: {
+                      ...prev[task.id],
+                      isRunning: false,
+                      isThinking: false,
+                      cursorMode: 'default' as const,
+                      speak: shortSpeech || prev[task.id].speak,
+                    },
+                  };
+                  concurrentTaskCursorsRef.current = next;
+                  return next;
+                });
+              } else if (status === 'completed' || status === 'paused' || status === 'cancelled' || status === 'failed') {
+                setConcurrentTaskCursors(prev => {
+                  if (!prev[task.id]) return prev;
+                  const next = {
+                    ...prev,
+                    [task.id]: {
+                      ...prev[task.id],
+                      isRunning: false,
+                      isThinking: false,
+                      cursorMode: 'default' as const,
+                      speak: shortSpeech || (status === 'completed' ? '已完成核验' : prev[task.id].speak),
+                    },
+                  };
+                  concurrentTaskCursorsRef.current = next;
+                  return next;
+                });
+                setTimeout(() => {
+                  setConcurrentTaskCursors(prev => {
+                    if (!prev[task.id]) return prev;
+                    const next = { ...prev };
+                    delete next[task.id];
+                    concurrentTaskCursorsRef.current = next;
+                    return next;
+                  });
+                }, 2400);
+              }
+            } else if (isPrimaryTask) {
+              if (!isProcessingInspectQueueRef.current && shortSpeech) {
+                if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
+                setAgentState(prev => ({
+                  ...prev,
+                  speak: shortSpeech,
+                  visible: true,
+                }));
+              }
+
+              if (status === 'waiting_user') {
+                setIsAgentThinking(false);
+                setIsAgentRunning(false);
+                isAgentRunningRef.current = false;
+                agentFocusManager.setCursorMode('default');
+              } else if (status === 'completed' || status === 'paused' || status === 'cancelled' || status === 'failed') {
+                if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
+                if (!isProcessingInspectQueueRef.current && inspectQueueRef.current.length === 0) {
+                  resetAgentStateToDefault();
+                  setAgentState(prev => {
+                    if (!prev.speak || isThinkingOrLoadingPhrase(prev.speak)) {
+                      const fallbackAnswer = [...task.events].reverse().find(e => e.type === 'answer' && e.text && e.text.trim() && !isThinkingOrLoadingPhrase(e.text));
+                      const parsed = fallbackAnswer ? parseAgentCommunication(fallbackAnswer.text) : null;
+                      const speech = parsed ? (parsed.shortText || parsed.fullText) : undefined;
+                      return { ...prev, speak: speech };
+                    }
+                    return prev;
+                  });
+                }
               }
             }
 
@@ -6398,13 +7053,12 @@ export default function App() {
       if (isNewTask) {
         task = runtime.createTask({
           id: taskId!,
-          sessionId: currentProject.id,
+          sessionId: currentProjectRef.current.id,
           goal: userMessage,
-          images: overrideImages,
+          images: effectiveImages,
           cardContext: effectiveCardContext,
         });
         updateAgentRuntimeTrace(task);
-        // Auto inspect if enabled
         if (localStorage.getItem('auto_inspect_on_launch') === 'true') {
           try {
             const initObservation = await inspectPage({ scope: 'overview' });
@@ -6435,7 +7089,7 @@ export default function App() {
           }
         }
       } else {
-        runtime.addUserInput(taskId!, userMessage, overrideImages, effectiveCardContext);
+        runtime.addUserInput(taskId!, userMessage, effectiveImages, effectiveCardContext);
         task = runtime.requireTask(taskId!);
       }
 
@@ -6448,27 +7102,137 @@ export default function App() {
         events: [...previous.events, { id: `${Date.now()}_${Math.random()}`, text: err.message || 'Agent 执行失败', kind: 'answer' }].slice(-16),
       } : previous);
     } finally {
-      setIsAgentThinking(false);
-      setIsAgentRunning(false);
-      isAgentRunningRef.current = false;
+      spawnOptions?.onFinally?.();
+      const isStillPrimary = launchedTaskId && launchedTaskId === activeTaskIdRef.current && !concurrentTaskCursorsRef.current[launchedTaskId];
+      if (isStillPrimary || !launchedTaskId) {
+        setIsAgentThinking(false);
+        setIsAgentRunning(false);
+        isAgentRunningRef.current = false;
+        setActiveTaskBadgeNumber(undefined);
 
-      // Clear lingering loading state if inspect queue is empty
-      if (inspectQueueRef.current.length === 0 && !isProcessingInspectQueueRef.current) {
-        resetAgentStateToDefault();
+        if (inspectQueueRef.current.length === 0 && !isProcessingInspectQueueRef.current) {
+          resetAgentStateToDefault();
+        }
       }
 
-      // 🌟 本轮卡片分发与创建完毕，平滑启动出图检视队列，按序消费出图卡片！
       setTimeout(() => {
         void processInspectQueueRef.current();
       }, 150);
     }
   };
 
+  const handleRequestVerifyAssetProvenance = useCallback(async (
+    category: 'character' | 'location' | 'prop',
+    item: {
+      id: string;
+      name: string;
+      description?: string;
+      role?: string;
+      appearance?: string;
+      vibe?: string;
+      atmosphere?: string;
+      visualDetails?: string;
+      materialAndState?: string;
+      storySignificance?: string;
+      owner?: string;
+      aliases?: string[];
+    }
+  ) => {
+    setVerifyingAssetIds(prev => (prev.includes(item.id) ? prev : [...prev, item.id]));
+
+    const targetAgentId = `assets.item.${category}.${item.id}`;
+    const el = typeof document !== 'undefined'
+      ? (document.querySelector(`[data-agent-id="${targetAgentId}"]`) as HTMLElement | null)
+      : null;
+    const rect = el?.getBoundingClientRect();
+    const screenX = rect ? rect.left + Math.min(rect.width * 0.65, 220) : 320;
+    const screenY = rect ? rect.top + rect.height * 0.5 : 280;
+    const targetCanvasX = (screenX - tx.get()) / tScale.get();
+    const targetCanvasY = (screenY - ty.get()) / tScale.get();
+
+    const categoryLabel = category === 'character' ? '角色' : category === 'location' ? '场景' : '道具';
+    const descParts = [
+      item.description,
+      item.role,
+      item.appearance,
+      item.vibe,
+      item.atmosphere,
+      item.visualDetails,
+      item.owner ? `归属：${item.owner}` : '',
+      item.materialAndState,
+      item.storySignificance,
+    ].map(v => (typeof v === 'string' ? v.trim() : '')).filter(Boolean);
+    const descText = Array.from(new Set(descParts)).join('；');
+    const existingAliases = Array.isArray(item.aliases) && item.aliases.length > 0 ? item.aliases.join('、') : '待推断';
+    const verifyPrompt = `请核验${categoryLabel}资产「${item.name}」（assetId: "${item.id}", category: "${category}"）在当前剧本中的真实出处。请先根据资产名称「${item.name}」与设定描述「${descText}」（已有别名：${existingAliases}）推断其可能的剧本别名或版本特征词（aliases），调用 asset.searchProvenanceCandidates 检索候选片段（若已知所在集/场且涉及代词指代也可配合 script.read 查阅），逐一分析剧本：判断该资产（或该特定版本）在此处是否需要出现在画面中（需要出现则算作出场，不出现在画面中则不算出场），最后调用 asset.commitProvenance 提交核验通过的 verifiedCandidateIds 或包含具体出场描写原句的 provenances（严禁将“人物：XXX”名单行作为出处内容）。`;
+
+    const primaryBusy = Boolean(
+      isAgentRunningRef.current ||
+      (activeTaskIdRef.current &&
+        runtimeRef.current?.getTask(activeTaskIdRef.current) &&
+        ['planning', 'waiting_tools', 'waiting_user'].includes(runtimeRef.current.getTask(activeTaskIdRef.current)!.status))
+    );
+
+    if (!primaryBusy) {
+      agentFocusManager.setPrimaryFocus(targetAgentId, 'working', 'verify_provenance');
+      setAgentState(prev => ({
+        ...prev,
+        x: targetCanvasX,
+        y: targetCanvasY,
+        speak: `正在核验「${item.name}」出处...`,
+        isMoving: true,
+        visible: true,
+        cursorMode: 'working',
+      }));
+      setTimeout(() => {
+        setAgentState(prev => ({ ...prev, isMoving: false }));
+      }, 360);
+    }
+
+    await handleRunAgent(
+      verifyPrompt,
+      undefined,
+      {
+        targetId: targetAgentId,
+        title: `出处核验 · ${item.name}`,
+        markdownSummary: `正在核验${categoryLabel}资产「${item.name}」（ID: ${item.id}）的剧本出处`,
+      },
+      {
+        forceNewTask: true,
+        detachedCursor: primaryBusy
+          ? {
+              x: targetCanvasX,
+              y: targetCanvasY,
+              targetId: targetAgentId,
+              speak: `正在核验「${item.name}」出处...`,
+            }
+          : undefined,
+        onFinally: () => {
+          setVerifyingAssetIds(prev => prev.filter(id => id !== item.id));
+        },
+      }
+    );
+  }, [tScale, tx, ty]);
+
   const handleCardAgentChat = useCallback(async (targetCardId: string, promptText: string) => {
     const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
     const targetCard = allCards.find(c => c.id === targetCardId) || cards.find(c => c.id === targetCardId);
     if (!targetCard) {
-      await handleRunAgent(promptText);
+      const uiInfo = buildUiTargetFocusInfo(targetCardId);
+      setGlobalChatHistory(prev => [
+        ...prev,
+        {
+          id: `msg_global_user_${Date.now()}`,
+          role: 'user',
+          text: promptText,
+          timestamp: Date.now(),
+        }
+      ]);
+      await handleRunAgent(promptText, undefined, {
+        targetId: uiInfo.targetId,
+        title: uiInfo.title,
+        markdownSummary: uiInfo.contextSummary,
+      });
       return;
     }
 
@@ -6574,6 +7338,20 @@ export default function App() {
     if (!msg) return;
     setTaskChatMessage('');
     setIsTaskChatOpen(false);
+    setAgentQuickInput(prev => prev ? {
+      ...prev,
+      placeholder: "输入你的想法...",
+      onAskResolve: undefined,
+    } : prev);
+    setGlobalChatHistory(prev => [
+      ...prev,
+      {
+        id: `msg_global_user_${Date.now()}`,
+        role: 'user',
+        text: msg,
+        timestamp: Date.now(),
+      }
+    ]);
     await handleRunAgent(msg);
   };
 
@@ -8004,6 +8782,12 @@ export default function App() {
         onTocItemOpened={handleTocItemOpened}
         onSelectionChange={setScriptSelection}
         onRequestGenerateAsset={handleRequestGenerateAsset}
+        onRequestVerifyAssetProvenance={handleRequestVerifyAssetProvenance}
+        verifyingAssetIds={verifyingAssetIds}
+        agentFocusedTargetId={agentFocus.primaryCardId || (agentQuickInput?.isOpen ? agentQuickInput.targetId : null)}
+        agentFocusedTargetIds={(Object.values(concurrentTaskCursors) as ConcurrentTaskCursorState[])
+          .map(c => c.targetId)
+          .filter((id): id is string => Boolean(id))}
       />
 
       {/* Top Right Controls */}
@@ -8012,7 +8796,7 @@ export default function App() {
         <button
           onClick={() => setShowSettings(true)}
           onPointerDown={e => e.stopPropagation()}
-          className="w-[36px] h-[36px] rounded-2xl corner-squircle bg-gray-100 dark:bg-neutral-800 border border-gray-200/80 dark:border-[#404040]/80 shadow-md flex items-center justify-center text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-700 transition-colors"
+          className="w-[36px] h-[36px] rounded-2xl corner-squircle bg-gray-100 dark:bg-neutral-800 border border-gray-300 dark:border-[#404040]/80 shadow-md flex items-center justify-center text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-700 transition-colors"
           title="后台配置"
         >
           <Settings className="w-4 h-4" />
@@ -8026,7 +8810,7 @@ export default function App() {
             }, 600);
           }}
           onPointerDown={e => e.stopPropagation()}
-          className="w-[36px] h-[36px] rounded-2xl corner-squircle bg-gray-100 dark:bg-neutral-800 border border-gray-200/80 dark:border-[#404040]/80 shadow-md flex items-center justify-center text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-700 transition-colors"
+          className="w-[36px] h-[36px] rounded-2xl corner-squircle bg-gray-100 dark:bg-neutral-800 border border-gray-300 dark:border-[#404040]/80 shadow-md flex items-center justify-center text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-700 transition-colors"
           title="Toggle Dark Mode"
         >
           <Sun className="w-4 h-4 hidden dark:block" />
@@ -8286,6 +9070,40 @@ export default function App() {
         )}
       </AnimatePresence>
 
+      {/* Concurrent Detached Agent Cursors (1 Task <-> 1 AgentCursor with Top-Right Number Badge) */}
+      {(Object.values(concurrentTaskCursors) as ConcurrentTaskCursorState[]).map(cursor => (
+        <React.Fragment key={cursor.taskId}>
+          <AgentCursor
+            agentState={{
+              x: cursor.x,
+              y: cursor.y,
+              visible: cursor.visible,
+              isActive: cursor.isActive,
+              isMoving: cursor.isMoving,
+              speak: cursor.speak,
+              cursorMode: cursor.cursorMode,
+            }}
+            transform={transformValues}
+            isIdle={!cursor.isRunning}
+            isZooming={isZooming}
+            isAgentRunning={cursor.isRunning}
+            isAgentThinking={cursor.isThinking}
+            selectedCards={[]}
+            isDarkMode={isDarkMode}
+            badgeNumber={cursor.badgeNumber}
+            quickInput={null}
+            onDismissSpeak={() => {
+              setConcurrentTaskCursors(prev => {
+                if (!prev[cursor.taskId]) return prev;
+                const next = { ...prev, [cursor.taskId]: { ...prev[cursor.taskId], speak: undefined } };
+                concurrentTaskCursorsRef.current = next;
+                return next;
+              });
+            }}
+          />
+        </React.Fragment>
+      ))}
+
       <AgentCursor 
         agentState={agentState}
         transform={transformValues}
@@ -8295,6 +9113,7 @@ export default function App() {
         isAgentThinking={isAgentThinking}
         selectedCards={activeSelectedCards}
         isDarkMode={isDarkMode}
+        badgeNumber={(isAgentRunning || isAgentThinking || Object.keys(concurrentTaskCursors).length > 0) ? activeTaskBadgeNumber : undefined}
         quickInput={
           agentQuickInput?.isOpen
             ? {
@@ -8314,8 +9133,22 @@ export default function App() {
                   const target = agentQuickInput.targetId || 'global';
                   setCardDrafts(prev => ({ ...prev, [target]: text }));
                   saveDraft(target, text); // Persist draft to IndexedDB
+                  if (text.length > 0) {
+                    setContextMenus(prev => {
+                      if (!prev['user']) return prev;
+                      const next = { ...prev };
+                      delete next['user'];
+                      return next;
+                    });
+                  }
                 },
                 onSubmit: async (prompt: string) => {
+                  setContextMenus(prev => {
+                    if (!prev['user']) return prev;
+                    const next = { ...prev };
+                    delete next['user'];
+                    return next;
+                  });
                   if (agentQuickInput.onAskResolve) {
                     const askResolver = agentQuickInput.onAskResolve;
                     const currentKey = agentQuickInput.targetId || 'global';
@@ -8404,6 +9237,12 @@ export default function App() {
                   }
                 },
                 onClose: () => {
+                  setContextMenus(prev => {
+                    if (!prev['user']) return prev;
+                    const next = { ...prev };
+                    delete next['user'];
+                    return next;
+                  });
                   if (agentQuickInput.onAskResolve) {
                     const askResolver = agentQuickInput.onAskResolve;
                     const currentKey = agentQuickInput.targetId || 'global';
@@ -8449,7 +9288,7 @@ export default function App() {
       {isTaskPanelCollapsed ? (
         <aside
           onClick={() => setIsTaskPanelCollapsed(false)}
-          className="fixed bottom-4 right-4 z-[90] h-[44px] px-3.5 rounded-[22px] corner-squircle border border-gray-200/90 bg-white/95 shadow-[0_12px_32px_rgba(0,0,0,0.12)] dark:border-[#3a3a3a] dark:bg-neutral-800/95 flex items-center gap-2.5 backdrop-blur-md cursor-pointer hover:shadow-lg transition-all select-none"
+          className="fixed bottom-4 right-4 z-[90] h-[44px] px-3.5 rounded-[22px] corner-squircle border border-gray-300 bg-white/95 shadow-[0_12px_32px_rgba(0,0,0,0.12)] dark:border-[#3a3a3a] dark:bg-neutral-800/95 flex items-center gap-2.5 backdrop-blur-md cursor-pointer hover:shadow-lg transition-all select-none"
           title="点击展开对话框"
         >
           <div className="flex items-center gap-1.5">
@@ -8483,7 +9322,7 @@ export default function App() {
           </button>
         </aside>
       ) : (
-        <aside className="fixed bottom-4 right-4 z-[90] w-[330px] rounded-[22px] corner-squircle border border-gray-200/90 bg-white/95 p-3.5 shadow-[0_16px_48px_rgba(0,0,0,0.18)] dark:border-[#3a3a3a] dark:bg-neutral-800/95 flex flex-col gap-2.5 backdrop-blur-md">
+        <aside className="fixed bottom-4 right-4 z-[90] w-[330px] rounded-[22px] corner-squircle border border-gray-300 bg-white/95 p-3.5 shadow-[0_16px_48px_rgba(0,0,0,0.18)] dark:border-[#3a3a3a] dark:bg-neutral-800/95 flex flex-col gap-2.5 backdrop-blur-md">
           {/* Header */}
           <div className="flex items-center justify-between gap-2">
             <div className="min-w-0 flex-1">
@@ -8553,6 +9392,15 @@ export default function App() {
           <div ref={agentTaskScrollRef} className="max-h-[220px] min-h-[60px] overflow-y-auto space-y-2.5 pr-1 text-xs no-scrollbar flex flex-col">
             {agentTask && agentTask.events.length > 0 ? (
               agentTask.events.map(event => {
+                if (event.kind === 'user') {
+                  return (
+                    <div key={event.id} className="flex justify-end">
+                      <div className="bg-purple-600 text-white dark:bg-purple-600 dark:text-white rounded-2xl corner-squircle px-3.5 py-2 text-[12px] leading-relaxed max-w-[95%] break-words whitespace-pre-wrap shadow-sm">
+                        {event.text}
+                      </div>
+                    </div>
+                  );
+                }
                 if (event.kind === 'answer') {
                   return (
                     <div key={event.id} className="flex justify-start">
@@ -8625,8 +9473,18 @@ export default function App() {
               ref={taskChatInputRef}
               type="text"
               value={taskChatMessage}
-              onChange={(e) => setTaskChatMessage(e.target.value)}
-              placeholder="输入你的想法或指令..."
+              onChange={(e) => {
+                setTaskChatMessage(e.target.value);
+                if (e.target.value.length > 0) {
+                  setContextMenus(prev => {
+                    if (!prev['user']) return prev;
+                    const next = { ...prev };
+                    delete next['user'];
+                    return next;
+                  });
+                }
+              }}
+              placeholder={agentTask?.status === 'waiting_user' ? "回复 Mira 的提问..." : "输入你的想法或指令..."}
               className="flex-1 min-w-0 bg-transparent text-[13px] text-gray-800 dark:text-neutral-100 placeholder-gray-400 dark:placeholder-neutral-500 outline-none font-medium"
             />
             <button
@@ -8653,6 +9511,13 @@ export default function App() {
                 >
                   继续
                 </button>
+              ) : agentTask.status === 'waiting_user' ? (
+                <button 
+                  onClick={() => taskChatInputRef.current?.focus()}
+                  className="flex-1 py-1 px-2.5 text-xs font-medium rounded-lg bg-amber-100 text-amber-700 hover:bg-amber-200 transition-colors corner-squircle dark:bg-amber-900/30 dark:text-amber-400 cursor-pointer"
+                >
+                  回复提问
+                </button>
               ) : (
                 <button 
                   onClick={handlePauseTask}
@@ -8675,7 +9540,16 @@ export default function App() {
       {/* User Context Menu Overlay (Screen Space) */}
       <AnimatePresence>
         {Object.entries(contextMenus)
-          .filter(([ownerId]) => ownerId === 'user')
+          .filter(([ownerId]) => {
+            if (ownerId !== 'user') return false;
+            // 且如果用户输入了内容，菜单卡片自动消失
+            const globalDraft = cardDrafts['global'] || '';
+            const activeDraft = cardDrafts[agentQuickInput?.targetId || 'global'] || '';
+            if (globalDraft.trim().length > 0 || activeDraft.trim().length > 0) {
+              return false;
+            }
+            return true;
+          })
           .map(([ownerId, menu]: [string, any]) => (
             <AgentContextMenu
               key={ownerId}
@@ -8792,7 +9666,7 @@ export default function App() {
 
       {/* Floating Toolbar */}
       <div 
-        className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-gray-100 dark:bg-neutral-800 border border-gray-200 dark:border-[#404040] shadow-lg rounded-[20px] corner-squircle p-1.5 z-50"
+        className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-gray-100 dark:bg-neutral-800 border border-gray-300 dark:border-[#404040] shadow-lg rounded-[20px] corner-squircle p-1.5 z-50"
         onPointerDown={e => e.stopPropagation()}
       >
         <button 

@@ -7,6 +7,8 @@ export type AgentToolName =
   | 'asset.create'
   | 'asset.update'
   | 'asset.delete'
+  | 'asset.searchProvenanceCandidates'
+  | 'asset.commitProvenance'
   | 'guide.lookup'
   | 'page.inspect'
   | 'card.inspect'
@@ -41,8 +43,8 @@ export const TOOL_CATEGORIES: Record<string, ToolCategoryMeta> = {
   asset: {
     id: 'asset',
     name: '项目资产管理与提取',
-    description: '项目角色/场景/道具资产的增删查改(asset.list, asset.create, asset.update, asset.delete)与提取',
-    toolIds: ['asset.list', 'asset.create', 'asset.update', 'asset.delete', 'asset.extractElements'],
+    description: '项目角色/场景/道具资产的增删查改(asset.list, asset.create, asset.update, asset.delete)、出处候选检索与逐条核验落盘(asset.searchProvenanceCandidates, asset.commitProvenance)与提取',
+    toolIds: ['asset.list', 'asset.create', 'asset.update', 'asset.delete', 'asset.searchProvenanceCandidates', 'asset.commitProvenance', 'asset.extractElements'],
   },
   card: {
     id: 'card',

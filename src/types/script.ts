@@ -1,6 +1,43 @@
+export type ProvenanceStatus = 'unverified' | 'verifying' | 'verified' | 'stale';
+
+export interface VerifiedProvenanceAnchor {
+  id: string;                 // 唯一锚点 ID，如 "vp_ep13_0"
+  sceneId?: string;           // 关联的分集/场次 ID
+  sceneTitle: string;         // 所属集/场标题，如 "第13集"
+  matchedTerm: string;        // 正文中实际命中的词（原名或别名，如"钥匙"）
+  anchorText: string;         // 命中的上下文指纹短语（前后各约12~16字）
+  offsetInAnchor: number;     // matchedTerm 在 anchorText 内的起始偏移量
+  fallbackCharIndex?: number; // 核验时刻的原始字符偏移（兜底用）
+  lineNumber?: number;        // 核验时刻的行号
+}
+
+export interface ScriptAssetVersion {
+  id: string;
+  name: string; // 版本名称（如 "日景"、"夜景"、"常服版"、"晚礼服版"）
+  description?: string; // 资产版本识别浅色描述（首次出场、服装/光影/状态区分特征）
+  role?: string;
+  appearance?: string;
+  personality?: string;
+  performanceNotes?: string;
+  type?: 'INT' | 'EXT';
+  timeOfDay?: string;
+  atmosphere?: string;
+  visualDetails?: string;
+  owner?: string;
+  materialAndState?: string;
+  storySignificance?: string;
+  aliases?: string[];
+  sourceScenes?: string[];
+  provenanceStatus?: ProvenanceStatus;
+  verifiedProvenance?: VerifiedProvenanceAnchor[];
+  verifiedScriptHash?: string;
+  referenceImage?: string;
+}
+
 export interface ScriptCharacter {
   id: string;
   name: string;
+  description?: string; // 资产识别浅色描述（首次出场、核心身份关系、多服装版本说明等防混淆信息）
   role: string; // 身份 / 角色设定
   age?: string;
   gender?: string;
@@ -10,28 +47,44 @@ export interface ScriptCharacter {
   performanceNotes: string; // 镜头表演/情绪重点
   aliases?: string[]; // 别名或代称
   sourceScenes?: string[]; // 出现场次，如 ["第1场", "第3场"]
+  provenanceStatus?: ProvenanceStatus;
+  verifiedProvenance?: VerifiedProvenanceAnchor[];
+  verifiedScriptHash?: string;
   referenceImage?: string; // 已生成的参考图
+  versions?: ScriptAssetVersion[]; // 多服装/造型版本二级列表
 }
 
 export interface ScriptLocation {
   id: string;
   name: string;
+  description?: string; // 资产识别浅色描述（首次出场、空间归属、日夜景区分等防混淆信息）
   type: 'INT' | 'EXT'; // 内景 / 外景
   timeOfDay: string; // 时间氛围（如 雨夜、黄昏）
   atmosphere: string; // 氛围与光影影调
   visualDetails: string; // 空间建筑与材质细节
+  aliases?: string[]; // 场景简称或别名
   sourceScenes?: string[];
+  provenanceStatus?: ProvenanceStatus;
+  verifiedProvenance?: VerifiedProvenanceAnchor[];
+  verifiedScriptHash?: string;
   referenceImage?: string;
+  versions?: ScriptAssetVersion[]; // 日景/夜景等多光影状态版本二级列表
 }
 
 export interface ScriptProp {
   id: string;
   name: string;
+  description?: string; // 资产识别浅色描述（首次出场、所属人、与相似道具的区分特征等防混淆信息）
   owner?: string; // 所属角色
   materialAndState: string; // 材质与物理状态
   storySignificance: string; // 剧情关键与特写表现
+  aliases?: string[]; // 道具简称或别名（如 "钥匙"、"金钥匙"）
   sourceScenes?: string[];
+  provenanceStatus?: ProvenanceStatus;
+  verifiedProvenance?: VerifiedProvenanceAnchor[];
+  verifiedScriptHash?: string;
   referenceImage?: string;
+  versions?: ScriptAssetVersion[]; // 多状态版本二级列表
 }
 
 export interface SceneChunk {

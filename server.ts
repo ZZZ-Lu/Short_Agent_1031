@@ -4,7 +4,7 @@ import { createServer as createViteServer } from "vite";
 import fs from "fs";
 import dotenv from "dotenv";
 import { AGENT_TOOL_REGISTRY } from './src/agent/toolRegistry';
-import { initialAgentContext, PROMPT_MODULES, resolveContext, type AgentContextSelection } from './src/agent/contextPolicy';
+import { initialAgentContext, PROMPT_MODULES, resolveContext, CONTROL_TOOLS, type AgentContextSelection } from './src/agent/contextPolicy';
 import { mcpRouter } from './src/server/mcpRouter';
 dotenv.config();
 const defaultPromptFilePath = path.join(process.cwd(), "src/agent/systemPrompt.txt");
@@ -80,7 +80,9 @@ const parametersForTool = (toolId: string) => {
     'asset.create': {
       properties: {
         type: { type: 'string', enum: ['characters', 'locations', 'props'], description: '资产类型（必填）：characters（角色）、locations（场景）、props（道具）' },
-        name: { type: 'string', description: '资产名称（如"Vivian"、"晚礼服造型"、"餐车车厢"、"机械钥匙"）' },
+        parentId: { type: 'string', description: '可选，若向已有资产追加二级版本（如新服装、夜景版），填入父资产 ID' },
+        name: { type: 'string', description: '资产名称（如"戴安娜"、"伯爵大厅"、"画（生日蛋糕）"）' },
+        description: { type: 'string', description: '资产识别浅色描述（防混淆、防重复、防丢失必填）：道具写明首次出场、谁的、与相似道具区分点；场景写明首次出场、归属及日夜景区分；角色写明首次出场、核心身份关系与多服装区分' },
         role: { type: 'string', description: '角色身份设定（角色适用，如"女主/列车掌权者"）' },
         appearance: { type: 'string', description: '外貌、服装穿搭与细节特征（角色适用）' },
         age: { type: 'string', description: '角色年龄' },
@@ -88,30 +90,38 @@ const parametersForTool = (toolId: string) => {
         personality: { type: 'string', description: '性格特征与心理状态' },
         performanceNotes: { type: 'string', description: '镜头表演与情绪重点' },
         locationType: { type: 'string', enum: ['INT', 'EXT'], description: '场景类型（场景适用）：INT（内景）、EXT（外景）' },
-        timeOfDay: { type: 'string', description: '时间氛围（场景适用，如"雨夜"、"黄昏"、"日景"）' },
+        timeOfDay: { type: 'string', description: '时间氛围（场景适用，如"雨夜"、"黄昏"、"日景"、"夜景"）' },
         atmosphere: { type: 'string', description: '空间氛围与光影影调（场景适用）' },
         visualDetails: { type: 'string', description: '空间结构、建筑材质与美术细节（场景适用）' },
         owner: { type: 'string', description: '道具所属角色（道具适用）' },
         materialAndState: { type: 'string', description: '材质与物理状态（道具适用）' },
         storySignificance: { type: 'string', description: '剧情关键作用与特写重点（道具适用）' },
+        aliases: { type: 'array', items: { type: 'string' }, description: '该资产在剧本中的简称或别名列表' },
         sourceScenes: { type: 'array', items: { type: 'string' }, description: '该资产在剧本中出现的位置/场次出处列表（如 ["第1集第1场", "第2集第3场"]）' },
-        items: { type: 'array', items: { type: 'object' }, description: '批量创建资产对象列表（每个对象可包含 name, sourceScenes 及各分类属性）' }
+        versions: {
+          type: 'array',
+          items: { type: 'object' },
+          description: '多版本二级列表（场景若有日景和夜景须拆分为两个版本；角色若有不同服装须拆分为不同版本；每项含 name、description 及对应外貌/光影/场次字段）'
+        },
+        items: { type: 'array', items: { type: 'object' }, description: '批量创建资产对象列表（每个对象可包含 name, description, versions, sourceScenes 及各分类属性）' }
       },
       required: ['type']
     },
     'asset.update': {
       properties: {
-        id: { type: 'string', description: '要修改的目标资产 ID（如 "char_xxx", "loc_xxx", "prop_xxx"）' },
+        id: { type: 'string', description: '要修改的目标资产 ID 或二级版本 ID（如 "char_xxx", "loc_xxx", "prop_xxx"）' },
         type: { type: 'string', enum: ['characters', 'locations', 'props'], description: '资产类型（可选）' },
-        updates: { type: 'object', description: '待更新的属性键值对（如 name, appearance, role, sourceScenes 等）' },
-        name: { type: 'string', description: '直接修改资产名称' },
+        updates: { type: 'object', description: '待更新的属性键值对（如 name, description, versions, appearance, role, sourceScenes 等）' },
+        name: { type: 'string', description: '直接修改资产或版本名称' },
+        description: { type: 'string', description: '直接修改资产识别浅色描述（首次出场、所属人、区分特征等）' },
         role: { type: 'string', description: '直接修改角色身份' },
         appearance: { type: 'string', description: '直接修改角色外貌/服装' },
         atmosphere: { type: 'string', description: '直接修改场景氛围' },
         visualDetails: { type: 'string', description: '直接修改场景细节' },
         materialAndState: { type: 'string', description: '直接修改道具材质状态' },
         storySignificance: { type: 'string', description: '直接修改道具剧情作用' },
-        sourceScenes: { type: 'array', items: { type: 'string' }, description: '直接更新或补充资产出现的位置/场次出处列表' }
+        sourceScenes: { type: 'array', items: { type: 'string' }, description: '直接更新或补充资产出现的位置/场次出处列表' },
+        versions: { type: 'array', items: { type: 'object' }, description: '更新该资产的多版本二级列表（如不同服装版本、日景/夜景版本）' }
       },
       required: ['id']
     },
@@ -121,6 +131,26 @@ const parametersForTool = (toolId: string) => {
         ids: { type: 'array', items: { type: 'string' }, description: '待批量删除的资产 ID 列表' },
         type: { type: 'string', enum: ['characters', 'locations', 'props'], description: '资产类型（可选）' }
       }
+    },
+    'asset.searchProvenanceCandidates': {
+      properties: {
+        id: { type: 'string', description: '目标资产 ID（如 "prop_xxx"、"char_xxx"、"loc_xxx"）' },
+        name: { type: 'string', description: '目标资产名称（如 "纯金钥匙"）' },
+        type: { type: 'string', enum: ['characters', 'locations', 'props'], description: '资产类型（可选）' },
+        aliases: { type: 'array', items: { type: 'string' }, description: '你根据该资产设定推断出的剧本中可能出现的简称或别名列表（如 ["纯金钥匙", "金钥匙", "钥匙"]）' },
+        scopeScenes: { type: 'array', items: { type: 'string' }, description: '可选，限定检索的分集/场次标题列表' }
+      }
+    },
+    'asset.commitProvenance': {
+      properties: {
+        id: { type: 'string', description: '目标资产 ID（如 "prop_xxx"）' },
+        name: { type: 'string', description: '目标资产名称（可选）' },
+        type: { type: 'string', enum: ['characters', 'locations', 'props'], description: '资产类型（可选）' },
+        aliases: { type: 'array', items: { type: 'string' }, description: '确认有效的资产别名/简称列表' },
+        verifiedCandidateIds: { type: 'array', items: { type: 'string' }, description: '经你逐一检查上下文后确认为该资产真实出场的 candidateId 列表（如 ["cand_0", "cand_2"]）' },
+        summary: { type: 'string', description: '核验结论与排除说明摘要' }
+      },
+      required: ['id', 'verifiedCandidateIds']
     },
     'ui.actAndObserve': { properties: { targetId: target, action: { type: 'string', enum: ['mouse.move', 'mouse.click', 'mouse.doubleClick', 'mouse.longPress', 'mouse.hover', 'mouse.drag', 'mouse.scroll', 'mouse.type', 'mouse.keyPress'] }, arguments: { type: 'object', description: '鼠标动作的附加参数。例如：mouse.scroll 可传 { delta: number }（正数向下，负数向上）；mouse.type 可传 { text: string, clear?: boolean }（输入文本，clear 为 true 时先清空原有内容）；mouse.keyPress 可传 { key: string, shiftKey?: boolean }（如 key="Enter"）' }, observe: { type: 'object', properties: observationProperties } }, required: ['targetId', 'action'] },
     'page.inspect': { properties: observationProperties },
@@ -327,12 +357,17 @@ interface ModelConfig {
 function getModelConfig(modelType: string, userKey?: string): ModelConfig {
   let endpoint = 'https://api.deepseek.com/chat/completions';
   let actualModel = 'deepseek-flash';
-  let apiKey = userKey || process.env.DEEPSEEK_API_KEY;
+  let apiKey = userKey || process.env.GEMINI_API_KEY || process.env.DEEPSEEK_API_KEY || process.env.DASHSCOPE_API_KEY || process.env.ARK_API_KEY || process.env.VOLCENGINE_API_KEY || process.env.ZHIPU_API_KEY || process.env.SILICONFLOW_API_KEY;
   let stream = true;
   let enableThinking = false;
   let reasoningEffort: 'low' | 'high' | 'max' = 'max';
 
-  if (modelType === 'deepseek-v4-pro') {
+  if (modelType.toLowerCase().includes('gemini') || modelType === 'gemini-2.5-flash' || modelType === 'gemini-2.5-pro') {
+    endpoint = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
+    actualModel = modelType.toLowerCase().includes('pro') ? 'gemini-2.5-pro' : 'gemini-2.5-flash';
+    apiKey = userKey || process.env.GEMINI_API_KEY || process.env.DEEPSEEK_API_KEY;
+    stream = true;
+  } else if (modelType === 'deepseek-v4-pro') {
     actualModel = 'deepseek-v4-pro';
     enableThinking = true;
     stream = true;
@@ -343,13 +378,26 @@ function getModelConfig(modelType: string, userKey?: string): ModelConfig {
     modelType === 'deepseek' ||
     modelType === 'auto'
   ) {
-    actualModel = 'deepseek-flash';
-    enableThinking = false;
-    stream = true;
+    if (
+      (modelType === 'auto' || modelType === 'deepseek-v4-flash') &&
+      process.env.GEMINI_API_KEY &&
+      !process.env.DEEPSEEK_API_KEY &&
+      !userKey
+    ) {
+      endpoint = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
+      actualModel = 'gemini-2.5-flash';
+      apiKey = process.env.GEMINI_API_KEY;
+      enableThinking = false;
+      stream = true;
+    } else {
+      actualModel = 'deepseek-flash';
+      enableThinking = false;
+      stream = true;
+    }
   } else if (modelType === 'qwen3.8-flash') {
     endpoint = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';
     actualModel = 'qwen3.8-flash';
-    apiKey = userKey || process.env.DASHSCOPE_API_KEY || process.env.DEEPSEEK_API_KEY;
+    apiKey = userKey || process.env.DASHSCOPE_API_KEY || process.env.GEMINI_API_KEY || process.env.DEEPSEEK_API_KEY;
     stream = true;
   } else if (
     modelType === 'qwen3-vl-plus' ||
@@ -359,7 +407,7 @@ function getModelConfig(modelType: string, userKey?: string): ModelConfig {
   ) {
     endpoint = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';
     actualModel = 'qwen3-vl-plus';
-    apiKey = userKey || process.env.DASHSCOPE_API_KEY || process.env.DEEPSEEK_API_KEY;
+    apiKey = userKey || process.env.DASHSCOPE_API_KEY || process.env.GEMINI_API_KEY || process.env.DEEPSEEK_API_KEY;
     stream = true;
   } else if (
     modelType === 'doubao-seed-2-1-pro-260915' ||
@@ -373,7 +421,7 @@ function getModelConfig(modelType: string, userKey?: string): ModelConfig {
   ) {
     endpoint = process.env.ARK_API_ENDPOINT || 'https://ark.cn-beijing.volces.com/api/v3/chat/completions';
     actualModel = process.env.ARK_MODEL_NAME || 'doubao-seed-2-1-pro-260915';
-    apiKey = userKey || process.env.ARK_API_KEY || process.env.VOLCENGINE_API_KEY || process.env.DASHSCOPE_API_KEY || process.env.DEEPSEEK_API_KEY;
+    apiKey = userKey || process.env.ARK_API_KEY || process.env.VOLCENGINE_API_KEY || process.env.GEMINI_API_KEY || process.env.DASHSCOPE_API_KEY || process.env.DEEPSEEK_API_KEY;
     stream = true;
     enableThinking = false;
   } else if (
@@ -382,7 +430,7 @@ function getModelConfig(modelType: string, userKey?: string): ModelConfig {
   ) {
     endpoint = process.env.GLM_API_ENDPOINT || 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';
     actualModel = process.env.GLM_MODEL_NAME || process.env.ZHIPU_MODEL_NAME || 'ZHIPU/GLM-5.3-Flash';
-    apiKey = userKey || process.env.DASHSCOPE_API_KEY || process.env.ZHIPU_API_KEY || process.env.DEEPSEEK_API_KEY;
+    apiKey = userKey || process.env.DASHSCOPE_API_KEY || process.env.ZHIPU_API_KEY || process.env.GEMINI_API_KEY || process.env.DEEPSEEK_API_KEY;
     stream = true;
     enableThinking = true;
 
@@ -395,7 +443,7 @@ function getModelConfig(modelType: string, userKey?: string): ModelConfig {
     }
   }
 
-  if (!apiKey) throw new Error('未配置 API Key');
+  if (!apiKey) throw new Error('未配置 API Key。请在 Settings > Secrets 面板中配置 GEMINI_API_KEY 或相关 API 密钥。');
   return { endpoint, actualModel, apiKey, stream, enableThinking, reasoningEffort };
 }
 
@@ -813,12 +861,74 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
         .filter((tool) => enabledToolIds.has(tool.id))
         .map((tool) => `【${tool.id}】\n  描述：${tool.description}\n  支持的参数：${tool.input}`)
         .join('\n\n');
-      const toolCatalog = turnContext.catalog.map(tool => `${tool.id}：${tool.description.slice(0, 65)}`).join('\n');
-      const promptCatalog = Object.entries(PROMPT_MODULES).map(([id, module]) => `${id}：${module.label}`).join('\n');
-      const selectedPrompts = turnContext.prompts.map(id => `【${PROMPT_MODULES[id].label}】\n${PROMPT_MODULES[id].content}`).join('\n\n');
-      const contextHeader = `【本轮上下文】思考层级：${turnContext.level}（0 全局规划，1 局部执行）。已注入工具：${turnContext.tools.join('、')}。已注入提示词：${turnContext.prompts.join('、') || '无'}。\n仅可调用本轮已注入工具。通过 sys.selectContext 选择下一轮的 level、tools、prompts；例如 {{调用 sys.selectContext, {"level":1,"tools":["script.read"],"prompts":["script"]}}。选择替换上一轮并在下一轮生效；可随时切换回 0 级。\n【可选工具目录】\n${toolCatalog}\n【可选提示词目录】\n${promptCatalog}\n【已选择的提示词】\n${selectedPrompts || '无'}\n`;
+      const getFirstSentence = (text: string): string => {
+        if (!text) return '';
+        const trimmed = text.trim();
+        const periodIdx = trimmed.search(/[。！？\n]/);
+        if (periodIdx !== -1) {
+          return trimmed.slice(0, periodIdx + 1);
+        }
+        return trimmed;
+      };
 
-            const formatObservations = (obsList: any[]) => {
+      const availableToolEntries = turnContext.catalog
+        .filter(tool => !CONTROL_TOOLS.includes(tool.id) && !enabledToolIds.has(tool.id) && tool.id !== 'card.annotateElements');
+      const toolCatalog = availableToolEntries.length
+        ? availableToolEntries.map(tool => `${tool.id}：${getFirstSentence(tool.description)}`).join('\n')
+        : '无（全部业务工具已在本轮注入）';
+      const activePromptSet = new Set(turnContext.prompts);
+      const availablePromptEntries = Object.entries(PROMPT_MODULES).filter(([id]) => !activePromptSet.has(id));
+      const promptCatalog = availablePromptEntries.length
+        ? availablePromptEntries.map(([id, module]) => `${id}：${module.label}`).join('\n')
+        : '无（全部提示词模块已生效）';
+      const selectedPrompts = turnContext.prompts.map(id => `【${PROMPT_MODULES[id].label}】\n${PROMPT_MODULES[id].content}`).join('\n\n');
+      const contextHeader = `【本轮上下文】思考层级：${turnContext.level}（0 全局规划，1 局部执行） | 已注入工具：${turnContext.tools.join('、')} | 已注入提示词：${turnContext.prompts.join('、') || '无'}
+规则：仅可调用本轮已注入工具。需增减工具、提示词或切换层级时，调用 {{调用 sys.selectContext, {"level": 0|1, "tools": [...], "prompts": [...]}}} 在下一轮生效。
+【可选业务工具目录（供 sys.selectContext 选择注入）】
+${toolCatalog}
+【可选提示词目录】
+${promptCatalog}
+【已生效的提示词】
+${selectedPrompts || '无'}
+`;
+
+      const cleanToolOutput = (val: unknown, depth = 0): unknown => {
+        if (depth > 6) return val;
+        if (val === null || val === undefined) return undefined;
+        if (typeof val === 'string') {
+          const trimmed = val.trim();
+          if (!trimmed) return undefined;
+          if (trimmed.startsWith('data:image/') || (trimmed.length > 500 && /^[A-Za-z0-9+/=]{500,}$/.test(trimmed))) {
+            return `[图片数据 ${Math.round(trimmed.length / 1024)}KB]`;
+          }
+          return trimmed;
+        }
+        if (typeof val !== 'object') {
+          return val;
+        }
+        if (Array.isArray(val)) {
+          const cleanedArr = val
+            .map(item => cleanToolOutput(item, depth + 1))
+            .filter(item => item !== undefined);
+          return cleanedArr;
+        }
+        const cleanedObj: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+          const cleanedVal = cleanToolOutput(v, depth + 1);
+          if (cleanedVal !== undefined && !(Array.isArray(cleanedVal) && cleanedVal.length === 0)) {
+            cleanedObj[k] = cleanedVal;
+          }
+        }
+        return cleanedObj;
+      };
+
+      const serializeCleanOutput = (output: any): string => {
+        if (typeof output === 'string') return output;
+        const cleaned = cleanToolOutput(output);
+        return JSON.stringify(cleaned ?? {});
+      };
+
+      const formatObservations = (obsList: any[]) => {
         let pageObs: string[] = [];
         let toolObs: string[] = [];
 
@@ -898,15 +1008,21 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
               pageObs.push(`【UI交互成功】动作 ${output.action} 作用于 ${output.targetId}。\n${pageText}`);
             } else if (name === 'guide.lookup') {
               toolObs.push(`【操作指南查询结果】\n查询词：${output.query || '未提供'}\n指南内容：${output.guidance}`);
+            } else if (name === 'user.ask') {
+              const askOut = output && typeof output === 'object' ? (output as any) : { answer: output };
+              const qText = askOut.question || '向用户提问';
+              const aText = askOut.answer ?? serializeCleanOutput(output);
+              const ctxLine = askOut.agentContext ? `\n提问前思考脉络：${askOut.agentContext}` : '';
+              toolObs.push(`【工具 user.ask 执行成功（用户已回复）】\n提问内容：${qText}${ctxLine}\n用户最新回答：${aText}`);
             } else {
-              toolObs.push(`【工具 ${name} 执行成功】\n${typeof output === 'string' ? output : JSON.stringify(output)}`);
+              toolObs.push(`【工具 ${name} 执行成功】\n${serializeCleanOutput(output)}`);
             }
           });
         }
 
         return {
-          pageObservations: pageObs.length ? pageObs.join('\n\n') : '暂无页面事实，请先调用 page.inspect 观察。',
-          toolResults: toolObs.length ? toolObs.join('\n\n') : '暂无。'
+          pageObservations: pageObs.length ? pageObs.join('\n\n') : '无',
+          toolResults: toolObs.length ? toolObs.join('\n\n') : '无'
         };
       };
 
@@ -936,7 +1052,7 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
               if (ev.toolName === 'page.inspect') text += `执行结果：[已观察页面，详见当前最新观察]\n`;
               else if (ev.toolName === 'guide.lookup') text += `执行结果：[已查阅操作指南]\n`;
               else {
-                let out = typeof ev.output === 'string' ? ev.output : JSON.stringify(ev.output || '');
+                let out = serializeCleanOutput(ev.output);
                 if (out.length > 200) out = out.substring(0, 200) + '...';
                 text += `执行结果：${out}\n`;
               }
@@ -962,7 +1078,25 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
         return cleaned.trim() || text.trim();
       };
 
-      const displayUserMessage = cleanUserGoalText(userMessage) || '（无新指令）';
+      const negotiationLog = Array.isArray(task?.negotiationLog) ? task.negotiationLog : [];
+      const userEntries = negotiationLog.filter((item: any) => item && item.role === 'user' && typeof item.content === 'string' && item.content.trim());
+      const firstUserGoal = userEntries.length > 0 ? cleanUserGoalText(userEntries[0].content) : '';
+      let displayUserMessage = cleanUserGoalText(userMessage) || '（无新指令）';
+      if (negotiationLog.length > 1 && userEntries.length > 1) {
+        const dialogueLines = negotiationLog
+          .map((entry: any, idx: number) => {
+            const cleaned = cleanUserGoalText(String(entry?.content || ''));
+            if (!cleaned) return '';
+            if (entry.role === 'agent') {
+              return `- Mira（提问）：${cleaned}`;
+            }
+            const isLatest = idx === negotiationLog.length - 1;
+            return isLatest ? `- 用户（本轮最新回复）：${cleaned}` : `- 用户：${cleaned}`;
+          })
+          .filter(Boolean)
+          .join('\n');
+        displayUserMessage = `【初始任务指令】：${firstUserGoal || displayUserMessage}\n【多轮对话与最新回复】：\n${dialogueLines}\n（请结合初始任务指令与用户的最新回复，直接继续推进任务）`;
+      }
 
       const effectiveCardContext = cardContext || task?.cardContext;
       let cardContextInjection = '';
@@ -990,9 +1124,10 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       }
 
       const basePrompt = getSystemPrompt();
+      const effectiveTaskGoal = cleanUserGoalText(task.goal || task.initialGoal || firstUserGoal) || '尚未设定';
       let finalPrompt = (contextHeader + cardContextInjection + basePrompt + (basePrompt.includes('{{toolPrompt}}') ? '' : `\n【本轮可调用工具】\n${toolPrompt}\n`))
         .replace('{{taskTitle}}', task.title || '尚未命名')
-        .replace('{{taskGoal}}', cleanUserGoalText(task.goal) || '尚未设定')
+        .replace('{{taskGoal}}', effectiveTaskGoal)
         .replace('{{taskSubGoal}}', task.subGoal || '暂未设定')
         .replace('{{taskProgress}}', task.progress || '刚刚开始')
         .replace('{{taskPlan}}', formatPlan(task.plan))
@@ -1076,7 +1211,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         const rawMsg = detail?.error?.message || detail?.message || `HTTP ${response.status}`;
         const isBalanceError = /insufficient\s*balance|quota|402|out\s*of\s*credit|余额不足|欠费/i.test(rawMsg);
         
-        const fallbackSystemKey = process.env.DEEPSEEK_API_KEY || process.env.DASHSCOPE_API_KEY || process.env.ZHIPU_API_KEY || process.env.SILICONFLOW_API_KEY;
+        const fallbackSystemKey = process.env.GEMINI_API_KEY || process.env.DEEPSEEK_API_KEY || process.env.DASHSCOPE_API_KEY || process.env.ZHIPU_API_KEY || process.env.SILICONFLOW_API_KEY;
         if (isBalanceError && fallbackSystemKey && keyToUse !== fallbackSystemKey) {
           console.warn(`User Key insufficient balance (${rawMsg}), retrying with system fallback API key...`);
           const retryRes = await fetch(endpoint, {
@@ -1356,6 +1491,9 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
               argsObj = parsed;
             } else if (parsed && Array.isArray(parsed)) {
               argsObj = { items: parsed };
+            } else if (normalizedName === 'user.ask') {
+              const qStr = typeof parsed === 'string' ? parsed : cleanedArgs.replace(/^[“"'\s]+|[”"'\s]+$/g, '');
+              argsObj = qStr ? { question: qStr } : {};
             } else {
               const err = `【参数语法错误】工具调用参数必须为合法的 JSON 对象格式 {"参数名": "参数值"}。当前输入的内容无法解析为对象：${cleanedArgs.slice(0, 100)}。请按 Schema 规范重构参数。`;
               validationErrors.push({ name: normalizedName, error: err, rawArgs: cleanedArgs });

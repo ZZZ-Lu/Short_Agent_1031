@@ -101,6 +101,7 @@ interface AgentCursorProps {
   isZooming?: boolean;
   isAgentRunning?: boolean;
   isAgentThinking?: boolean;
+  badgeNumber?: number;
   selectedCards?: CardData[];
   quickInput?: QuickInputConfig | null;
   onClickPointer?: () => void;
@@ -286,6 +287,7 @@ export function AgentCursor({
   isZooming = false, 
   isAgentRunning,
   isAgentThinking,
+  badgeNumber,
   selectedCards = [],
   quickInput, 
   onClickPointer, 
@@ -395,9 +397,10 @@ export function AgentCursor({
     return null;
   }, [submittedUserPrompt, isAgentRunning, quickInput?.isOpen, quickInput?.onAskResolve, quickInput?.targetId, quickInput?.contextHistory, quickInput?.lastReply, agentState.lastPrompt, agentState.lastPromptTargetId]);
 
+  const hasSelectedCanvasCards = Boolean(selectedCards && selectedCards.length > 0);
   const isDefaultOrSelectionSpeak = !agentState.speak ||
     rawIsThinking ||
-    agentState.speak.startsWith('选了') ||
+    (hasSelectedCanvasCards && agentState.speak.startsWith('选了')) ||
     agentState.speak === '我能帮什么忙？';
 
   // Effective agent speak for Row 2:
@@ -408,7 +411,7 @@ export function AgentCursor({
   // When Agent is actively running/executing without submittedUserPrompt:
   //   - Strictly execution/thinking mode: show active speak or fallback to "正在思考..." / "正在操作...".
   // When idle and quickInput is open:
-  //   - Show dynamic selection prompt.
+  //   - Show dynamic selection prompt for canvas cards, or preserve specific UI/script/asset selection speak.
   const effectiveAgentSpeak = submittedUserPrompt
     ? (agentState.speak && !agentState.speak.startsWith('选了') && agentState.speak !== '我能帮什么忙？' && !isThinkingPhrase(agentState.speak)
         ? agentState.speak
@@ -683,6 +686,7 @@ export function AgentCursor({
 
   return (
     <motion.div
+      data-agent-cursor-root="true"
       className="fixed top-0 left-0 z-[9999] flex items-center select-none pointer-events-none"
       style={{ x: targetScreenX, y: targetScreenY }}
       initial={false}
@@ -767,6 +771,14 @@ export function AgentCursor({
                 strokeLinejoin="round"
               />
             </svg>
+          )}
+          {badgeNumber !== undefined && badgeNumber > 0 && (
+            <div
+              data-testid={`agent-cursor-badge-${badgeNumber}`}
+              className="absolute -top-1.5 -right-1.5 z-20 min-w-[16px] h-[16px] px-1 rounded-full bg-[#a45cf8] text-white text-[10px] font-bold font-mono leading-none flex items-center justify-center shadow-md border border-white/90 dark:border-zinc-900 select-none pointer-events-none"
+            >
+              {badgeNumber}
+            </div>
           )}
         </div>
         

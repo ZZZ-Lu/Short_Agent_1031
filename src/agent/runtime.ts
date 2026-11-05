@@ -24,6 +24,7 @@ export interface RuntimeTask {
   id: string;
   sessionId: string;
   goal: string;
+  initialGoal?: string;
   title: string;
   status: RuntimeTaskStatus;
   turn: number;
@@ -36,6 +37,7 @@ export interface RuntimeTask {
   history: AgentHistoryItem[];
   events: RuntimeEvent[];
   pendingCallIds: string[];
+  pendingAskCallId?: string;
   negotiationLog: Array<{ role: 'user' | 'agent', content: string, timestamp: number }>;
   lastGoalUpdatedAt: number;
   lastUserInputAt: number;
@@ -81,6 +83,7 @@ export class AgentRuntime {
       id: input.id,
       sessionId: input.sessionId,
       goal: '',
+      initialGoal: input.goal,
       title: '尚未命名',
       status: 'planning',
       turn: 0,
@@ -108,7 +111,11 @@ export class AgentRuntime {
 
   addUserInput(taskId: string, input: string, images?: string[], cardContext?: Record<string, any>) {
     const task = this.requireTask(taskId);
-    task.negotiationLog.push({ role: 'user', content: input, timestamp: Date.now() });
+    const finalAnswer = input.trim() || '（用户未回答）';
+    if (!task.initialGoal && task.goal) {
+      task.initialGoal = task.goal;
+    }
+    task.negotiationLog.push({ role: 'user', content: finalAnswer, timestamp: Date.now() });
     task.lastUserInputAt = Date.now();
     if (images && images.length > 0) {
       task.images = images;
@@ -116,11 +123,60 @@ export class AgentRuntime {
     if (cardContext) {
       task.cardContext = cardContext;
     }
-    this.addEvent(task, { type: 'user', text: input });
+    const currentTurnId = `${task.id}:turn:${task.turn}`;
+    this.addEvent(task, { turnId: currentTurnId, type: 'user', text: finalAnswer });
+
+    const pendingAskEvent = [...task.events].reverse().find(
+      e => e.type === 'tool' && e.toolName === 'user.ask' && (e.status === 'running' || e.status === 'queued')
+    );
+    const askCallId = task.pendingAskCallId || pendingAskEvent?.callId;
+    if (askCallId) {
+      const prevOut = (pendingAskEvent?.output && typeof pendingAskEvent.output === 'object')
+        ? (pendingAskEvent.output as Record<string, unknown>)
+        : {};
+      const question = (typeof prevOut.question === 'string' && prevOut.question)
+        || (typeof pendingAskEvent?.input?.question === 'string' && pendingAskEvent.input.question)
+        || task.summary
+        || '';
+      const askOutput: Record<string, unknown> = {
+        ...prevOut,
+        question: question || '向用户提问',
+        answer: finalAnswer,
+        status: 'answered',
+      };
+      this.updateLastTool(task, askCallId, 'succeeded', `用户已回复：${finalAnswer}`, { output: askOutput });
+      task.observations.push({
+        role: 'tool',
+        content: {
+          callId: askCallId,
+          name: 'user.ask',
+          status: 'succeeded',
+          output: askOutput,
+        },
+      });
+      task.pendingAskCallId = undefined;
+    } else if (task.status === 'waiting_user') {
+      const replyCallId = `user_reply_${Date.now()}`;
+      task.observations.push({
+        role: 'tool',
+        content: {
+          callId: replyCallId,
+          name: 'user.ask',
+          status: 'succeeded',
+          output: {
+            question: task.summary || '等待用户指示',
+            answer: finalAnswer,
+            status: 'answered',
+          },
+        },
+      });
+    }
+
     // If it was waiting, completed, or paused, resume it
     if (task.status === 'waiting_user' || terminal.has(task.status) || task.status === 'paused') {
       task.status = 'planning';
     }
+    this.publish(task);
   }
 
   addAgentQuestion(taskId: string, question: string) {
@@ -130,7 +186,7 @@ export class AgentRuntime {
 
   private isInterrupted(task: RuntimeTask, signal?: AbortSignal): boolean {
     const status = task.status as RuntimeTaskStatus;
-    return status === 'paused' || terminal.has(status) || Boolean(signal?.aborted);
+    return status === 'paused' || status === 'waiting_user' || terminal.has(status) || Boolean(signal?.aborted);
   }
 
   async wake(taskId: string): Promise<RuntimeTask> {
@@ -175,10 +231,24 @@ export class AgentRuntime {
           break;
         }
 
+        const hasUserAskTool = Array.isArray(result.toolCalls) && result.toolCalls.some(
+          call => !call.validationError && (
+            call.name === 'user.ask' ||
+            (call.name === 'sys.endTask' && typeof call.arguments?.waitForUser === 'string' && Boolean(call.arguments.waitForUser))
+          )
+        );
+
         // The debug transport snapshot is for the developer trace only. It
         // must never become part of the next model request's history.
-        // Results are delivered once. Only explicit failure lessons persist.
-        task.observations = [];
+        // Results are delivered once, except when pausing on user.ask where the
+        // data read in the preceding turn must remain visible once the user replies.
+        const preservedObservations = hasUserAskTool
+          ? task.observations.filter(obs => {
+              const name = (obs.content as any)?.name;
+              return name !== 'sys.nudge' && name !== 'user.ask';
+            })
+          : [];
+        task.observations = [...preservedObservations];
         result.narration.forEach(text => this.addEvent(task, { turnId, type: 'thought', text }));
         const fullAnswer = result.response || result.speak || result.fullAnswer;
         if (fullAnswer) {
@@ -201,9 +271,17 @@ export class AgentRuntime {
         if (result.goal && typeof result.goal === 'string') {
           task.goal = result.goal;
         }
+        if (Array.isArray(result.failureSummaries)) {
+          result.failureSummaries.forEach(summary => {
+            if (typeof summary === 'string' && summary.trim()) {
+              task.history.push({ role: 'agent', content: { name: 'agent.failure_summary', summary: summary.trim() } });
+            }
+          });
+        }
 
-        // Dedicated State Node: Automatically extract and update cognitive state after every turn's output
-        if (this.options.updateStateNode && !this.isInterrupted(task, signal)) {
+        // Dedicated State Node: Automatically extract and update cognitive state after every turn's output.
+        // When user.ask is present, transition to waiting_user first so there is zero UI latency/race window.
+        if (this.options.updateStateNode && !hasUserAskTool && !this.isInterrupted(task, signal)) {
           try {
             await this.options.updateStateNode(task, result, signal);
           } catch (nodeErr) {
@@ -307,6 +385,12 @@ export class AgentRuntime {
         }
         task.pendingCallIds = [];
 
+        if (hasUserAskTool && this.options.updateStateNode && !signal.aborted) {
+          void Promise.resolve(this.options.updateStateNode(task, result, signal))
+            .then(() => this.publish(task))
+            .catch(nodeErr => console.warn('Dedicated state node execution failed:', nodeErr));
+        }
+
         this.publish(task);
       }
     } catch (error) {
@@ -323,7 +407,7 @@ export class AgentRuntime {
       }
     } finally {
       this.running.delete(taskId);
-      if ((task.status as RuntimeTaskStatus) !== 'paused') {
+      if ((task.status as RuntimeTaskStatus) !== 'paused' && (task.status as RuntimeTaskStatus) !== 'waiting_user') {
         this.abortControllers.delete(taskId);
       }
     }
@@ -437,6 +521,56 @@ export class AgentRuntime {
       return;
     }
 
+    if (call.name === 'user.ask') {
+      const existingAnswer = task.events.find(e => e.turnId === turnId && e.type === 'answer');
+      const communicationText = existingAnswer?.text || '';
+      const rawQuestion = typeof call.arguments?.question === 'string' && call.arguments.question.trim()
+        ? call.arguments.question.trim()
+        : '';
+      const questionText = rawQuestion || communicationText || '请确认或补充信息：';
+      const thoughtEvents = task.events.filter(e => e.turnId === turnId && e.type === 'thought' && e.text?.trim());
+      const latestThought = thoughtEvents.length > 0 ? thoughtEvents[thoughtEvents.length - 1].text.trim() : undefined;
+
+      if (!existingAnswer && questionText) {
+        this.addEvent(task, { turnId, type: 'answer', text: questionText });
+      }
+      task.summary = communicationText || questionText;
+      task.pendingAskCallId = call.id;
+      task.status = 'waiting_user';
+
+      let hostQuestion = questionText;
+      try {
+        const hostOut = await this.options.executeTool(call, task, signal);
+        if (typeof hostOut === 'string' && hostOut.trim()) {
+          hostQuestion = hostOut.trim();
+        } else if (hostOut && typeof hostOut === 'object' && typeof (hostOut as any).question === 'string' && (hostOut as any).question.trim()) {
+          hostQuestion = (hostOut as any).question.trim();
+        }
+      } catch (err) {
+        console.warn('user.ask host hook error:', err);
+      }
+
+      const fullQuestionForContext = communicationText && rawQuestion && !communicationText.includes(rawQuestion)
+        ? `${rawQuestion}（${communicationText}）`
+        : (communicationText || rawQuestion || hostQuestion);
+
+      const lastLog = task.negotiationLog[task.negotiationLog.length - 1];
+      if (!lastLog || lastLog.role !== 'agent' || lastLog.content !== fullQuestionForContext) {
+        task.negotiationLog.push({ role: 'agent', content: fullQuestionForContext, timestamp: Date.now() });
+      }
+
+      this.updateLastTool(task, call.id, 'running', `等待用户回复：${hostQuestion}`, {
+        output: {
+          question: fullQuestionForContext,
+          shortQuestion: hostQuestion,
+          agentContext: latestThought,
+          status: 'waiting_user',
+        },
+      });
+      this.publish(task);
+      return;
+    }
+
     if (call.name === 'sys.endTask') {
       const existingAnswer = task.events.find(e => e.turnId === turnId && e.type === 'answer');
       const communicationText = existingAnswer?.text || '';
@@ -467,7 +601,12 @@ export class AgentRuntime {
         if (!existingAnswer) {
           this.addEvent(task, { turnId, type: 'answer', text: waitForUserText });
         }
-        task.summary = communicationText || waitForUserText || task.summary;
+        const fullAsk = communicationText || waitForUserText;
+        const lastLog = task.negotiationLog[task.negotiationLog.length - 1];
+        if (fullAsk && (!lastLog || lastLog.role !== 'agent' || lastLog.content !== fullAsk)) {
+          task.negotiationLog.push({ role: 'agent', content: fullAsk, timestamp: Date.now() });
+        }
+        task.summary = fullAsk || task.summary;
       } else if (isPaused) {
         task.status = 'paused';
         const pauseMsg = communicationText || '任务已挂起暂停，等待后台事件唤醒。';
@@ -490,7 +629,7 @@ export class AgentRuntime {
 
     try {
       const output = await this.options.executeTool(call, task, signal);
-      if (task.status === 'paused' || terminal.has(task.status) || signal?.aborted) return;
+      if (task.status === 'paused' || task.status === 'waiting_user' || terminal.has(task.status) || signal?.aborted) return;
       this.updateLastTool(task, call.id, 'succeeded', `已完成：${call.name}`, { output });
       task.observations.push({ role: 'tool', content: { callId: call.id, name: call.name, status: 'succeeded', output } });
     } catch (error) {

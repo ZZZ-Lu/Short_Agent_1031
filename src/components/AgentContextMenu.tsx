@@ -40,7 +40,7 @@ export function AgentContextMenu({
   // Viewport clamping
   const menuWidth = 260;
   const clampedX = typeof window !== 'undefined' ? Math.max(12, Math.min(x, window.innerWidth - menuWidth - 20)) : x;
-  const clampedY = typeof window !== 'undefined' ? Math.max(12, Math.min(y, window.innerHeight - 240)) : y;
+  const clampedY = typeof window !== 'undefined' ? Math.max(12, Math.min(y, window.innerHeight - 155)) : y;
 
   return (
     <div
@@ -55,7 +55,7 @@ export function AgentContextMenu({
         animate={{ opacity: 1, y: 0 }}
         exit={{ opacity: 0, y: 5 }}
         transition={{ duration: 0.15 }}
-        className="bg-gray-100 dark:bg-neutral-800 border border-gray-200/80 dark:border-[#404040]/80 shadow-[0_12px_40px_rgb(0,0,0,0.12)] rounded-2xl corner-squircle w-[260px] overflow-hidden"
+        className="bg-gray-100 dark:bg-neutral-800 border border-gray-300 dark:border-[#404040]/80 shadow-[0_12px_40px_rgb(0,0,0,0.12)] rounded-2xl corner-squircle w-[260px] overflow-hidden"
       >
         {/* Quick Actions */}
         <div className="p-1.5 flex flex-col">

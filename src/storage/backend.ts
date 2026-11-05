@@ -35,14 +35,31 @@ export class StorageBackend {
   private connection?: Promise<IDBDatabase>;
   private open() {
     return this.connection ||= new Promise((resolve, reject) => {
-      const req = indexedDB.open(this.databaseName, 1);
-      req.onupgradeneeded = () => {
-        for (const store of ['projects', 'cards', 'assets', 'history']) req.result.createObjectStore(store);
+      const createStores = (db: IDBDatabase) => {
+        for (const store of ['projects', 'cards', 'assets', 'history']) {
+          if (!db.objectStoreNames.contains(store)) db.createObjectStore(store);
+        }
       };
+      const req = indexedDB.open(this.databaseName, 1);
+      req.onupgradeneeded = () => createStores(req.result);
       req.onerror = () => { this.connection = undefined; reject(req.error); };
       req.onblocked = () => { /* Existing connections close on versionchange. Never delete the database. */ };
       req.onsuccess = () => {
         const db = req.result;
+        if (!db.objectStoreNames.contains('projects')) {
+          const nextVer = (db.version || 1) + 1;
+          db.close();
+          const upgradeReq = indexedDB.open(this.databaseName, nextVer);
+          upgradeReq.onupgradeneeded = () => createStores(upgradeReq.result);
+          upgradeReq.onsuccess = () => {
+            const upgradedDb = upgradeReq.result;
+            upgradedDb.onversionchange = () => { upgradedDb.close(); this.connection = undefined; };
+            upgradedDb.onclose = () => { this.connection = undefined; };
+            resolve(upgradedDb);
+          };
+          upgradeReq.onerror = () => { this.connection = undefined; reject(upgradeReq.error); };
+          return;
+        }
         db.onversionchange = () => { db.close(); this.connection = undefined; };
         db.onclose = () => { this.connection = undefined; };
         resolve(db);
