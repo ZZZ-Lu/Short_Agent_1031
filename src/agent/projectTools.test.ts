@@ -647,3 +647,77 @@ test('出处防误判与严格锚点还原：Agent提交3处出处时界面绝�
   ]);
 });
 
+test('asset.commitProvenance 跨集增量补充与重设测试：补充第二集出处时默认保留第一集出处，显式传 mode="overwrite" 时才全量替换', () => {
+  const multiEpScript = [
+    '第一集',
+    '1-5',
+    '日 外 布莱克伍德庄园',
+    '人物 娜塔莉亚 布拉姆 管家 塞莱特斯',
+    '▲庄园的门被打开，打量着坐在主位的男人【布莱克伍德家主：布拉姆】，布拉姆衣着华丽，随意把玩着手中的手枪。',
+    '布拉姆：哦？你就不怕沦为野兽的口粮吗？',
+    '第二集',
+    '2-1',
+    '日 外 布莱克伍德庄园',
+    '人物 娜塔莉亚 布拉姆 塞莱特斯 戴安娜',
+    '▲布拉姆看到塞莱特斯，眼神平静又带着几分冷漠。',
+    '▲布拉姆一下子站了起来，佣人们齐刷刷地低下头去，他冷眼看着塞莱特斯。',
+    '▲娜塔莉亚被打得侧着脸，布拉姆立刻拦住了塞莱特斯。',
+  ].join('\n');
+
+  let proj: ProjectData = {
+    id: 'p_multi_ep',
+    scriptText: multiEpScript,
+    characters: [],
+    locations: [],
+    props: [],
+  };
+
+  // 第一步：提取第一集出处（2处）
+  const createRes = executeProjectAssetMutation('asset.create', {
+    type: 'characters',
+    name: '布拉姆',
+    role: '布莱克伍德家主 / 教父',
+    provenances: [
+      { sceneTitle: '1-5', evidenceText: '▲庄园的门被打开，打量着坐在主位的男人【布莱克伍德家主：布拉姆】，布拉姆衣着华丽，随意把玩着手中的手枪。' },
+      { sceneTitle: '1-5', evidenceText: '布拉姆：哦？你就不怕沦为野兽的口粮吗？' },
+    ],
+  }, proj);
+  proj = { ...proj, ...createRes.updatedProject };
+  const bramId = proj.characters[0].id;
+  assert.equal(proj.characters[0].verifiedProvenance.length, 2);
+
+  // 第二步：调用 asset.commitProvenance 补充第二集出处（3处），不传 mode（默认 append）
+  const commitEp2 = executeProjectAssetMutation('asset.commitProvenance', {
+    id: bramId,
+    type: 'characters',
+    provenances: [
+      { sceneTitle: '第二集 2-1', evidenceText: '▲布拉姆看到塞莱特斯，眼神平静又带着几分冷漠。' },
+      { sceneTitle: '第二集 2-1', evidenceText: '▲布拉姆一下子站了起来，佣人们齐刷刷地低下头去，他冷眼看着塞莱特斯。' },
+      { sceneTitle: '第二集 2-1', evidenceText: '▲娜塔莉亚被打得侧着脸，布拉姆立刻拦住了塞莱特斯。' },
+    ],
+    summary: '补充第二集2-1布莱克伍德庄园中布拉姆的出场出处',
+  }, proj);
+  proj = { ...proj, ...commitEp2.updatedProject };
+
+  const updatedBram = proj.characters[0];
+  assert.equal((commitEp2.output as any).mode, 'append');
+  assert.equal((commitEp2.output as any).submittedCount, 3);
+  assert.equal(updatedBram.verifiedProvenance.length, 5, '第一集2处 + 第二集3处，共应保留5处出处');
+  assert.ok(updatedBram.sourceScenes.some((s: string) => s.includes('1-5')), '必须保留第一集场次');
+  assert.ok(updatedBram.sourceScenes.some((s: string) => s.includes('2-1')), '必须包含第二集场次');
+
+  // 第三步：若显式传入 mode: "overwrite"，则仅保留本次提交的锚点
+  const overwriteRes = executeProjectAssetMutation('asset.commitProvenance', {
+    id: bramId,
+    type: 'characters',
+    mode: 'overwrite',
+    provenances: [
+      { sceneTitle: '第二集 2-1', evidenceText: '▲布拉姆看到塞莱特斯，眼神平静又带着几分冷漠。' },
+    ],
+  }, proj);
+  proj = { ...proj, ...overwriteRes.updatedProject };
+  assert.equal((overwriteRes.output as any).mode, 'overwrite');
+  assert.equal(proj.characters[0].verifiedProvenance.length, 1);
+});
+
+

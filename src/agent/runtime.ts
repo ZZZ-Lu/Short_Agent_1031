@@ -1,5 +1,5 @@
 import type { AgentHistoryItem, AgentToolCall, AgentTurnResult } from './protocol';
-import { initialAgentContext, validateSelection, type AgentContextSelection } from './contextPolicy';
+import { initialAgentContext, mergeTaskNotes, validateSelection, type AgentContextSelection } from './contextPolicy';
 
 export type RuntimeTaskStatus = 'planning' | 'waiting_tools' | 'waiting_user' | 'completed' | 'failed' | 'cancelled' | 'paused';
 export type RuntimeToolStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
@@ -279,17 +279,14 @@ export class AgentRuntime {
           });
         }
 
-        // Dedicated State Node: Automatically extract and update cognitive state after every turn's output.
-        // When user.ask is present, transition to waiting_user first so there is zero UI latency/race window.
-        if (this.options.updateStateNode && !hasUserAskTool && !this.isInterrupted(task, signal)) {
-          try {
-            await this.options.updateStateNode(task, result, signal);
-          } catch (nodeErr) {
-            console.warn('Dedicated state node execution failed:', nodeErr);
-          }
-        }
-
         if (result.complete) {
+          if (this.options.updateStateNode && !this.isInterrupted(task, signal)) {
+            try {
+              await this.options.updateStateNode(task, result, signal);
+            } catch (nodeErr) {
+              console.warn('Dedicated state node execution failed:', nodeErr);
+            }
+          }
           task.status = 'completed';
           if (result.speak) task.summary = result.speak;
           this.publish(task);
@@ -300,12 +297,10 @@ export class AgentRuntime {
           // Check if this task is an active multi-step autonomous task with unfinished work
           const planList = Array.isArray(task.plan) && task.plan.length > 0 ? task.plan : (Array.isArray(result.plan) && result.plan.length > 0 ? result.plan : []);
           const hasPendingPlan = planList.some(p => p && p.status !== 'completed');
-          const hasActiveSubGoal = Boolean(task.subGoal && task.subGoal.trim() && task.subGoal !== '暂未设定');
-          const isAutonomousMode = task.thinkingLevel === 1;
-          const hasActiveGoal = Boolean(task.goal && task.goal.trim() && task.goal !== '尚未设定');
+          const isAutonomousMode = task.context?.level === 1 || task.thinkingLevel === 1;
           const hasExecutedTools = task.events.some(e => e.type === 'tool' && e.status === 'succeeded');
 
-          const isUnfinishedTask = hasPendingPlan || hasActiveSubGoal || (isAutonomousMode && hasActiveGoal) || (hasActiveGoal && hasExecutedTools);
+          const isUnfinishedTask = hasPendingPlan || isAutonomousMode || hasExecutedTools;
 
           if (isUnfinishedTask && emptyToolCount < MAX_EMPTY_TOOL_RETRIES) {
             emptyToolCount++;
@@ -342,6 +337,13 @@ export class AgentRuntime {
             break;
           }
 
+          if (this.options.updateStateNode && !this.isInterrupted(task, signal)) {
+            try {
+              await this.options.updateStateNode(task, result, signal);
+            } catch (nodeErr) {
+              console.warn('Dedicated state node execution failed:', nodeErr);
+            }
+          }
           task.status = 'completed';
           if (result.speak) task.summary = result.speak;
           this.publish(task);
@@ -385,10 +387,21 @@ export class AgentRuntime {
         }
         task.pendingCallIds = [];
 
-        if (hasUserAskTool && this.options.updateStateNode && !signal.aborted) {
-          void Promise.resolve(this.options.updateStateNode(task, result, signal))
-            .then(() => this.publish(task))
-            .catch(nodeErr => console.warn('Dedicated state node execution failed:', nodeErr));
+        // Dedicated State Node: Run AFTER tools have executed so the cognitive state
+        // reflects the actual completed tool actions (e.g., sys.selectContext already loaded tools).
+        // When user.ask is present, fire non-blocking so waiting_user UI updates with zero latency.
+        if (this.options.updateStateNode && !signal.aborted && (task.status as RuntimeTaskStatus) !== 'cancelled') {
+          if (hasUserAskTool) {
+            void Promise.resolve(this.options.updateStateNode(task, result, signal))
+              .then(() => this.publish(task))
+              .catch(nodeErr => console.warn('Dedicated state node execution failed:', nodeErr));
+          } else {
+            try {
+              await this.options.updateStateNode(task, result, signal);
+            } catch (nodeErr) {
+              console.warn('Dedicated state node execution failed:', nodeErr);
+            }
+          }
         }
 
         this.publish(task);
@@ -464,7 +477,14 @@ export class AgentRuntime {
       try {
         const selection = validateSelection(call.arguments, this.options.enabledTools?.() ?? []);
         task.context = selection;
-        this.updateLastTool(task, call.id, 'succeeded', '已选择下一轮上下文', { output: selection });
+        task.thinkingLevel = selection.level;
+        if (Array.isArray(selection.categories)) {
+          task.requestedCategories = selection.categories;
+        }
+        const loadedDesc = selection.categories && selection.categories.length > 0
+          ? selection.categories.join(', ')
+          : (selection.tools.join(', ') || '无');
+        this.updateLastTool(task, call.id, 'succeeded', `已切换至 ${selection.level} 级并装载工具: ${loadedDesc}`, { output: selection });
         task.observations.push({ role: 'tool', content: { callId: call.id, name: call.name, status: 'succeeded', output: selection } });
       } catch (error) {
         const message = error instanceof Error ? error.message : '上下文选择失败';
@@ -487,16 +507,12 @@ export class AgentRuntime {
         rawNotes = rawNotes.join('\n');
       }
       if (typeof rawNotes === 'string') {
-        const mode = call.arguments.notesMode || call.arguments.mode;
-        if (mode === 'overwrite' || mode === 'replace' || mode === 'rewrite') {
-          task.notes = rawNotes;
-        } else {
-          task.notes = task.notes ? task.notes + '\n' + rawNotes : rawNotes;
-        }
+        const mode = String(call.arguments.notesMode || call.arguments.mode || 'append');
+        task.notes = mergeTaskNotes(task.notes, rawNotes, mode);
       } else if (typeof call.arguments.overwriteNotes === 'string') {
-        task.notes = call.arguments.overwriteNotes;
+        task.notes = mergeTaskNotes(task.notes, call.arguments.overwriteNotes, 'overwrite');
       } else if (typeof call.arguments.appendNotes === 'string') {
-        task.notes = task.notes ? task.notes + '\n' + call.arguments.appendNotes : call.arguments.appendNotes;
+        task.notes = mergeTaskNotes(task.notes, call.arguments.appendNotes, 'append');
       }
       if (Array.isArray(call.arguments.plan)) task.plan = call.arguments.plan.map((item: any) => ({ ...item, status: item.status || 'pending' }));
       this.updateLastTool(task, call.id, 'succeeded', `已完成：${call.name}`, { output: '状态已持久化' });

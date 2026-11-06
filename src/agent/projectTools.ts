@@ -287,20 +287,33 @@ function attachDirectProvenancesToItem(
 
   if (newAnchors.length === 0) return;
 
-  const existingAnchors: VerifiedAnchorRecord[] = Array.isArray(targetItem.verifiedProvenance)
-    ? targetItem.verifiedProvenance
-    : [];
+  const isOverwrite =
+    rawInput.mode === 'overwrite' ||
+    rawInput.provenanceMode === 'overwrite' ||
+    rawInput.replace === true;
+  const existingAnchors: VerifiedAnchorRecord[] =
+    !isOverwrite && Array.isArray(targetItem.verifiedProvenance)
+      ? targetItem.verifiedProvenance
+      : [];
   const mergedByPos = new Map<string, VerifiedAnchorRecord>();
   for (const a of [...existingAnchors, ...newAnchors]) {
     if (!a) continue;
-    const key = `${a.sceneTitle || ''}:${a.fallbackCharIndex ?? a.anchorText}`;
-    mergedByPos.set(key, a);
+    const key =
+      typeof a.fallbackCharIndex === 'number' && a.fallbackCharIndex >= 0
+        ? `pos:${a.fallbackCharIndex}`
+        : `${a.sceneTitle || ''}:${a.anchorText || a.evidenceText || ''}`;
+    const prev = mergedByPos.get(key);
+    if (!prev || (a.evidenceText && (!prev.evidenceText || a.evidenceText.length > prev.evidenceText.length))) {
+      mergedByPos.set(key, a);
+    }
   }
 
-  const finalAnchors = Array.from(mergedByPos.values());
+  const finalAnchors = Array.from(mergedByPos.values()).sort(
+    (a, b) => (a.fallbackCharIndex ?? 0) - (b.fallbackCharIndex ?? 0)
+  );
   const finalScenes = Array.from(
     new Set([
-      ...(Array.isArray(targetItem.sourceScenes) ? targetItem.sourceScenes : []),
+      ...(!isOverwrite && Array.isArray(targetItem.sourceScenes) ? targetItem.sourceScenes : []),
       ...finalAnchors.map(a => a.sceneTitle).filter(Boolean),
     ])
   );
@@ -748,10 +761,23 @@ export function executeProjectAssetMutation(
           )
         : [];
 
-    // Merge candidateAnchors and directAnchors sorted by script position
-    const combinedAnchorMap = new Map<number, VerifiedAnchorRecord>();
-    for (const a of [...candidateAnchors, ...directAnchors]) {
-      const posKey = a.fallbackCharIndex ?? -1;
+    const isOverwrite =
+      args.mode === 'overwrite' ||
+      args.provenanceMode === 'overwrite' ||
+      args.replace === true;
+    const existingAnchors: VerifiedAnchorRecord[] =
+      !isOverwrite && Array.isArray(originalItem.verifiedProvenance)
+        ? originalItem.verifiedProvenance
+        : [];
+
+    // Merge existingAnchors (unless overwrite), candidateAnchors, and directAnchors sorted by script position
+    const combinedAnchorMap = new Map<string, VerifiedAnchorRecord>();
+    for (const a of [...existingAnchors, ...candidateAnchors, ...directAnchors]) {
+      if (!a) continue;
+      const posKey =
+        typeof a.fallbackCharIndex === 'number' && a.fallbackCharIndex >= 0
+          ? `pos:${a.fallbackCharIndex}`
+          : `${a.sceneTitle || ''}:${a.anchorText || a.evidenceText || ''}`;
       const existing = combinedAnchorMap.get(posKey);
       if (!existing || (a.evidenceText && (!existing.evidenceText || a.evidenceText.length > existing.evidenceText.length))) {
         combinedAnchorMap.set(posKey, a);
@@ -770,7 +796,12 @@ export function executeProjectAssetMutation(
       ])
     );
 
-    const verifiedScenes = Array.from(new Set(verifiedProvenance.map(a => a.sceneTitle).filter(Boolean)));
+    const verifiedScenes = Array.from(
+      new Set([
+        ...(!isOverwrite && Array.isArray(originalItem.sourceScenes) ? originalItem.sourceScenes : []),
+        ...verifiedProvenance.map(a => a.sceneTitle).filter(Boolean),
+      ])
+    );
 
     const currentList = [...(project[found.type] || [])];
     const updatedItem = {
@@ -787,11 +818,18 @@ export function executeProjectAssetMutation(
       const versionsCopy = Array.isArray(parentCopy.versions) ? [...parentCopy.versions] : [];
       versionsCopy[found.versionIndex] = updatedItem;
       parentCopy.versions = versionsCopy;
+      const allVerScenes = versionsCopy.flatMap((v: any) => (Array.isArray(v?.sourceScenes) ? v.sourceScenes : []));
+      if (allVerScenes.length > 0) {
+        parentCopy.sourceScenes = Array.from(
+          new Set([...(Array.isArray(parentCopy.sourceScenes) ? parentCopy.sourceScenes : []), ...allVerScenes])
+        );
+      }
       currentList[found.index] = parentCopy;
     } else {
       currentList[found.index] = updatedItem;
     }
 
+    const submittedCount = candidateAnchors.length + directAnchors.length;
     return {
       updatedProject: {
         [found.type]: currentList,
@@ -801,12 +839,14 @@ export function executeProjectAssetMutation(
         type: found.type,
         id: originalItem.id,
         name: displayAssetName,
+        mode: isOverwrite ? 'overwrite' : 'append',
         aliases: finalAliases,
+        submittedCount,
         verifiedCount: verifiedProvenance.length,
         sourceScenes: verifiedScenes,
         provenanceStatus: 'verified',
         item: updatedItem,
-        message: `已完成资产【${displayAssetName}】出处核验：共确认 ${verifiedProvenance.length} 处真实出场（涉及场次：${verifiedScenes.join('、') || '无'}）。`,
+        message: `已完成资产【${displayAssetName}】出处${isOverwrite ? '重设' : '增量更新'}：本次提交 ${submittedCount} 处，当前累计确认 ${verifiedProvenance.length} 处真实出场（涉及场次：${verifiedScenes.join('、') || '无'}）。`,
       },
     };
   }

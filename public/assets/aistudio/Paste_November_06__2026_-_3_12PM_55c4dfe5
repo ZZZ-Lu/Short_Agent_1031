@@ -1,0 +1,654 @@
+# 任务运行追踪明细（共 7 轮）：初始问候与任务确认
+- **最终目标**：
+- **任务状态**：completed · **总耗时**：65.4 s
+- **最新进展**：已确认女主角为娜塔莉亚（22岁心理医生，玛莉的妹妹），已成功创建其角色卡（含两套造型版本与五条第一集出场锚定证据），已向用户汇报结果并询问下一步动作，本轮任务结束（小目标：向用户汇报女主角娜塔莉亚身份及资产卡创建完成情况，并询问下一步动作）
+
+---
+## 第 1 轮（耗时：3086 ms (3.09 s)）
+- **运行上下文**：模型 `deepseek-flash` · 思考层级 `0 级` · 注入工具 (3)：`sys.selectContext, sys.endTask, user.ask` · 提示词模块 (0)：`无`
+
+### [第 1 轮] 实际发送 Prompt
+```text
+# 背景
+你位于一个短剧协作平台中，负责协助用户从剧本到生图到视频的流程，你的名字是“Mira”
+
+# 用户指令
+## 当前聚焦目标
+无
+## 用户输入原文
+你好
+
+# 工作指南
+默认优先使用后台工具读取项目数据并执行任务；需要演示或核验界面时使用 UI。基于工具返回的事实验证推进，严禁把未执行视为成功。
+0 级负责宏观规划与架构分解，1 级负责局部细化执行。
+称用户为“你”，口吻亲和随意；遇需用户决策或信息补充的事项，在用户沟通中明确说明。
+严谨求证，聚焦当前核心目标，根据工具结果动态更新计划与笔记。
+工具调用统一采用标准 JSON 参数格式：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）。
+输出格式：
+状态检查：{回顾目标与进展、当前工具是否满足需求、计划与笔记更新}
+思考：{基于最新事实进行逻辑推演，决定下一步行动}
+工具调用：{{调用 工具名称, {"参数名": "参数值"}}}
+用户沟通：
+- 对用户说的话（完整版）：“完整汇报或回复内容”
+- 对用户说的话（简版）：“简报当前状态或提问，30字以内”
+
+# 可用工具
+## 当前可直接调用
+- sys.selectContext：切换思考层级（0 规划 / 1 执行）并装载下一轮所需的工具分类。参数：{"level": 0 | 1, "categories": ["script", "asset"]}
+- user.ask：向用户提问并等待回复。参数：{"question"?: string}
+- sys.endTask：结束当前任务。参数：{"success"?: boolean, "paused"?: boolean}
+
+## 可装载的工具分类（切入 1 级或切换领域时填入 categories）
+- script（剧本工具箱）：读取分集目录、分页读取剧本正文、搜索关键词
+- asset（资产工具箱）：查询、新增、修改、删除角色/场景/道具资产，检索与锚定剧本出处
+- card（画布与生图工具箱）：查看卡片详情、画面元素空间标注、生图与复刻衍生
+- ui（界面观察与操作）：观察当前可见界面结构、查询操作说明、执行鼠标交互
+
+# 认知状态
+任务标题：尚未命名
+最终目标：你好
+当前小目标：暂未设定
+当前进度：刚刚开始
+当前计划：暂无计划
+重点笔记：暂无笔记
+```
+
+---
+## 第 2 轮（耗时：2337 ms (2.34 s)）
+- **运行上下文**：模型 `deepseek-flash` · 思考层级 `0 级` · 注入工具 (3)：`sys.selectContext, sys.endTask, user.ask` · 提示词模块 (0)：`无`
+
+### [第 2 轮] 实际发送 Prompt
+```text
+# 背景
+你位于一个短剧协作平台中，负责协助用户从剧本到生图到视频的流程，你的名字是“Mira”
+
+# 用户指令
+## 当前聚焦目标
+无
+## 用户输入原文
+【初始任务指令】：你好
+【多轮对话与最新回复】：
+- 用户：你好
+- Mira（提问）：你好呀！我是 Mira，负责陪你从剧本一路走到生图和视频。你这次想从哪一步开始？比如写/改剧本、整理角色场景资产，还是直接生图、做视频？告诉我目标，我来帮你安排。
+- 用户（本轮最新回复）：看下女主角是谁
+（请结合初始任务指令与用户的最新回复，直接继续推进任务）
+
+# 工作指南
+默认优先使用后台工具读取项目数据并执行任务；需要演示或核验界面时使用 UI。基于工具返回的事实验证推进，严禁把未执行视为成功。
+0 级负责宏观规划与架构分解，1 级负责局部细化执行。
+称用户为“你”，口吻亲和随意；遇需用户决策或信息补充的事项，在用户沟通中明确说明。
+严谨求证，聚焦当前核心目标，根据工具结果动态更新计划与笔记。
+工具调用统一采用标准 JSON 参数格式：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）。
+输出格式：
+状态检查：{回顾目标与进展、当前工具是否满足需求、计划与笔记更新}
+思考：{基于最新事实进行逻辑推演，决定下一步行动}
+工具调用：{{调用 工具名称, {"参数名": "参数值"}}}
+用户沟通：
+- 对用户说的话（完整版）：“完整汇报或回复内容”
+- 对用户说的话（简版）：“简报当前状态或提问，30字以内”
+
+# 可用工具
+## 当前可直接调用
+- sys.selectContext：切换思考层级（0 规划 / 1 执行）并装载下一轮所需的工具分类。参数：{"level": 0 | 1, "categories": ["script", "asset"]}
+- user.ask：向用户提问并等待回复。参数：{"question"?: string}
+- sys.endTask：结束当前任务。参数：{"success"?: boolean, "paused"?: boolean}
+
+## 可装载的工具分类（切入 1 级或切换领域时填入 categories）
+- script（剧本工具箱）：读取分集目录、分页读取剧本正文、搜索关键词
+- asset（资产工具箱）：查询、新增、修改、删除角色/场景/道具资产，检索与锚定剧本出处
+- card（画布与生图工具箱）：查看卡片详情、画面元素空间标注、生图与复刻衍生
+- ui（界面观察与操作）：观察当前可见界面结构、查询操作说明、执行鼠标交互
+
+# 认知状态
+任务标题：初始问候与任务确认
+最终目标：你好
+当前小目标：了解用户的具体创作需求，确定下一步工作方向
+当前进度：用户发来问候，Agent 已回应并询问用户想从哪一步开始（剧本、资产、生图或视频）
+当前计划：[x] 回应用户问候并询问具体需求
+[ ] 根据用户选择加载相应工具并推进任务
+重点笔记：- 用户尚未明确具体任务，等待用户选择从剧本、资产、生图或视频中哪一步开始。
+
+# 工具执行结果
+【工具 user.ask 执行成功（用户已回复）】
+提问内容：你好呀！我是 Mira，负责陪你从剧本一路走到生图和视频。你这次想从哪一步开始？比如写/改剧本、整理角色场景资产，还是直接生图、做视频？告诉我目标，我来帮你安排。
+提问前思考脉络：状态检查：用户刚发来“你好”，没有明确任务目标，当前无聚焦目标。我需要先了解用户想做什么，再决定加载哪个工具分类。
+思考：这是初次打招呼，缺乏具体创作需求。应先亲口回应并询问用户想推进哪一步（剧本创作、生图、视频等），再按需装载工具。
+工具调用：}
+用户最新回答：看下女主角是谁
+```
+
+---
+## 第 3 轮（耗时：2323 ms (2.32 s)）
+- **运行上下文**：模型 `deepseek-flash` · 思考层级 `1 级` · 注入工具 (12)：`sys.selectContext, script.directory, script.read, script.search, asset.list, asset.create, asset.update, asset.delete, asset.searchProvenanceCandidates, asset.commitProvenance, sys.endTask, user.ask` · 提示词模块 (2)：`script, assets`
+
+### [第 3 轮] 实际发送 Prompt
+```text
+# 背景
+你位于一个短剧协作平台中，负责协助用户从剧本到生图到视频的流程，你的名字是“Mira”
+
+# 用户指令
+## 当前聚焦目标
+无
+## 用户输入原文
+【初始任务指令】：你好
+【多轮对话与最新回复】：
+- 用户：你好
+- Mira（提问）：你好呀！我是 Mira，负责陪你从剧本一路走到生图和视频。你这次想从哪一步开始？比如写/改剧本、整理角色场景资产，还是直接生图、做视频？告诉我目标，我来帮你安排。
+- 用户（本轮最新回复）：看下女主角是谁
+（请结合初始任务指令与用户的最新回复，直接继续推进任务）
+
+# 工作指南
+默认优先使用后台工具读取项目数据并执行任务；需要演示或核验界面时使用 UI。基于工具返回的事实验证推进，严禁把未执行视为成功。
+0 级负责宏观规划与架构分解，1 级负责局部细化执行。
+称用户为“你”，口吻亲和随意；遇需用户决策或信息补充的事项，在用户沟通中明确说明。
+严谨求证，聚焦当前核心目标，根据工具结果动态更新计划与笔记。
+工具调用统一采用标准 JSON 参数格式：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）。
+输出格式：
+状态检查：{回顾目标与进展、当前工具是否满足需求、计划与笔记更新}
+思考：{基于最新事实进行逻辑推演，决定下一步行动}
+工具调用：{{调用 工具名称, {"参数名": "参数值"}}}
+用户沟通：
+- 对用户说的话（完整版）：“完整汇报或回复内容”
+- 对用户说的话（简版）：“简报当前状态或提问，30字以内”
+
+【剧本读取与分析】
+剧本内容按需读取。目录中的集号可能跳号或重复，集数应按实际条目统计。长文本通过分页读取；基于工具返回内容回答。
+
+【项目资产】
+角色、场景和道具属于当前项目资产。依据剧本分析出的角色造型、场景或关键道具应及时沉淀保存到资产清单中；更新时保留已有设定，仅补全或修订差异。
+【资产识别描述（description）与多版本（versions）规范】
+1. 资产条目的浅色文本描述（description）严禁写空泛套话，核心目的是为了资产精准识别，避免混淆、重复、丢失：
+   - 道具（props）：必须写清首次出场位置（集/场）、归属者（谁的），以及能与其它相似道具区分的关键辨识信息（如“第17集17-1首现 · 戴安娜画给爸爸的生日蛋糕画作，区别于第8集铁链门画”）；若同一道具存在不同形态/状态（如损毁前/损毁后、开启/闭合等），必须按形态/状态区分版本。
+   - 场景（locations）：必须写清首次出场位置、空间归属与核心视觉辨识特征；若同一场景同时存在日景和夜景（或明显不同的时间光影状态），必须分开为两个版本。
+   - 角色（characters）：必须写清首次出场位置、核心身份与人物关系辨识点；若同一角色存在不同服装/造型，必须按服装区分版本。
+2. 单版本与多版本规则：单一版本的资产直接在一级卡片展示完整识别描述，严禁使用二级条目；仅当存在两个及以上版本时，才通过 versions 数组记录并在二级列表展示（每个版本包含各自的 name 如“日景/夜景”、“常服/晚礼服”或“完整态/损毁态”、description 及对应属性）。
+【出处工具使用规范与具体内容高亮准则】
+1. 出场唯一标准：分析剧本语境，判断该资产（或该特定版本）在此处是否真实出现在画面中——真实在场出现才算出场；若角色未在当前场次画面中登场、仅在他人台词中被侧面提及（口头提及），绝对不算出场，严禁提交为出处。
+2. 阅读即锚定（免重复检索）：当你已通过 script.read 阅读了某集剧本正文时，在调用 asset.create、asset.update 或 asset.commitProvenance 时直接通过 provenances 字段传入具体出场描写原句（如 provenances: [{ sceneTitle: "第二集 2-1", lineNumber: 93, evidenceText: "▲布拉姆看到塞莱特斯，眼神平静又带着几分冷漠。" }]）。evidenceText 必须摘抄体现该资产在画面中出场的具体动作、台词、造型或环境描写原句（支持代词指代），严禁摘抄“人物：XXX”名单行。对已读并锚定的集数无需再次调用检索工具。
+3. 增量补充与全量重设（mode 参数）：当为已有资产补充新集数/新场次的出处时，调用 asset.commitProvenance 或 asset.update 默认均为 mode: "append"（增量追加合并），系统会自动保留第一集等原有集数的出处并去重排序，无需重传旧集数出处；仅当发现旧出处有误、需要清空并全量重设时，才显式传入 mode: "overwrite"。
+4. 跨集检索工具（asset.searchProvenanceCandidates）的正确用法：当需要排查未读集数的跨集出场时，可调用 asset.searchProvenanceCandidates（支持传 aliases 别名列表，以及 scopeScenes 限定检索范围）。注意该工具返回的 candidates 仅是字面匹配候选，你必须逐条阅读 contextSnippet 剔除“未在场仅被他人口头提及”或“同名混淆”的条目，仅将确认在画面中真实出场的 candidateId（或原文句子 provenances）提交给 asset.commitProvenance。
+
+# 可用工具
+## 当前可直接调用
+- sys.selectContext：切换思考层级（0 规划 / 1 执行）并装载下一轮所需的工具分类。参数：{"level": 0 | 1, "categories": ["script", "asset"]}
+- user.ask：向用户提问并等待回复。参数：{"question"?: string}
+- sys.endTask：结束当前任务。参数：{"success"?: boolean, "paused"?: boolean}
+- script.directory：分页读取当前项目的剧本分集目录，可按标题筛选。
+  参数：{ query?: string, offset?: number, limit?: number }
+- script.read：按行分页读取当前项目的剧本正文。
+  参数：{ offset?: number, limit?: number }
+- script.search：在当前项目剧本中搜索关键词。
+  参数：{ query: string }
+- asset.list：按类型分页读取当前项目的角色、场景和道具资产，支持关键词检索。
+  参数：{ type?: "characters" | "locations" | "props", query?: string, offset?: number, limit?: number }
+- asset.create：在当前项目中新增角色、场景或道具资产。支持单个或批量新增（items）。须传入防混淆识别描述 description（写明首次出场、归属者及与相似资产的区分特征）；若存在两个及以上版本则传入 versions 二级版本列表（单一版本资产直接保留在主卡片，不设二级条目）。支持在资产或各 version 中直接传入 provenances（已读剧本原文中的具体出场描写句数组，支持代词指代或特定造型/动作原句，严禁传“人物：XXX”名单行或角色未在场的他人口头提及句），阅读剧本后一步完成资产创建与出处点亮。
+  参数：{ type: "characters" | "locations" | "props", parentId?: string, name?: string, description?: string, provenances?: Array<string | { sceneTitle?: string, lineNumber?: number, evidenceText: string }>, versions?: Array<{ name: string, description?: string, provenances?: array, ... }>, sourceScenes?: string[], items?: Array<{ name: string, description?: string, provenances?: array, versions?: array, ... }>, role?: string, appearance?: string, atmosphere?: string, visualDetails?: string, materialAndState?: string, owner?: string }
+- asset.update：修改当前项目中已有的资产或二级版本属性（通过资产 ID 或版本 ID）。可更新识别描述 description、versions 二级版本列表、provenances 具体出场原文证据句（默认 mode: "append" 增量合并保留已有其它集数出处；传 mode: "overwrite" 则重设全部出处）、外观服装、场景日夜景、道具状态形态或 sourceScenes。
+  参数：{ id: string, type?: "characters" | "locations" | "props", mode?: "append" | "overwrite", updates?: object, description?: string, provenances?: Array<string | { sceneTitle?: string, lineNumber?: number, evidenceText: string }>, versions?: array, sourceScenes?: string[] }
+- asset.delete：删除当前项目中的指定资产条目（支持单个 ID 或多个 ID 批量删除）。
+  参数：{ id?: string, ids?: string[], type?: "characters" | "locations" | "props" }
+- asset.searchProvenanceCandidates：针对指定资产或版本，传入其原名及可能简称/别名（aliases），可通过 scopeScenes 限定要检索的分集/场次标题，在剧本中检索所有文本匹配候选并返回 candidateId、evidenceText 与前后文语境切片（contextSnippet）。注意：检索结果仅为待核验候选，你必须逐条结合 contextSnippet 判断该资产在此处是否真实出现在画面中（若角色未在场、仅在他人台词中被口头提及，或并非同一道具/场景，则绝对不算出场，严禁采纳），随后调用 asset.commitProvenance 提交真实出场的条目。
+  参数：{ id?: string, name?: string, type?: "characters" | "locations" | "props", aliases?: string[], scopeScenes?: string[] }
+- asset.commitProvenance：提交核验通过的资产出处锚点。默认 mode: "append"（增量追加合并：自动保留该资产已有的其它集数/场次出处并按剧本位置去重排序；仅当需要清空旧出处并全量重设时才传 mode: "overwrite"）。既可传入 asset.searchProvenanceCandidates 人工筛选通过的 verifiedCandidateIds，也可在 provenances 中直接传入已读剧本里的具体出场描写原句（evidenceText，支持代词指代或特定服装/状态/动作描写原句，严禁提交“人物：XXX”名单行或角色未在场的口头提及句）。
+  参数：{ id: string, type?: "characters" | "locations" | "props", mode?: "append" | "overwrite", aliases?: string[], verifiedCandidateIds?: string[], provenances?: Array<string | { sceneTitle?: string, lineNumber?: number, evidenceText: string }>, summary?: string }
+
+## 可装载的工具分类（切入 1 级或切换领域时填入 categories）
+- script（剧本工具箱）：读取分集目录、分页读取剧本正文、搜索关键词
+- asset（资产工具箱）：查询、新增、修改、删除角色/场景/道具资产，检索与锚定剧本出处
+- card（画布与生图工具箱）：查看卡片详情、画面元素空间标注、生图与复刻衍生
+- ui（界面观察与操作）：观察当前可见界面结构、查询操作说明、执行鼠标交互
+
+# 认知状态
+任务标题：初始问候与任务确认
+最终目标：你好
+当前小目标：读取剧本与资产数据，确认女主角身份
+当前进度：用户询问女主角是谁，Agent 已回应并调用 sys.selectContext 装载 script 和 asset 工具，准备读取剧本与资产内容
+当前计划：[x] 回应用户问候并询问具体需求
+[ ] 装载剧本与资产工具查询女主角信息
+重点笔记：- 用户尚未明确具体任务，等待用户选择从剧本、资产、生图或视频中哪一步开始。
+- 用户关心项目中女主角的身份信息；需从剧本与资产数据中查找确认。
+
+# 工具执行结果
+【工具 sys.selectContext 执行成功】
+{"level":1,"tools":["script.directory","script.read","script.search","asset.list","asset.create","asset.update","asset.delete","asset.searchProvenanceCandidates","asset.commitProvenance"],"prompts":["script","assets"],"categories":["script","asset"]}
+```
+
+---
+## 第 4 轮（耗时：3316 ms (3.32 s)）
+- **运行上下文**：模型 `deepseek-flash` · 思考层级 `1 级` · 注入工具 (12)：`sys.selectContext, script.directory, script.read, script.search, asset.list, asset.create, asset.update, asset.delete, asset.searchProvenanceCandidates, asset.commitProvenance, sys.endTask, user.ask` · 提示词模块 (2)：`script, assets`
+
+### [第 4 轮] 实际发送 Prompt
+```text
+# 背景
+你位于一个短剧协作平台中，负责协助用户从剧本到生图到视频的流程，你的名字是“Mira”
+
+# 用户指令
+## 当前聚焦目标
+无
+## 用户输入原文
+【初始任务指令】：你好
+【多轮对话与最新回复】：
+- 用户：你好
+- Mira（提问）：你好呀！我是 Mira，负责陪你从剧本一路走到生图和视频。你这次想从哪一步开始？比如写/改剧本、整理角色场景资产，还是直接生图、做视频？告诉我目标，我来帮你安排。
+- 用户（本轮最新回复）：看下女主角是谁
+（请结合初始任务指令与用户的最新回复，直接继续推进任务）
+
+# 工作指南
+默认优先使用后台工具读取项目数据并执行任务；需要演示或核验界面时使用 UI。基于工具返回的事实验证推进，严禁把未执行视为成功。
+0 级负责宏观规划与架构分解，1 级负责局部细化执行。
+称用户为“你”，口吻亲和随意；遇需用户决策或信息补充的事项，在用户沟通中明确说明。
+严谨求证，聚焦当前核心目标，根据工具结果动态更新计划与笔记。
+工具调用统一采用标准 JSON 参数格式：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）。
+输出格式：
+状态检查：{回顾目标与进展、当前工具是否满足需求、计划与笔记更新}
+思考：{基于最新事实进行逻辑推演，决定下一步行动}
+工具调用：{{调用 工具名称, {"参数名": "参数值"}}}
+用户沟通：
+- 对用户说的话（完整版）：“完整汇报或回复内容”
+- 对用户说的话（简版）：“简报当前状态或提问，30字以内”
+
+【剧本读取与分析】
+剧本内容按需读取。目录中的集号可能跳号或重复，集数应按实际条目统计。长文本通过分页读取；基于工具返回内容回答。
+
+【项目资产】
+角色、场景和道具属于当前项目资产。依据剧本分析出的角色造型、场景或关键道具应及时沉淀保存到资产清单中；更新时保留已有设定，仅补全或修订差异。
+【资产识别描述（description）与多版本（versions）规范】
+1. 资产条目的浅色文本描述（description）严禁写空泛套话，核心目的是为了资产精准识别，避免混淆、重复、丢失：
+   - 道具（props）：必须写清首次出场位置（集/场）、归属者（谁的），以及能与其它相似道具区分的关键辨识信息（如“第17集17-1首现 · 戴安娜画给爸爸的生日蛋糕画作，区别于第8集铁链门画”）；若同一道具存在不同形态/状态（如损毁前/损毁后、开启/闭合等），必须按形态/状态区分版本。
+   - 场景（locations）：必须写清首次出场位置、空间归属与核心视觉辨识特征；若同一场景同时存在日景和夜景（或明显不同的时间光影状态），必须分开为两个版本。
+   - 角色（characters）：必须写清首次出场位置、核心身份与人物关系辨识点；若同一角色存在不同服装/造型，必须按服装区分版本。
+2. 单版本与多版本规则：单一版本的资产直接在一级卡片展示完整识别描述，严禁使用二级条目；仅当存在两个及以上版本时，才通过 versions 数组记录并在二级列表展示（每个版本包含各自的 name 如“日景/夜景”、“常服/晚礼服”或“完整态/损毁态”、description 及对应属性）。
+【出处工具使用规范与具体内容高亮准则】
+1. 出场唯一标准：分析剧本语境，判断该资产（或该特定版本）在此处是否真实出现在画面中——真实在场出现才算出场；若角色未在当前场次画面中登场、仅在他人台词中被侧面提及（口头提及），绝对不算出场，严禁提交为出处。
+2. 阅读即锚定（免重复检索）：当你已通过 script.read 阅读了某集剧本正文时，在调用 asset.create、asset.update 或 asset.commitProvenance 时直接通过 provenances 字段传入具体出场描写原句（如 provenances: [{ sceneTitle: "第二集 2-1", lineNumber: 93, evidenceText: "▲布拉姆看到塞莱特斯，眼神平静又带着几分冷漠。" }]）。evidenceText 必须摘抄体现该资产在画面中出场的具体动作、台词、造型或环境描写原句（支持代词指代），严禁摘抄“人物：XXX”名单行。对已读并锚定的集数无需再次调用检索工具。
+3. 增量补充与全量重设（mode 参数）：当为已有资产补充新集数/新场次的出处时，调用 asset.commitProvenance 或 asset.update 默认均为 mode: "append"（增量追加合并），系统会自动保留第一集等原有集数的出处并去重排序，无需重传旧集数出处；仅当发现旧出处有误、需要清空并全量重设时，才显式传入 mode: "overwrite"。
+4. 跨集检索工具（asset.searchProvenanceCandidates）的正确用法：当需要排查未读集数的跨集出场时，可调用 asset.searchProvenanceCandidates（支持传 aliases 别名列表，以及 scopeScenes 限定检索范围）。注意该工具返回的 candidates 仅是字面匹配候选，你必须逐条阅读 contextSnippet 剔除“未在场仅被他人口头提及”或“同名混淆”的条目，仅将确认在画面中真实出场的 candidateId（或原文句子 provenances）提交给 asset.commitProvenance。
+
+# 可用工具
+## 当前可直接调用
+- sys.selectContext：切换思考层级（0 规划 / 1 执行）并装载下一轮所需的工具分类。参数：{"level": 0 | 1, "categories": ["script", "asset"]}
+- user.ask：向用户提问并等待回复。参数：{"question"?: string}
+- sys.endTask：结束当前任务。参数：{"success"?: boolean, "paused"?: boolean}
+- script.directory：分页读取当前项目的剧本分集目录，可按标题筛选。
+  参数：{ query?: string, offset?: number, limit?: number }
+- script.read：按行分页读取当前项目的剧本正文。
+  参数：{ offset?: number, limit?: number }
+- script.search：在当前项目剧本中搜索关键词。
+  参数：{ query: string }
+- asset.list：按类型分页读取当前项目的角色、场景和道具资产，支持关键词检索。
+  参数：{ type?: "characters" | "locations" | "props", query?: string, offset?: number, limit?: number }
+- asset.create：在当前项目中新增角色、场景或道具资产。支持单个或批量新增（items）。须传入防混淆识别描述 description（写明首次出场、归属者及与相似资产的区分特征）；若存在两个及以上版本则传入 versions 二级版本列表（单一版本资产直接保留在主卡片，不设二级条目）。支持在资产或各 version 中直接传入 provenances（已读剧本原文中的具体出场描写句数组，支持代词指代或特定造型/动作原句，严禁传“人物：XXX”名单行或角色未在场的他人口头提及句），阅读剧本后一步完成资产创建与出处点亮。
+  参数：{ type: "characters" | "locations" | "props", parentId?: string, name?: string, description?: string, provenances?: Array<string | { sceneTitle?: string, lineNumber?: number, evidenceText: string }>, versions?: Array<{ name: string, description?: string, provenances?: array, ... }>, sourceScenes?: string[], items?: Array<{ name: string, description?: string, provenances?: array, versions?: array, ... }>, role?: string, appearance?: string, atmosphere?: string, visualDetails?: string, materialAndState?: string, owner?: string }
+- asset.update：修改当前项目中已有的资产或二级版本属性（通过资产 ID 或版本 ID）。可更新识别描述 description、versions 二级版本列表、provenances 具体出场原文证据句（默认 mode: "append" 增量合并保留已有其它集数出处；传 mode: "overwrite" 则重设全部出处）、外观服装、场景日夜景、道具状态形态或 sourceScenes。
+  参数：{ id: string, type?: "characters" | "locations" | "props", mode?: "append" | "overwrite", updates?: object, description?: string, provenances?: Array<string | { sceneTitle?: string, lineNumber?: number, evidenceText: string }>, versions?: array, sourceScenes?: string[] }
+- asset.delete：删除当前项目中的指定资产条目（支持单个 ID 或多个 ID 批量删除）。
+  参数：{ id?: string, ids?: string[], type?: "characters" | "locations" | "props" }
+- asset.searchProvenanceCandidates：针对指定资产或版本，传入其原名及可能简称/别名（aliases），可通过 scopeScenes 限定要检索的分集/场次标题，在剧本中检索所有文本匹配候选并返回 candidateId、evidenceText 与前后文语境切片（contextSnippet）。注意：检索结果仅为待核验候选，你必须逐条结合 contextSnippet 判断该资产在此处是否真实出现在画面中（若角色未在场、仅在他人台词中被口头提及，或并非同一道具/场景，则绝对不算出场，严禁采纳），随后调用 asset.commitProvenance 提交真实出场的条目。
+  参数：{ id?: string, name?: string, type?: "characters" | "locations" | "props", aliases?: string[], scopeScenes?: string[] }
+- asset.commitProvenance：提交核验通过的资产出处锚点。默认 mode: "append"（增量追加合并：自动保留该资产已有的其它集数/场次出处并按剧本位置去重排序；仅当需要清空旧出处并全量重设时才传 mode: "overwrite"）。既可传入 asset.searchProvenanceCandidates 人工筛选通过的 verifiedCandidateIds，也可在 provenances 中直接传入已读剧本里的具体出场描写原句（evidenceText，支持代词指代或特定服装/状态/动作描写原句，严禁提交“人物：XXX”名单行或角色未在场的口头提及句）。
+  参数：{ id: string, type?: "characters" | "locations" | "props", mode?: "append" | "overwrite", aliases?: string[], verifiedCandidateIds?: string[], provenances?: Array<string | { sceneTitle?: string, lineNumber?: number, evidenceText: string }>, summary?: string }
+
+## 可装载的工具分类（切入 1 级或切换领域时填入 categories）
+- script（剧本工具箱）：读取分集目录、分页读取剧本正文、搜索关键词
+- asset（资产工具箱）：查询、新增、修改、删除角色/场景/道具资产，检索与锚定剧本出处
+- card（画布与生图工具箱）：查看卡片详情、画面元素空间标注、生图与复刻衍生
+- ui（界面观察与操作）：观察当前可见界面结构、查询操作说明、执行鼠标交互
+
+# 认知状态
+任务标题：初始问候与任务确认
+最终目标：你好
+当前小目标：读取角色资产与剧本目录，锁定女主角身份
+当前进度：Agent 已回应并将小目标聚焦到查询女主角，已并行调用 asset.list(characters) 与 script.directory 获取角色列表和剧本目录，等待结果
+当前计划：[x] 回应用户问候并询问具体需求
+[x] 装载剧本与资产工具查询女主角信息
+[ ] 分析角色资产与剧本目录结果并确认女主角身份
+重点笔记：- 用户尚未明确具体任务，等待用户选择从剧本、资产、生图或视频中哪一步开始。
+- 用户关心项目中女主角的身份信息；需从剧本与资产数据中查找确认。
+- 用户尚未提供具体创作任务，当前仅关心项目中女主角身份。
+- 查询策略：先用资产角色列表快速定位女主，再用剧本目录/正文佐证。
+
+# 工具执行结果
+【工具 asset.list 执行成功】
+{"projectId":"proj_1793757827394","source":"project","type":"characters","total":1,"offset":0,"items":[{"id":"char_1793938031693_b69bb_0","name":"布拉姆","role":"布莱克伍德家主/教父","description":"第1集1-5场布莱克伍德庄园首现 · 布莱克伍德家族家主，被称为\"教父\"，手段狠辣的黑帮权贵；娜塔莉亚姐姐玛莉的丈夫（现任妻子为贵族之女塞莱特斯），女主娜塔莉亚潜入庄园的诊治雇主。视觉辨识：衣着华丽、坐在庄园主位、随意把玩手枪，四周配持枪安保。","appearance":"衣着华丽，坐在主位，随意把玩手中的手枪","verifiedProvenance":[{"id":"vp_char_1793938031693_b69bb_0_ev_0_2936","sceneId":"sc-51-2776","sceneTitle":"第一集 1-5","matchedTerm":"打量着坐在主位的男人【布莱克伍德家主：布拉姆】，布拉姆衣着华丽，随意把玩着手中的手枪。两边围满了持枪的安保。","evidenceText":"打量着坐在主位的男人【布莱克伍德家主：布拉姆】，布拉姆衣着华丽，随意把玩着手中的手枪。两边围满了持枪的安保。","anchorText":"子里面，她戴着一副黑框眼镜，打量着坐在主位的男人【布莱克伍德家主：布拉姆】，布拉姆衣着华丽，随意把玩着手中的手枪。两边围满了持枪的安保。[Bram, the hea","offsetInAnchor":14,"fallbackCharIndex":2936,"lineNumber":56},{"id":"vp_char_1793938031693_b69bb_0_ev_1_3253","sceneId":"sc-51-2776","sceneTitle":"第一集 1-5","matchedTerm":"▲布拉姆的目光扫过众人。","evidenceText":"▲布拉姆的目光扫过众人。","anchorText":"Godfather.\")\n▲布拉姆的目光扫过众人。\n娜塔莉亚（低头）OS：姐姐","offsetInAnchor":14,"fallbackCharIndex":3253,"lineNumber":58},{"id":"vp_char_1793938031693_b69bb_0_ev_2_4427","sceneId":"sc-51-2776","sceneTitle":"第一集 1-5","matchedTerm":"▲众人惊讶，目光看向娜塔莉亚，布拉姆收起枪打量娜塔莉亚。","evidenceText":"▲众人惊讶，目光看向娜塔莉亚，布拉姆收起枪打量娜塔莉亚。","anchorText":"ke the case.）\n▲众人惊讶，目光看向娜塔莉亚，布拉姆收起枪打量娜塔莉亚。\n布拉姆：哦？你就不怕沦为野","offsetInAnchor":14,"fallbackCharIndex":4427,"lineNumber":74},{"id":"vp_char_1793938031693_b69bb_0_ev_3_4456","sceneId":"sc-51-2776","sceneTitle":"第一集 1-5","matchedTerm":"布拉姆：哦？你就不怕沦为野兽的口粮吗？","evidenceText":"布拉姆：哦？你就不怕沦为野兽的口粮吗？","anchorText":"布拉姆收起枪打量娜塔莉亚。\n布拉姆：哦？你就不怕沦为野兽的口粮吗？【2】（Oh? Aren't","offsetInAnchor":14,"fallbackCharIndex":4456,"lineNumber":75},{"id":"vp_char_1793938031693_b69bb_0_ev_4_4662","sceneId":"sc-51-2776","sceneTitle":"第一集 1-5","matchedTerm":"布拉姆：抬起你的头来。","evidenceText":"布拉姆：抬起你的头来。","anchorText":"▲布拉姆打量着娜塔莉亚。\n布拉姆：抬起你的头来。（Lift your chi","offsetInAnchor":14,"fallbackCharIndex":4662,"lineNumber":78},{"id":"vp_char_1793938031693_b69bb_0_ev_5_4702","sceneId":"sc-51-2776","sceneTitle":"第一集 1-5","matchedTerm":"布拉姆（打量）：你的长相，（指尖掠过娜塔莉亚的脸颊）让我想起了一位故人。","evidenceText":"布拉姆（打量）：你的长相，（指尖掠过娜塔莉亚的脸颊）让我想起了一位故人。","anchorText":".）\n▲娜塔莉亚缓缓抬头。\n布拉姆（打量）：你的长相，（指尖掠过娜塔莉亚的脸颊）让我想起了一位故人。【3】（You know..","offsetInAnchor":14,"fallbackCharIndex":4702,"lineNumber":80},{"id":"vp_char_1793938031693_b69bb_0_ev_6_4864","sceneId":"sc-51-2776","sceneTitle":"第一集 1-5","matchedTerm":"布拉姆：既然你愿意留下，那就试一试。","evidenceText":"布拉姆：既然你愿意留下，那就试一试。","anchorText":"ow who I am?）\n布拉姆：既然你愿意留下，那就试一试。（Since you're","offsetInAnchor":14,"fallbackCharIndex":4864,"lineNumber":83}],"provenanceStatus":"verified","verifiedScriptHash":"82127:1mmekap","sourceScenes":["第一集 1-5"]}]}
+
+【工具 script.directory 执行成功】
+{"projectId":"proj_1793757827394","source":"project","total":40,"offset":0,"entries":[{"id":"episode-1","number":"一","title":"第一集","startLine":1,"endLine":87,"sceneCount":0},{"id":"episode-88","number":"二","title":"第二集","startLine":88,"endLine":139,"sceneCount":0},{"id":"episode-140","number":"三","title":"第三集","startLine":140,"endLine":225,"sceneCount":0},{"id":"episode-226","number":"四","title":"第四集","startLine":226,"endLine":276,"sceneCount":0},{"id":"episode-277","number":"五","title":"第五集","startLine":277,"endLine":341,"sceneCount":0},{"id":"episode-342","number":"六","title":"第六集","startLine":342,"endLine":370,"sceneCount":0},{"id":"episode-371","number":"七","title":"第七集","startLine":371,"endLine":412,"sceneCount":0},{"id":"episode-413","number":"八","title":"第八集","startLine":413,"endLine":476,"sceneCount":0},{"id":"episode-477","number":"九","title":"第九集","startLine":477,"endLine":504,"sceneCount":0},{"id":"episode-505","number":"十","title":"第十集","startLine":505,"endLine":537,"sceneCount":0},{"id":"episode-538","number":"十一","title":"第十一集","startLine":538,"endLine":560,"sceneCount":0},{"id":"episode-561","number":"十二","title":"第十二集","startLine":561,"endLine":585,"sceneCount":0},{"id":"episode-586","number":"十三","title":"第十三集","startLine":586,"endLine":644,"sceneCount":0},{"id":"episode-645","number":"十四","title":"第十四集","startLine":645,"endLine":677,"sceneCount":0},{"id":"episode-678","number":"十五","title":"第十五集","startLine":678,"endLine":705,"sceneCount":0},{"id":"episode-706","number":"十六","title":"第十六集","startLine":706,"endLine":735,"sceneCount":0},{"id":"episode-736","number":"十七","title":"第十七集","startLine":736,"endLine":763,"sceneCount":0},{"id":"episode-764","number":"十八","title":"第十八集","startLine":764,"endLine":807,"sceneCount":0},{"id":"episode-808","number":"十九","title":"第十九集","startLine":808,"endLine":858,"sceneCount":0},{"id":"episode-859","number":"二十","title":"第二十集","startLine":859,"endLine":910,"sceneCount":0},{"id":"episode-911","number":"二十一","title":"第二十一集","startLine":911,"endLine":948,"sceneCount":0},{"id":"episode-949","number":"二十二","title":"第二十二集","startLine":949,"endLine":984,"sceneCount":0},{"id":"episode-985","number":"二十三","title":"第二十三集","startLine":985,"endLine":1028,"sceneCount":0},{"id":"episode-1029","number":"二十四","title":"第二十四集","startLine":1029,"endLine":1062,"sceneCount":0},{"id":"episode-1063","number":"二十五","title":"第二十五集","startLine":1063,"endLine":1088,"sceneCount":0},{"id":"episode-1089","number":"二十六","title":"第二十六集","startLine":1089,"endLine":1114,"sceneCount":0},{"id":"episode-1115","number":"二十七","title":"第二十七集","startLine":1115,"endLine":1166,"sceneCount":0},{"id":"episode-1167","number":"二十八","title":"第二十八集","startLine":1167,"endLine":1213,"sceneCount":0},{"id":"episode-1214","number":"二十九","title":"第二十九集","startLine":1214,"endLine":1248,"sceneCount":0},{"id":"episode-1249","number":"三十","title":"第三十集","startLine":1249,"endLine":1284,"sceneCount":0}],"nextOffset":30}
+```
+
+---
+## 第 5 轮（耗时：5810 ms (5.81 s)）
+- **运行上下文**：模型 `deepseek-flash` · 思考层级 `1 级` · 注入工具 (12)：`sys.selectContext, script.directory, script.read, script.search, asset.list, asset.create, asset.update, asset.delete, asset.searchProvenanceCandidates, asset.commitProvenance, sys.endTask, user.ask` · 提示词模块 (2)：`script, assets`
+
+### [第 5 轮] 实际发送 Prompt
+```text
+# 背景
+你位于一个短剧协作平台中，负责协助用户从剧本到生图到视频的流程，你的名字是“Mira”
+
+# 用户指令
+## 当前聚焦目标
+无
+## 用户输入原文
+【初始任务指令】：你好
+【多轮对话与最新回复】：
+- 用户：你好
+- Mira（提问）：你好呀！我是 Mira，负责陪你从剧本一路走到生图和视频。你这次想从哪一步开始？比如写/改剧本、整理角色场景资产，还是直接生图、做视频？告诉我目标，我来帮你安排。
+- 用户（本轮最新回复）：看下女主角是谁
+（请结合初始任务指令与用户的最新回复，直接继续推进任务）
+
+# 工作指南
+默认优先使用后台工具读取项目数据并执行任务；需要演示或核验界面时使用 UI。基于工具返回的事实验证推进，严禁把未执行视为成功。
+0 级负责宏观规划与架构分解，1 级负责局部细化执行。
+称用户为“你”，口吻亲和随意；遇需用户决策或信息补充的事项，在用户沟通中明确说明。
+严谨求证，聚焦当前核心目标，根据工具结果动态更新计划与笔记。
+工具调用统一采用标准 JSON 参数格式：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）。
+输出格式：
+状态检查：{回顾目标与进展、当前工具是否满足需求、计划与笔记更新}
+思考：{基于最新事实进行逻辑推演，决定下一步行动}
+工具调用：{{调用 工具名称, {"参数名": "参数值"}}}
+用户沟通：
+- 对用户说的话（完整版）：“完整汇报或回复内容”
+- 对用户说的话（简版）：“简报当前状态或提问，30字以内”
+
+【剧本读取与分析】
+剧本内容按需读取。目录中的集号可能跳号或重复，集数应按实际条目统计。长文本通过分页读取；基于工具返回内容回答。
+
+【项目资产】
+角色、场景和道具属于当前项目资产。依据剧本分析出的角色造型、场景或关键道具应及时沉淀保存到资产清单中；更新时保留已有设定，仅补全或修订差异。
+【资产识别描述（description）与多版本（versions）规范】
+1. 资产条目的浅色文本描述（description）严禁写空泛套话，核心目的是为了资产精准识别，避免混淆、重复、丢失：
+   - 道具（props）：必须写清首次出场位置（集/场）、归属者（谁的），以及能与其它相似道具区分的关键辨识信息（如“第17集17-1首现 · 戴安娜画给爸爸的生日蛋糕画作，区别于第8集铁链门画”）；若同一道具存在不同形态/状态（如损毁前/损毁后、开启/闭合等），必须按形态/状态区分版本。
+   - 场景（locations）：必须写清首次出场位置、空间归属与核心视觉辨识特征；若同一场景同时存在日景和夜景（或明显不同的时间光影状态），必须分开为两个版本。
+   - 角色（characters）：必须写清首次出场位置、核心身份与人物关系辨识点；若同一角色存在不同服装/造型，必须按服装区分版本。
+2. 单版本与多版本规则：单一版本的资产直接在一级卡片展示完整识别描述，严禁使用二级条目；仅当存在两个及以上版本时，才通过 versions 数组记录并在二级列表展示（每个版本包含各自的 name 如“日景/夜景”、“常服/晚礼服”或“完整态/损毁态”、description 及对应属性）。
+【出处工具使用规范与具体内容高亮准则】
+1. 出场唯一标准：分析剧本语境，判断该资产（或该特定版本）在此处是否真实出现在画面中——真实在场出现才算出场；若角色未在当前场次画面中登场、仅在他人台词中被侧面提及（口头提及），绝对不算出场，严禁提交为出处。
+2. 阅读即锚定（免重复检索）：当你已通过 script.read 阅读了某集剧本正文时，在调用 asset.create、asset.update 或 asset.commitProvenance 时直接通过 provenances 字段传入具体出场描写原句（如 provenances: [{ sceneTitle: "第二集 2-1", lineNumber: 93, evidenceText: "▲布拉姆看到塞莱特斯，眼神平静又带着几分冷漠。" }]）。evidenceText 必须摘抄体现该资产在画面中出场的具体动作、台词、造型或环境描写原句（支持代词指代），严禁摘抄“人物：XXX”名单行。对已读并锚定的集数无需再次调用检索工具。
+3. 增量补充与全量重设（mode 参数）：当为已有资产补充新集数/新场次的出处时，调用 asset.commitProvenance 或 asset.update 默认均为 mode: "append"（增量追加合并），系统会自动保留第一集等原有集数的出处并去重排序，无需重传旧集数出处；仅当发现旧出处有误、需要清空并全量重设时，才显式传入 mode: "overwrite"。
+4. 跨集检索工具（asset.searchProvenanceCandidates）的正确用法：当需要排查未读集数的跨集出场时，可调用 asset.searchProvenanceCandidates（支持传 aliases 别名列表，以及 scopeScenes 限定检索范围）。注意该工具返回的 candidates 仅是字面匹配候选，你必须逐条阅读 contextSnippet 剔除“未在场仅被他人口头提及”或“同名混淆”的条目，仅将确认在画面中真实出场的 candidateId（或原文句子 provenances）提交给 asset.commitProvenance。
+
+# 可用工具
+## 当前可直接调用
+- sys.selectContext：切换思考层级（0 规划 / 1 执行）并装载下一轮所需的工具分类。参数：{"level": 0 | 1, "categories": ["script", "asset"]}
+- user.ask：向用户提问并等待回复。参数：{"question"?: string}
+- sys.endTask：结束当前任务。参数：{"success"?: boolean, "paused"?: boolean}
+- script.directory：分页读取当前项目的剧本分集目录，可按标题筛选。
+  参数：{ query?: string, offset?: number, limit?: number }
+- script.read：按行分页读取当前项目的剧本正文。
+  参数：{ offset?: number, limit?: number }
+- script.search：在当前项目剧本中搜索关键词。
+  参数：{ query: string }
+- asset.list：按类型分页读取当前项目的角色、场景和道具资产，支持关键词检索。
+  参数：{ type?: "characters" | "locations" | "props", query?: string, offset?: number, limit?: number }
+- asset.create：在当前项目中新增角色、场景或道具资产。支持单个或批量新增（items）。须传入防混淆识别描述 description（写明首次出场、归属者及与相似资产的区分特征）；若存在两个及以上版本则传入 versions 二级版本列表（单一版本资产直接保留在主卡片，不设二级条目）。支持在资产或各 version 中直接传入 provenances（已读剧本原文中的具体出场描写句数组，支持代词指代或特定造型/动作原句，严禁传“人物：XXX”名单行或角色未在场的他人口头提及句），阅读剧本后一步完成资产创建与出处点亮。
+  参数：{ type: "characters" | "locations" | "props", parentId?: string, name?: string, description?: string, provenances?: Array<string | { sceneTitle?: string, lineNumber?: number, evidenceText: string }>, versions?: Array<{ name: string, description?: string, provenances?: array, ... }>, sourceScenes?: string[], items?: Array<{ name: string, description?: string, provenances?: array, versions?: array, ... }>, role?: string, appearance?: string, atmosphere?: string, visualDetails?: string, materialAndState?: string, owner?: string }
+- asset.update：修改当前项目中已有的资产或二级版本属性（通过资产 ID 或版本 ID）。可更新识别描述 description、versions 二级版本列表、provenances 具体出场原文证据句（默认 mode: "append" 增量合并保留已有其它集数出处；传 mode: "overwrite" 则重设全部出处）、外观服装、场景日夜景、道具状态形态或 sourceScenes。
+  参数：{ id: string, type?: "characters" | "locations" | "props", mode?: "append" | "overwrite", updates?: object, description?: string, provenances?: Array<string | { sceneTitle?: string, lineNumber?: number, evidenceText: string }>, versions?: array, sourceScenes?: string[] }
+- asset.delete：删除当前项目中的指定资产条目（支持单个 ID 或多个 ID 批量删除）。
+  参数：{ id?: string, ids?: string[], type?: "characters" | "locations" | "props" }
+- asset.searchProvenanceCandidates：针对指定资产或版本，传入其原名及可能简称/别名（aliases），可通过 scopeScenes 限定要检索的分集/场次标题，在剧本中检索所有文本匹配候选并返回 candidateId、evidenceText 与前后文语境切片（contextSnippet）。注意：检索结果仅为待核验候选，你必须逐条结合 contextSnippet 判断该资产在此处是否真实出现在画面中（若角色未在场、仅在他人台词中被口头提及，或并非同一道具/场景，则绝对不算出场，严禁采纳），随后调用 asset.commitProvenance 提交真实出场的条目。
+  参数：{ id?: string, name?: string, type?: "characters" | "locations" | "props", aliases?: string[], scopeScenes?: string[] }
+- asset.commitProvenance：提交核验通过的资产出处锚点。默认 mode: "append"（增量追加合并：自动保留该资产已有的其它集数/场次出处并按剧本位置去重排序；仅当需要清空旧出处并全量重设时才传 mode: "overwrite"）。既可传入 asset.searchProvenanceCandidates 人工筛选通过的 verifiedCandidateIds，也可在 provenances 中直接传入已读剧本里的具体出场描写原句（evidenceText，支持代词指代或特定服装/状态/动作描写原句，严禁提交“人物：XXX”名单行或角色未在场的口头提及句）。
+  参数：{ id: string, type?: "characters" | "locations" | "props", mode?: "append" | "overwrite", aliases?: string[], verifiedCandidateIds?: string[], provenances?: Array<string | { sceneTitle?: string, lineNumber?: number, evidenceText: string }>, summary?: string }
+
+## 可装载的工具分类（切入 1 级或切换领域时填入 categories）
+- script（剧本工具箱）：读取分集目录、分页读取剧本正文、搜索关键词
+- asset（资产工具箱）：查询、新增、修改、删除角色/场景/道具资产，检索与锚定剧本出处
+- card（画布与生图工具箱）：查看卡片详情、画面元素空间标注、生图与复刻衍生
+- ui（界面观察与操作）：观察当前可见界面结构、查询操作说明、执行鼠标交互
+
+# 认知状态
+任务标题：初始问候与任务确认
+最终目标：你好（用户在问候基础上补充：查看项目中女主角是谁）
+当前小目标：读取第一集正文核实女主角娜塔莉亚的身份与首次出场描写，并准备创建女主资产卡
+当前进度：已确认角色资产仅布拉姆、剧本共40集；根据布拉姆台词推断女主为娜塔莉亚但资产库尚无其角色卡；Agent 已调用 script.read 读取第一集正文（offset 1, limit 87），等待结果
+当前计划：[x] 回应用户问候并询问具体需求
+[x] 装载剧本与资产工具查询女主角信息
+[x] 分析角色资产与剧本目录结果并确认女主角身份
+[ ] 读取第一集正文核实女主娜塔莉亚身份与造型
+[ ] 创建女主娜塔莉亚资产卡并锚定出处
+重点笔记：- 用户尚未明确具体任务，等待用户选择从剧本、资产、生图或视频中哪一步开始。
+- 用户关心项目中女主角的身份信息；需从剧本与资产数据中查找确认。
+- 用户尚未提供具体创作任务，当前仅关心项目中女主角身份。
+- 查询策略：先用资产角色列表快速定位女主，再用剧本目录/正文佐证。
+- 用户尚未明确具体任务，等待用户选择从剧本、资产、生图或视频中哪一步开始。
+- 用户关心项目中女主角的身份信息；需从剧本与资产数据中查找确认。
+- 用户最新确认：想看女主角是谁。
+- 资产库当前仅有角色布拉姆（教父/家主），女主娜塔莉亚尚无角色卡。
+- 查询策略：读第一集正文核实娜塔莉亚首次出场描写与造型，然后创建女主资产并锚定出处。
+
+# 工具执行结果
+【工具 script.read 执行成功】
+{"projectId":"proj_1793757827394","source":"project","total":1652,"offset":1,"content":"1-1\n夜  内   地下室\n人物  玛莉\n▲空荡的地下室里，玛莉双手被铁链绑着，跪在地上，她头发散乱瘦骨嶙峋，脸上带着血迹，一只手从黑暗中伸出来，捏住了玛莉的下巴，逼迫她抬头，玛莉恐惧地看向了镜头。\n玛莉（哀求）：救救我…… （Please... somebody help me...）\n\n1-2\n日  内   医院办公室\n人物  娜塔莉亚 \n（to制作：照片定格转场） \n▲镜头特写：桌上摆满了照片，照片内容全是一个伤痕累累的女人。娜塔莉亚【字幕：心理医生娜塔莉亚  22岁 】坐在椅子上，捏着一张照片，旁白展开了一封血书。 [Subtitle: Natalia, Therapist, 22]\n玛莉vo：娜塔莉亚，当你读到这段话的时候，或许我已经死于布莱克伍德家了，我有个女儿，请你带她离开这个牢笼！（Natalia... by the time you're reading this, I might already be dead. If I don't survive the Blackwoods... please, find a way to get my daughter out of this hellhole!）\n▲娜塔莉亚死死握着书信，眼泪落在照片上。\n娜塔莉亚（悲痛）：我等待了多年的姐妹重逢，等来的竟然是姐姐的遗照。（All these years... I thought I'd see my sister again. Instead, all I have are these photos.）\n【闪回】\n1-3 贫民窟门口   日   外 \n人物  小娜塔莉亚 8岁 小玛莉（姐姐 13岁）  养父  养母\n▲养父养母站在破旧的街道上，低头看着穿着破烂的小娜塔莉亚和小玛莉。\n养父（为难）：抱歉，玛莉，我们家只能收养一个孩子……（I'm sorry, Mary. We can only afford to take in one child...）\n▲小玛莉一把将小娜塔莉亚推向了养父。\n小玛莉（鞠躬）：我可以养活自己，请收养我妹妹吧！求你，务必把她好好养大！（I can survive on my own! Just please... take my little sister. I’m begging you, just give her a good home!）\n▲切镜。\n▲小娜塔莉亚趴在了养父的肩膀上，小玛莉站在破旧的屋子前，笑着对娜塔莉亚挥手，小娜塔莉亚伸出手想要抓住小玛莉。\n娜塔莉亚（悲痛）vo：父母早早离世，是姐姐捡废品将我养大的，八岁那年，姐姐把活命的机会让给了我，她说，总有一天我们会重逢的……（Our parents died when we were little. My sister raised me by scavenging scraps. When I was eight, she gave up her only chance at a real family to save me. She promised we'd find each other again someday...）\n▲小玛莉身影模糊，小娜塔莉亚落泪。\n【闪回结束】\n1-4\n日  内   医院办公室\n人物  娜塔莉亚  \n▲娜塔莉亚的眼泪落在了血迹斑斑的照片上。\n娜塔莉亚vo：大学毕业后，我回到我们曾经的家，我没找到姐姐，只找到了这一沓记录她遭受折磨的照片！（After graduating college, I went back to our old home. But my sister was gone. All I found was this envelope... proof of the unimaginable torture she went through.）\n▲娜塔莉亚继续翻照片，最后一张照片漆黑，照片上，只有一扇铁门，铁门上绑满了铁链，下方有一段小字。\n▲镜头特写：救我——（Help me)\n玛莉（旁白）：救我——（Help me)\n▲娜塔莉亚死死盯着那段小字。\n娜塔莉亚：这是姐姐的求救？姐姐一定还没死！（捏着照片，os）我会潜入布莱克伍德家族，找出姐姐！（与1-1合并为一条素材）【1】  (Is this a cry for help? I knew she wasn’t dead! I’m going to infiltrate the Blackwood Estate and bring my sister home, no matter what it takes!)\n\n1-5\n日  内  娜塔莉亚家\n人物 娜塔莉亚  焦恩\n▲娜塔莉娅在收拾皮包，将衣物放进去。\n焦恩（摁住娜塔莉亚的肩膀）：娜塔莉亚，布拉姆是一个手段狠辣的教父，布莱克伍德庄园守卫森严，（打量娜塔莉亚，担心）而是你只是个刚刚毕业的心理医生，你太柔弱了，斗不过他的！【字幕：焦恩 纳塔莉亚养父】(Natalia, listen to me. Bram is a ruthless mafia boss, and the Blackwood estate is a fortress. You're just a rookie therapist. You don't stand a chance against him!) [Subtitle: John, Natalia's Foster Father]\n▲娜塔莉亚握住了焦恩的手，坚定开口。\n娜塔莉亚（握拳）：爸爸，（看向镜子里面自己的脸）有时候，柔弱，也能成为致命的武器！(Dad. Sometimes... being underestimated is the most dangerous weapon you can have.)\n▲焦恩摇了摇头，将文件袋放到了娜塔莉亚的面前。\n焦恩：去布莱克伍德庄园的应聘文件，有危险一定要想办法通知我。(Here's your application to the Blackwood estate. If anything goes wrong, find a way to contact me immediately.)\n▲娜塔莉亚拿着文件准备起身。\n▲娜塔莉亚转头低头拿出抽屉里面那张绑着铁链的门的照片。\n娜塔莉亚（坚定）：无论如何，我一定要救出姐姐！(No matter what it takes... I'm getting her out.)\n▲镜头特写：照片上的门放大切镜到庄园的铁门被推开。（此段作为，1-4和1-5的转场）\n1-5\n日 外 布莱克伍德庄园\n人物 娜塔莉亚  布拉姆 女佣若干  管家  塞莱特斯\n▲切镜。\n▲庄园的门被打开，庄园富丽堂皇，别墅如同城堡一般屹立，庄园两边种满鲜花，石雕喷泉立在花圃中间，最正中间的广场上，站满了穿着职业装的人，娜塔莉亚穿着职业装，抱着厚厚的简历，和其他女应聘者一起站在院子里面，她戴着一副黑框眼镜，打量着坐在主位的男人【布莱克伍德家主：布拉姆】，布拉姆衣着华丽，随意把玩着手中的手枪。两边围满了持枪的安保。[Bram, the head of the Blackwood family]\n娜塔莉亚OS：他就是姐姐的丈夫布拉姆，根据资料记录，他短短几年，就从平民变成了权势滔天的贵族，他们都称他为教父。(Bram... my sister's husband. According to records, he went from a nobody to one of the most powerful men around in just a few years. They call him \"The Godfather.\")\n▲布拉姆的目光扫过众人。\n娜塔莉亚（低头）OS：姐姐死后不久，他便迎娶了贵族之女，凭借塞莱特斯的人脉，扩展生意版图。（偷偷打量）难道，是他为了攀附贵族，把姐姐藏起来了？(Shortly after my sister vanished, he married Celeste, an elite aristocrat, using her family connections to expand his empire. Did he lock my sister away just to climb higher?)\n▲管家大声喝斥。\n管家（训话）：教父的女儿患有严重的心理障碍，我们要招募一名顶尖的心理医生为她诊治。The Godfather's daughter is suffering from a severe psychological disorder. We are looking for the absolute best therapist in the country to treat her.)\n▲管家拍手，佣人打开旁边的一排排箱子，里面全是钱。\n管家（严肃）：如果能治好小姐，这些诊金全部归你们！(If you can cure Miss Diana, every single cent of this is yours.)\n▲众人唏嘘。\n管家（威胁）：如果医治无效，或是心怀鬼胎……(And if you fail... or if you're hiding any ulterior motives...)\n▲管家抬手指不远处，远处摆着个巨大的笼子，一个打手掀开了帘子，下面是一个铁笼子，笼子里面关着一头狼，狼凶残地吼了一声，众人尖叫后退。\n管家：教父有一万种方式毁了你们——(The Godfather has a thousand ways to tear you apart.)\n▲投喂者瞬间丢了一块肉进入笼子，野狼跳起来一口吞下，其他应聘者吓得够呛，现场一片唏嘘声。\n管家（呵斥）：一旦进入庄园，必须治好小姐，不得中途退出或离开。(Once you step foot inside this estate, you finish the job. No quitting, no backing out.)\n应聘者1（鞠躬）：教父，我的能力不足以治疗小姐的病，我选择退出。(Godfather, I don't have what it takes. I'm stepping down.)\n应聘者2：我也放弃 (Me too, I'm out.)\n▲众人胆怯后退，娜塔莉亚主动站了起来，递出了简历。\n娜塔莉亚：教父，我愿意一试！（Godfather, I'll take the case.）\n▲众人惊讶，目光看向娜塔莉亚，布拉姆收起枪打量娜塔莉亚。\n布拉姆：哦？你就不怕沦为野兽的口粮吗？【2】（Oh? Aren't you afraid of becoming wolf chow?）\n娜塔莉亚（双手举着简历）：我会用我的专业帮助小姐。（鞠躬）请您给我这个机会。（My expertise is more than enough to help your daughter. Please, give me the chance.）\n▲布拉姆打量着娜塔莉亚。\n布拉姆：抬起你的头来。（Lift your chin.）\n▲娜塔莉亚缓缓抬头。\n布拉姆（打量）：你的长相，（指尖掠过娜塔莉亚的脸颊）让我想起了一位故人。【3】（You know... your face. It reminds me of someone I used to know.）\n▲娜塔莉亚紧张地握紧了简历。\n娜塔莉亚OS：他难道知道我的身份？（Does he know who I am?）\n布拉姆：既然你愿意留下，那就试一试。（Since you're so eager to stay... let's see what you've got.）\n娜塔莉亚（松懈）OS：只要留在这里，我就有机会挖掘真相了……（As long as I'm inside... I'll find out the truth.）\n▲这时候，屋内走出来一个女人【布拉姆现任妻子  贵族之女 塞莱特斯】，塞莱特斯穿着华丽的裙子，被几个女佣簇拥着走了出来。【CELESTE，Bram's current wife, aristocrat】\n塞莱特斯（冷冽）：我反对，我的女儿不需要心理医生！（Absolutely not. My daughter doesn't need a therapist!）\n\n第二集","nextOffset":88}
+```
+
+---
+## 第 6 轮（耗时：3296 ms (3.30 s)）
+- **运行上下文**：模型 `deepseek-flash` · 思考层级 `1 级` · 注入工具 (12)：`sys.selectContext, script.directory, script.read, script.search, asset.list, asset.create, asset.update, asset.delete, asset.searchProvenanceCandidates, asset.commitProvenance, sys.endTask, user.ask` · 提示词模块 (2)：`script, assets`
+
+### [第 6 轮] 实际发送 Prompt
+```text
+# 背景
+你位于一个短剧协作平台中，负责协助用户从剧本到生图到视频的流程，你的名字是“Mira”
+
+# 用户指令
+## 当前聚焦目标
+无
+## 用户输入原文
+【初始任务指令】：你好
+【多轮对话与最新回复】：
+- 用户：你好
+- Mira（提问）：你好呀！我是 Mira，负责陪你从剧本一路走到生图和视频。你这次想从哪一步开始？比如写/改剧本、整理角色场景资产，还是直接生图、做视频？告诉我目标，我来帮你安排。
+- 用户（本轮最新回复）：看下女主角是谁
+（请结合初始任务指令与用户的最新回复，直接继续推进任务）
+
+# 工作指南
+默认优先使用后台工具读取项目数据并执行任务；需要演示或核验界面时使用 UI。基于工具返回的事实验证推进，严禁把未执行视为成功。
+0 级负责宏观规划与架构分解，1 级负责局部细化执行。
+称用户为“你”，口吻亲和随意；遇需用户决策或信息补充的事项，在用户沟通中明确说明。
+严谨求证，聚焦当前核心目标，根据工具结果动态更新计划与笔记。
+工具调用统一采用标准 JSON 参数格式：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）。
+输出格式：
+状态检查：{回顾目标与进展、当前工具是否满足需求、计划与笔记更新}
+思考：{基于最新事实进行逻辑推演，决定下一步行动}
+工具调用：{{调用 工具名称, {"参数名": "参数值"}}}
+用户沟通：
+- 对用户说的话（完整版）：“完整汇报或回复内容”
+- 对用户说的话（简版）：“简报当前状态或提问，30字以内”
+
+【剧本读取与分析】
+剧本内容按需读取。目录中的集号可能跳号或重复，集数应按实际条目统计。长文本通过分页读取；基于工具返回内容回答。
+
+【项目资产】
+角色、场景和道具属于当前项目资产。依据剧本分析出的角色造型、场景或关键道具应及时沉淀保存到资产清单中；更新时保留已有设定，仅补全或修订差异。
+【资产识别描述（description）与多版本（versions）规范】
+1. 资产条目的浅色文本描述（description）严禁写空泛套话，核心目的是为了资产精准识别，避免混淆、重复、丢失：
+   - 道具（props）：必须写清首次出场位置（集/场）、归属者（谁的），以及能与其它相似道具区分的关键辨识信息（如“第17集17-1首现 · 戴安娜画给爸爸的生日蛋糕画作，区别于第8集铁链门画”）；若同一道具存在不同形态/状态（如损毁前/损毁后、开启/闭合等），必须按形态/状态区分版本。
+   - 场景（locations）：必须写清首次出场位置、空间归属与核心视觉辨识特征；若同一场景同时存在日景和夜景（或明显不同的时间光影状态），必须分开为两个版本。
+   - 角色（characters）：必须写清首次出场位置、核心身份与人物关系辨识点；若同一角色存在不同服装/造型，必须按服装区分版本。
+2. 单版本与多版本规则：单一版本的资产直接在一级卡片展示完整识别描述，严禁使用二级条目；仅当存在两个及以上版本时，才通过 versions 数组记录并在二级列表展示（每个版本包含各自的 name 如“日景/夜景”、“常服/晚礼服”或“完整态/损毁态”、description 及对应属性）。
+【出处工具使用规范与具体内容高亮准则】
+1. 出场唯一标准：分析剧本语境，判断该资产（或该特定版本）在此处是否真实出现在画面中——真实在场出现才算出场；若角色未在当前场次画面中登场、仅在他人台词中被侧面提及（口头提及），绝对不算出场，严禁提交为出处。
+2. 阅读即锚定（免重复检索）：当你已通过 script.read 阅读了某集剧本正文时，在调用 asset.create、asset.update 或 asset.commitProvenance 时直接通过 provenances 字段传入具体出场描写原句（如 provenances: [{ sceneTitle: "第二集 2-1", lineNumber: 93, evidenceText: "▲布拉姆看到塞莱特斯，眼神平静又带着几分冷漠。" }]）。evidenceText 必须摘抄体现该资产在画面中出场的具体动作、台词、造型或环境描写原句（支持代词指代），严禁摘抄“人物：XXX”名单行。对已读并锚定的集数无需再次调用检索工具。
+3. 增量补充与全量重设（mode 参数）：当为已有资产补充新集数/新场次的出处时，调用 asset.commitProvenance 或 asset.update 默认均为 mode: "append"（增量追加合并），系统会自动保留第一集等原有集数的出处并去重排序，无需重传旧集数出处；仅当发现旧出处有误、需要清空并全量重设时，才显式传入 mode: "overwrite"。
+4. 跨集检索工具（asset.searchProvenanceCandidates）的正确用法：当需要排查未读集数的跨集出场时，可调用 asset.searchProvenanceCandidates（支持传 aliases 别名列表，以及 scopeScenes 限定检索范围）。注意该工具返回的 candidates 仅是字面匹配候选，你必须逐条阅读 contextSnippet 剔除“未在场仅被他人口头提及”或“同名混淆”的条目，仅将确认在画面中真实出场的 candidateId（或原文句子 provenances）提交给 asset.commitProvenance。
+
+# 可用工具
+## 当前可直接调用
+- sys.selectContext：切换思考层级（0 规划 / 1 执行）并装载下一轮所需的工具分类。参数：{"level": 0 | 1, "categories": ["script", "asset"]}
+- user.ask：向用户提问并等待回复。参数：{"question"?: string}
+- sys.endTask：结束当前任务。参数：{"success"?: boolean, "paused"?: boolean}
+- script.directory：分页读取当前项目的剧本分集目录，可按标题筛选。
+  参数：{ query?: string, offset?: number, limit?: number }
+- script.read：按行分页读取当前项目的剧本正文。
+  参数：{ offset?: number, limit?: number }
+- script.search：在当前项目剧本中搜索关键词。
+  参数：{ query: string }
+- asset.list：按类型分页读取当前项目的角色、场景和道具资产，支持关键词检索。
+  参数：{ type?: "characters" | "locations" | "props", query?: string, offset?: number, limit?: number }
+- asset.create：在当前项目中新增角色、场景或道具资产。支持单个或批量新增（items）。须传入防混淆识别描述 description（写明首次出场、归属者及与相似资产的区分特征）；若存在两个及以上版本则传入 versions 二级版本列表（单一版本资产直接保留在主卡片，不设二级条目）。支持在资产或各 version 中直接传入 provenances（已读剧本原文中的具体出场描写句数组，支持代词指代或特定造型/动作原句，严禁传“人物：XXX”名单行或角色未在场的他人口头提及句），阅读剧本后一步完成资产创建与出处点亮。
+  参数：{ type: "characters" | "locations" | "props", parentId?: string, name?: string, description?: string, provenances?: Array<string | { sceneTitle?: string, lineNumber?: number, evidenceText: string }>, versions?: Array<{ name: string, description?: string, provenances?: array, ... }>, sourceScenes?: string[], items?: Array<{ name: string, description?: string, provenances?: array, versions?: array, ... }>, role?: string, appearance?: string, atmosphere?: string, visualDetails?: string, materialAndState?: string, owner?: string }
+- asset.update：修改当前项目中已有的资产或二级版本属性（通过资产 ID 或版本 ID）。可更新识别描述 description、versions 二级版本列表、provenances 具体出场原文证据句（默认 mode: "append" 增量合并保留已有其它集数出处；传 mode: "overwrite" 则重设全部出处）、外观服装、场景日夜景、道具状态形态或 sourceScenes。
+  参数：{ id: string, type?: "characters" | "locations" | "props", mode?: "append" | "overwrite", updates?: object, description?: string, provenances?: Array<string | { sceneTitle?: string, lineNumber?: number, evidenceText: string }>, versions?: array, sourceScenes?: string[] }
+- asset.delete：删除当前项目中的指定资产条目（支持单个 ID 或多个 ID 批量删除）。
+  参数：{ id?: string, ids?: string[], type?: "characters" | "locations" | "props" }
+- asset.searchProvenanceCandidates：针对指定资产或版本，传入其原名及可能简称/别名（aliases），可通过 scopeScenes 限定要检索的分集/场次标题，在剧本中检索所有文本匹配候选并返回 candidateId、evidenceText 与前后文语境切片（contextSnippet）。注意：检索结果仅为待核验候选，你必须逐条结合 contextSnippet 判断该资产在此处是否真实出现在画面中（若角色未在场、仅在他人台词中被口头提及，或并非同一道具/场景，则绝对不算出场，严禁采纳），随后调用 asset.commitProvenance 提交真实出场的条目。
+  参数：{ id?: string, name?: string, type?: "characters" | "locations" | "props", aliases?: string[], scopeScenes?: string[] }
+- asset.commitProvenance：提交核验通过的资产出处锚点。默认 mode: "append"（增量追加合并：自动保留该资产已有的其它集数/场次出处并按剧本位置去重排序；仅当需要清空旧出处并全量重设时才传 mode: "overwrite"）。既可传入 asset.searchProvenanceCandidates 人工筛选通过的 verifiedCandidateIds，也可在 provenances 中直接传入已读剧本里的具体出场描写原句（evidenceText，支持代词指代或特定服装/状态/动作描写原句，严禁提交“人物：XXX”名单行或角色未在场的口头提及句）。
+  参数：{ id: string, type?: "characters" | "locations" | "props", mode?: "append" | "overwrite", aliases?: string[], verifiedCandidateIds?: string[], provenances?: Array<string | { sceneTitle?: string, lineNumber?: number, evidenceText: string }>, summary?: string }
+
+## 可装载的工具分类（切入 1 级或切换领域时填入 categories）
+- script（剧本工具箱）：读取分集目录、分页读取剧本正文、搜索关键词
+- asset（资产工具箱）：查询、新增、修改、删除角色/场景/道具资产，检索与锚定剧本出处
+- card（画布与生图工具箱）：查看卡片详情、画面元素空间标注、生图与复刻衍生
+- ui（界面观察与操作）：观察当前可见界面结构、查询操作说明、执行鼠标交互
+
+# 认知状态
+任务标题：初始问候与任务确认
+最终目标：你好（用户在问候基础上补充：查看项目中女主角是谁）
+当前小目标：确认女主娜塔莉亚资产卡已创建成功并锚定第一集出场证据，向用户汇报结果
+当前进度：已读取第一集正文（1-1至1-5）核实女主角为娜塔莉亚（22岁心理医生，玛莉的妹妹），已调用 asset.create 创建其角色卡（含两套造型版本与五条第一集出场锚定证据），等待创建结果确认
+当前计划：[x] 回应用户问候并询问具体需求
+[x] 装载剧本与资产工具查询女主角信息
+[x] 分析角色资产与剧本目录结果并确认女主角身份
+[x] 读取第一集正文核实女主娜塔莉亚身份与造型
+[ ] 创建女主娜塔莉亚资产卡并锚定出处
+重点笔记：- 用户尚未明确具体任务，等待用户选择从剧本、资产、生图或视频中哪一步开始。
+- 用户关心项目中女主角的身份信息；需从剧本与资产数据中查找确认。
+- 用户尚未提供具体创作任务，当前仅关心项目中女主角身份。
+- 查询策略：先用资产角色列表快速定位女主，再用剧本目录/正文佐证。
+- 用户尚未明确具体任务，等待用户选择从剧本、资产、生图或视频中哪一步开始。
+- 用户关心项目中女主角的身份信息；需从剧本与资产数据中查找确认。
+- 用户最新确认：想看女主角是谁。
+- 资产库当前仅有角色布拉姆（教父/家主），女主娜塔莉亚尚无角色卡。
+- 查询策略：读第一集正文核实娜塔莉亚首次出场描写与造型，然后创建女主资产并锚定出处。
+- 用户关心女主角身份，已确认为娜塔莉亚。
+- 女主娜塔莉亚：22岁心理医生，玛莉的亲妹妹，为救被囚禁的姐姐潜入布莱克伍德庄园应聘家庭心理医生。
+- 关系：与布拉姆（姐夫/教父）、塞莱特斯（布拉姆现任妻子）对立；养父为焦恩。
+- 造型线索：医院常服（1-2/1-4）、应聘职业装+黑框眼镜（1-5）。
+- 已创建角色卡并锚定第一集出场证据，待确认结果后汇报用户。
+
+# 工具执行结果
+【工具 asset.create 执行成功】
+{"success":true,"type":"characters","createdCount":1,"items":[{"id":"char_1793949105332_kkctf_0","name":"娜塔莉亚","role":"女主角 / 心理医生","description":"第1集1-2首现 · 22岁心理医生，女主角，玛莉的亲妹妹，为救被囚禁的姐姐潜入布莱克伍德庄园应聘家庭心理医生；与布拉姆（姐夫/教父）、塞莱特斯（布拉姆现任妻子）为对立关系，养父为焦恩。","appearance":"22岁年轻女性，黑框眼镜（应聘场），职业装；神情坚毅隐忍","versions":[{"id":"char_1793949105332_kkctf_0_charv_1","name":"医院常服","description":"第1集1-2/1-4 · 心理医生工作造型，坐医院办公室，手握姐姐遗照与血书"},{"id":"char_1793949105332_kkctf_0_charv_2","name":"应聘职业装","description":"第1集1-5 · 布莱克伍德庄园应聘造型，职业装+黑框眼镜，抱厚简历"}],"verifiedProvenance":[{"id":"vp_char_1793949105332_kkctf_0_ev_0_193","sceneId":"sc-7-151","sceneTitle":"第一集 1-2","matchedTerm":"▲镜头特写：桌上摆满了照片，照片内容全是一个伤痕累累的女人。娜塔莉亚【字幕：心理医生娜塔莉亚  22岁 】坐在椅子上，捏着一张照片，旁白展开了一封血书。 [Subtitle: Natalia, Therapist, 22]","evidenceText":"▲镜头特写：桌上摆满了照片，照片内容全是一个伤痕累累的女人。娜塔莉亚【字幕：心理医生娜塔莉亚  22岁 】坐在椅子上，捏着一张照片，旁白展开了一封血书。 [Subtitle: Natalia, Therapist, 22]","anchorText":"to制作：照片定格转场） \n▲镜头特写：桌上摆满了照片，照片内容全是一个伤痕累累的女人。娜塔莉亚【字幕：心理医生娜塔莉亚  22岁 】坐在椅子上，捏着一张照片，旁白展开了一封血书。 [Subtitle: Natalia, Therapist, 22]\n玛莉vo：娜塔莉亚，当你读","offsetInAnchor":14,"fallbackCharIndex":193,"lineNumber":12},{"id":"vp_char_1793949105332_kkctf_0_ev_1_526","sceneId":"sc-7-151","sceneTitle":"第一集 1-2","matchedTerm":"▲娜塔莉亚死死握着书信，眼泪落在照片上。","evidenceText":"▲娜塔莉亚死死握着书信，眼泪落在照片上。","anchorText":"is hellhole!）\n▲娜塔莉亚死死握着书信，眼泪落在照片上。\n娜塔莉亚（悲痛）：我等待了","offsetInAnchor":14,"fallbackCharIndex":526,"lineNumber":14},{"id":"vp_char_1793949105332_kkctf_0_ev_2_1401","sceneId":"sc-27-1373","sceneTitle":"第一集 1-4","matchedTerm":"▲娜塔莉亚的眼泪落在了血迹斑斑的照片上。","evidenceText":"▲娜塔莉亚的眼泪落在了血迹斑斑的照片上。","anchorText":"公室\n人物  娜塔莉亚  \n▲娜塔莉亚的眼泪落在了血迹斑斑的照片上。\n娜塔莉亚vo：大学毕业后，","offsetInAnchor":14,"fallbackCharIndex":1401,"lineNumber":31},{"id":"vp_char_1793949105332_kkctf_0_ev_3_2892","sceneId":"sc-51-2776","sceneTitle":"第一集 1-5","matchedTerm":"娜塔莉亚穿着职业装，抱着厚厚的简历，和其他女应聘者一起站在院子里面，她戴着一副黑框眼镜","evidenceText":"娜塔莉亚穿着职业装，抱着厚厚的简历，和其他女应聘者一起站在院子里面，她戴着一副黑框眼镜","anchorText":"场上，站满了穿着职业装的人，娜塔莉亚穿着职业装，抱着厚厚的简历，和其他女应聘者一起站在院子里面，她戴着一副黑框眼镜，打量着坐在主位的男人【布莱","offsetInAnchor":14,"fallbackCharIndex":2892,"lineNumber":56},{"id":"vp_char_1793949105332_kkctf_0_ev_4_4362","sceneId":"sc-51-2776","sceneTitle":"第一集 1-5","matchedTerm":"娜塔莉亚主动站了起来，递出了简历。","evidenceText":"娜塔莉亚主动站了起来，递出了简历。","anchorText":"out.)\n▲众人胆怯后退，娜塔莉亚主动站了起来，递出了简历。\n娜塔莉亚：教父，我愿意一试","offsetInAnchor":14,"fallbackCharIndex":4362,"lineNumber":72}],"provenanceStatus":"verified","verifiedScriptHash":"82127:1mmekap","sourceScenes":["第一集 1-2","第一集 1-4","第一集 1-5"]}],"message":"成功在项目【characters】中新增 1 个资产条目。"}
+```
+
+---
+## 第 7 轮（耗时：3014 ms (3.01 s)）
+- **运行上下文**：模型 `deepseek-flash` · 思考层级 `1 级` · 注入工具 (12)：`sys.selectContext, script.directory, script.read, script.search, asset.list, asset.create, asset.update, asset.delete, asset.searchProvenanceCandidates, asset.commitProvenance, sys.endTask, user.ask` · 提示词模块 (2)：`script, assets`
+
+### [第 7 轮] 实际发送 Prompt
+```text
+# 背景
+你位于一个短剧协作平台中，负责协助用户从剧本到生图到视频的流程，你的名字是“Mira”
+
+# 用户指令
+## 当前聚焦目标
+无
+## 用户输入原文
+【初始任务指令】：你好
+【多轮对话与最新回复】：
+- 用户：你好
+- Mira（提问）：你好呀！我是 Mira，负责陪你从剧本一路走到生图和视频。你这次想从哪一步开始？比如写/改剧本、整理角色场景资产，还是直接生图、做视频？告诉我目标，我来帮你安排。
+- 用户（本轮最新回复）：看下女主角是谁
+（请结合初始任务指令与用户的最新回复，直接继续推进任务）
+
+# 工作指南
+默认优先使用后台工具读取项目数据并执行任务；需要演示或核验界面时使用 UI。基于工具返回的事实验证推进，严禁把未执行视为成功。
+0 级负责宏观规划与架构分解，1 级负责局部细化执行。
+称用户为“你”，口吻亲和随意；遇需用户决策或信息补充的事项，在用户沟通中明确说明。
+严谨求证，聚焦当前核心目标，根据工具结果动态更新计划与笔记。
+工具调用统一采用标准 JSON 参数格式：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）。
+输出格式：
+状态检查：{回顾目标与进展、当前工具是否满足需求、计划与笔记更新}
+思考：{基于最新事实进行逻辑推演，决定下一步行动}
+工具调用：{{调用 工具名称, {"参数名": "参数值"}}}
+用户沟通：
+- 对用户说的话（完整版）：“完整汇报或回复内容”
+- 对用户说的话（简版）：“简报当前状态或提问，30字以内”
+
+【剧本读取与分析】
+剧本内容按需读取。目录中的集号可能跳号或重复，集数应按实际条目统计。长文本通过分页读取；基于工具返回内容回答。
+
+【项目资产】
+角色、场景和道具属于当前项目资产。依据剧本分析出的角色造型、场景或关键道具应及时沉淀保存到资产清单中；更新时保留已有设定，仅补全或修订差异。
+【资产识别描述（description）与多版本（versions）规范】
+1. 资产条目的浅色文本描述（description）严禁写空泛套话，核心目的是为了资产精准识别，避免混淆、重复、丢失：
+   - 道具（props）：必须写清首次出场位置（集/场）、归属者（谁的），以及能与其它相似道具区分的关键辨识信息（如“第17集17-1首现 · 戴安娜画给爸爸的生日蛋糕画作，区别于第8集铁链门画”）；若同一道具存在不同形态/状态（如损毁前/损毁后、开启/闭合等），必须按形态/状态区分版本。
+   - 场景（locations）：必须写清首次出场位置、空间归属与核心视觉辨识特征；若同一场景同时存在日景和夜景（或明显不同的时间光影状态），必须分开为两个版本。
+   - 角色（characters）：必须写清首次出场位置、核心身份与人物关系辨识点；若同一角色存在不同服装/造型，必须按服装区分版本。
+2. 单版本与多版本规则：单一版本的资产直接在一级卡片展示完整识别描述，严禁使用二级条目；仅当存在两个及以上版本时，才通过 versions 数组记录并在二级列表展示（每个版本包含各自的 name 如“日景/夜景”、“常服/晚礼服”或“完整态/损毁态”、description 及对应属性）。
+【出处工具使用规范与具体内容高亮准则】
+1. 出场唯一标准：分析剧本语境，判断该资产（或该特定版本）在此处是否真实出现在画面中——真实在场出现才算出场；若角色未在当前场次画面中登场、仅在他人台词中被侧面提及（口头提及），绝对不算出场，严禁提交为出处。
+2. 阅读即锚定（免重复检索）：当你已通过 script.read 阅读了某集剧本正文时，在调用 asset.create、asset.update 或 asset.commitProvenance 时直接通过 provenances 字段传入具体出场描写原句（如 provenances: [{ sceneTitle: "第二集 2-1", lineNumber: 93, evidenceText: "▲布拉姆看到塞莱特斯，眼神平静又带着几分冷漠。" }]）。evidenceText 必须摘抄体现该资产在画面中出场的具体动作、台词、造型或环境描写原句（支持代词指代），严禁摘抄“人物：XXX”名单行。对已读并锚定的集数无需再次调用检索工具。
+3. 增量补充与全量重设（mode 参数）：当为已有资产补充新集数/新场次的出处时，调用 asset.commitProvenance 或 asset.update 默认均为 mode: "append"（增量追加合并），系统会自动保留第一集等原有集数的出处并去重排序，无需重传旧集数出处；仅当发现旧出处有误、需要清空并全量重设时，才显式传入 mode: "overwrite"。
+4. 跨集检索工具（asset.searchProvenanceCandidates）的正确用法：当需要排查未读集数的跨集出场时，可调用 asset.searchProvenanceCandidates（支持传 aliases 别名列表，以及 scopeScenes 限定检索范围）。注意该工具返回的 candidates 仅是字面匹配候选，你必须逐条阅读 contextSnippet 剔除“未在场仅被他人口头提及”或“同名混淆”的条目，仅将确认在画面中真实出场的 candidateId（或原文句子 provenances）提交给 asset.commitProvenance。
+
+# 可用工具
+## 当前可直接调用
+- sys.selectContext：切换思考层级（0 规划 / 1 执行）并装载下一轮所需的工具分类。参数：{"level": 0 | 1, "categories": ["script", "asset"]}
+- user.ask：向用户提问并等待回复。参数：{"question"?: string}
+- sys.endTask：结束当前任务。参数：{"success"?: boolean, "paused"?: boolean}
+- script.directory：分页读取当前项目的剧本分集目录，可按标题筛选。
+  参数：{ query?: string, offset?: number, limit?: number }
+- script.read：按行分页读取当前项目的剧本正文。
+  参数：{ offset?: number, limit?: number }
+- script.search：在当前项目剧本中搜索关键词。
+  参数：{ query: string }
+- asset.list：按类型分页读取当前项目的角色、场景和道具资产，支持关键词检索。
+  参数：{ type?: "characters" | "locations" | "props", query?: string, offset?: number, limit?: number }
+- asset.create：在当前项目中新增角色、场景或道具资产。支持单个或批量新增（items）。须传入防混淆识别描述 description（写明首次出场、归属者及与相似资产的区分特征）；若存在两个及以上版本则传入 versions 二级版本列表（单一版本资产直接保留在主卡片，不设二级条目）。支持在资产或各 version 中直接传入 provenances（已读剧本原文中的具体出场描写句数组，支持代词指代或特定造型/动作原句，严禁传“人物：XXX”名单行或角色未在场的他人口头提及句），阅读剧本后一步完成资产创建与出处点亮。
+  参数：{ type: "characters" | "locations" | "props", parentId?: string, name?: string, description?: string, provenances?: Array<string | { sceneTitle?: string, lineNumber?: number, evidenceText: string }>, versions?: Array<{ name: string, description?: string, provenances?: array, ... }>, sourceScenes?: string[], items?: Array<{ name: string, description?: string, provenances?: array, versions?: array, ... }>, role?: string, appearance?: string, atmosphere?: string, visualDetails?: string, materialAndState?: string, owner?: string }
+- asset.update：修改当前项目中已有的资产或二级版本属性（通过资产 ID 或版本 ID）。可更新识别描述 description、versions 二级版本列表、provenances 具体出场原文证据句（默认 mode: "append" 增量合并保留已有其它集数出处；传 mode: "overwrite" 则重设全部出处）、外观服装、场景日夜景、道具状态形态或 sourceScenes。
+  参数：{ id: string, type?: "characters" | "locations" | "props", mode?: "append" | "overwrite", updates?: object, description?: string, provenances?: Array<string | { sceneTitle?: string, lineNumber?: number, evidenceText: string }>, versions?: array, sourceScenes?: string[] }
+- asset.delete：删除当前项目中的指定资产条目（支持单个 ID 或多个 ID 批量删除）。
+  参数：{ id?: string, ids?: string[], type?: "characters" | "locations" | "props" }
+- asset.searchProvenanceCandidates：针对指定资产或版本，传入其原名及可能简称/别名（aliases），可通过 scopeScenes 限定要检索的分集/场次标题，在剧本中检索所有文本匹配候选并返回 candidateId、evidenceText 与前后文语境切片（contextSnippet）。注意：检索结果仅为待核验候选，你必须逐条结合 contextSnippet 判断该资产在此处是否真实出现在画面中（若角色未在场、仅在他人台词中被口头提及，或并非同一道具/场景，则绝对不算出场，严禁采纳），随后调用 asset.commitProvenance 提交真实出场的条目。
+  参数：{ id?: string, name?: string, type?: "characters" | "locations" | "props", aliases?: string[], scopeScenes?: string[] }
+- asset.commitProvenance：提交核验通过的资产出处锚点。默认 mode: "append"（增量追加合并：自动保留该资产已有的其它集数/场次出处并按剧本位置去重排序；仅当需要清空旧出处并全量重设时才传 mode: "overwrite"）。既可传入 asset.searchProvenanceCandidates 人工筛选通过的 verifiedCandidateIds，也可在 provenances 中直接传入已读剧本里的具体出场描写原句（evidenceText，支持代词指代或特定服装/状态/动作描写原句，严禁提交“人物：XXX”名单行或角色未在场的口头提及句）。
+  参数：{ id: string, type?: "characters" | "locations" | "props", mode?: "append" | "overwrite", aliases?: string[], verifiedCandidateIds?: string[], provenances?: Array<string | { sceneTitle?: string, lineNumber?: number, evidenceText: string }>, summary?: string }
+
+## 可装载的工具分类（切入 1 级或切换领域时填入 categories）
+- script（剧本工具箱）：读取分集目录、分页读取剧本正文、搜索关键词
+- asset（资产工具箱）：查询、新增、修改、删除角色/场景/道具资产，检索与锚定剧本出处
+- card（画布与生图工具箱）：查看卡片详情、画面元素空间标注、生图与复刻衍生
+- ui（界面观察与操作）：观察当前可见界面结构、查询操作说明、执行鼠标交互
+
+# 认知状态
+任务标题：初始问候与任务确认
+最终目标：你好（用户在问候基础上补充：查看项目中女主角是谁）
+当前小目标：向用户汇报女主角娜塔莉亚身份及资产卡创建完成情况，并询问下一步动作
+当前进度：已确认女主角为娜塔莉亚（22岁心理医生，玛莉的妹妹），已成功创建其角色卡（含两套造型版本与五条第一集出场锚定证据），准备向用户汇报结果并引导下一步
+当前计划：[x] 回应用户问候并询问具体需求
+[x] 装载剧本与资产工具查询女主角信息
+[x] 分析角色资产与剧本目录结果并确认女主角身份
+[x] 读取第一集正文核实女主娜塔莉亚身份与造型
+[x] 创建女主娜塔莉亚资产卡并锚定出处
+[ ] 向用户汇报女主信息并询问下一步
+重点笔记：- 用户尚未明确具体任务，等待用户选择从剧本、资产、生图或视频中哪一步开始。
+- 用户关心项目中女主角的身份信息；需从剧本与资产数据中查找确认。
+- 用户尚未提供具体创作任务，当前仅关心项目中女主角身份。
+- 查询策略：先用资产角色列表快速定位女主，再用剧本目录/正文佐证。
+- 用户尚未明确具体任务，等待用户选择从剧本、资产、生图或视频中哪一步开始。
+- 用户关心项目中女主角的身份信息；需从剧本与资产数据中查找确认。
+- 用户最新确认：想看女主角是谁。
+- 资产库当前仅有角色布拉姆（教父/家主），女主娜塔莉亚尚无角色卡。
+- 查询策略：读第一集正文核实娜塔莉亚首次出场描写与造型，然后创建女主资产并锚定出处。
+- 用户关心女主角身份，已确认为娜塔莉亚。
+- 女主娜塔莉亚：22岁心理医生，玛莉的亲妹妹，为救被囚禁的姐姐潜入布莱克伍德庄园应聘家庭心理医生。
+- 关系：与布拉姆（姐夫/教父）、塞莱特斯（布拉姆现任妻子）对立；养父为焦恩。
+- 造型线索：医院常服（1-2/1-4）、应聘职业装+黑框眼镜（1-5）。
+- 已创建角色卡并锚定第一集出场证据，待确认结果后汇报用户。
+- 用户最新确认：想看女主角是谁。
+- 女主娜塔莉亚：22岁心理医生，玛莉的亲妹妹，为救被囚禁的姐姐潜入布莱克伍德庄园应聘家庭心理医生。
+- 关系：与布拉姆（姐夫/教父）、塞莱特斯（布拉姆现任妻子）对立；养父为焦恩。
+- 造型线索：医院常服（1-2/1-4）、应聘职业装+黑框眼镜（1-5）。
+- 资产卡已创建成功：两套造型版本+五条第一集出场锚点均已落地。
+- 下一步待用户选择：补全女主后期出场、梳理其他角色、或直接进入生图。
+
+# 工具执行结果
+【执行工具 sys.nudge 失败】
+原因：【系统提示】检测到本轮未输出任何 {{调用 ...}} 工具指令，当前任务尚未结束（未调用 sys.endTask）。请紧接上一轮的【状态检查】与【思考】，直接输出具体的工具调用指令（如读取数据、修改资产或在任务完全结束时显式调用 sys.endTask 结束任务）。
+
+【⚠️ 系统重要提示：本轮必须调用工具】上一轮未检测到任何 {{调用 ...}} 工具指令，当前任务尚未结束。请在【状态检查】与【思考】后，务必直接输出具体的 {{调用 工具名, {参数}}} 指令推进任务。若所有目标已确实完成，请显式调用 {{调用 sys.endTask}}，结束汇报直接写在【用户沟通】中。严禁在【思考】后遗漏工具调用！
+
+```

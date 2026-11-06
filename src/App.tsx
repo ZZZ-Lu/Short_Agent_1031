@@ -38,7 +38,7 @@ import { assetExtractionService } from './services/assetExtractionService';
 import { getActiveMcpKey, getActiveMcpTokenSync, getMcpConfig } from './utils/mcpStorage';
 import { CanvasLineageOverlay } from './components/CanvasLineageOverlay';
 import { AGENT_TOOL_REGISTRY, getAgentToolConfig } from './agent/toolRegistry';
-import { initialAgentContext } from './agent/contextPolicy';
+import { initialAgentContext, mergeTaskNotes } from './agent/contextPolicy';
 import { getPageComponentDefinition, type MouseActionName } from './agent/pageComponentRegistry';
 import { buildAutoInjectedCardContext, buildMultiCardInjectedContext } from './agent/cardContextBuilder';
 import { agentFocusManager, type AgentFocusSnapshot } from './agent/agentFocusManager';
@@ -1456,9 +1456,8 @@ export default function App() {
       const name = parentChar ? `${parentChar.name}（${char?.name || charId}）` : (char?.name || charId);
       const summaryLines = [
         `【当前聚焦的剧本角色资产】`,
-        `- 目标ID: ${targetId}`,
-        `- 角色ID: ${charId}`,
-        parentChar ? `- 所属主角色: ${parentChar.name} (${parentChar.id})` : '',
+        parentChar ? `- 版本ID: ${charId}` : `- 资产ID: ${charId}`,
+        parentChar ? `- 所属主资产ID: ${parentChar.id} (${parentChar.name})` : '',
         `- 角色名: ${name}`,
         char?.description ? `- 资产识别描述: ${char.description}` : '',
         char?.role || parentChar?.role ? `- 身份/定位: ${char?.role || parentChar?.role}` : '',
@@ -1491,9 +1490,8 @@ export default function App() {
       const name = parentLoc ? `${parentLoc.name}（${loc?.name || locId}）` : (loc?.name || locId);
       const summaryLines = [
         `【当前聚焦的剧本场景资产】`,
-        `- 目标ID: ${targetId}`,
-        `- 场景ID: ${locId}`,
-        parentLoc ? `- 所属主场景: ${parentLoc.name} (${parentLoc.id})` : '',
+        parentLoc ? `- 版本ID: ${locId}` : `- 资产ID: ${locId}`,
+        parentLoc ? `- 所属主资产ID: ${parentLoc.id} (${parentLoc.name})` : '',
         `- 场景名: ${name}`,
         loc?.description ? `- 资产识别描述: ${loc.description}` : '',
         loc?.type || parentLoc?.type ? `- 内外景: ${loc?.type || parentLoc?.type}` : '',
@@ -1527,9 +1525,8 @@ export default function App() {
       const name = parentProp ? `${parentProp.name}（${prop?.name || propId}）` : (prop?.name || propId);
       const summaryLines = [
         `【当前聚焦的剧本道具资产】`,
-        `- 目标ID: ${targetId}`,
-        `- 道具ID: ${propId}`,
-        parentProp ? `- 所属主道具: ${parentProp.name} (${parentProp.id})` : '',
+        parentProp ? `- 版本ID: ${propId}` : `- 资产ID: ${propId}`,
+        parentProp ? `- 所属主资产ID: ${parentProp.id} (${parentProp.name})` : '',
         `- 道具名: ${name}`,
         prop?.description ? `- 资产识别描述: ${prop.description}` : '',
         prop?.owner || parentProp?.owner ? `- 归属者: ${prop?.owner || parentProp?.owner}` : '',
@@ -1555,7 +1552,6 @@ export default function App() {
           title: `剧本选中片段`,
           contextSummary: [
             `【当前聚焦的剧本正文片段】`,
-            `- 目标ID: script.text`,
             `- 选中文本范围: [${scriptSelection?.start ?? 0}, ${scriptSelection?.end ?? selText.length}]`,
             `- 选中剧本内容:`,
             selText,
@@ -2087,6 +2083,7 @@ export default function App() {
                 cardContext: taskCardContext,
                 modelType: agentModel,
                 requireTool: false,
+                systemPrompt: localStorage.getItem('mira_saved_prompt_main') || localStorage.getItem('mira_custom_system_prompt') || undefined,
               })
             });
             if (res.ok) {
@@ -6537,8 +6534,10 @@ export default function App() {
               enabledTools: AGENT_TOOL_REGISTRY.filter(tool => getAgentToolConfig()[tool.id]).map(tool => tool.id),
               contextSelection: task.context,
               requireTool,
+              systemPrompt: localStorage.getItem('mira_saved_prompt_main') || localStorage.getItem('mira_custom_system_prompt') || undefined,
               jsonAdapterModel,
               jsonAdapterKey,
+              jsonAdapterPrompt: localStorage.getItem('mira_saved_prompt_jsonAdapter') || localStorage.getItem('mira_custom_json_adapter_prompt') || undefined,
             };
             updateAgentRuntimeTrace(task, trace => ({
               ...trace,
@@ -6798,6 +6797,14 @@ export default function App() {
               const stateNodeUserMessage = userLogs.length > 1 && latestUserMsg !== firstUserMsg
                 ? `【初始任务总目标】：${firstUserMsg}\n【用户最新补充/回复】：${latestUserMsg}`
                 : (latestUserMsg || task.goal);
+              const executedTools = (task.events || [])
+                .filter(e => e.turnId === targetTurnId && e.type === 'tool')
+                .map(e => ({
+                  name: e.toolName,
+                  status: e.status,
+                  input: e.input,
+                  summary: e.text,
+                }));
               const res = await fetch('/api/agent/update-state-node', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -6809,18 +6816,20 @@ export default function App() {
                     progress: task.progress,
                     plan: task.plan,
                     notes: task.notes,
-                    thinkingLevel: task.thinkingLevel ?? 0,
+                    thinkingLevel: task.context?.level ?? task.thinkingLevel ?? 0,
                     domain: task.domain,
-                    requestedCategories: task.requestedCategories,
+                    requestedCategories: task.context?.categories || task.requestedCategories,
                   },
                   userMessage: stateNodeUserMessage,
                   lastTurnOutput: {
                     narration: lastTurnResult.narration,
                     speak: lastTurnResult.speak,
                     toolCalls: lastTurnResult.toolCalls,
+                    executedTools,
                   },
                   apiKey: savedKey,
                   model: agentModel,
+                  statePrompt: localStorage.getItem('mira_saved_prompt_state') || localStorage.getItem('mira_custom_state_prompt') || undefined,
                 }),
                 signal,
               });
@@ -6844,17 +6853,20 @@ export default function App() {
                 }
                 if (responseData.subGoal) task.subGoal = responseData.subGoal;
                 if (responseData.progress) task.progress = responseData.progress;
-                if (responseData.thinkingLevel === 0 || responseData.thinkingLevel === 1) task.thinkingLevel = responseData.thinkingLevel;
+                if (task.context?.level === 0 || task.context?.level === 1) {
+                  task.thinkingLevel = task.context.level;
+                } else if (responseData.thinkingLevel === 0 || responseData.thinkingLevel === 1) {
+                  task.thinkingLevel = responseData.thinkingLevel;
+                }
                 if (responseData.domain) task.domain = responseData.domain;
-                if (Array.isArray(responseData.requestedCategories)) task.requestedCategories = responseData.requestedCategories;
+                if (Array.isArray(task.context?.categories) && task.context.categories.length > 0) {
+                  task.requestedCategories = task.context.categories;
+                } else if (Array.isArray(responseData.requestedCategories)) {
+                  task.requestedCategories = responseData.requestedCategories;
+                }
                 if (Array.isArray(responseData.plan)) task.plan = responseData.plan;
                 if (typeof responseData.notes === 'string' && responseData.notes.trim()) {
-                  if (responseData.notesMode === 'overwrite') {
-                    task.notes = responseData.notes.trim();
-                  } else {
-                    const cleanNote = responseData.notes.trim().replace(/^- \s*/, '');
-                    task.notes = task.notes ? `${task.notes}\n- ${cleanNote}` : `- ${cleanNote}`;
-                  }
+                  task.notes = mergeTaskNotes(task.notes, responseData.notes, responseData.notesMode || 'overwrite');
                 }
                 task.lastGoalUpdatedAt = Date.now();
               }

@@ -4,7 +4,7 @@ import { createServer as createViteServer } from "vite";
 import fs from "fs";
 import dotenv from "dotenv";
 import { AGENT_TOOL_REGISTRY } from './src/agent/toolRegistry';
-import { initialAgentContext, PROMPT_MODULES, resolveContext, CONTROL_TOOLS, type AgentContextSelection } from './src/agent/contextPolicy';
+import { initialAgentContext, PROMPT_MODULES, TOOL_CATEGORIES, resolveContext, CONTROL_TOOLS, cleanToolOutputForPrompt, mergeTaskNotes, type AgentContextSelection } from './src/agent/contextPolicy';
 import { mcpRouter } from './src/server/mcpRouter';
 dotenv.config();
 const defaultPromptFilePath = path.join(process.cwd(), "src/agent/systemPrompt.txt");
@@ -12,47 +12,91 @@ const defaultStatePromptFilePath = path.join(process.cwd(), "src/agent/stateNode
 const defaultLandmarksPromptFilePath = path.join(process.cwd(), "src/agent/subjectLandmarksPrompt.txt");
 const defaultJsonAdapterPromptFilePath = path.join(process.cwd(), "src/agent/jsonAdapterPrompt.txt");
 const customPromptDir = path.join(process.cwd(), ".data");
-const customPromptFilePath = path.join(customPromptDir, "systemPrompt.txt");
-const customStatePromptFilePath = path.join(customPromptDir, "stateNodePrompt.txt");
-const customLandmarksPromptFilePath = path.join(customPromptDir, "subjectLandmarksPrompt.txt");
-const customJsonAdapterPromptFilePath = path.join(customPromptDir, "jsonAdapterPrompt.txt");
+const userSavedPromptsFilePath = path.join(customPromptDir, "user_saved_prompts.json");
+const legacyCustomPromptFilePath = path.join(customPromptDir, "systemPrompt.txt");
 
-function getPrompt(type: 'main' | 'state' | 'landmarks' | 'jsonAdapter' = 'main') {
+type ManagedPromptType = 'main' | 'state' | 'landmarks' | 'jsonAdapter';
+
+interface SavedPromptEntry {
+  prompt: string;
+  updatedAt: number;
+}
+
+function getDefaultPromptPath(type: ManagedPromptType): string {
+  return type === 'state'
+    ? defaultStatePromptFilePath
+    : type === 'landmarks'
+    ? defaultLandmarksPromptFilePath
+    : type === 'jsonAdapter'
+    ? defaultJsonAdapterPromptFilePath
+    : defaultPromptFilePath;
+}
+
+function readUserSavedPrompts(): Partial<Record<ManagedPromptType, SavedPromptEntry>> {
   try {
-    const isProd = process.env.NODE_ENV === 'production';
-    const customPath = type === 'state'
-      ? customStatePromptFilePath
-      : type === 'landmarks'
-      ? customLandmarksPromptFilePath
-      : type === 'jsonAdapter'
-      ? customJsonAdapterPromptFilePath
-      : customPromptFilePath;
-    const defaultPath = type === 'state'
-      ? defaultStatePromptFilePath
-      : type === 'landmarks'
-      ? defaultLandmarksPromptFilePath
-      : type === 'jsonAdapter'
-      ? defaultJsonAdapterPromptFilePath
-      : defaultPromptFilePath;
-    if (isProd) {
-      if (fs.existsSync(customPath)) {
-        return fs.readFileSync(customPath, "utf-8");
-      }
-      if (fs.existsSync(defaultPath)) {
-        return fs.readFileSync(defaultPath, "utf-8");
-      }
-    } else {
-      if (fs.existsSync(defaultPath)) {
-        return fs.readFileSync(defaultPath, "utf-8");
-      }
-      if (fs.existsSync(customPath)) {
-        return fs.readFileSync(customPath, "utf-8");
-      }
+    // Clean up legacy tracked .data/systemPrompt.txt if present so it never overrides newer prompts
+    if (fs.existsSync(legacyCustomPromptFilePath)) {
+      try { fs.unlinkSync(legacyCustomPromptFilePath); } catch {}
     }
-    return "";
-  } catch (e) {
-    return "";
+    if (!fs.existsSync(userSavedPromptsFilePath)) return {};
+    const raw = fs.readFileSync(userSavedPromptsFilePath, "utf-8");
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
   }
+}
+
+function writeUserSavedPrompt(type: ManagedPromptType, prompt: string, updatedAt = Date.now()): number {
+  const defaultPath = getDefaultPromptPath(type);
+  if (fs.existsSync(path.dirname(defaultPath))) {
+    fs.writeFileSync(defaultPath, prompt, "utf-8");
+  }
+  if (!fs.existsSync(customPromptDir)) {
+    fs.mkdirSync(customPromptDir, { recursive: true });
+  }
+  const existing = readUserSavedPrompts();
+  existing[type] = { prompt, updatedAt };
+  fs.writeFileSync(userSavedPromptsFilePath, JSON.stringify(existing, null, 2), "utf-8");
+  return updatedAt;
+}
+
+function getPromptWithMeta(type: ManagedPromptType = 'main'): { prompt: string; updatedAt: number; source: 'user_saved' | 'default' } {
+  try {
+    const defaultPath = getDefaultPromptPath(type);
+    const savedMap = readUserSavedPrompts();
+    const savedEntry = savedMap[type];
+    if (savedEntry && typeof savedEntry.prompt === 'string' && savedEntry.prompt.trim().length > 0) {
+      // Auto-heal src/agent/*.txt if an AI Studio container snapshot sync reverted the tracked file
+      try {
+        if (fs.existsSync(defaultPath)) {
+          const currentDefault = fs.readFileSync(defaultPath, "utf-8");
+          if (currentDefault !== savedEntry.prompt) {
+            fs.writeFileSync(defaultPath, savedEntry.prompt, "utf-8");
+          }
+        }
+      } catch {}
+      return {
+        prompt: savedEntry.prompt,
+        updatedAt: typeof savedEntry.updatedAt === 'number' ? savedEntry.updatedAt : Date.now(),
+        source: 'user_saved',
+      };
+    }
+    if (fs.existsSync(defaultPath)) {
+      return {
+        prompt: fs.readFileSync(defaultPath, "utf-8"),
+        updatedAt: 0,
+        source: 'default',
+      };
+    }
+    return { prompt: "", updatedAt: 0, source: 'default' };
+  } catch {
+    return { prompt: "", updatedAt: 0, source: 'default' };
+  }
+}
+
+function getPrompt(type: ManagedPromptType = 'main') {
+  return getPromptWithMeta(type).prompt;
 }
 
 function getSystemPrompt() {
@@ -98,12 +142,17 @@ const parametersForTool = (toolId: string) => {
         storySignificance: { type: 'string', description: '剧情关键作用与特写重点（道具适用）' },
         aliases: { type: 'array', items: { type: 'string' }, description: '该资产在剧本中的简称或别名列表' },
         sourceScenes: { type: 'array', items: { type: 'string' }, description: '该资产在剧本中出现的位置/场次出处列表（如 ["第1集第1场", "第2集第3场"]）' },
+        provenances: {
+          type: 'array',
+          items: { type: 'object' },
+          description: '剧本原文中的具体出场描写句列表（每项如 { sceneTitle: "1-5", lineNumber: 56, evidenceText: "▲布拉姆衣着华丽，随意把玩着手中的手枪。" }，严禁传“人物：XXX”名单行或未在场的口头提及句）'
+        },
         versions: {
           type: 'array',
           items: { type: 'object' },
-          description: '多版本二级列表（场景若有日景和夜景须拆分为两个版本；角色若有不同服装须拆分为不同版本；每项含 name、description 及对应外貌/光影/场次字段）'
+          description: '多版本二级列表（场景若有日景和夜景须拆分为两个版本；角色若有不同服装须拆分为不同版本；每项含 name、description、provenances 及对应外貌/光影/场次字段）'
         },
-        items: { type: 'array', items: { type: 'object' }, description: '批量创建资产对象列表（每个对象可包含 name, description, versions, sourceScenes 及各分类属性）' }
+        items: { type: 'array', items: { type: 'object' }, description: '批量创建资产对象列表（每个对象可包含 name, description, provenances, versions, sourceScenes 及各分类属性）' }
       },
       required: ['type']
     },
@@ -111,7 +160,8 @@ const parametersForTool = (toolId: string) => {
       properties: {
         id: { type: 'string', description: '要修改的目标资产 ID 或二级版本 ID（如 "char_xxx", "loc_xxx", "prop_xxx"）' },
         type: { type: 'string', enum: ['characters', 'locations', 'props'], description: '资产类型（可选）' },
-        updates: { type: 'object', description: '待更新的属性键值对（如 name, description, versions, appearance, role, sourceScenes 等）' },
+        mode: { type: 'string', enum: ['append', 'overwrite'], description: '出处更新模式：默认 "append"（增量追加合并，保留已有其它集数出处）；传 "overwrite" 则清空旧出处全量重设' },
+        updates: { type: 'object', description: '待更新的属性键值对（如 name, description, provenances, versions, appearance, role, sourceScenes 等）' },
         name: { type: 'string', description: '直接修改资产或版本名称' },
         description: { type: 'string', description: '直接修改资产识别浅色描述（首次出场、所属人、区分特征等）' },
         role: { type: 'string', description: '直接修改角色身份' },
@@ -121,6 +171,11 @@ const parametersForTool = (toolId: string) => {
         materialAndState: { type: 'string', description: '直接修改道具材质状态' },
         storySignificance: { type: 'string', description: '直接修改道具剧情作用' },
         sourceScenes: { type: 'array', items: { type: 'string' }, description: '直接更新或补充资产出现的位置/场次出处列表' },
+        provenances: {
+          type: 'array',
+          items: { type: 'object' },
+          description: '补充或重设的具体出场描写原句列表（如 [{ sceneTitle: "2-1", lineNumber: 93, evidenceText: "..." }]）'
+        },
         versions: { type: 'array', items: { type: 'object' }, description: '更新该资产的多版本二级列表（如不同服装版本、日景/夜景版本）' }
       },
       required: ['id']
@@ -135,22 +190,36 @@ const parametersForTool = (toolId: string) => {
     'asset.searchProvenanceCandidates': {
       properties: {
         id: { type: 'string', description: '目标资产 ID（如 "prop_xxx"、"char_xxx"、"loc_xxx"）' },
-        name: { type: 'string', description: '目标资产名称（如 "纯金钥匙"）' },
+        name: { type: 'string', description: '目标资产名称（如 "布拉姆"、"纯金钥匙"）' },
         type: { type: 'string', enum: ['characters', 'locations', 'props'], description: '资产类型（可选）' },
-        aliases: { type: 'array', items: { type: 'string' }, description: '你根据该资产设定推断出的剧本中可能出现的简称或别名列表（如 ["纯金钥匙", "金钥匙", "钥匙"]）' },
-        scopeScenes: { type: 'array', items: { type: 'string' }, description: '可选，限定检索的分集/场次标题列表' }
+        aliases: { type: 'array', items: { type: 'string' }, description: '该资产在剧本中可能出现的简称或别名列表（如 ["布拉姆", "教父"]）' },
+        scopeScenes: { type: 'array', items: { type: 'string' }, description: '可选，限定检索的分集/场次标题列表（如 ["第二集", "2-1"]）' }
       }
     },
     'asset.commitProvenance': {
       properties: {
-        id: { type: 'string', description: '目标资产 ID（如 "prop_xxx"）' },
+        id: { type: 'string', description: '目标资产 ID（如 "char_xxx"、"prop_xxx"）' },
         name: { type: 'string', description: '目标资产名称（可选）' },
         type: { type: 'string', enum: ['characters', 'locations', 'props'], description: '资产类型（可选）' },
+        mode: {
+          type: 'string',
+          enum: ['append', 'overwrite'],
+          description: '出处提交模式：默认 "append"（增量追加合并，自动保留已有其它集数/场次出处并去重排序）；仅当需要清空旧出处并全量重设时传 "overwrite"'
+        },
         aliases: { type: 'array', items: { type: 'string' }, description: '确认有效的资产别名/简称列表' },
-        verifiedCandidateIds: { type: 'array', items: { type: 'string' }, description: '经你逐一检查上下文后确认为该资产真实出场的 candidateId 列表（如 ["cand_0", "cand_2"]）' },
+        verifiedCandidateIds: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '经你逐条核验 contextSnippet 后确认为该资产在画面中真实出场的 candidateId 列表（如 ["cand_L56_2825"]，严禁包含未在场仅被他人口头提及的候选）'
+        },
+        provenances: {
+          type: 'array',
+          items: { type: 'object' },
+          description: '直接提交已读剧本中该资产在画面中真实出场的具体描写原句列表（每项如 { sceneTitle: "第二集 2-1", lineNumber: 93, evidenceText: "▲布拉姆看到塞莱特斯，眼神平静又带着几分冷漠。" }）'
+        },
         summary: { type: 'string', description: '核验结论与排除说明摘要' }
       },
-      required: ['id', 'verifiedCandidateIds']
+      required: ['id']
     },
     'ui.actAndObserve': { properties: { targetId: target, action: { type: 'string', enum: ['mouse.move', 'mouse.click', 'mouse.doubleClick', 'mouse.longPress', 'mouse.hover', 'mouse.drag', 'mouse.scroll', 'mouse.type', 'mouse.keyPress'] }, arguments: { type: 'object', description: '鼠标动作的附加参数。例如：mouse.scroll 可传 { delta: number }（正数向下，负数向上）；mouse.type 可传 { text: string, clear?: boolean }（输入文本，clear 为 true 时先清空原有内容）；mouse.keyPress 可传 { key: string, shiftKey?: boolean }（如 key="Enter"）' }, observe: { type: 'object', properties: observationProperties } }, required: ['targetId', 'action'] },
     'page.inspect': { properties: observationProperties },
@@ -789,47 +858,30 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
     const reqType = String(req.query.type || 'main');
-    const type: 'main' | 'state' | 'landmarks' | 'jsonAdapter' = 
+    const type: ManagedPromptType = 
       reqType === 'state' ? 'state' :
       reqType === 'landmarks' || reqType === 'subject_landmarks' ? 'landmarks' :
       reqType === 'jsonAdapter' || reqType === 'json_adapter' ? 'jsonAdapter' : 'main';
-    res.json({ prompt: getPrompt(type), type });
+    const meta = getPromptWithMeta(type);
+    res.json({ prompt: meta.prompt, type, updatedAt: meta.updatedAt, source: meta.source });
   });
 
   app.post('/api/agent/prompt', express.json(), (req, res) => {
     try {
-      const { prompt, type = 'main' } = req.body;
+      const { prompt, type = 'main', updatedAt } = req.body;
       if (typeof prompt !== 'string') {
         return res.status(400).json({ error: 'Invalid prompt content' });
       }
       const reqType = String(type);
-      const targetType: 'main' | 'state' | 'landmarks' | 'jsonAdapter' =
+      const targetType: ManagedPromptType =
         reqType === 'state' ? 'state' :
         reqType === 'landmarks' || reqType === 'subject_landmarks' ? 'landmarks' :
         reqType === 'jsonAdapter' || reqType === 'json_adapter' ? 'jsonAdapter' : 'main';
-      const defaultPath = targetType === 'state'
-        ? defaultStatePromptFilePath
-        : targetType === 'landmarks'
-        ? defaultLandmarksPromptFilePath
-        : targetType === 'jsonAdapter'
-        ? defaultJsonAdapterPromptFilePath
-        : defaultPromptFilePath;
-      const customPath = targetType === 'state'
-        ? customStatePromptFilePath
-        : targetType === 'landmarks'
-        ? customLandmarksPromptFilePath
-        : targetType === 'jsonAdapter'
-        ? customJsonAdapterPromptFilePath
-        : customPromptFilePath;
-
-      if (fs.existsSync(path.dirname(defaultPath))) {
-        fs.writeFileSync(defaultPath, prompt, 'utf-8');
-      }
-      if (!fs.existsSync(customPromptDir)) {
-        fs.mkdirSync(customPromptDir, { recursive: true });
-      }
-      fs.writeFileSync(customPath, prompt, 'utf-8');
-      res.json({ success: true, type: targetType });
+      const ts = typeof updatedAt === 'number' && Number.isFinite(updatedAt) && updatedAt > 0
+        ? updatedAt
+        : Date.now();
+      const savedAt = writeUserSavedPrompt(targetType, prompt, ts);
+      res.json({ success: true, type: targetType, updatedAt: savedAt, source: 'user_saved' });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
@@ -851,6 +903,7 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
         requireTool = false, 
         images = [], 
         cardContext,
+        systemPrompt: customSystemPrompt,
         jsonAdapterModel,
         jsonAdapterKey,
         jsonAdapterPrompt: customJsonAdapterPrompt,
@@ -862,80 +915,70 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
       const configuredToolIds = Array.isArray(enabledTools)
         ? enabledTools.filter((tool): tool is string => typeof tool === 'string' && allToolIds.has(tool))
         : AGENT_TOOL_REGISTRY.map((tool) => tool.id);
-      const rawContext = contextSelection && (contextSelection.level === 0 || contextSelection.level === 1) && Array.isArray(contextSelection.tools) && Array.isArray(contextSelection.prompts)
+      const rawContext = contextSelection && (contextSelection.level === 0 || contextSelection.level === 1) && (Array.isArray(contextSelection.tools) || Array.isArray(contextSelection.categories))
         ? contextSelection as AgentContextSelection : initialAgentContext();
       const turnContext = resolveContext(rawContext, configuredToolIds);
       const enabledToolIds = new Set<string>(turnContext.tools);
-      const toolPrompt = AGENT_TOOL_REGISTRY
-        .filter((tool) => enabledToolIds.has(tool.id))
-        .map((tool) => `【${tool.id}】\n  描述：${tool.description}\n  支持的参数：${tool.input}`)
-        .join('\n\n');
-      const getFirstSentence = (text: string): string => {
-        if (!text) return '';
-        const trimmed = text.trim();
-        const periodIdx = trimmed.search(/[。！？\n]/);
-        if (periodIdx !== -1) {
-          return trimmed.slice(0, periodIdx + 1);
-        }
-        return trimmed;
-      };
+      const controlToolLines = [
+        `- sys.selectContext：切换思考层级（0 规划 / 1 执行）并装载下一轮所需的工具分类。\n  参数：{ level: 0 | 1, categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[] }`,
+        `- user.ask：向用户提问并挂起任务等待回复（问题直接写在【用户沟通】中，无需传参）。\n  参数：{ question?: string }`,
+        `- sys.endTask：结束当前任务（最终汇报直接写在【用户沟通】中；若需等待异步任务可设 paused: true）。\n  参数：{ success?: boolean, paused?: boolean }`,
+      ];
+      const injectedBusinessTools = AGENT_TOOL_REGISTRY
+        .filter((tool) => enabledToolIds.has(tool.id) && !CONTROL_TOOLS.includes(tool.id))
+        .map((tool) => `- ${tool.id}：${tool.description}\n  参数：${tool.input}`);
+      const categoryLines = Object.values(TOOL_CATEGORIES)
+        .filter(cat => cat.tools.some(t => configuredToolIds.includes(t)))
+        .map(cat => `- ${cat.id}（${cat.label}）：${cat.description}`)
+        .join('\n');
+      const assembledToolPrompt = [
+        `## 当前可直接调用`,
+        ...controlToolLines,
+        ...injectedBusinessTools,
+        ``,
+        `## 可装载的工具分类（切入 1 级或切换领域时填入 categories）`,
+        categoryLines || '无',
+      ].join('\n');
 
-      const availableToolEntries = turnContext.catalog
-        .filter(tool => !CONTROL_TOOLS.includes(tool.id) && !enabledToolIds.has(tool.id) && tool.id !== 'card.annotateElements');
-      const toolCatalog = availableToolEntries.length
-        ? availableToolEntries.map(tool => `${tool.id}：${getFirstSentence(tool.description)}`).join('\n')
-        : '无（全部业务工具已在本轮注入）';
-      const activePromptSet = new Set(turnContext.prompts);
-      const availablePromptEntries = Object.entries(PROMPT_MODULES).filter(([id]) => !activePromptSet.has(id));
-      const promptCatalog = availablePromptEntries.length
-        ? availablePromptEntries.map(([id, module]) => `${id}：${module.label}`).join('\n')
-        : '无（全部提示词模块已生效）';
-      const selectedPrompts = turnContext.prompts.map(id => `【${PROMPT_MODULES[id].label}】\n${PROMPT_MODULES[id].content}`).join('\n\n');
-      const contextHeader = `【本轮上下文】思考层级：${turnContext.level}（0 全局规划，1 局部执行） | 已注入工具：${turnContext.tools.join('、')} | 已注入提示词：${turnContext.prompts.join('、') || '无'}
-规则：仅可调用本轮已注入工具。需增减工具、提示词或切换层级时，调用 {{调用 sys.selectContext, {"level": 0|1, "tools": [...], "prompts": [...]}}} 在下一轮生效。
-【可选业务工具目录（供 sys.selectContext 选择注入）】
-${toolCatalog}
-【可选提示词目录】
-${promptCatalog}
-【已生效的提示词】
-${selectedPrompts || '无'}
-`;
-
-      const cleanToolOutput = (val: unknown, depth = 0): unknown => {
-        if (depth > 6) return val;
-        if (val === null || val === undefined) return undefined;
-        if (typeof val === 'string') {
-          const trimmed = val.trim();
-          if (!trimmed) return undefined;
-          if (trimmed.startsWith('data:image/') || (trimmed.length > 500 && /^[A-Za-z0-9+/=]{500,}$/.test(trimmed))) {
-            return `[图片数据 ${Math.round(trimmed.length / 1024)}KB]`;
-          }
-          return trimmed;
-        }
-        if (typeof val !== 'object') {
-          return val;
-        }
-        if (Array.isArray(val)) {
-          const cleanedArr = val
-            .map(item => cleanToolOutput(item, depth + 1))
-            .filter(item => item !== undefined);
-          return cleanedArr;
-        }
-        const cleanedObj: Record<string, unknown> = {};
-        for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
-          const cleanedVal = cleanToolOutput(v, depth + 1);
-          if (cleanedVal !== undefined && !(Array.isArray(cleanedVal) && cleanedVal.length === 0)) {
-            cleanedObj[k] = cleanedVal;
-          }
-        }
-        return cleanedObj;
-      };
+      const cleanToolOutput = (val: unknown, depth = 0): unknown => cleanToolOutputForPrompt(val, depth);
 
       const serializeCleanOutput = (output: any): string => {
         if (typeof output === 'string') return output;
         const cleaned = cleanToolOutput(output);
         return JSON.stringify(cleaned ?? {});
       };
+
+      const cleanUserGoalText = (text: string): string => {
+        if (!text) return '';
+        let cleaned = text.replace(/# 目标卡片与拓扑上下文信息[\s\S]*?用户针对该卡片的指令[:：]\s*/gi, '');
+        cleaned = cleaned.replace(/【当前右键聚焦的目标卡片信息】[\s\S]*?用户针对该卡片的指令[:：]\s*/gi, '');
+        cleaned = cleaned.replace(/【当前聚焦的[\s\S]*?用户(?:针对该[^\n]*的)?指令[:：]\s*/gi, '');
+        return cleaned.trim() || text.trim();
+      };
+
+      const negotiationLog = Array.isArray(task?.negotiationLog) ? task.negotiationLog : [];
+      const userEntries = negotiationLog.filter((item: any) => item && item.role === 'user' && typeof item.content === 'string' && item.content.trim());
+      const firstUserGoal = userEntries.length > 0 ? cleanUserGoalText(userEntries[0].content) : '';
+      const hasMultiTurnDialogue = negotiationLog.length > 1 && userEntries.length > 1;
+      let displayUserMessage = cleanUserGoalText(userMessage) || '（无新指令）';
+      if (hasMultiTurnDialogue) {
+        const dialogueLines = negotiationLog
+          .map((entry: any, idx: number) => {
+            const cleaned = cleanUserGoalText(String(entry?.content || ''));
+            if (!cleaned) return '';
+            if (entry.role === 'agent') {
+              return `- Mira（提问）：${cleaned}`;
+            }
+            const isLatest = idx === negotiationLog.length - 1;
+            return isLatest ? `- 用户（本轮最新回复）：${cleaned}` : `- 用户：${cleaned}`;
+          })
+          .filter(Boolean)
+          .join('\n');
+        displayUserMessage = `【初始任务指令】：${firstUserGoal || displayUserMessage}\n【多轮对话与最新回复】：\n${dialogueLines}\n（请结合初始任务指令与用户的最新回复，直接继续推进任务）`;
+      }
+
+      const hasNudgeObservation = Array.isArray(observations) && observations.some((obs: any) => obs?.content?.name === 'sys.nudge');
+      const effectiveRequireTool = Boolean(requireTool || hasNudgeObservation);
 
       const formatObservations = (obsList: any[]) => {
         let pageObs: string[] = [];
@@ -1005,6 +1048,19 @@ ${selectedPrompts || '无'}
           obsList.forEach(obs => {
             if (obs.role !== 'tool' || !obs.content) return;
             const { name, status, output, error } = obs.content;
+            // sys.nudge 统一由 Prompt 尾部的 effectiveRequireTool 提示呈现，避免双重警告
+            if (name === 'sys.nudge') {
+              return;
+            }
+            // sys.selectContext 成功时输出单行简明确认（不展开冗长 JSON 数组），明确告知模型层级切换与工具装载已完成
+            if (name === 'sys.selectContext' && status === 'succeeded') {
+              const selOut = (output && typeof output === 'object') ? (output as any) : {};
+              const cats = Array.isArray(selOut.categories) && selOut.categories.length > 0
+                ? selOut.categories.join(', ')
+                : (Array.isArray(selOut.tools) && selOut.tools.length > 0 ? selOut.tools.join(', ') : '无');
+              toolObs.push(`【工具 sys.selectContext 执行成功】已切换至 ${selOut.level ?? 1} 级，已装载工具分类：${cats}`);
+              return;
+            }
             if (status === 'failed') {
               toolObs.push(`【执行工具 ${name} 失败】\n原因：${error || '未知'}`);
               return;
@@ -1018,11 +1074,14 @@ ${selectedPrompts || '无'}
             } else if (name === 'guide.lookup') {
               toolObs.push(`【操作指南查询结果】\n查询词：${output.query || '未提供'}\n指南内容：${output.guidance}`);
             } else if (name === 'user.ask') {
+              // 当 # 用户指令 已通过 negotiationLog 完整呈现多轮对话与最新回复时，不在 # 工具执行结果 中重复输出 user.ask
+              if (hasMultiTurnDialogue) {
+                return;
+              }
               const askOut = output && typeof output === 'object' ? (output as any) : { answer: output };
               const qText = askOut.question || '向用户提问';
               const aText = askOut.answer ?? serializeCleanOutput(output);
-              const ctxLine = askOut.agentContext ? `\n提问前思考脉络：${askOut.agentContext}` : '';
-              toolObs.push(`【工具 user.ask 执行成功（用户已回复）】\n提问内容：${qText}${ctxLine}\n用户最新回答：${aText}`);
+              toolObs.push(`【工具 user.ask 执行成功（用户已回复）】\n提问内容：${qText}\n用户最新回答：${aText}`);
             } else {
               toolObs.push(`【工具 ${name} 执行成功】\n${serializeCleanOutput(output)}`);
             }
@@ -1079,39 +1138,12 @@ ${selectedPrompts || '无'}
       };
 
       const formattedObs = formatObservations(observations);
-      
-      const cleanUserGoalText = (text: string): string => {
-        if (!text) return '';
-        let cleaned = text.replace(/# 目标卡片与拓扑上下文信息[\s\S]*?用户针对该卡片的指令[:：]\s*/gi, '');
-        cleaned = cleaned.replace(/【当前右键聚焦的目标卡片信息】[\s\S]*?用户针对该卡片的指令[:：]\s*/gi, '');
-        return cleaned.trim() || text.trim();
-      };
-
-      const negotiationLog = Array.isArray(task?.negotiationLog) ? task.negotiationLog : [];
-      const userEntries = negotiationLog.filter((item: any) => item && item.role === 'user' && typeof item.content === 'string' && item.content.trim());
-      const firstUserGoal = userEntries.length > 0 ? cleanUserGoalText(userEntries[0].content) : '';
-      let displayUserMessage = cleanUserGoalText(userMessage) || '（无新指令）';
-      if (negotiationLog.length > 1 && userEntries.length > 1) {
-        const dialogueLines = negotiationLog
-          .map((entry: any, idx: number) => {
-            const cleaned = cleanUserGoalText(String(entry?.content || ''));
-            if (!cleaned) return '';
-            if (entry.role === 'agent') {
-              return `- Mira（提问）：${cleaned}`;
-            }
-            const isLatest = idx === negotiationLog.length - 1;
-            return isLatest ? `- 用户（本轮最新回复）：${cleaned}` : `- 用户：${cleaned}`;
-          })
-          .filter(Boolean)
-          .join('\n');
-        displayUserMessage = `【初始任务指令】：${firstUserGoal || displayUserMessage}\n【多轮对话与最新回复】：\n${dialogueLines}\n（请结合初始任务指令与用户的最新回复，直接继续推进任务）`;
-      }
 
       const effectiveCardContext = cardContext || task?.cardContext;
       let cardContextInjection = '';
       if (effectiveCardContext) {
         if (effectiveCardContext.markdownSummary) {
-          cardContextInjection = `\n${effectiveCardContext.markdownSummary}\n\n`;
+          cardContextInjection = effectiveCardContext.markdownSummary.trim();
         } else {
           const rawAnnotations = Array.isArray(effectiveCardContext.annotations)
             ? effectiveCardContext.annotations
@@ -1121,33 +1153,70 @@ ${selectedPrompts || '无'}
             annotationsText = `\n- 已有元素标注 (${rawAnnotations.length} 项):\n` +
               rawAnnotations.map((a: any) => `  * [${a.id}] ${a.label} (${a.category || '元素'}${a.point ? ` 坐标[${a.point.x},${a.point.y}]` : ''})${a.description ? ` - ${a.description}` : ''}`).join('\n');
           }
-          cardContextInjection = `
-# 目标卡片上下文信息 (Selected Card Context)
+          cardContextInjection = `# 目标卡片上下文信息 (Selected Card Context)
 - 卡片ID：${effectiveCardContext.cardId || effectiveCardContext.id || '未知'}
 - 标题/分集：${effectiveCardContext.title || effectiveCardContext.fileName || '未命名卡片'}
 - 卡片提示词：${effectiveCardContext.prompt || '无提示词'}
 - 比例/分辨率：${effectiveCardContext.aspectRatio || effectiveCardContext.ratio || '默认'} (${effectiveCardContext.resolution || effectiveCardContext.res || '2K'})
-${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态视觉上下文' : ''}${annotationsText}
-`;
+${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态视觉上下文' : ''}${annotationsText}`.trim();
         }
       }
 
-      const basePrompt = getSystemPrompt();
-      const effectiveTaskGoal = cleanUserGoalText(task.goal || task.initialGoal || firstUserGoal) || '尚未设定';
-      let finalPrompt = (contextHeader + cardContextInjection + basePrompt + (basePrompt.includes('{{toolPrompt}}') ? '' : `\n【本轮可调用工具】\n${toolPrompt}\n`))
-        .replace('{{taskTitle}}', task.title || '尚未命名')
-        .replace('{{taskGoal}}', effectiveTaskGoal)
-        .replace('{{taskSubGoal}}', task.subGoal || '暂未设定')
-        .replace('{{taskProgress}}', task.progress || '刚刚开始')
-        .replace('{{taskPlan}}', formatPlan(task.plan))
-        .replace('{{taskNotes}}', task.notes || '暂无笔记')
-        .replace('{{userMessage}}', displayUserMessage)
-        .replace('{{history}}', formatHistory(history, events))
-        .replace('{{toolPrompt}}', toolPrompt)
-        .replace('{{pageObservations}}', formattedObs.pageObservations)
-        .replace('{{toolResults}}', formattedObs.toolResults);
+      const effectiveTaskGoal = cleanUserGoalText(task?.goal || task?.initialGoal || firstUserGoal) || '尚未设定';
+      const hasToolResults = Boolean(formattedObs.toolResults && formattedObs.toolResults.trim() && formattedObs.toolResults.trim() !== '无');
+      const hasPageObs = Boolean(formattedObs.pageObservations && formattedObs.pageObservations.trim() && formattedObs.pageObservations.trim() !== '无');
 
-      if (requireTool) {
+      const promptSections: string[] = [
+        `# 背景`,
+        `你位于一个短剧协作平台中，负责协助用户从剧本到生图到视频的流程，你的名字是“Mira”`,
+        ``,
+        `# 用户指令`,
+        `## 当前聚焦目标`,
+        cardContextInjection || '无',
+        `## 用户输入原文`,
+        displayUserMessage,
+        ``,
+        `# 工作指南`,
+        `默认优先使用后台工具读取项目数据并执行任务；需要演示或核验界面时使用 UI。基于工具返回的事实验证推进，严禁把未执行视为成功。`,
+        `0 级负责宏观规划与架构分解，1 级负责局部细化执行。`,
+        `称用户为“你”，口吻亲和随意；遇需用户决策或信息补充的事项，在用户沟通中明确说明。`,
+        `严谨求证，聚焦当前核心目标，根据工具结果动态更新计划与笔记。`,
+        `工具调用统一采用标准 JSON 参数格式：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）。`,
+        `输出格式：`,
+        `状态检查：{回顾目标与进展、当前工具是否满足需求、计划与笔记更新}`,
+        `思考：{基于最新事实进行逻辑推演，决定下一步行动}`,
+        `工具调用：{{调用 工具名称, {"参数名": "参数值"}}}`,
+        `用户沟通：`,
+        `- 对用户说的话（完整版）：“完整汇报或回复内容”`,
+        `- 对用户说的话（简版）：“简报当前状态或提问，30字以内”`,
+      ];
+
+      const dedupedNotes = task?.notes ? mergeTaskNotes(undefined, task.notes, 'overwrite') : '';
+      promptSections.push(
+        ``,
+        `# 可用工具`,
+        assembledToolPrompt,
+        ``,
+        `# 认知状态`,
+        `任务标题：${task?.title || '尚未命名'}`,
+        `最终目标：${effectiveTaskGoal}`,
+        `当前小目标：${task?.subGoal || '暂未设定'}`,
+        `当前进度：${task?.progress || '刚刚开始'}`,
+        `当前计划：${formatPlan(task?.plan)}`,
+        `重点笔记：${dedupedNotes || '暂无笔记'}`,
+      );
+
+      if (hasToolResults) {
+        promptSections.push(``, `# 工具执行结果`, formattedObs.toolResults);
+      }
+
+      if (hasPageObs) {
+        promptSections.push(``, `# 页面观察`, formattedObs.pageObservations);
+      }
+
+      let finalPrompt = promptSections.join('\n');
+
+      if (effectiveRequireTool) {
         finalPrompt += `\n\n【⚠️ 系统重要提示：本轮必须调用工具】上一轮未检测到任何 {{调用 ...}} 工具指令，当前任务尚未结束。请在【状态检查】与【思考】后，务必直接输出具体的 {{调用 工具名, {参数}}} 指令推进任务。若所有目标已确实完成，请显式调用 {{调用 sys.endTask}}，结束汇报直接写在【用户沟通】中。严禁在【思考】后遗漏工具调用！\n`;
       }
 
@@ -1278,6 +1347,22 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
           }
         }
 
+        // 4. Fallback for "用户沟通：..." when model omits "对用户说的话" prefix
+        if (!speakText && !fullAnswerText) {
+          const commMatch = fullContent.match(/用户沟通\s*[:：]\s*\{?([\s\S]*?)\}?$/i);
+          if (commMatch && commMatch[1]) {
+            const rawComm = commMatch[1]
+              .replace(/\{\{[\s\S]*?\}\}/g, '')
+              .replace(/^[“"'\s{]+|[”"'\s}]+$/g, '')
+              .trim();
+            if (rawComm) {
+              fullAnswerText = rawComm;
+              const firstSentence = rawComm.split(/[。！？\n]/)[0] || rawComm;
+              speakText = firstSentence.length > 30 ? firstSentence.slice(0, 28) + '...' : firstSentence;
+            }
+          }
+        }
+
         // If only full version exists, extract first sentence for speakText
         if (!speakText && fullAnswerText) {
           const firstSentence = fullAnswerText.split(/[。！？\n]/)[0] || fullAnswerText;
@@ -1289,8 +1374,10 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         }
 
         let cleanContent = fullContent
+          .replace(/用户沟通\s*[:：]\s*\{?\s*(?:-|\*|\+)?\s*对用户说的话[\s\S]*$/gi, '')
           .replace(/(?:-|\*|\+)?\s*对用户说的话\s*[（(][^）)]*[）)]\s*[:：][\s\S]*?(?=(?:(?:-|\*|\+)?\s*对用户说的话|\{\{|$))/gi, '')
           .replace(/(?:-|\*|\+)?\s*对用户说的话\s*[:：][\s\S]*?(?=\{\{|$)/gi, '')
+          .replace(/用户沟通\s*[:：][\s\S]*$/gi, '')
           .replace(/\{\{[\s\S]*?\}\}/g, '')
           .replace(/<thought>[\s\S]*?<\/thought>/gi, '')
           .replace(/<thought>/g, '').replace(/<\/thought>/g, '')
@@ -1301,7 +1388,12 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         }
       }
       
-      let parsed: any = { narration, speak: speakText, response: message.content || fullAnswerText || '', fullAnswer: message.content || fullAnswerText || '' };
+      let parsed: any = {
+        narration,
+        speak: speakText,
+        response: fullAnswerText || speakText || '',
+        fullAnswer: fullAnswerText || speakText || '',
+      };
       const allowedTools = enabledToolIds;
       const toolNameByFunction = new Map(AGENT_TOOL_REGISTRY.map((tool) => [functionNameForTool(tool.id), tool.id]));
       
@@ -1516,12 +1608,26 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         let schemaError: string | null = null;
 
         if (normalizedName === 'sys.selectContext') {
+          if (typeof argsObj.categories === 'string') {
+            argsObj.categories = argsObj.categories.split(/[,，\s]+/).map((s: string) => s.trim()).filter(Boolean);
+          }
+          if (typeof argsObj.tools === 'string') {
+            argsObj.tools = argsObj.tools.split(/[,，\s]+/).map((s: string) => s.trim()).filter(Boolean);
+          }
+          if (typeof argsObj.prompts === 'string') {
+            argsObj.prompts = argsObj.prompts.split(/[,，\s]+/).map((s: string) => s.trim()).filter(Boolean);
+          }
           if (argsObj.level !== 0 && argsObj.level !== 1) {
             schemaError = '【参数校验错误】sys.selectContext 必需参数 "level" 必须为数字 0（全局规划）或 1（局部执行）。';
-          } else if (argsObj.tools && !Array.isArray(argsObj.tools)) {
-            schemaError = '【参数校验错误】sys.selectContext 参数 "tools" 必须为字符串数组，如 ["script.directory", "script.read"]。';
-          } else if (argsObj.prompts && !Array.isArray(argsObj.prompts)) {
+          } else if (argsObj.categories !== undefined && !Array.isArray(argsObj.categories)) {
+            schemaError = '【参数校验错误】sys.selectContext 参数 "categories" 必须为字符串数组，如 ["script", "asset"]。';
+          } else if (argsObj.tools !== undefined && !Array.isArray(argsObj.tools)) {
+            schemaError = '【参数校验错误】sys.selectContext 参数 "tools" 必须为字符串数组。';
+          } else if (argsObj.prompts !== undefined && !Array.isArray(argsObj.prompts)) {
             schemaError = '【参数校验错误】sys.selectContext 参数 "prompts" 必须为提示词模块字符串数组。';
+          } else if (argsObj.categories === undefined && argsObj.tools === undefined) {
+            argsObj.categories = [];
+            argsObj.tools = [];
           }
         } else if (normalizedName === 'sys.endTask') {
           delete argsObj.finalResponse;
@@ -1626,7 +1732,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
             model: actualModel,
             messages,
             tools: turnContext.tools,
-            context: { level: turnContext.level, tools: turnContext.tools, prompts: turnContext.prompts },
+            context: { level: turnContext.level, tools: turnContext.tools, prompts: [] },
           },
           response: {
             content: message.content ?? null,
@@ -1643,10 +1749,12 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
   // Dedicated Lightweight Cognitive State Update Node
   app.post('/api/agent/update-state-node', async (req, res) => {
     try {
-      const { currentTask, userMessage, lastTurnOutput, apiKey, model } = req.body || {};
+      const { currentTask, userMessage, lastTurnOutput, apiKey, model, statePrompt: customStatePrompt } = req.body || {};
       const { endpoint, actualModel, apiKey: keyToUse } = getModelConfig(model || 'deepseek-v4-flash', apiKey);
 
-      let statePromptTemplate = getPrompt('state');
+      let statePromptTemplate = (typeof customStatePrompt === 'string' && customStatePrompt.trim().length > 0)
+        ? customStatePrompt
+        : getPrompt('state');
       if (!statePromptTemplate || !statePromptTemplate.trim()) {
         statePromptTemplate = `你是一个超高效、高精度的 Agent 认知状态提取与更新节点。
 你的唯一职责是：根据用户原始指令、Agent 最新的思考与发言、工具执行动作，提炼并无缝更新 Agent 的认知状态 JSON。
@@ -1670,8 +1778,8 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
   "goal": "归纳出的最新终极目标（根据用户指令提炼）",
   "subGoal": "当前步骤对应的具体小目标，清晰明确",
   "progress": "当前最新进度描述（如：已完成xxx，准备处理xxx）",
-  "notes": "提取关键笔记文本",
-  "notesMode": "append 或 overwrite",
+  "notes": "融合旧笔记与本轮新事实后的完整精简笔记（剔除已过时的开场状态与重复项）",
+  "notesMode": "overwrite",
   "plan": [{"id": "1", "title": "步骤标题", "status": "pending | completed"}]
 }
 `;
@@ -1715,8 +1823,8 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
           goal: userMessage || currentTask?.goal,
           subGoal: fallbackSubGoal,
           progress: speakText ? '已完成本轮回答与分析' : (currentTask?.progress || '步骤运行中'),
-          notes: speakText ? speakText.slice(0, 100) : undefined,
-          notesMode: 'append',
+          notes: speakText ? mergeTaskNotes(currentTask?.notes, speakText.slice(0, 100), 'append') : undefined,
+          notesMode: 'overwrite',
           debugPrompt: prompt,
           fallbackNotice: `接口响应异常 (${response.status})，已启用启发式保底提炼机制`,
           apiError: errText,
@@ -1731,14 +1839,19 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         console.warn('Failed to parse json from state node output:', data.content);
       }
 
+      const resolvedNotesMode = parsed.notesMode === 'append' ? 'append' : 'overwrite';
+      const consolidatedNotes = typeof parsed.notes === 'string' && parsed.notes.trim()
+        ? mergeTaskNotes(currentTask?.notes, parsed.notes, resolvedNotesMode)
+        : undefined;
+
       res.json({
         taskTitle: typeof parsed.taskTitle === 'string' && parsed.taskTitle.trim() ? parsed.taskTitle.trim() : undefined,
         goal: typeof parsed.goal === 'string' && parsed.goal.trim() ? parsed.goal.trim() : undefined,
         subGoal: typeof parsed.subGoal === 'string' && parsed.subGoal.trim() ? parsed.subGoal.trim() : undefined,
         progress: typeof parsed.progress === 'string' && parsed.progress.trim() ? parsed.progress.trim() : undefined,
         plan: Array.isArray(parsed.plan) ? parsed.plan : undefined,
-        notes: typeof parsed.notes === 'string' ? parsed.notes : undefined,
-        notesMode: parsed.notesMode === 'overwrite' ? 'overwrite' : 'append',
+        notes: consolidatedNotes,
+        notesMode: 'overwrite',
         debugPrompt: prompt,
       });
     } catch (err: any) {

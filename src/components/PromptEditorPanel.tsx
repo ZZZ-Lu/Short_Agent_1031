@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Save, LoaderCircle, Check, Copy, RotateCcw, Cpu, TerminalSquare, AlertCircle, Zap, Eye } from 'lucide-react';
-
-type PromptTabType = 'main' | 'state' | 'jsonAdapter' | 'landmarks';
+import { resolvePromptSyncState, type PromptTabType } from '../utils/promptPersistence';
 
 interface TabConfig {
   id: PromptTabType;
@@ -10,6 +9,8 @@ interface TabConfig {
   filename: string;
   description: string;
   storageKey: string;
+  savedKey: string;
+  savedAtKey: string;
   dirtyKey: string;
 }
 
@@ -19,8 +20,10 @@ const TABS: TabConfig[] = [
     label: '主循环 Agent Prompt',
     icon: TerminalSquare,
     filename: 'systemPrompt.txt',
-    description: '配置主循环系统的思考与工具调用指令，改动将直接保存至 src/agent/systemPrompt.txt。',
+    description: '配置主循环系统的思考与工具调用指令，改动将直接保存至 src/agent/systemPrompt.txt 与持久快照缓存。',
     storageKey: 'mira_custom_system_prompt',
+    savedKey: 'mira_saved_prompt_main',
+    savedAtKey: 'mira_saved_at_main',
     dirtyKey: 'mira_prompt_dirty_main',
   },
   {
@@ -30,6 +33,8 @@ const TABS: TabConfig[] = [
     filename: 'stateNodePrompt.txt',
     description: '配置每轮循环后自动调用的“认知状态提取节点”指令，改动将直接保存至 src/agent/stateNodePrompt.txt。',
     storageKey: 'mira_custom_state_prompt',
+    savedKey: 'mira_saved_prompt_state',
+    savedAtKey: 'mira_saved_at_state',
     dirtyKey: 'mira_prompt_dirty_state',
   },
   {
@@ -39,6 +44,8 @@ const TABS: TabConfig[] = [
     filename: 'jsonAdapterPrompt.txt',
     description: '配置负责将非标指令、自然语言或伪代码重构为标准工具 Schema 参数的转译大模型指令，改动将直接保存至 src/agent/jsonAdapterPrompt.txt。',
     storageKey: 'mira_custom_json_adapter_prompt',
+    savedKey: 'mira_saved_prompt_jsonAdapter',
+    savedAtKey: 'mira_saved_at_jsonAdapter',
     dirtyKey: 'mira_prompt_dirty_json_adapter',
   },
   {
@@ -48,6 +55,8 @@ const TABS: TabConfig[] = [
     filename: 'subjectLandmarksPrompt.txt',
     description: '配置执行空间定位与意图驱动 Visual Grounding 画面元素标注的专家模型指令，改动将直接保存至 src/agent/subjectLandmarksPrompt.txt。',
     storageKey: 'mira_custom_landmarks_prompt',
+    savedKey: 'mira_saved_prompt_landmarks',
+    savedAtKey: 'mira_saved_at_landmarks',
     dirtyKey: 'mira_prompt_dirty_landmarks',
   },
 ];
@@ -56,10 +65,10 @@ export const PromptEditorPanel = () => {
   const [activeTab, setActiveTab] = useState<PromptTabType>('main');
 
   const [prompts, setPrompts] = useState<Record<PromptTabType, string>>(() => ({
-    main: localStorage.getItem('mira_custom_system_prompt') || '',
-    state: localStorage.getItem('mira_custom_state_prompt') || '',
-    jsonAdapter: localStorage.getItem('mira_custom_json_adapter_prompt') || '',
-    landmarks: localStorage.getItem('mira_custom_landmarks_prompt') || '',
+    main: localStorage.getItem('mira_custom_system_prompt') || localStorage.getItem('mira_saved_prompt_main') || '',
+    state: localStorage.getItem('mira_custom_state_prompt') || localStorage.getItem('mira_saved_prompt_state') || '',
+    jsonAdapter: localStorage.getItem('mira_custom_json_adapter_prompt') || localStorage.getItem('mira_saved_prompt_jsonAdapter') || '',
+    landmarks: localStorage.getItem('mira_custom_landmarks_prompt') || localStorage.getItem('mira_saved_prompt_landmarks') || '',
   }));
 
   const [dirties, setDirties] = useState<Record<PromptTabType, boolean>>(() => ({
@@ -92,14 +101,48 @@ export const PromptEditorPanel = () => {
       }
       const data = await res.json();
       if (typeof data.prompt === 'string') {
-        const isDirty = dirtiesRef.current[type];
-        if (force || !isDirty) {
-          const cfg = TABS.find(t => t.id === type);
-          if (cfg) {
-            setPrompts(prev => ({ ...prev, [type]: data.prompt }));
-            localStorage.setItem(cfg.storageKey, data.prompt);
-            setDirties(prev => ({ ...prev, [type]: false }));
-            localStorage.setItem(cfg.dirtyKey, 'false');
+        const cfg = TABS.find(t => t.id === type);
+        if (cfg) {
+          const localSnapshot = {
+            currentText: localStorage.getItem(cfg.storageKey) || promptsRef.current[type] || '',
+            savedText: localStorage.getItem(cfg.savedKey) || '',
+            savedAt: Number(localStorage.getItem(cfg.savedAtKey) || '0') || 0,
+            isDirty: dirtiesRef.current[type],
+          };
+
+          const resolution = resolvePromptSyncState(
+            localSnapshot,
+            {
+              prompt: data.prompt,
+              updatedAt: typeof data.updatedAt === 'number' ? data.updatedAt : 0,
+              source: data.source === 'user_saved' ? 'user_saved' : 'default',
+            },
+            { force }
+          );
+
+          setPrompts(prev => ({ ...prev, [type]: resolution.nextText }));
+          localStorage.setItem(cfg.storageKey, resolution.nextText);
+          if (resolution.nextSavedText) {
+            localStorage.setItem(cfg.savedKey, resolution.nextSavedText);
+          }
+          if (resolution.nextSavedAt > 0) {
+            localStorage.setItem(cfg.savedAtKey, String(resolution.nextSavedAt));
+          }
+          setDirties(prev => ({ ...prev, [type]: resolution.nextDirty }));
+          localStorage.setItem(cfg.dirtyKey, resolution.nextDirty ? 'true' : 'false');
+
+          // If container was reset by snapshot sync while browser holds a newer user-saved prompt,
+          // automatically re-sync the user-saved prompt back to the server.
+          if (resolution.shouldPushToServer && resolution.nextSavedText) {
+            fetch('/api/agent/prompt', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                prompt: resolution.nextSavedText,
+                type,
+                updatedAt: resolution.nextSavedAt || Date.now(),
+              }),
+            }).catch(() => {});
           }
         }
       }
@@ -130,7 +173,8 @@ export const PromptEditorPanel = () => {
   const savePrompt = async () => {
     const targetTab = activeTab;
     const textToSave = promptsRef.current[targetTab];
-    const cfg = currentTabConfig;
+    const cfg = TABS.find(t => t.id === targetTab) || currentTabConfig;
+    const now = Date.now();
 
     setSaving(true);
     setError(null);
@@ -138,13 +182,16 @@ export const PromptEditorPanel = () => {
       const res = await fetch('/api/agent/prompt', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: textToSave, type: targetTab }),
+        body: JSON.stringify({ prompt: textToSave, type: targetTab, updatedAt: now }),
       });
       if (!res.ok) {
         const errorData = await res.json().catch(() => ({}));
         throw new Error(errorData.error || `HTTP ${res.status} ${res.statusText}`);
       }
 
+      localStorage.setItem(cfg.storageKey, textToSave);
+      localStorage.setItem(cfg.savedKey, textToSave);
+      localStorage.setItem(cfg.savedAtKey, String(now));
       setDirties(prev => ({ ...prev, [targetTab]: false }));
       localStorage.setItem(cfg.dirtyKey, 'false');
 
@@ -159,11 +206,15 @@ export const PromptEditorPanel = () => {
   };
 
   const handleReset = async () => {
-    if (!confirm(`确定要放弃未保存草稿并重新拉取服务器最新的 ${currentTabConfig.label} 吗？`)) return;
     const cfg = currentTabConfig;
-    localStorage.removeItem(cfg.storageKey);
-    localStorage.setItem(cfg.dirtyKey, 'false');
-    setDirties(prev => ({ ...prev, [activeTab]: false }));
+    const savedBaseline = localStorage.getItem(cfg.savedKey);
+    if (isCurrentDirty && savedBaseline) {
+      setPrompts(prev => ({ ...prev, [activeTab]: savedBaseline }));
+      localStorage.setItem(cfg.storageKey, savedBaseline);
+      setDirties(prev => ({ ...prev, [activeTab]: false }));
+      localStorage.setItem(cfg.dirtyKey, 'false');
+      return;
+    }
     await fetchPrompt(activeTab, true);
   };
 

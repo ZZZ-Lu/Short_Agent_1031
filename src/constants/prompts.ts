@@ -45,8 +45,8 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = {
   "goal": "归纳出的最新终极目标（根据用户指令提炼）",
   "subGoal": "当前步骤对应的具体小目标，清晰明确",
   "progress": "当前最新进度描述（如：已完成xxx，准备处理xxx）",
-  "notes": "提取关键笔记文本",
-  "notesMode": "append 或 overwrite",
+  "notes": "融合旧笔记与本轮新事实后的完整精简笔记（剔除已过时的开场状态与重复项）",
+  "notesMode": "overwrite",
   "plan": [{"id": "1", "title": "步骤标题", "status": "pending | completed"}]
 }`,
   jsonAdapterPrompt: `你是一个极其精准的工具 JSON 转译节点。你的任务是将输入的伪代码、自然语言或非标指令，严格转译为符合 Schema 的标准 JSON 参数。
