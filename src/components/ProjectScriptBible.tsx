@@ -95,9 +95,10 @@ const reconstructText = (blocks: { title: string, hash: string }[]) => {
   return blocks.map(b => store[b.hash] || '').join('');
 };
 
-import { ScriptProject, ScriptCharacter, ScriptLocation, ScriptProp, ScriptAssetVersion, ProvenanceStatus } from '../types/script';
+import { ScriptProject, ScriptCharacter, ScriptLocation, ScriptProp, ScriptAssetVersion, ProvenanceStatus, ScriptAnnotation } from '../types/script';
+import { ScriptCodeEditor, ScriptCodeEditorRef } from './script/ScriptCodeEditor';
 import { assetExtractionService } from '../services/assetExtractionService';
-import { calculateAssetProvenance, resolveVerifiedProvenance, AssetProvenanceItem } from '../utils/assetProvenance';
+import { calculateAssetProvenance, resolveVerifiedProvenance, AssetProvenanceItem, AssetProvenanceHighlightSpan } from '../utils/assetProvenance';
 import { getAssetIdentificationText, getVersionIdentificationText, mergeMultiVersionAssetList, itemToVersion } from '../utils/assetVersions';
 import { ScriptView } from '../agent/scriptTools';
 import { CardData } from './GenerationCard';
@@ -325,7 +326,13 @@ const CandidateMatchesOverlay = React.memo(function CandidateMatchesOverlay({
       {/* Header Tag - Static position without sliding */}
       <div
         onMouseEnter={handleMouseEnter}
-        className="mr-1 shrink-0 px-3 py-1 rounded-full bg-white dark:bg-neutral-800 text-gray-800 dark:text-neutral-100 shadow-md text-xs font-bold font-mono whitespace-nowrap pointer-events-auto cursor-pointer flex items-center gap-1.5"
+        onClick={(e) => {
+          e.stopPropagation();
+          if (activeAssetMatches.length > 0) {
+            onSelectMatch(0, activeAssetMatches[0]);
+          }
+        }}
+        className="mr-1 shrink-0 px-3 py-1 rounded-full bg-white dark:bg-neutral-800 text-gray-800 dark:text-neutral-100 shadow-md text-xs font-bold font-mono whitespace-nowrap pointer-events-auto cursor-pointer flex items-center gap-1.5 active:scale-95 transition-transform"
       >
         {provenanceStatus === 'verifying' ? (
           <>
@@ -673,6 +680,8 @@ export function ProjectScriptBible({
     cardHeight?: number;
   } | null>(null);
   const [activeAssetMatchIndex, setActiveAssetMatchIndex] = useState<number | null>(null);
+  const [activeMultiHighlightSpans, setActiveMultiHighlightSpans] = useState<AssetProvenanceHighlightSpan[]>([]);
+  const [activeProvenanceTargetChar, setActiveProvenanceTargetChar] = useState<number | null>(null);
   const [isCandidateOverlayExpanded, setIsCandidateOverlayExpanded] = useState(false);
 
   const handleSelectAssetHighlight = useCallback((
@@ -684,6 +693,8 @@ export function ProjectScriptBible({
   ) => {
     if (!forceActivate && activeAssetHighlight?.id === item.id) {
       setActiveAssetHighlight(null);
+      setActiveMultiHighlightSpans([]);
+      setActiveProvenanceTargetChar(null);
       setIsCandidateOverlayExpanded(false);
     } else {
       let rawY = 140;
@@ -716,6 +727,8 @@ export function ProjectScriptBible({
         cardHeight: cardH,
       });
       setActiveAssetMatchIndex(null);
+      setActiveMultiHighlightSpans([]);
+      setActiveProvenanceTargetChar(null);
     }
   }, [activeAssetHighlight]);
 
@@ -762,12 +775,18 @@ export function ProjectScriptBible({
       const target = e.target as HTMLElement | null;
       if (!target) return;
 
-      // Keep selection if clicking inside an asset item or inside CandidateMatchesOverlay
-      if (target.closest('[data-asset-item]') || target.closest('[data-provenance-overlay]')) {
+      // Keep selection if clicking inside an asset item, inside CandidateMatchesOverlay, or inside the script card (editor, text, toolbar)
+      if (
+        target.closest('[data-asset-item]') ||
+        target.closest('[data-provenance-overlay]') ||
+        (scriptCardRef.current && scriptCardRef.current.contains(target))
+      ) {
         return;
       }
 
       setActiveAssetHighlight(null);
+      setActiveMultiHighlightSpans([]);
+      setActiveProvenanceTargetChar(null);
       setIsCandidateOverlayExpanded(false);
     };
 
@@ -1113,7 +1132,7 @@ export function ProjectScriptBible({
   scrollPositionsRef.current = scrollPositions;
   const isRestoringScrollRef = useRef(false);
   const inferenceAttemptedRef = useRef<Set<string>>(new Set());
-  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const editorRef = useRef<ScriptCodeEditorRef | null>(null);
 
   // Project selector dropdown inside card
   const [isProjectDropdownOpen, setIsProjectDropdownOpen] = useState(false);
@@ -1127,6 +1146,9 @@ export function ProjectScriptBible({
 
   // Table of Contents (TOC) Dropdown state & parsing
   const [inferredPatterns, setInferredPatterns] = useState<string[]>(() => {
+    if (Array.isArray(currentProject.tocConfig?.patterns) && currentProject.tocConfig!.patterns!.length > 0) {
+      return currentProject.tocConfig!.patterns!;
+    }
     try {
       const saved = localStorage.getItem(`script_toc_patterns_${currentProject.id}`);
       return saved ? JSON.parse(saved) : [];
@@ -1203,10 +1225,23 @@ export function ProjectScriptBible({
   useEffect(() => {
     if (!scriptDraft || scriptDraft.trim().length < 20) return;
 
-    // Do not infer if we already have patterns loaded in state (either from localStorage or from a previous fallback in this session)
-    if (inferredPatterns.length > 0) return;
-    
-    // Check localStorage just to be safe
+    // Ensure project.scenes is populated even if patterns were already loaded from cache
+    if (inferredPatterns.length > 0) {
+      if (!Array.isArray(currentProject.scenes) || currentProject.scenes.length === 0) {
+        import('../utils/slicer')
+          .then(({ sliceScriptIntoScenes }) => {
+            const scenePat = currentProject.tocConfig?.scenePattern || inferredPatterns[1];
+            const flags = currentProject.tocConfig?.flags || 'gim';
+            const newScenes = sliceScriptIntoScenes(scriptDraft, scenePat, flags);
+            if (newScenes.length > 0) {
+              onUpdateProject({ scenes: newScenes });
+            }
+          })
+          .catch(() => {});
+      }
+      return;
+    }
+
     const saved = localStorage.getItem(`script_toc_patterns_${currentProject.id}`);
     if (saved && saved !== '[]') return;
 
@@ -1236,7 +1271,6 @@ export function ProjectScriptBible({
           apiKey = glmKey;
         }
 
-        // Retrieve prompt directly from the codebase constants (which are written back by the save endpoint)
         const systemPrompt = CODE_PIPELINE_PROMPTS.tocInferSystemPrompt;
 
         const res = await fetch('/api/script-toc-pattern', {
@@ -1254,7 +1288,6 @@ export function ProjectScriptBible({
         const data = await res.json();
         if (!isMounted) return;
 
-        // Save raw inference to local storage for Settings debugging
         try {
           localStorage.setItem('last_toc_infer_result', JSON.stringify(data, null, 2));
         } catch (e) {}
@@ -1268,26 +1301,39 @@ export function ProjectScriptBible({
           localStorage.setItem(`script_toc_patterns_${currentProject.id}`, JSON.stringify(patterns));
         }
 
-        // Auto-slice scenes if scenePattern exists
-        if (data.scenePattern) {
-          import('../utils/slicer').then(({ sliceScriptIntoScenes }) => {
-            if (!isMounted) return;
-            const newScenes = sliceScriptIntoScenes(scriptDraft, data.scenePattern, data.flags || 'gim');
-            // Update global project state so Data Viewer panel can read it
-            onUpdateProject({ scenes: newScenes });
-          }).catch(console.error);
-        }
+        import('../utils/slicer').then(({ sliceScriptIntoScenes }) => {
+          if (!isMounted) return;
+          const newScenes = sliceScriptIntoScenes(scriptDraft, data.scenePattern, data.flags || 'gim');
+          onUpdateProject({
+            tocConfig: {
+              tocPattern: data.tocPattern,
+              scenePattern: data.scenePattern,
+              flags: data.flags || 'gim',
+              patterns,
+            },
+            scenes: newScenes,
+          });
+        }).catch(console.error);
 
       } catch {
         if (!isMounted) return;
         const fallbackPatterns = [
           "^【\\s*第?\\s*[0-9一二三四五六七八九十百千]+\\s*[集话回][^】]*】.*",
           "^第\\s*[0-9一二三四五六七八九十百千]+\\s*[集话回].*",
+          "^\\d+\\s*[-—–]\\s*\\d+.*",
           "^【\\s*(?:场|场景|场次)?\\s*[0-9一二三四五六七八九十百千]+[^】]*】.*",
           "^第\\s*[0-9一二三四五六七八九十百千]+\\s*[场幕].*",
           "^(?:EPISODE|EP|CHAPTER|SCENE)\\s*#?\\s*\\d+.*"
         ];
         setInferredPatterns(fallbackPatterns);
+        import('../utils/slicer').then(({ sliceScriptIntoScenes }) => {
+          if (!isMounted) return;
+          const newScenes = sliceScriptIntoScenes(scriptDraft);
+          onUpdateProject({
+            tocConfig: { patterns: fallbackPatterns, flags: 'gim' },
+            scenes: newScenes,
+          });
+        }).catch(() => {});
       } finally {
         if (isMounted) setIsInferringToc(false);
       }
@@ -1309,9 +1355,18 @@ export function ProjectScriptBible({
     const items: TocItem[] = [];
     let charAccumulator = 0;
 
-    // Only use patterns explicitly set in state (AI inferred or the injected explicit fallback)
+    const builtinPatterns = [
+      "^【\\s*第?\\s*[0-9一二三四五六七八九十百千]+\\s*[集话回][^】]*】.*",
+      "^第\\s*[0-9一二三四五六七八九十百千]+\\s*[集话回].*",
+      "^\\d+\\s*[-—–]\\s*\\d+(?:\\s*(?:[日夜晨昏早晚内外景INTEXT.\\s].*)?|$)",
+      "^【\\s*(?:场|场景|场次)?\\s*[0-9一二三四五六七八九十百千]+[^】]*】.*",
+      "^第\\s*[0-9一二三四五六七八九十百千]+\\s*[场幕].*",
+      "^(?:EPISODE|EP|CHAPTER|SCENE)\\s*#?\\s*\\d+.*"
+    ];
+
+    const mergedPatternStrings = Array.from(new Set([...inferredPatterns, ...builtinPatterns]));
     const activeRegexes: RegExp[] = [];
-    inferredPatterns.forEach(patternStr => {
+    mergedPatternStrings.forEach(patternStr => {
       try {
         activeRegexes.push(new RegExp(patternStr, 'i'));
       } catch (e) {
@@ -1319,8 +1374,10 @@ export function ProjectScriptBible({
       }
     });
 
-    // If no patterns are active yet (inferring), don't show TOC
     if (activeRegexes.length === 0) return [];
+
+    const nextLineSceneMetaRx =
+      /^(?:[日夜晨昏早晚黄昏清晨白昼午夜]+[\s/·]+[内外]+景?|[内外]+景?[\s/·]+[日夜晨昏早晚黄昏清晨白昼午夜]+)(?:\s+.*)?$/;
 
     lines.forEach((rawLine, index) => {
       const trimmed = rawLine.trim();
@@ -1329,7 +1386,7 @@ export function ProjectScriptBible({
         return;
       }
 
-      let isMatch = activeRegexes.some(rx => rx.test(trimmed));
+      const isMatch = activeRegexes.some(rx => rx.test(trimmed));
 
       if (isMatch) {
         let title = trimmed;
@@ -1342,10 +1399,19 @@ export function ProjectScriptBible({
           title = trimmed.replace(/^#+\s*/, '');
         }
 
+        // If bare dash-scene header like "22-2" is followed by "日 内 布拉姆房间" on next line, attach as subTitle
+        if (!subTitle && /^\d+\s*[-—–]\s*\d+$/.test(title) && index + 1 < lines.length) {
+          const nextTrimmed = lines[index + 1].trim();
+          if (nextLineSceneMetaRx.test(nextTrimmed)) {
+            subTitle = nextTrimmed;
+          }
+        }
+
         let type: TocItem['type'] = 'scene';
-        if (/集|EPISODE|EP\b/i.test(trimmed)) {
+        const isDashScene = /^\d+\s*[-—–]\s*\d+/.test(trimmed);
+        if (!isDashScene && /集|EPISODE|EP\b/i.test(trimmed)) {
           type = 'episode';
-        } else if (/场|SCENE|EXT\.|INT\./i.test(trimmed) || /^\d+[-—]\d+/.test(trimmed)) {
+        } else if (isDashScene || /场|SCENE|EXT\.|INT\./i.test(trimmed)) {
           type = 'scene';
         } else if (/幕|章|回|CHAPTER|ACT/i.test(trimmed)) {
           type = 'chapter';
@@ -1390,72 +1456,7 @@ export function ProjectScriptBible({
     return items;
   }, [scriptDraft, inferredPatterns]);
 
-  // Pixel-exact vertical offset calculator for textarea caret position (accounting for dynamic line wrapping)
-  const getTextareaCharTop = (textarea: HTMLTextAreaElement, charIndex: number): number => {
-    try {
-      const style = window.getComputedStyle(textarea);
-      const mirror = document.createElement('div');
 
-      const properties = [
-        'boxSizing',
-        'paddingTop',
-        'paddingRight',
-        'paddingBottom',
-        'paddingLeft',
-        'borderTopWidth',
-        'borderRightWidth',
-        'borderBottomWidth',
-        'borderLeftWidth',
-        'fontFamily',
-        'fontSize',
-        'fontWeight',
-        'fontStyle',
-        'letterSpacing',
-        'lineHeight',
-        'textTransform',
-        'wordSpacing',
-        'wordBreak',
-        'wordWrap',
-        'whiteSpace',
-        'tabSize',
-      ];
-
-      mirror.style.position = 'absolute';
-      mirror.style.top = '-99999px';
-      mirror.style.left = '-99999px';
-      mirror.style.visibility = 'hidden';
-      mirror.style.overflow = 'hidden';
-      mirror.style.whiteSpace = 'pre-wrap';
-      mirror.style.wordBreak = 'break-word';
-
-      properties.forEach(prop => {
-        const val = (style as any)[prop];
-        if (val !== undefined && typeof val === 'string') {
-          (mirror.style as any)[prop] = val;
-        }
-      });
-
-      // Use textarea clientWidth (excludes scrollbar width) to replicate word wrapping exactly
-      mirror.style.width = `${textarea.clientWidth}px`;
-
-      const textBefore = textarea.value.slice(0, charIndex);
-      mirror.textContent = textBefore;
-
-      const marker = document.createElement('span');
-      marker.textContent = textarea.value.slice(charIndex, charIndex + 1) || ' ';
-      mirror.appendChild(marker);
-
-      document.body.appendChild(mirror);
-      const targetTop = marker.offsetTop;
-      document.body.removeChild(mirror);
-
-      return targetTop;
-    } catch {
-      const computedLineHeight = parseFloat(window.getComputedStyle(textarea).lineHeight) || 28;
-      const linesBefore = textarea.value.slice(0, charIndex).split('\n').length;
-      return Math.max(0, (linesBefore - 1) * computedLineHeight);
-    }
-  };
 
   const liveHighlightedAsset = useMemo(() => {
     if (!activeAssetHighlight) return null;
@@ -1516,65 +1517,49 @@ export function ProjectScriptBible({
     // Only display verified provenance matches; never display raw unverified full-text hits directly
     if (activeProvenanceStatus !== 'verified') return [];
     if (Array.isArray(liveHighlightedAsset?.verifiedProvenance) && liveHighlightedAsset.verifiedProvenance.length > 0) {
-      return resolveVerifiedProvenance(scriptDraft, tocItems, liveHighlightedAsset.verifiedProvenance);
+      return resolveVerifiedProvenance(scriptDraft, tocItems, liveHighlightedAsset.verifiedProvenance, {
+        assetName: liveHighlightedAsset.name || activeAssetHighlight.name,
+      });
     }
     return [];
   }, [activeAssetHighlight, activeProvenanceStatus, liveHighlightedAsset, scriptDraft, tocItems]);
 
   const jumpToAssetMatch = useCallback((match: AssetProvenanceItem) => {
+    if (activeTab !== 'script') {
+      changeActiveTab('script');
+    }
+
+    const highlightSpans: AssetProvenanceHighlightSpan[] =
+      Array.isArray(match.highlights) && match.highlights.length > 0
+        ? match.highlights
+        : (() => {
+            const startChar = match.highlightCharIndex ?? match.firstMatchCharIndex ?? match.charIndex;
+            const len =
+              match.highlightText && match.highlightText.length > 0
+                ? match.highlightText.length
+                : match.matchedTerm && match.matchedTerm.length > 0
+                  ? match.matchedTerm.length
+                  : activeAssetHighlight ? activeAssetHighlight.name.length : 2;
+            return [
+              {
+                charIndex: startChar,
+                endCharIndex: startChar + len,
+                text: scriptDraft.slice(startChar, startChar + len),
+                lineNumber: match.lineNumber,
+              },
+            ];
+          })();
+
+    setActiveMultiHighlightSpans(highlightSpans);
+
+    const firstSpan = highlightSpans[0];
+    const jumpChar = firstSpan ? firstSpan.charIndex : (match.highlightCharIndex ?? match.firstMatchCharIndex ?? match.charIndex);
+    setActiveProvenanceTargetChar(jumpChar);
+
     requestAnimationFrame(() => {
-      const node = textareaRef.current;
-      if (!node || !activeAssetHighlight) return;
-
-      if (activeTab !== 'script') {
-        changeActiveTab('script');
-      }
-
-      const jumpChar = match.highlightCharIndex ?? match.firstMatchCharIndex ?? match.charIndex;
-      const highlightLength = (match.highlightText && match.highlightText.length > 0)
-        ? match.highlightText.length
-        : (match.matchedTerm && match.matchedTerm.length > 0)
-          ? match.matchedTerm.length
-          : activeAssetHighlight.name.length;
-      const targetTop = getTextareaCharTop(node, jumpChar);
-      const scrollTarget = Math.max(0, targetTop - 120);
-
-      isRestoringScrollRef.current = true;
-
-      // 1. First scroll textarea directly to the exact target position so target text is in view
-      node.scrollTop = scrollTarget;
-
-      // 2. Now that the text is within the viewport, focus and setSelectionRange without browser auto-scroll conflict
-      try {
-        node.focus({ preventScroll: true });
-        node.setSelectionRange(
-          jumpChar,
-          jumpChar + highlightLength
-        );
-      } catch {}
-
-      // 3. Ensure exact scrollTarget position is locked
-      node.scrollTop = scrollTarget;
-
-      // 4. Update stored scroll positions
-      scrollPositionsRef.current[currentProject.id] = scrollTarget;
-      setScrollPositions(prev => ({ ...prev, [currentProject.id]: scrollTarget }));
-      try {
-        localStorage.setItem('script_scroll_positions', JSON.stringify(scrollPositionsRef.current));
-      } catch {}
-
-      // 5. Reinforce position on next frame and release scroll lock
-      requestAnimationFrame(() => {
-        if (textareaRef.current) {
-          textareaRef.current.scrollTop = scrollTarget;
-        }
-        setTimeout(() => {
-          isRestoringScrollRef.current = false;
-        }, 100);
-      });
+      editorRef.current?.scrollToOffset(jumpChar, { center: true, behavior: 'smooth' });
     });
-  }, [activeAssetHighlight, activeTab, changeActiveTab, currentProject.id]);
-
+  }, [activeAssetHighlight, activeTab, changeActiveTab, scriptDraft]);
 
   const handleJumpToToc = (item: TocItem) => {
     onTocOpenChange(false);
@@ -1583,45 +1568,16 @@ export function ProjectScriptBible({
     }
 
     const performJump = () => {
-      const node = textareaRef.current;
-      if (!node) return;
-
-      // 1. Calculate pixel-perfect vertical scroll offset using DOM text measurement
-      const exactTop = getTextareaCharTop(node, item.charIndex);
-      const targetScroll = Math.max(0, exactTop - 20);
-
-      // Lock scroll state listener temporarily to avoid state thrashing during programmatic jump
-      isRestoringScrollRef.current = true;
-
-      // 2. Focus and select text using preventScroll: true so browser doesn't reset scroll position
-      try {
-        node.focus({ preventScroll: true });
-        node.setSelectionRange(item.charIndex, item.charIndex + item.title.length);
-      } catch {}
-
-      // 3. Perform smooth scrolling to exact target
-      node.scrollTo({ top: targetScroll, behavior: 'smooth' });
-
-      // 4. Update stored scroll positions
-      setScrollPositions(prev => {
-        const next = { ...prev, [currentProject.id]: targetScroll };
-        scrollPositionsRef.current = next;
-        try {
-          localStorage.setItem('script_scroll_positions', JSON.stringify(next));
-        } catch {}
-        return next;
+      editorRef.current?.scrollToOffset(item.charIndex, {
+        center: false,
+        behavior: 'smooth',
+        select: true,
+        selectLength: item.title.length,
       });
-
-      // 5. Reinforce position after transition and unlock listener
-      setTimeout(() => {
-        if (textareaRef.current) {
-          textareaRef.current.scrollTop = targetScroll;
-        }
-        isRestoringScrollRef.current = false;
-      }, 250);
+      editorRef.current?.focus();
     };
 
-    if (activeTab === 'script' && textareaRef.current) {
+    if (activeTab === 'script') {
       requestAnimationFrame(() => {
         performJump();
       });
@@ -1630,7 +1586,7 @@ export function ProjectScriptBible({
         requestAnimationFrame(() => {
           performJump();
         });
-      }, 240);
+      }, 200);
     }
     onTocItemOpened({ id: item.id, title: item.title, lineNumber: item.lineNumber, type: item.type });
   };
@@ -1724,27 +1680,22 @@ export function ProjectScriptBible({
     if (searchMatches.length === 0) return;
     const match = searchMatches[index];
     if (!match) return;
-    const node = textareaRef.current;
-    if (!node) return;
 
-    const exactTop = getTextareaCharTop(node, match.start);
-    const targetScroll = Math.max(0, exactTop - 50);
-    isRestoringScrollRef.current = true;
-    try {
-      node.focus({ preventScroll: true });
-      node.setSelectionRange(match.start, match.end);
-      const selText = scriptDraft.slice(match.start, match.end);
-      const linesBefore = scriptDraft.slice(0, match.start).split('\n');
-      const linesSelected = selText.split('\n');
-      const lineStart = linesBefore.length;
-      const lineEnd = lineStart + linesSelected.length - 1;
-      onSelectionChange({ text: selText, start: match.start, end: match.end, lineStart, lineEnd });
-    } catch {}
-    node.scrollTo({ top: targetScroll, behavior: 'smooth' });
-    setTimeout(() => {
-      isRestoringScrollRef.current = false;
-    }, 150);
-  }, [searchMatches, getTextareaCharTop, scriptDraft, onSelectionChange]);
+    editorRef.current?.scrollToOffset(match.start, {
+      center: true,
+      behavior: 'smooth',
+      select: true,
+      selectLength: match.end - match.start,
+    });
+    editorRef.current?.focus();
+
+    const selText = scriptDraft.slice(match.start, match.end);
+    const linesBefore = scriptDraft.slice(0, match.start).split('\n');
+    const linesSelected = selText.split('\n');
+    const lineStart = linesBefore.length;
+    const lineEnd = lineStart + linesSelected.length - 1;
+    onSelectionChange({ text: selText, start: match.start, end: match.end, lineStart, lineEnd });
+  }, [searchMatches, scriptDraft, onSelectionChange]);
 
   const handleNextMatch = useCallback(() => {
     if (searchMatches.length === 0) return;
@@ -1778,7 +1729,14 @@ export function ProjectScriptBible({
     }
   }, [isSearchOpen]);
 
-  // Keyboard shortcut Ctrl+F / Cmd+F inside script panel
+  const handleDismissProvenanceHighlights = useCallback(() => {
+    setActiveMultiHighlightSpans([]);
+    setActiveProvenanceTargetChar(null);
+    setActiveAssetHighlight(null);
+    setActiveAssetMatchIndex(null);
+  }, []);
+
+  // Keyboard shortcuts: Ctrl+F (Search) and Escape (Dismiss Highlights) inside script panel
   useEffect(() => {
     if (!isOpen || activeTab !== 'script') return;
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -1789,11 +1747,17 @@ export function ProjectScriptBible({
           searchInputRef.current?.focus();
           searchInputRef.current?.select();
         }, 50);
+      } else if (e.key === 'Escape') {
+        if (activeMultiHighlightSpans.length > 0) {
+          handleDismissProvenanceHighlights();
+        } else if (isSearchOpen) {
+          setIsSearchOpen(false);
+        }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen, activeTab]);
+  }, [isOpen, activeTab, activeMultiHighlightSpans.length, isSearchOpen, handleDismissProvenanceHighlights]);
 
   // Single replace
   const handleReplaceCurrent = useCallback(() => {
@@ -1830,6 +1794,11 @@ export function ProjectScriptBible({
   // Sync script draft when currentProject changes
   useEffect(() => {
     setScriptDraft(currentProject?.scriptText || '');
+    setActiveMultiHighlightSpans([]);
+    if (Array.isArray(currentProject?.tocConfig?.patterns) && currentProject.tocConfig!.patterns!.length > 0) {
+      setInferredPatterns(currentProject.tocConfig!.patterns!);
+      return;
+    }
     try {
       const saved = localStorage.getItem(`script_toc_patterns_${currentProject.id}`);
       setInferredPatterns(saved ? JSON.parse(saved) : []);
@@ -1854,36 +1823,31 @@ export function ProjectScriptBible({
     }
   }, [isOpen]);
 
-  // Synchronously restore scroll position upon textarea mount before making text visible
-  const handleTextareaRef = useCallback((node: HTMLTextAreaElement | null) => {
-    textareaRef.current = node;
-    if (node) {
+  // Synchronously restore scroll position upon CodeMirror mount
+  useEffect(() => {
+    if (isAnimationSettled && isOpen) {
       const targetScroll = scrollPositionsRef.current[currentProject.id] || 0;
       isRestoringScrollRef.current = true;
-      node.scrollTop = targetScroll;
-      // Double check in next frame and reveal text only after position is locked
       requestAnimationFrame(() => {
-        if (textareaRef.current) {
-          textareaRef.current.scrollTop = targetScroll;
+        if (editorRef.current) {
+          editorRef.current.scrollToTop(targetScroll);
         }
-        // Give browser 1 frame to render the scroll position at opacity-0, then smoothly fade in
         requestAnimationFrame(() => {
           setIsPositionReady(true);
+          setTimeout(() => {
+            isRestoringScrollRef.current = false;
+          }, 100);
         });
-        setTimeout(() => {
-          isRestoringScrollRef.current = false;
-        }, 100);
       });
     } else {
       setIsPositionReady(false);
     }
-  }, [currentProject.id]);
+  }, [isAnimationSettled, isOpen, currentProject.id]);
 
   const saveScrollDebounceRef = useRef<NodeJS.Timeout | null>(null);
 
-  const handleScriptScroll = useCallback((e: React.UIEvent<HTMLTextAreaElement>) => {
+  const handleScriptScroll = useCallback((top: number) => {
     if (isRestoringScrollRef.current || !isPositionReady) return;
-    const top = e.currentTarget.scrollTop;
     scrollPositionsRef.current[currentProject.id] = top;
 
     if (saveScrollDebounceRef.current) {
@@ -2080,22 +2044,69 @@ export function ProjectScriptBible({
     }
   }, [autoSaveEnabled]);
 
-  const handleScriptChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    const val = e.target.value;
+  const editorAnnotations = useMemo<ScriptAnnotation[]>(() => {
+    const list: ScriptAnnotation[] = [];
+
+    // 1. Search & Replace highlights
+    if (searchMatches.length > 0) {
+      searchMatches.forEach((m, idx) => {
+        list.push({
+          id: `search-${idx}-${m.start}`,
+          from: m.start,
+          to: m.end,
+          category: 'search',
+          active: idx === safeMatchIndex,
+          colorVariant: 'amber',
+        });
+      });
+    }
+
+    // 2. Provenance highlights
+    if (activeMultiHighlightSpans.length > 0) {
+      activeMultiHighlightSpans.forEach((sp, idx) => {
+        const isTarget = activeProvenanceTargetChar !== null
+          ? sp.charIndex === activeProvenanceTargetChar
+          : idx === 0;
+
+        list.push({
+          id: `prov-${idx}-${sp.charIndex}`,
+          from: sp.charIndex,
+          to: sp.endCharIndex,
+          category: 'provenance',
+          name: sp.text,
+          active: isTarget,
+          badgeText: activeMultiHighlightSpans.length > 1 ? `${idx + 1}` : undefined,
+          badgeTooltip: `出处条目 ${idx + 1}/${activeMultiHighlightSpans.length}: ${sp.text} (点击聚焦)`,
+          colorVariant: 'blue',
+          onClick: () => {
+            setActiveProvenanceTargetChar(sp.charIndex);
+          },
+        });
+      });
+    }
+
+    return list;
+  }, [searchMatches, safeMatchIndex, activeMultiHighlightSpans, activeProvenanceTargetChar]);
+
+  const handleScriptTextChange = useCallback((val: string) => {
     setScriptDraft(val);
+    if (activeMultiHighlightSpans.length > 0) {
+      setActiveMultiHighlightSpans([]);
+      setActiveProvenanceTargetChar(null);
+    }
     onUpdateProject({ scriptText: val });
 
-    const cursorOffset = e.target.selectionStart;
+    const cursorOffset = editorRef.current?.getSelection().start || 0;
     const scene = updateSceneIndicator(val, cursorOffset);
     setVersionStatus('有未保存改动');
 
     if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
     if (autoSaveEnabled) {
-        typingTimerRef.current = setTimeout(() => {
-            triggerAssessChange(val, scene, cursorOffset);
-        }, 3000);
+      typingTimerRef.current = setTimeout(() => {
+        triggerAssessChange(val, scene, cursorOffset);
+      }, 3000);
     }
-  };
+  }, [activeMultiHighlightSpans.length, autoSaveEnabled, onUpdateProject, triggerAssessChange]);
 
   const handleSaveRename = (projectId: string) => {
     if (editingProjectName.trim()) {
@@ -2698,7 +2709,7 @@ export function ProjectScriptBible({
                                           setVersionStatus('内容未改变');
                                           setTimeout(() => setVersionStatus('已同步'), 2000);
                                       } else {
-                                          triggerAssessChange(scriptDraft, currentSceneIndicator, textareaRef.current?.selectionStart || 0);
+                                          triggerAssessChange(scriptDraft, currentSceneIndicator, editorRef.current?.getSelection().start || 0);
                                       }
                                   }}
                                   className="text-[10px] px-1.5 py-0.5 bg-blue-500/10 text-blue-600 dark:text-blue-400 rounded corner-squircle hover:bg-blue-500/20 transition-colors">
@@ -2792,22 +2803,15 @@ export function ProjectScriptBible({
                                                             }
                                                         }
                                                         
-                                                        // Select in preview textarea
+                                                        // Select in preview editor
                                                         setTimeout(() => {
-                                                            if (textareaRef.current) {
-                                                                const node = textareaRef.current;
-                                                                const exactTop = getTextareaCharTop(node, diffStart);
-                                                                const targetScroll = Math.max(0, exactTop - (node.clientHeight / 2));
-                                                                
-                                                                isRestoringScrollRef.current = true;
-                                                                node.focus({ preventScroll: true });
-                                                                node.setSelectionRange(diffStart, diffStart);
-                                                                
-                                                                node.scrollTo({
-                                                                    top: targetScroll,
-                                                                    behavior: 'smooth'
-                                                                });
-                                                            }
+                                                            editorRef.current?.scrollToOffset(diffStart, {
+                                                                center: true,
+                                                                behavior: 'smooth',
+                                                                select: true,
+                                                                selectLength: 0,
+                                                            });
+                                                            editorRef.current?.focus();
                                                         }, 50);
                                                     }
                                                 }}
@@ -3039,43 +3043,90 @@ export function ProjectScriptBible({
                     )}
                   </AnimatePresence>
 
+                  {/* Floating Quick-Exit Capsule for Provenance Highlights: 布拉姆 (41处) [退出高亮 ✕] */}
+                  <AnimatePresence>
+                    {activeMultiHighlightSpans.length > 0 && activeAssetHighlight && (
+                      <motion.div
+                        initial={{ opacity: 0, y: -8, scale: 0.95 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        exit={{ opacity: 0, y: -8, scale: 0.95 }}
+                        transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
+                        className={`absolute top-3 z-30 flex items-center shadow-lg bg-white/95 dark:bg-neutral-800/95 backdrop-blur-md border border-blue-200/80 dark:border-blue-900/50 rounded-full pl-3 pr-1.5 py-1 text-xs select-none pointer-events-auto transition-all duration-200 ${
+                          isTocOpen ? 'left-[300px]' : 'left-5'
+                        }`}
+                      >
+                        <div className="flex items-center gap-1.5 mr-2">
+                          <span className="font-semibold text-gray-800 dark:text-neutral-100 max-w-[130px] truncate">
+                            {activeAssetHighlight.name}
+                          </span>
+                          <span className="text-[11px] font-mono text-blue-600 dark:text-blue-400 font-semibold">
+                            ({activeMultiHighlightSpans.length}处)
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={handleDismissProvenanceHighlights}
+                          title="退出出处高亮模式 (快捷键: Esc)"
+                          className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium text-gray-600 hover:text-gray-900 dark:text-neutral-300 dark:hover:text-white bg-blue-50/80 hover:bg-blue-100 dark:bg-neutral-700/80 dark:hover:bg-neutral-700 transition-colors cursor-pointer group"
+                        >
+                          <span>退出高亮</span>
+                          <X className="w-3.5 h-3.5 text-gray-400 group-hover:text-gray-700 dark:text-neutral-400 dark:group-hover:text-white transition-colors" />
+                        </button>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+
                   {isAnimationSettled ? (
-                    <textarea
-                      key={`script-${currentProject.id}`}
-                      ref={handleTextareaRef}
-                      data-agent-target="script.text"
-                      data-agent-actions="mouse.move mouse.click mouse.hover mouse.drag mouse.scroll mouse.type mouse.keyPress"
-                      value={previewVersionId ? getPreviewText() : scriptDraft}
-                      readOnly={!!previewVersionId}
-                      onChange={handleScriptChange}
-                      onScroll={handleScriptScroll}
-                      onSelect={(event) => {
-                        const node = event.currentTarget;
-                        const start = node.selectionStart;
-                        const end = node.selectionEnd;
-                        updateSceneIndicator(node.value, start);
-                        if (start === end) return onSelectionChange(null);
-                        onSelectionChange({
-                          text: node.value.slice(start, end), start, end,
-                          lineStart: node.value.slice(0, start).split('\n').length,
-                          lineEnd: node.value.slice(0, end).split('\n').length,
-                        });
-                      }}
-                      placeholder="在此直接输入或粘贴剧本正文...&#10;&#10;例如：&#10;【场 1】内景. 房间 - 夜&#10;主角坐在桌前，窗外微风拂过...&#10;&#10;【场 2】外景. 街道 - 日&#10;阳光穿透树梢，洒在人行道上..."
-                      className={`w-full flex-1 h-full pl-[22px] pr-[17px] pt-4 pb-4 text-[14px] font-medium leading-relaxed bg-transparent border-0 outline-none text-gray-800 dark:text-neutral-300 placeholder-gray-400 dark:placeholder-neutral-500 resize-none overflow-y-auto transition-all duration-200 ease-out ${
-                        isPositionReady ? 'opacity-100' : 'opacity-0 pointer-events-none'
-                      } ${
-                        isCandidateOverlayExpanded ? 'blur-[3.5px] opacity-60 pointer-events-none' : 'blur-none'
-                      }`}
-                      spellCheck={false}
-                    />
+                    <div className="relative flex-1 flex flex-col min-h-0 w-full h-full overflow-hidden">
+                      <ScriptCodeEditor
+                        key={`script-${currentProject.id}`}
+                        ref={editorRef}
+                        value={previewVersionId ? getPreviewText() : scriptDraft}
+                        readOnly={!!previewVersionId}
+                        onChange={handleScriptTextChange}
+                        placeholder="在此直接输入或粘贴剧本正文...&#10;&#10;例如：&#10;【场 1】内景. 房间 - 夜&#10;主角坐在桌前，窗外微风拂过...&#10;&#10;【场 2】外景. 街道 - 日&#10;阳光穿透树梢，洒在人行道上..."
+                        annotations={editorAnnotations}
+                        onEscape={handleDismissProvenanceHighlights}
+                        onCursorMove={(cursorOffset) => {
+                          updateSceneIndicator(scriptDraft, cursorOffset);
+                          if (activeMultiHighlightSpans.length > 0) {
+                            const hit = activeMultiHighlightSpans.find(
+                              sp => cursorOffset >= sp.charIndex && cursorOffset <= sp.endCharIndex
+                            );
+                            if (hit && hit.charIndex !== activeProvenanceTargetChar) {
+                              setActiveProvenanceTargetChar(hit.charIndex);
+                            }
+                          }
+                        }}
+                        onSelectionChange={(selection) => {
+                          if (selection) {
+                            updateSceneIndicator(scriptDraft, selection.start);
+                            onSelectionChange(selection);
+                            if (activeMultiHighlightSpans.length > 0) {
+                              const hit = activeMultiHighlightSpans.find(
+                                sp => selection.start >= sp.charIndex && selection.start <= sp.endCharIndex
+                              );
+                              if (hit && hit.charIndex !== activeProvenanceTargetChar) {
+                                setActiveProvenanceTargetChar(hit.charIndex);
+                              }
+                            }
+                          } else {
+                            onSelectionChange(null);
+                          }
+                        }}
+                        onScroll={handleScriptScroll}
+                        className={`transition-all duration-150 ease-out ${
+                          isPositionReady ? 'opacity-100' : 'opacity-0 pointer-events-none'
+                        }`}
+                      />
+                    </div>
                   ) : (
                     <div className="w-full flex-1 h-full" />
                   )}
 
                   {/* Bottom Right Floating Stats */}
                   <div className={`absolute bottom-5 right-6 pointer-events-none select-none flex items-center gap-2.5 text-gray-400 dark:text-neutral-500 transition-all duration-200 ${
-                    isCandidateOverlayExpanded ? 'opacity-20 blur-[2px]' : 'opacity-60 blur-none'
+                    isCandidateOverlayExpanded ? 'opacity-30 blur-none' : 'opacity-60 blur-none'
                   }`}>
                     <div className="flex flex-col items-center">
                       <span className="text-[11px] font-medium tabular-nums leading-none">{(scriptDraft || '').length}</span>

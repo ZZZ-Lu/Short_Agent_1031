@@ -1,5 +1,21 @@
 export type ProvenanceStatus = 'unverified' | 'verifying' | 'verified' | 'stale';
 
+export type ScriptAnnotationCategory = 'character' | 'location' | 'prop' | 'provenance' | 'search';
+
+export interface ScriptAnnotation {
+  id: string;
+  from: number;
+  to: number;
+  category: ScriptAnnotationCategory;
+  name?: string;
+  badgeText?: string;
+  badgeTooltip?: string;
+  colorVariant?: 'blue' | 'purple' | 'amber' | 'emerald' | 'gray';
+  active?: boolean;
+  onClick?: () => void;
+  meta?: Record<string, unknown>;
+}
+
 export interface VerifiedProvenanceAnchor {
   id: string;                 // 唯一锚点 ID，如 "vp_ep13_0"
   sceneId?: string;           // 关联的分集/场次 ID
@@ -89,12 +105,27 @@ export interface ScriptProp {
 
 export interface SceneChunk {
   index: number;
+  id?: string;
+  episodeId?: string;
+  episodeTitle?: string;
+  sceneNumber?: string;
   title: string;
   type?: 'INT' | 'EXT' | 'MIXED';
   locationName?: string;
   timeOfDay?: string;
   characterNames?: string[];
+  startLine?: number;
+  endLine?: number;
+  charIndex?: number;
+  endCharIndex?: number;
   rawText: string;
+}
+
+export interface ScriptTocConfig {
+  tocPattern?: string;
+  scenePattern?: string;
+  flags?: string;
+  patterns?: string[];
 }
 
 export type ExtractionModelType = 
@@ -169,6 +200,7 @@ export interface ScriptProject {
   updatedAt: number;
   scriptText: string;
   universe: ScriptUniverse;
+  tocConfig?: ScriptTocConfig; // 持久化的目录与分场识别正则配置
   scenes?: SceneChunk[]; // 另存的智能分场切片信息
   characters: ScriptCharacter[];
   locations: ScriptLocation[];

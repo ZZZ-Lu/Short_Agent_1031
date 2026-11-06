@@ -101,7 +101,12 @@ function findAssetInProject(
 
 export function executeProjectReadTool(name: string, args: Record<string, unknown>, project: ProjectData) {
   if (name === 'script.directory') {
-    const all = readScriptDirectory(project.scriptText, { query: typeof args.query === 'string' ? args.query : undefined });
+    const all = readScriptDirectory(project.scriptText, {
+      query: typeof args.query === 'string' ? args.query : undefined,
+      scenePattern: project.tocConfig?.scenePattern,
+      flags: project.tocConfig?.flags,
+      precomputedScenes: Array.isArray(project.scenes) ? project.scenes : undefined,
+    });
     const offset = pageNumber(args.offset, 0, Number.MAX_SAFE_INTEGER);
     const limit = Math.max(1, pageNumber(args.limit, 100, 200));
     return { projectId: project.id, source: 'project', total: all.length, offset, entries: all.slice(offset, offset + limit), nextOffset: offset + limit < all.length ? offset + limit : null };
@@ -239,7 +244,7 @@ export function executeProjectReadTool(name: string, args: Record<string, unknow
         evidenceText: c.evidenceText,
         contextSnippet: c.contextSnippet,
       })),
-      instruction: '请结合 assetProfile 逐一审阅每条 candidate 的 contextSnippet，分析剧本判断该资产（或该特定版本）在此处是否需要出现在画面中：需要出现在画面中则算作出场，不出现在画面中则不算出场。随后调用 asset.commitProvenance 提交真实出场的 verifiedCandidateIds（也可在 provenances 中直接提交原文具体出场描写句 evidenceText，包含代词指代或特定服装/状态描写句）。',
+      instruction: '请结合 assetProfile 逐一审阅每条 candidate 的 contextSnippet，分析剧本判断该资产（或该特定版本）在此处是否需要出现在画面中：需要出现在画面中则算作出场；若角色未在场且仅在他人台词中被侧面提及（口头提及）则绝对不算出场，严禁提交。随后调用 asset.commitProvenance 提交真实出场的 verifiedCandidateIds（也可在 provenances 中直接提交原文具体出场描写句 evidenceText，包含代词指代或特定服装/状态描写句）。',
     };
   }
   throw new Error(`未知项目工具：${name}`);

@@ -487,3 +487,163 @@ test('阅读即锚定与具体内容高亮测试：支持代词指代原句锚�
     '▲布拉姆审视着娜塔莉亚的表情，娜塔莉亚看着安保人员端着的枪，忍不住紧张。'
   );
 });
+
+test('集-场二级目录解析与多场次出处智能折叠及多处同时高亮测试（如第22集 22—1 与 22-2）', () => {
+  const ep22Script = [
+    '第二十二集',
+    '22—1日 内 布拉姆房间',
+    '人物 塞莱特斯 宾客若干 莱恩 伊丽莎白 布拉姆 娜塔莉亚',
+    '▲众人齐刷刷地看着屋内，只见布拉姆穿着衬衣站在屋内，娜塔莉亚拿着戴安娜的分析报告站在屋内。',
+    '塞莱特斯（惊讶）：怎么会这样？（Wait... what is this?）',
+    '▲娜塔莉亚对视塞莱特斯摇了摇头。',
+    '【闪回】',
+    '22-2',
+    '日 内 布拉姆房间',
+    '人物 布拉姆 娜塔莉亚',
+    '▲布拉姆一把捏住了娜塔莉亚的下巴，准备吻上去。',
+    '▲突然，外面传来了敲门声。',
+  ].join('\n');
+
+  const ep22Proj: ProjectData = {
+    id: 'p_ep22',
+    scriptText: ep22Script,
+    characters: [],
+    locations: [],
+    props: [],
+  };
+
+  // 1. 验证 script.directory 返回集-场二级结构，准确识别同行场次头(22—1)与跨行场次头(22-2 + 日 内 布拉姆房间)及人物表
+  const dirRes = executeProjectReadTool('script.directory', {}, ep22Proj) as any;
+  assert.equal(dirRes.total, 1);
+  assert.equal(dirRes.entries[0].title, '第二十二集');
+  assert.equal(dirRes.entries[0].sceneCount, 2);
+  assert.equal(dirRes.entries[0].scenes[0].sceneNumber, '22-1');
+  assert.equal(dirRes.entries[0].scenes[0].timeOfDay, '日');
+  assert.equal(dirRes.entries[0].scenes[0].type, 'INT');
+  assert.equal(dirRes.entries[0].scenes[0].locationName, '布拉姆房间');
+  assert.ok(dirRes.entries[0].scenes[0].characterNames.includes('布拉姆'));
+  assert.equal(dirRes.entries[0].scenes[1].sceneNumber, '22-2');
+  assert.equal(dirRes.entries[0].scenes[1].timeOfDay, '日');
+  assert.equal(dirRes.entries[0].scenes[1].type, 'INT');
+  assert.equal(dirRes.entries[0].scenes[1].locationName, '布拉姆房间');
+
+  // 2. 验证仅在 22—1 出场的“塞莱特斯”不会折叠为“二十二集”，而是精准展示为“22-1”
+  const createCeleste = executeProjectAssetMutation('asset.create', {
+    type: 'characters',
+    name: '塞莱特斯',
+    provenances: ['塞莱特斯（惊讶）：怎么会这样？（Wait... what is this?）'],
+  }, ep22Proj);
+  const celesteChar = createCeleste.updatedProject.characters[0];
+  const resolvedCeleste = resolveVerifiedProvenance(ep22Script, undefined, celesteChar.verifiedProvenance, {
+    assetName: '塞莱特斯',
+  });
+  assert.equal(resolvedCeleste.length, 1);
+  assert.equal(resolvedCeleste[0].type, 'scene');
+  assert.equal(resolvedCeleste[0].displayLabel, '22-1');
+
+  // 3. 验证在 22—1 与 22-2 均由 Agent 提交出场的“布拉姆”自动折叠为“二十二集”，且 highlights 严格聚合 Agent 提交的两处出场内容
+  const createBram = executeProjectAssetMutation('asset.create', {
+    type: 'characters',
+    name: '布拉姆',
+    provenances: [
+      { sceneTitle: '22—1', evidenceText: '▲众人齐刷刷地看着屋内，只见布拉姆穿着衬衣站在屋内，娜塔莉亚拿着戴安娜的分析报告站在屋内。' },
+      { sceneTitle: '22-2', evidenceText: '▲布拉姆一把捏住了娜塔莉亚的下巴，准备吻上去。' },
+    ],
+  }, ep22Proj);
+  const bramChar = createBram.updatedProject.characters[0];
+  const resolvedBram = resolveVerifiedProvenance(ep22Script, undefined, bramChar.verifiedProvenance, {
+    assetName: '布拉姆',
+  });
+  assert.equal(resolvedBram.length, 1);
+  assert.equal(resolvedBram[0].type, 'episode');
+  assert.equal(resolvedBram[0].displayLabel, '二十二集');
+  assert.equal(resolvedBram[0].isFullEpisode, true);
+  assert.ok(Array.isArray(resolvedBram[0].highlights));
+  assert.equal(resolvedBram[0].highlights!.length, 2);
+  assert.equal(
+    resolvedBram[0].highlights![0].text,
+    '▲众人齐刷刷地看着屋内，只见布拉姆穿着衬衣站在屋内，娜塔莉亚拿着戴安娜的分析报告站在屋内。'
+  );
+  assert.equal(
+    resolvedBram[0].highlights![1].text,
+    '▲布拉姆一把捏住了娜塔莉亚的下巴，准备吻上去。'
+  );
+});
+
+test('出处防误判与严格锚点还原：Agent提交3处出处时界面绝不擅自搜词扩充为10处，且不包含未锚定场次', () => {
+  const ep1Script = [
+    '第一集',
+    '1-1',
+    '日 外 布莱克伍德庄园',
+    '人物 娜塔莉亚 布拉姆 管家 塞莱特斯',
+    '▲庄园的门被打开，打量着坐在主位的男人【布莱克伍德家主：布拉姆】，布拉姆衣着华丽，随意把玩着手中的手枪。',
+    '▲布拉姆冷冷地扫视全场应聘者。',
+    '▲布拉姆收起枪打量娜塔莉亚。',
+    '布拉姆：哦？你就不怕沦为野兽的口粮吗？',
+    '▲娜塔莉亚缓缓抬头看向布拉姆。',
+    '布拉姆（打量）：你的长相，（指尖掠过娜塔莉亚的脸颊）让我想起了一位故人。',
+    '▲布拉姆起身离开座位，管家跟在布拉姆身后。',
+    '1-5',
+    '日 内 娜塔莉亚家',
+    '人物 娜塔莉亚 焦恩',
+    '▲娜塔莉亚在收拾皮包，将衣物放进去。',
+    '焦恩（摁住娜塔莉亚的肩膀）：娜塔莉亚，布拉姆是一个手段狠辣的教父，布莱克伍德庄园守卫森严，（打量娜塔莉亚，担心）而是你只是个刚刚毕业的心理医生，你太柔弱了，斗不过他的！【字幕：焦恩 娜塔莉亚养父】',
+    '娜塔莉亚：爸爸，我必须去。',
+  ].join('\n');
+
+  let ep1Proj: ProjectData = {
+    id: 'p_ep1',
+    scriptText: ep1Script,
+    characters: [],
+    locations: [],
+    props: [],
+  };
+
+  // Agent 仅提交 3 处出处
+  const createRes = executeProjectAssetMutation('asset.create', {
+    type: 'characters',
+    name: '布拉姆',
+    role: '布莱克伍德家主 / 教父',
+    provenances: [
+      {
+        sceneTitle: '1-1',
+        evidenceText: '▲庄园的门被打开，打量着坐在主位的男人【布莱克伍德家主：布拉姆】，布拉姆衣着华丽，随意把玩着手中的手枪。',
+      },
+      {
+        sceneTitle: '1-1',
+        evidenceText: '布拉姆：哦？你就不怕沦为野兽的口粮吗？',
+      },
+      {
+        sceneTitle: '1-1',
+        evidenceText: '布拉姆（打量）：你的长相，（指尖掠过娜塔莉亚的脸颊）让我想起了一位故人。',
+      },
+    ],
+  }, ep1Proj);
+
+  ep1Proj = { ...ep1Proj, ...createRes.updatedProject };
+  const bramAsset = ep1Proj.characters[0];
+  assert.equal(bramAsset.verifiedProvenance.length, 3);
+
+  // 1. 验证检索工具正常工作：全文客观检出词频命中候选（包含 1-1 与 1-5 处命中）
+  const searchCandidates = executeProjectReadTool('asset.searchProvenanceCandidates', {
+    id: bramAsset.id,
+  }, ep1Proj) as any;
+  const candScenes = searchCandidates.candidates.map((c: any) => c.sceneTitle);
+  assert.ok(candScenes.some((s: string) => s.includes('1-1')));
+  assert.ok(candScenes.some((s: string) => s.includes('1-5')));
+
+  // 2. 验证出处解析与展示：Agent 提交了 3 个出处，resolveVerifiedProvenance 必须严格只返回这 3 个高亮（绝不自动搜词扩充成 7~10 个，也绝不包含 1-5 场）
+  const resolved = resolveVerifiedProvenance(ep1Script, undefined, bramAsset.verifiedProvenance, {
+    assetName: '布拉姆',
+  });
+  assert.equal(resolved.length, 1);
+  assert.equal(resolved[0].displayLabel, '1-1');
+  assert.equal(resolved[0].highlights?.length, 3, '高亮数量必须严格等于 Agent 提交的 3 处，严禁脚本自行搜词扩充');
+  const allHighlightedTexts = (resolved[0].highlights || []).map(h => h.text);
+  assert.deepEqual(allHighlightedTexts, [
+    '▲庄园的门被打开，打量着坐在主位的男人【布莱克伍德家主：布拉姆】，布拉姆衣着华丽，随意把玩着手中的手枪。',
+    '布拉姆：哦？你就不怕沦为野兽的口粮吗？',
+    '布拉姆（打量）：你的长相，（指尖掠过娜塔莉亚的脸颊）让我想起了一位故人。',
+  ]);
+});
+

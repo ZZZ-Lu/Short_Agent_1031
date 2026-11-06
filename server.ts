@@ -525,43 +525,52 @@ async function parseChatCompletionResponse(response: Response, isStream: boolean
 function inferPatternHeuristically(sampleText: string): { tocPattern: string; scenePattern: string; flags: string; patternDescription: string } {
   const lines = sampleText.split('\n').map(l => l.trim()).filter(Boolean);
   
-  const bracketEpisodeMatch = lines.some(l => /^【\s*第?\s*[0-9一二三四五六七八九十百]+\s*[集话回].*?】/i.test(l));
-  const bracketSceneMatch = lines.some(l => /^【\s*(?:场|场景|场次)?\s*[0-9一二三四五六七八九十百]+.*?】/i.test(l));
-  const plainEpisodeMatch = lines.some(l => /^第\s*[0-9一二三四五六七八九十百]+\s*[集话回]/i.test(l));
-  const plainSceneMatch = lines.some(l => /^第\s*[0-9一二三四五六七八九十百]+\s*[场幕]/i.test(l));
+  const bracketEpisodeMatch = lines.some(l => /^【\s*第?\s*[0-9一二三四五六七八九十百千]+\s*[集话回].*?】/i.test(l));
+  const bracketSceneMatch = lines.some(l => /^【\s*(?:场|场景|场次)?\s*[0-9一二三四五六七八九十百千]+.*?】/i.test(l));
+  const plainEpisodeMatch = lines.some(l => /^第?\s*[0-9一二三四五六七八九十百千]+\s*[集话回]/i.test(l));
+  const dashSceneMatch = lines.some(l => /^\d+\s*[-—–]\s*\d+/i.test(l));
+  const plainSceneMatch = lines.some(l => /^第\s*[0-9一二三四五六七八九十百千]+\s*[场幕]/i.test(l));
   const englishEpisodeMatch = lines.some(l => /^(?:EPISODE|EP|CHAPTER)\s*#?\s*\d+/i.test(l));
-  const englishSceneMatch = lines.some(l => /^SCENE\s*#?\s*\d+/i.test(l));
+  const englishSceneMatch = lines.some(l => /^(?:SCENE\s*#?\s*\d+|(?:INT\.|EXT\.|内景|外景)\s+)/i.test(l));
 
-  let tocPattern = "";
+  let epPattern = "";
   let scenePattern = "";
   let patternDescription = "";
 
   if (bracketEpisodeMatch) {
-    tocPattern = "^【\\s*第?\\s*[0-9一二三四五六七八九十百千]+\\s*[集话回][^】]*】.*";
+    epPattern = "^【\\s*第?\\s*[0-9一二三四五六七八九十百千]+\\s*[集话回][^】]*】.*";
     patternDescription += "方括号集数格式";
   } else if (plainEpisodeMatch) {
-    tocPattern = "^第\\s*[0-9一二三四五六七八九十百千]+\\s*[集话回].*";
+    epPattern = "^第?\\s*[0-9一二三四五六七八九十百千]+\\s*[集话回].*";
     patternDescription += "标准集数格式";
   } else if (englishEpisodeMatch) {
-    tocPattern = "^(?:EPISODE|EP|CHAPTER)\\s*#?\\s*\\d+.*";
+    epPattern = "^(?:EPISODE|EP|CHAPTER)\\s*#?\\s*\\d+.*";
     patternDescription += "英文Episode格式";
   }
 
-  if (bracketSceneMatch) {
+  if (dashSceneMatch) {
+    scenePattern = "^\\d+\\s*[-—–]\\s*\\d+.*";
+    patternDescription += (patternDescription ? " + " : "") + "连字符分场格式(如1-1/22—1)";
+  } else if (bracketSceneMatch) {
     scenePattern = "^【\\s*(?:场|场景|场次)?\\s*[0-9一二三四五六七八九十百千]+[^】]*】.*";
     patternDescription += (patternDescription ? " + " : "") + "方括号场次格式";
   } else if (plainSceneMatch) {
     scenePattern = "^第\\s*[0-9一二三四五六七八九十百千]+\\s*[场幕].*";
     patternDescription += (patternDescription ? " + " : "") + "标准场次格式";
   } else if (englishSceneMatch) {
-    scenePattern = "^SCENE\\s*#?\\s*\\d+.*";
+    scenePattern = "^(?:SCENE\\s*#?\\s*\\d+|(?:INT\\.|EXT\\.|内景|外景)\\s+).*";
     patternDescription += (patternDescription ? " + " : "") + "英文Scene格式";
   }
 
   // Fallbacks
   if (!scenePattern) {
-    scenePattern = "^第\\s*[0-9一二三四五六七八九十百千]+\\s*场.*";
+    scenePattern = "^(?:\\d+\\s*[-—–]\\s*\\d+|第\\s*[0-9一二三四五六七八九十百千]+\\s*[场幕]|【\\s*(?:场|场景|场次)?\\s*[0-9一二三四五六七八九十百千]+[^】]*】).*";
   }
+  if (!epPattern) {
+    epPattern = "^(?:【\\s*第?\\s*[0-9一二三四五六七八九十百千]+\\s*[集话回][^】]*】|第?\\s*[0-9一二三四五六七八九十百千]+\\s*[集话回]).*";
+  }
+
+  const tocPattern = epPattern && scenePattern ? `(?:${epPattern}|${scenePattern})` : (epPattern || scenePattern);
 
   return { tocPattern, scenePattern, flags: "gim", patternDescription };
 }
