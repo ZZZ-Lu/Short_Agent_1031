@@ -6811,20 +6811,16 @@ export default function App() {
                 body: JSON.stringify({
                   currentTask: {
                     title: task.title,
-                    goal: task.goal || firstUserMsg,
+                    goal: task.goal || '暂无',
                     subGoal: task.subGoal,
                     progress: task.progress,
                     plan: task.plan,
                     notes: task.notes,
-                    thinkingLevel: task.context?.level ?? task.thinkingLevel ?? 0,
-                    domain: task.domain,
-                    requestedCategories: task.context?.categories || task.requestedCategories,
                   },
                   userMessage: stateNodeUserMessage,
                   lastTurnOutput: {
                     narration: lastTurnResult.narration,
-                    speak: lastTurnResult.speak,
-                    toolCalls: lastTurnResult.toolCalls,
+                    response: lastTurnResult.response || lastTurnResult.fullAnswer || lastTurnResult.speak,
                     executedTools,
                   },
                   apiKey: savedKey,
@@ -6855,14 +6851,9 @@ export default function App() {
                 if (responseData.progress) task.progress = responseData.progress;
                 if (task.context?.level === 0 || task.context?.level === 1) {
                   task.thinkingLevel = task.context.level;
-                } else if (responseData.thinkingLevel === 0 || responseData.thinkingLevel === 1) {
-                  task.thinkingLevel = responseData.thinkingLevel;
                 }
-                if (responseData.domain) task.domain = responseData.domain;
-                if (Array.isArray(task.context?.categories) && task.context.categories.length > 0) {
+                if (Array.isArray(task.context?.categories)) {
                   task.requestedCategories = task.context.categories;
-                } else if (Array.isArray(responseData.requestedCategories)) {
-                  task.requestedCategories = responseData.requestedCategories;
                 }
                 if (Array.isArray(responseData.plan)) task.plan = responseData.plan;
                 if (typeof responseData.notes === 'string' && responseData.notes.trim()) {

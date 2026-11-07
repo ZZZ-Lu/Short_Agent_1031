@@ -166,24 +166,53 @@ test('0级首轮日常问候直接回复时，即使状态节点填充了 subGoa
   assert.equal(finished.events.some(e => e.text.includes('系统干预')), false);
 });
 
-test('updateStateNode 在本轮工具（如 sys.selectContext）执行完成后才运行，确保下一轮认知状态准确反映工具已生效', async () => {
+test('updateStateNode 在本轮工具（如 sys.selectContext）执行完成后才运行，且 1 级必须回到 0 级才能调用 sys.endTask 结束任务', async () => {
   const seenInStateNode: Array<{ turn: number; level: number; toolStatus: string | undefined }> = [];
   const runtime = new AgentRuntime({
     enabledTools: () => ['script.directory', 'script.read', 'asset.create', 'sys.endTask', 'user.ask'],
     requestTurn: async task => {
       if (task.turn === 1) {
         return {
-          narration: ['切换至1级并装载script和asset'],
-          toolCalls: [{ id: 'sel_1', name: 'sys.selectContext', arguments: { level: 1, categories: ['script', 'asset'] } }],
+          narration: ['第1轮：0级展开script和asset候选分类'],
+          toolCalls: [{ id: 'sel_cat', name: 'sys.selectContext', arguments: { level: 0, categories: ['script', 'asset'] } }],
           complete: false,
         };
       }
-      // 第 2 轮进入 requestTurn 时，updateStateNode 在第 1 轮工具执行后写入的进度与计划已生效
-      assert.equal(task.context.level, 1);
-      assert.equal(task.progress, '已切换至 1 级并装载 script, asset');
+      if (task.turn === 2) {
+        assert.equal(task.context.level, 0);
+        assert.deepEqual(task.context.categories, ['script', 'asset']);
+        return {
+          narration: ['第2轮：挑选具体工具切入1级'],
+          toolCalls: [{ id: 'sel_tools', name: 'sys.selectContext', arguments: { level: 1, tools: ['script.directory', 'script.read', 'asset.create'] } }],
+          complete: false,
+        };
+      }
+      if (task.turn === 3) {
+        assert.equal(task.context.level, 1);
+        assert.deepEqual(task.context.tools, ['script.directory', 'script.read', 'asset.create']);
+        // 模拟模型在 1 级违规尝试直接调用 sys.endTask，应被 Runtime 拦截报错而不会结束任务
+        return {
+          narration: ['第3轮：尝试在1级直接结束任务（应被拦截）'],
+          toolCalls: [{ id: 'illegal_end', name: 'sys.endTask', arguments: { success: true } }],
+          complete: false,
+        };
+      }
+      if (task.turn === 4) {
+        assert.equal(task.context.level, 1);
+        assert.equal((task.observations[0].content as any).status, 'failed');
+        assert.ok(String((task.observations[0].content as any).error).includes('1 级执行层，不可直接调用 sys.endTask'));
+        return {
+          narration: ['第4轮：调用 sys.selectContext 返回 0 级'],
+          toolCalls: [{ id: 'back_0', name: 'sys.selectContext', arguments: { level: 0 } }],
+          complete: false,
+        };
+      }
+      // 第 5 轮回到 0 级后，正式调用 sys.endTask 成功结束
+      assert.equal(task.context.level, 0);
+      assert.deepEqual(task.context.tools, []);
       return {
-        narration: ['已完成'],
-        toolCalls: [{ id: 'end_1', name: 'sys.endTask', arguments: { success: true } }],
+        narration: ['第5轮：0级验收通过，结束任务'],
+        toolCalls: [{ id: 'end_ok', name: 'sys.endTask', arguments: { success: true } }],
         complete: false,
       };
     },
@@ -194,9 +223,6 @@ test('updateStateNode 在本轮工具（如 sys.selectContext）执行完成后�
         level: task.context.level,
         toolStatus: turnToolEvent?.status,
       });
-      if (task.turn === 1) {
-        task.progress = `已切换至 ${task.context.level} 级并装载 ${(task.context.categories || []).join(', ')}`;
-      }
     },
     executeTool: async () => ({ ok: true }),
   });
@@ -204,12 +230,11 @@ test('updateStateNode 在本轮工具（如 sys.selectContext）执行完成后�
   const task = runtime.createTask({ id: 'task_order', sessionId: 'proj_1', goal: '提取角色布拉姆' });
   const finished = await runtime.wake(task.id);
   assert.equal(finished.status, 'completed');
-  assert.equal(finished.turn, 2);
-  assert.deepEqual(seenInStateNode[0], {
-    turn: 1,
-    level: 1,
-    toolStatus: 'succeeded',
-  });
+  assert.equal(finished.turn, 5);
+  assert.deepEqual(seenInStateNode[0], { turn: 1, level: 0, toolStatus: 'succeeded' });
+  assert.deepEqual(seenInStateNode[1], { turn: 2, level: 1, toolStatus: 'succeeded' });
+  assert.deepEqual(seenInStateNode[2], { turn: 3, level: 1, toolStatus: 'failed' });
+  assert.deepEqual(seenInStateNode[3], { turn: 4, level: 0, toolStatus: 'succeeded' });
 });
 
 

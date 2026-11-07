@@ -919,26 +919,47 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
         ? contextSelection as AgentContextSelection : initialAgentContext();
       const turnContext = resolveContext(rawContext, configuredToolIds);
       const enabledToolIds = new Set<string>(turnContext.tools);
-      const controlToolLines = [
-        `- sys.selectContext：切换思考层级（0 规划 / 1 执行）并装载下一轮所需的工具分类。\n  参数：{ level: 0 | 1, categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[] }`,
-        `- user.ask：向用户提问并挂起任务等待回复（问题直接写在【用户沟通】中，无需传参）。\n  参数：{ question?: string }`,
-        `- sys.endTask：结束当前任务（最终汇报直接写在【用户沟通】中；若需等待异步任务可设 paused: true）。\n  参数：{ success?: boolean, paused?: boolean }`,
-      ];
+      const isLevel1 = turnContext.level === 1;
+      const controlToolLines = isLevel1
+        ? [
+            `- sys.selectContext：切换思考层级或调整工具（1 级无法结束任务；当 1 级执行步骤完成后，必须调用 {"level": 0} 返回 0 级验收后才可调用 sys.endTask）。\n  参数：{ level: 0 | 1, categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[] }`,
+            `- user.ask：向用户提问并挂起任务等待回复（问题直接写在【用户沟通】中，无需传参）。\n  参数：{ question?: string }`,
+          ]
+        : [
+            `- sys.selectContext：切换思考层级与装载工具。规则：① 需使用业务工具时，先传 {"level": 0, "categories": [...]} 展开对应分类下的候选工具简表；② 从候选简表中按需挑选具体工具 ID 传 {"level": 1, "tools": [...]} 切入 1 级执行；③ 1 级执行完毕返回 0 级后可调用 sys.endTask 结束任务。\n  参数：{ level: 0 | 1, categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[] }`,
+            `- user.ask：向用户提问并挂起任务等待回复（问题直接写在【用户沟通】中，无需传参）。\n  参数：{ question?: string }`,
+            `- sys.endTask：结束当前任务（仅限 0 级调用，最终汇报直接写在【用户沟通】中；若需等待异步任务可设 paused: true）。\n  参数：{ success?: boolean, paused?: boolean }`,
+          ];
       const injectedBusinessTools = AGENT_TOOL_REGISTRY
         .filter((tool) => enabledToolIds.has(tool.id) && !CONTROL_TOOLS.includes(tool.id))
         .map((tool) => `- ${tool.id}：${tool.description}\n  参数：${tool.input}`);
+      const candidateToolLines = (turnContext.candidateTools || [])
+        .map((tool) => `- ${tool.id}：${tool.summary}`);
       const categoryLines = Object.values(TOOL_CATEGORIES)
         .filter(cat => cat.tools.some(t => configuredToolIds.includes(t)))
         .map(cat => `- ${cat.id}（${cat.label}）：${cat.description}`)
         .join('\n');
-      const assembledToolPrompt = [
+      const assembledToolSections: string[] = [
         `## 当前可直接调用`,
         ...controlToolLines,
         ...injectedBusinessTools,
-        ``,
-        `## 可装载的工具分类（切入 1 级或切换领域时填入 categories）`,
-        categoryLines || '无',
-      ].join('\n');
+      ];
+      if (!isLevel1) {
+        if (candidateToolLines.length > 0) {
+          assembledToolSections.push(
+            ``,
+            `## 已展开分类 [${turnContext.categories.join(', ')}] 的候选工具简表（请按当前任务实际需要挑选具体工具 ID 填入 tools，调用 sys.selectContext({"level": 1, "tools": [...]}) 切入 1 级执行）`,
+            ...candidateToolLines,
+          );
+        } else {
+          assembledToolSections.push(
+            ``,
+            `## 可装载的工具分类（需调用业务工具时，先调用 sys.selectContext({"level": 0, "categories": [...]}) 展开对应分类下的候选工具简表）`,
+            categoryLines || '无',
+          );
+        }
+      }
+      const assembledToolPrompt = assembledToolSections.join('\n');
 
       const cleanToolOutput = (val: unknown, depth = 0): unknown => cleanToolOutputForPrompt(val, depth);
 
@@ -1052,13 +1073,19 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
             if (name === 'sys.nudge') {
               return;
             }
-            // sys.selectContext 成功时输出单行简明确认（不展开冗长 JSON 数组），明确告知模型层级切换与工具装载已完成
+            // sys.selectContext 成功时输出单行简明确认，明确区分“展开分类候选简表”、“切入1级装载具体工具”与“返回0级验收”三种状态
             if (name === 'sys.selectContext' && status === 'succeeded') {
               const selOut = (output && typeof output === 'object') ? (output as any) : {};
-              const cats = Array.isArray(selOut.categories) && selOut.categories.length > 0
-                ? selOut.categories.join(', ')
-                : (Array.isArray(selOut.tools) && selOut.tools.length > 0 ? selOut.tools.join(', ') : '无');
-              toolObs.push(`【工具 sys.selectContext 执行成功】已切换至 ${selOut.level ?? 1} 级，已装载工具分类：${cats}`);
+              const level = selOut.level ?? 0;
+              const tools = Array.isArray(selOut.tools) ? selOut.tools : [];
+              const cats = Array.isArray(selOut.categories) ? selOut.categories : [];
+              if (level === 1 && tools.length > 0) {
+                toolObs.push(`【工具 sys.selectContext 执行成功】已切换至 1 级执行层，已精确装载工具：${tools.join(', ')}`);
+              } else if (level === 0 && cats.length > 0 && tools.length === 0) {
+                toolObs.push(`【工具 sys.selectContext 执行成功】已展开工具分类 [${cats.join(', ')}] 的候选工具简表（当前处于 0 级，请从上方候选简表中挑选本次任务真正需要的具体工具 ID 填入 tools，并调用 sys.selectContext({"level": 1, "tools": [...]}) 切入 1 级执行）`);
+              } else {
+                toolObs.push(`【工具 sys.selectContext 执行成功】已返回 0 级规划与验收层（业务工具已卸载，请核对全局计划与执行结果，确认全部完成后调用 sys.endTask 结束任务）`);
+              }
               return;
             }
             if (status === 'failed') {
@@ -1162,7 +1189,9 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         }
       }
 
-      const effectiveTaskGoal = cleanUserGoalText(task?.goal || task?.initialGoal || firstUserGoal) || '尚未设定';
+      const effectiveTaskGoal = (typeof task?.goal === 'string' && task.goal.trim())
+        ? cleanUserGoalText(task.goal)
+        : '暂无';
       const hasToolResults = Boolean(formattedObs.toolResults && formattedObs.toolResults.trim() && formattedObs.toolResults.trim() !== '无');
       const hasPageObs = Boolean(formattedObs.pageObservations && formattedObs.pageObservations.trim() && formattedObs.pageObservations.trim() !== '无');
 
@@ -1178,17 +1207,32 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         ``,
         `# 工作指南`,
         `默认优先使用后台工具读取项目数据并执行任务；需要演示或核验界面时使用 UI。基于工具返回的事实验证推进，严禁把未执行视为成功。`,
-        `0 级负责宏观规划与架构分解，1 级负责局部细化执行。`,
+        `0 级负责宏观规划、分步选择工具（先传 categories 展开候选简表，再传 tools 装载具体工具切入 1 级）与终局验收结案；1 级仅负责局部细化执行且无法调用 sys.endTask，执行完毕后必须调用 sys.selectContext({"level": 0}) 回到 0 级才能结束任务。`,
         `称用户为“你”，口吻亲和随意；遇需用户决策或信息补充的事项，在用户沟通中明确说明。`,
         `严谨求证，聚焦当前核心目标，根据工具结果动态更新计划与笔记。`,
         `工具调用统一采用标准 JSON 参数格式：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）。`,
-        `输出格式：`,
-        `状态检查：{回顾目标与进展、当前工具是否满足需求、计划与笔记更新}`,
-        `思考：{基于最新事实进行逻辑推演，决定下一步行动}`,
-        `工具调用：{{调用 工具名称, {"参数名": "参数值"}}}`,
+        `# 输出格式`,
+        `状态检查：`,
+        `{回顾并检查上面的“认知状态”。`,
+        `- 最终目标是什么？`,
+        `- 当前小目标是什么？`,
+        `- 小目标是否解决？`,
+        `- 不用思考，靠直觉回答你当前的注意力焦点是什么？`,
+        `- 小目标是否调整？`,
+        `- 当前已装载的工具或页面中可能和小目标有关的组件是什么？`,
+        `- 是否需要切换思考层级/装载其它工具，或跳转其它页面/组件获取更多信息？`,
+        `- 当前进度是否需要更新？`,
+        `- 是否需要调整计划？`,
+        `- 是否在“工具执行结果”或“页面观察”中发现了需要记录到“重点笔记”中的线索或信息？}`,
+        `思考：`,
+        `{你应该使用内心独白的方式，基于当前工具执行结果或页面观察进行下一步操作的逻辑推演。如果需要，请调用工具，系统会自动执行你的操作。}`,
+        `工具调用：`,
+        `{{调用 工具名称, {"参数名": "参数值"}}}`,
         `用户沟通：`,
-        `- 对用户说的话（完整版）：“完整汇报或回复内容”`,
-        `- 对用户说的话（简版）：“简报当前状态或提问，30字以内”`,
+        `{`,
+        `- 对用户说的话（完整版）：“如果需要，此处插入完整的描述，但也要尽可能简洁，注意，调用了工具不等于完成任务，要等工具返回结果并检查”`,
+        `- 对用户说的话（简版）：“插入对用户说的话，介绍当前任务状态、汇报结果或向用户提问。需要用户回复时直接在此简版提问并调用 user.ask 挂起等待，无需在工具调用中重复回复，口语化，控制在30字以内”`,
+        `}`,
       ];
 
       const dedupedNotes = task?.notes ? mergeTaskNotes(undefined, task.notes, 'overwrite') : '';
@@ -1217,7 +1261,11 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       let finalPrompt = promptSections.join('\n');
 
       if (effectiveRequireTool) {
-        finalPrompt += `\n\n【⚠️ 系统重要提示：本轮必须调用工具】上一轮未检测到任何 {{调用 ...}} 工具指令，当前任务尚未结束。请在【状态检查】与【思考】后，务必直接输出具体的 {{调用 工具名, {参数}}} 指令推进任务。若所有目标已确实完成，请显式调用 {{调用 sys.endTask}}，结束汇报直接写在【用户沟通】中。严禁在【思考】后遗漏工具调用！\n`;
+        if (isLevel1) {
+          finalPrompt += `\n\n【⚠️ 系统重要提示：本轮必须调用工具】上一轮未检测到任何 {{调用 ...}} 工具指令。当前处于 1 级执行层（不可直接调用 sys.endTask），请在【状态检查】与【思考】后，直接输出具体的业务工具调用指令推进执行；若 1 级执行步骤已全部完成，请调用 {{调用 sys.selectContext, {"level": 0}}} 返回 0 级验收后再结束任务。严禁遗漏工具调用！\n`;
+        } else {
+          finalPrompt += `\n\n【⚠️ 系统重要提示：本轮必须调用工具】上一轮未检测到任何 {{调用 ...}} 工具指令，当前任务尚未结束。请在【状态检查】与【思考】后，务必直接输出具体的 {{调用 工具名, {参数}}} 指令推进任务。若所有目标已确实完成，请显式调用 {{调用 sys.endTask}}，结束汇报直接写在【用户沟通】中。严禁在【思考】后遗漏工具调用！\n`;
+        }
       }
 
       const allImages: string[] = [
@@ -1630,6 +1678,9 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
             argsObj.tools = [];
           }
         } else if (normalizedName === 'sys.endTask') {
+          if (isLevel1) {
+            schemaError = '【层级权限拦截】当前处于 1 级执行层，不可直接调用 sys.endTask 结束任务。请先调用 sys.selectContext({"level": 0}) 返回 0 级核验全局计划后，再调用 sys.endTask。';
+          }
           delete argsObj.finalResponse;
           if (argsObj.success === undefined) {
             argsObj.success = true;
@@ -1752,48 +1803,80 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       const { currentTask, userMessage, lastTurnOutput, apiKey, model, statePrompt: customStatePrompt } = req.body || {};
       const { endpoint, actualModel, apiKey: keyToUse } = getModelConfig(model || 'deepseek-v4-flash', apiKey);
 
-      let statePromptTemplate = (typeof customStatePrompt === 'string' && customStatePrompt.trim().length > 0)
-        ? customStatePrompt
-        : getPrompt('state');
-      if (!statePromptTemplate || !statePromptTemplate.trim()) {
-        statePromptTemplate = `你是一个超高效、高精度的 Agent 认知状态提取与更新节点。
-你的唯一职责是：根据用户原始指令、Agent 最新的思考与发言、工具执行动作，提炼并无缝更新 Agent 的认知状态 JSON。
+      const defaultDeltaMergeStatePrompt = `你是一个认知状态增量合并与整理节点。
+你的职责是：对照【当前认知状态（上一轮旧状态）】，读取【本轮最新输入与主循环输出】，将主循环在“状态检查”和“思考”中产出的本轮增量变化，合并整理为最新的认知状态 JSON。
 
-【当前认知状态】
+【当前认知状态（上一轮旧状态）】
 - 任务标题: {{taskTitle}}
-- 终极目标: {{taskGoal}}
+- 最终目标: {{taskGoal}}
 - 当前小目标: {{taskSubGoal}}
 - 当前进度: {{taskProgress}}
 - 当前计划: {{taskPlan}}
 - 重点笔记: {{taskNotes}}
 
-【最新对话与 Agent 主模型发言】
+【本轮最新输入与主循环输出】
 - 用户指令/回复: {{userMessage}}
-- Agent 主模型发言/思考: {{lastTurnOutput}}
+- Agent 主循环输出:
+{{lastTurnOutput}}
 
-【输出规约】
-请输出严谨且合法的 JSON 对象，格式如下：
+【输出格式（严格输出合法 JSON）】
+请按以下字段顺序逐步核对并输出 JSON：
 {
-  "taskTitle": "8字以内的任务简短标题",
-  "goal": "归纳出的最新终极目标（根据用户指令提炼）",
-  "subGoal": "当前步骤对应的具体小目标，清晰明确",
-  "progress": "当前最新进度描述（如：已完成xxx，准备处理xxx）",
-  "notes": "融合旧笔记与本轮新事实后的完整精简笔记（剔除已过时的开场状态与重复项）",
-  "notesMode": "overwrite",
-  "plan": [{"id": "1", "title": "步骤标题", "status": "pending | completed"}]
-}
-`;
+  "stateCheck": "一句话核对本轮增量：上一步小目标是否已解决？本轮主循环在状态检查中提出了哪些进度/计划调整？发现了哪些需要并入重点笔记的新线索？",
+  "taskTitle": "8字以内的任务简短标题（已有明确标题时保持不变）",
+  "goal": "根据主循环在状态检查与思考中总结归纳出的最终目标（若处于多轮对话补充阶段，保留并融合已有最终目标）",
+  "subGoal": "更新后的当前小目标（对应主循环状态检查中确认的当前/下一步小目标）",
+  "progress": "更新后的当前进度（合并已完成事项与当前正在推进的事项）",
+  "plan": [
+    {"id": "1", "title": "计划步骤标题", "status": "completed | pending"}
+  ],
+  "notes": "合并整理后的重点笔记：将【上一轮重点笔记】与主循环本轮在【状态检查/思考/沟通】中发现的新线索合并；保留主循环已列出的具体数据、ID、行号或原文引文（主循环写了什么就保留什么，未提及的内容不做扩写），剔除已过时的过程状态与重复项",
+  "notesMode": "overwrite"
+}`;
+
+      let statePromptTemplate = (typeof customStatePrompt === 'string' && customStatePrompt.trim().length > 0)
+        ? customStatePrompt
+        : getPrompt('state');
+      if (
+        !statePromptTemplate ||
+        !statePromptTemplate.trim() ||
+        !statePromptTemplate.includes('根据主循环在状态检查与思考中总结归纳出的最终目标') ||
+        statePromptTemplate.includes('必须在 notes 中原样保留')
+      ) {
+        statePromptTemplate = defaultDeltaMergeStatePrompt;
+      }
+
+      let formattedLastTurnOutput = '';
+      if (typeof lastTurnOutput === 'string') {
+        formattedLastTurnOutput = lastTurnOutput;
+      } else if (lastTurnOutput && typeof lastTurnOutput === 'object') {
+        const narrationLines = Array.isArray(lastTurnOutput.narration)
+          ? lastTurnOutput.narration.filter(Boolean).join('\n')
+          : (typeof lastTurnOutput.narration === 'string' ? lastTurnOutput.narration : '');
+        const commText = String(lastTurnOutput.response || lastTurnOutput.fullAnswer || lastTurnOutput.speak || '').trim();
+        const toolsSummary = Array.isArray(lastTurnOutput.executedTools) && lastTurnOutput.executedTools.length > 0
+          ? lastTurnOutput.executedTools
+              .map((t: any) => `${t.name}(${JSON.stringify(t.input || {})}) -> ${t.status}${t.error ? `: ${t.error}` : ''}`)
+              .join('；')
+          : '无';
+        formattedLastTurnOutput = [
+          `  * 【状态检查与思考】：\n${narrationLines || '无'}`,
+          `  * 【对用户说的话】：${commText || '无'}`,
+          `  * 【本轮执行的工具动作】：${toolsSummary}`,
+        ].join('\n');
+      } else {
+        formattedLastTurnOutput = '无';
       }
 
       const prompt = statePromptTemplate
         .replace('{{taskTitle}}', currentTask?.title || '尚未命名')
-        .replace('{{taskGoal}}', currentTask?.goal || '尚未设定')
+        .replace('{{taskGoal}}', (typeof currentTask?.goal === 'string' && currentTask.goal.trim()) ? currentTask.goal.trim() : '暂无')
         .replace('{{taskSubGoal}}', currentTask?.subGoal || '暂未设定')
         .replace('{{taskProgress}}', currentTask?.progress || '刚刚开始')
         .replace('{{taskPlan}}', JSON.stringify(currentTask?.plan || []))
         .replace('{{taskNotes}}', currentTask?.notes || '暂无笔记')
         .replace('{{userMessage}}', userMessage || '（无新指令）')
-        .replace('{{lastTurnOutput}}', typeof lastTurnOutput === 'string' ? lastTurnOutput : JSON.stringify(lastTurnOutput || {}));
+        .replace('{{lastTurnOutput}}', formattedLastTurnOutput);
 
       const requestPayload = {
         model: actualModel,
@@ -1801,7 +1884,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         thinking: { type: 'disabled' },
         extra_body: { thinking: { type: 'disabled' } },
         messages: [
-          { role: 'system', content: '你是一个严格输出 JSON 的认知状态更新节点。' },
+          { role: 'system', content: '你是一个严格输出 JSON 的认知状态增量合并与整理节点。' },
           { role: 'user', content: prompt }
         ]
       };
@@ -1814,7 +1897,9 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
 
       if (!response.ok) {
         const errText = await response.text();
-        const speakText = typeof lastTurnOutput === 'object' && lastTurnOutput?.speak ? String(lastTurnOutput.speak) : '';
+        const speakText = typeof lastTurnOutput === 'object' && (lastTurnOutput?.response || lastTurnOutput?.speak)
+          ? String(lastTurnOutput.response || lastTurnOutput.speak)
+          : '';
         const fallbackTitle = (userMessage || currentTask?.title || '任务运行').slice(0, 10);
         const fallbackSubGoal = speakText ? speakText.slice(0, 30) : (currentTask?.subGoal || userMessage || '正在推进任务');
 
@@ -1845,6 +1930,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         : undefined;
 
       res.json({
+        stateCheck: typeof parsed.stateCheck === 'string' && parsed.stateCheck.trim() ? parsed.stateCheck.trim() : undefined,
         taskTitle: typeof parsed.taskTitle === 'string' && parsed.taskTitle.trim() ? parsed.taskTitle.trim() : undefined,
         goal: typeof parsed.goal === 'string' && parsed.goal.trim() ? parsed.goal.trim() : undefined,
         subGoal: typeof parsed.subGoal === 'string' && parsed.subGoal.trim() ? parsed.subGoal.trim() : undefined,

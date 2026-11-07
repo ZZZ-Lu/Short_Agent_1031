@@ -306,7 +306,9 @@ export class AgentRuntime {
             emptyToolCount++;
             recoveryCount++;
             const nudgeCallId = `nudge_${Date.now()}`;
-            const nudgeMsg = '【系统提示】检测到本轮未输出任何 {{调用 ...}} 工具指令，当前任务尚未结束（未调用 sys.endTask）。请紧接上一轮的【状态检查】与【思考】，直接输出具体的工具调用指令（如读取数据、修改资产或在任务完全结束时显式调用 sys.endTask 结束任务）。';
+            const nudgeMsg = (task.context?.level ?? 0) === 1
+              ? '【系统提示】检测到本轮未输出任何 {{调用 ...}} 工具指令。当前处于 1 级执行层（1 级无法直接结束任务），请直接输出具体的业务工具调用指令推进执行；若 1 级执行步骤已完成，请调用 {{调用 sys.selectContext, {"level": 0}}} 返回 0 级验收后再结束任务。'
+              : '【系统提示】检测到本轮未输出任何 {{调用 ...}} 工具指令，当前任务尚未结束（未调用 sys.endTask）。请紧接上一轮的【状态检查】与【思考】，直接输出具体的工具调用指令（如调用 sys.selectContext 装载工具，或在任务完全结束时显式调用 sys.endTask 结束任务）。';
 
             task.observations.push({
               role: 'tool',
@@ -481,10 +483,15 @@ export class AgentRuntime {
         if (Array.isArray(selection.categories)) {
           task.requestedCategories = selection.categories;
         }
-        const loadedDesc = selection.categories && selection.categories.length > 0
-          ? selection.categories.join(', ')
-          : (selection.tools.join(', ') || '无');
-        this.updateLastTool(task, call.id, 'succeeded', `已切换至 ${selection.level} 级并装载工具: ${loadedDesc}`, { output: selection });
+        let statusSummary = '';
+        if (selection.level === 1 && selection.tools.length > 0) {
+          statusSummary = `已切换至 1 级执行层并装载具体工具: ${selection.tools.join(', ')}`;
+        } else if (selection.level === 0 && selection.categories && selection.categories.length > 0) {
+          statusSummary = `已展开工具分类 [${selection.categories.join(', ')}] 的候选简表，请挑选具体工具填入 tools 切入 1 级`;
+        } else {
+          statusSummary = '已返回 0 级规划与验收层（业务工具已卸载，可核对全局计划并调用 sys.endTask 结束任务）';
+        }
+        this.updateLastTool(task, call.id, 'succeeded', statusSummary, { output: selection });
         task.observations.push({ role: 'tool', content: { callId: call.id, name: call.name, status: 'succeeded', output: selection } });
       } catch (error) {
         const message = error instanceof Error ? error.message : '上下文选择失败';
@@ -588,6 +595,13 @@ export class AgentRuntime {
     }
 
     if (call.name === 'sys.endTask') {
+      if ((task.context?.level ?? 0) === 1) {
+        const errMsg = '当前处于 1 级执行层，不可直接调用 sys.endTask 结束任务。请先调用 sys.selectContext({"level": 0}) 返回 0 级核验全局计划后，再调用 sys.endTask。';
+        this.updateLastTool(task, call.id, 'failed', `失败：${call.name} · ${errMsg}`, { error: errMsg });
+        task.history.push({ role: 'tool', content: { callId: call.id, name: call.name, status: 'failed', error: errMsg } });
+        task.observations.push({ role: 'tool', content: { callId: call.id, name: call.name, status: 'failed', error: errMsg } });
+        return;
+      }
       const existingAnswer = task.events.find(e => e.turnId === turnId && e.type === 'answer');
       const communicationText = existingAnswer?.text || '';
       const responseSuggestsPending = /后台|渲染|排队|稍候|生成中|等待生成|正在生成|提交生成/i.test(communicationText);

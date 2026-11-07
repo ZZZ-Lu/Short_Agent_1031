@@ -3,20 +3,31 @@ import { test } from 'node:test';
 import { AgentRuntime } from './runtime';
 import { cleanToolOutputForPrompt, initialAgentContext, mergeTaskNotes, resolveContext, validateSelection } from './contextPolicy';
 
-test('首轮仅注入系统控制工具，后续按选择和设置过滤', () => {
+test('首轮仅注入系统控制工具，后续按选择和设置过滤，且1级不注入sys.endTask', () => {
   const enabled = ['script.read', 'asset.list', 'sys.endTask', 'user.ask'];
   const initial = resolveContext(initialAgentContext(), enabled);
   assert.equal(initial.level, 0);
   assert(!initial.tools.includes('script.read'));
   assert(initial.tools.includes('sys.selectContext'));
+  assert(initial.tools.includes('sys.endTask'));
+
   const selection = validateSelection({ level: 1, tools: ['script.read'], prompts: ['script'] }, enabled);
-  assert(resolveContext(selection, enabled).tools.includes('script.read'));
+  const resolvedLevel1 = resolveContext(selection, enabled);
+  assert.equal(resolvedLevel1.level, 1);
+  assert(resolvedLevel1.tools.includes('script.read'));
+  assert(!resolvedLevel1.tools.includes('sys.endTask'));
+
+  const backToLevel0 = validateSelection({ level: 0 }, enabled);
+  const resolvedBack0 = resolveContext(backToLevel0, enabled);
+  assert.equal(resolvedBack0.level, 0);
+  assert.deepEqual(resolvedBack0.tools, ['sys.selectContext', 'sys.endTask', 'user.ask']);
+
   assert(!resolveContext(selection, []).tools.includes('script.read'));
   assert.throws(() => validateSelection({ level: 1, tools: ['unknown'], prompts: [] }, enabled));
   assert.throws(() => validateSelection({ level: 1, tools: [], prompts: ['unknown'] }, enabled));
 });
 
-test('上下文选择在下一轮生效，并可回到全局层级', async () => {
+test('上下文选择在下一轮生效，并可回到全局层级结束任务', async () => {
   const seen: number[] = [];
   const runtime = new AgentRuntime({
     enabledTools: () => ['script.read'],
@@ -25,9 +36,9 @@ test('上下文选择在下一轮生效，并可回到全局层级', async () =>
       if (task.turn === 1) return { narration: [], complete: false, toolCalls: [{ id: 'a', name: 'sys.selectContext', arguments: { level: 1, tools: ['script.read'], prompts: ['script'] } }] };
       if (task.turn === 2) {
         assert.deepEqual(task.context.tools, ['script.read']);
-        return { narration: [], complete: false, toolCalls: [{ id: 'b', name: 'sys.selectContext', arguments: { level: 0, tools: [], prompts: [] } }] };
+        return { narration: [], complete: false, toolCalls: [{ id: 'b', name: 'sys.selectContext', arguments: { level: 0 } }] };
       }
-      return { narration: [], complete: true, toolCalls: [] };
+      return { narration: [], complete: false, toolCalls: [{ id: 'c', name: 'sys.endTask', arguments: { success: true } }] };
     },
     executeTool: async () => { throw new Error('系统选择不应进入业务执行器'); },
   });
@@ -38,17 +49,28 @@ test('上下文选择在下一轮生效，并可回到全局层级', async () =>
   assert(result.events.some(event => event.toolName === 'sys.selectContext' && event.status === 'succeeded'));
 });
 
-test('按工具分类 categories 装载时自动展开具体工具并自动关联领域提示词，无需手动传 prompts', () => {
-  const enabled = ['script.directory', 'script.read', 'asset.create', 'sys.endTask', 'user.ask'];
-  const sel = validateSelection({ level: 1, categories: ['script', 'asset'] }, enabled);
-  assert.equal(sel.level, 1);
-  assert.deepEqual(sel.tools, ['script.directory', 'script.read', 'asset.create']);
-  assert.deepEqual(sel.prompts, ['script', 'assets']);
+test('两步漏斗：0级选categories先展开候选工具简表，再传具体tools切入1级精确装载', () => {
+  const enabled = ['script.directory', 'script.read', 'script.search', 'asset.create', 'asset.delete', 'sys.endTask', 'user.ask'];
 
-  // Also compatible when model passes category names inside tools array
-  const selCompat = validateSelection({ level: 1, tools: ['script', 'assets'] }, enabled);
-  assert.deepEqual(selCompat.tools, ['script.directory', 'script.read', 'asset.create']);
-  assert.deepEqual(selCompat.prompts, ['script', 'assets']);
+  // 第一步：仅传 categories 时保持在 0 级，并展开 candidateTools 供下一轮挑选
+  const step1 = validateSelection({ level: 0, categories: ['script', 'asset'] }, enabled);
+  assert.equal(step1.level, 0);
+  assert.deepEqual(step1.tools, []);
+  assert.deepEqual(step1.categories, ['script', 'asset']);
+  const resolvedStep1 = resolveContext(step1, enabled);
+  assert.equal(resolvedStep1.level, 0);
+  assert.deepEqual(
+    resolvedStep1.candidateTools.map(t => t.id),
+    ['script.directory', 'script.read', 'script.search', 'asset.create', 'asset.delete']
+  );
+
+  // 第二步：从候选中挑选具体 tools 切入 1 级，仅注入所选的 3 个工具，不注入未选的 script.search / asset.delete 和 sys.endTask
+  const step2 = validateSelection({ level: 1, tools: ['script.directory', 'script.read', 'asset.create'] }, enabled);
+  assert.equal(step2.level, 1);
+  assert.deepEqual(step2.tools, ['script.directory', 'script.read', 'asset.create']);
+  const resolvedStep2 = resolveContext(step2, enabled);
+  assert.equal(resolvedStep2.level, 1);
+  assert.deepEqual(resolvedStep2.tools, ['sys.selectContext', 'script.directory', 'script.read', 'asset.create', 'user.ask']);
 });
 
 test('mergeTaskNotes 按行去重并在进入具体任务后剔除开场占位笔记', () => {

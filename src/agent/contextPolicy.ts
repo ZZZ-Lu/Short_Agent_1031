@@ -77,6 +77,7 @@ export const PROMPT_MODULES: Record<string, { label: string; content: string }> 
 };
 
 export const CONTROL_TOOLS: AgentToolName[] = ['sys.selectContext', 'sys.endTask', 'user.ask'];
+export const LEVEL_1_CONTROL_TOOLS: AgentToolName[] = ['sys.selectContext', 'user.ask'];
 export const initialAgentContext = (): AgentContextSelection => ({ level: 0, tools: [], prompts: [], categories: [] });
 
 export function derivePromptsFromTools(tools: readonly string[]): string[] {
@@ -93,22 +94,36 @@ export function derivePromptsFromTools(tools: readonly string[]): string[] {
 export function resolveContext(selection: AgentContextSelection | undefined, enabled: readonly string[]) {
   const available = new Set(enabled);
   const context = selection ?? initialAgentContext();
-  const expandedTools = new Set<AgentToolName>([...CONTROL_TOOLS, ...(context.tools || [])]);
-  if (Array.isArray(context.categories)) {
+  const isLevel1 = context.level === 1;
+  const activeControlTools = isLevel1 ? LEVEL_1_CONTROL_TOOLS : CONTROL_TOOLS;
+  const expandedTools = new Set<AgentToolName>([
+    ...activeControlTools,
+    ...(isLevel1 ? (context.tools || []) : []),
+  ]);
+
+  const injected = AGENT_TOOL_REGISTRY.filter(
+    tool =>
+      expandedTools.has(tool.id) &&
+      (tool.id === 'sys.selectContext' || available.has(tool.id))
+  );
+  const injectedIds = injected.map(tool => tool.id);
+
+  const candidateToolIds = new Set<AgentToolName>();
+  if (!isLevel1 && Array.isArray(context.categories)) {
     for (const rawCat of context.categories) {
       const catKey = CATEGORY_ALIASES[String(rawCat).trim().toLowerCase()];
       const cat = catKey ? TOOL_CATEGORIES[catKey] : undefined;
       if (cat) {
         for (const toolId of cat.tools) {
-          expandedTools.add(toolId);
+          if (available.has(toolId)) {
+            candidateToolIds.add(toolId);
+          }
         }
       }
     }
   }
-  const injected = AGENT_TOOL_REGISTRY.filter(
-    tool => expandedTools.has(tool.id) && (tool.id === 'sys.selectContext' || available.has(tool.id))
-  );
-  const injectedIds = injected.map(tool => tool.id);
+  const candidateTools = AGENT_TOOL_REGISTRY.filter(tool => candidateToolIds.has(tool.id));
+
   const explicitPrompts = Array.isArray(context.prompts)
     ? context.prompts.filter(id => Object.hasOwn(PROMPT_MODULES, id))
     : [];
@@ -119,6 +134,7 @@ export function resolveContext(selection: AgentContextSelection | undefined, ena
     tools: injectedIds,
     prompts,
     categories: context.categories || [],
+    candidateTools,
     catalog: AGENT_TOOL_REGISTRY.filter(tool => available.has(tool.id) || tool.id === 'sys.selectContext'),
   };
 }
@@ -134,9 +150,6 @@ export function validateSelection(args: Record<string, unknown>, enabled: readon
   if (args.prompts !== undefined && (!Array.isArray(args.prompts) || !args.prompts.every(item => typeof item === 'string'))) {
     throw new Error('prompts 必须是提示词模块 ID 数组。');
   }
-  if (args.tools === undefined && args.categories === undefined) {
-    throw new Error('请提供 categories 或 tools 数组。');
-  }
 
   const available = new Set(enabled);
   const known = new Set(AGENT_TOOL_REGISTRY.map((tool: AgentToolDefinition) => tool.id));
@@ -144,23 +157,23 @@ export function validateSelection(args: Record<string, unknown>, enabled: readon
   const resolvedCategories = new Set<string>();
 
   for (const rawCat of (args.categories as string[] | undefined) ?? []) {
-    const catKey = CATEGORY_ALIASES[rawCat.trim().toLowerCase()];
+    const trimmed = rawCat.trim();
+    const catKey = CATEGORY_ALIASES[trimmed.toLowerCase()];
     if (catKey && TOOL_CATEGORIES[catKey]) {
       resolvedCategories.add(catKey);
-      for (const toolId of TOOL_CATEGORIES[catKey].tools) {
-        if (available.has(toolId)) {
-          resolvedTools.add(toolId);
-        }
+    } else if (known.has(trimmed as AgentToolName)) {
+      if (!available.has(trimmed) && trimmed !== 'sys.selectContext') {
+        throw new Error(`工具不存在或未启用：${trimmed}`);
       }
-    } else if (known.has(rawCat as AgentToolName) && available.has(rawCat)) {
-      resolvedTools.add(rawCat as AgentToolName);
+      resolvedTools.add(trimmed as AgentToolName);
     } else {
       throw new Error(`工具分类不存在或未启用：${rawCat}`);
     }
   }
 
-  for (const id of (args.tools as string[] | undefined) ?? []) {
-    const catKey = CATEGORY_ALIASES[id.trim().toLowerCase()];
+  for (const rawId of (args.tools as string[] | undefined) ?? []) {
+    const id = rawId.trim();
+    const catKey = CATEGORY_ALIASES[id.toLowerCase()];
     if (known.has(id as AgentToolName)) {
       if (!available.has(id) && id !== 'sys.selectContext') {
         throw new Error(`工具不存在或未启用：${id}`);
@@ -168,11 +181,6 @@ export function validateSelection(args: Record<string, unknown>, enabled: readon
       resolvedTools.add(id as AgentToolName);
     } else if (catKey && TOOL_CATEGORIES[catKey]) {
       resolvedCategories.add(catKey);
-      for (const toolId of TOOL_CATEGORIES[catKey].tools) {
-        if (available.has(toolId)) {
-          resolvedTools.add(toolId);
-        }
-      }
     } else {
       throw new Error(`工具不存在或未启用：${id}`);
     }
@@ -187,15 +195,39 @@ export function validateSelection(args: Record<string, unknown>, enabled: readon
     explicitPrompts.push(normalizedPrompt);
   }
 
-  const finalTools = [...resolvedTools];
-  const finalPrompts = [...new Set([...explicitPrompts, ...derivePromptsFromTools(finalTools)])];
+  // 1. 已选定具体业务工具 ID -> 切入 1 级执行层（仅装载所选具体工具）
+  if (resolvedTools.size > 0) {
+    const finalTools = [...resolvedTools];
+    const finalPrompts = [...new Set([...explicitPrompts, ...derivePromptsFromTools(finalTools)])];
+    return {
+      level: 1,
+      tools: finalTools,
+      prompts: finalPrompts,
+      categories: [...resolvedCategories],
+    };
+  }
 
-  return {
-    level: args.level,
-    tools: finalTools,
-    prompts: finalPrompts,
-    categories: [...resolvedCategories],
-  };
+  // 2. 仅选择了工具分类 categories（未选具体 tools） -> 保持在 0 级工具选择阶段，展开对应分类下的候选工具简表供下一轮挑选
+  if (resolvedCategories.size > 0) {
+    return {
+      level: 0,
+      tools: [],
+      prompts: explicitPrompts,
+      categories: [...resolvedCategories],
+    };
+  }
+
+  // 3. 未传 categories 与 tools 且目标为 0 级 -> 从 1 级执行完毕返回 0 级验收层（卸载全部业务工具）
+  if (args.level === 0) {
+    return {
+      level: 0,
+      tools: [],
+      prompts: explicitPrompts,
+      categories: [],
+    };
+  }
+
+  throw new Error('切入 1 级执行层必须通过 tools 指定具体工具 ID 数组（若尚未展开分类，请先传 categories 展开候选工具简表）。');
 }
 
 const OBSOLETE_GREETING_NOTE_RE = /尚未明确具体任务|尚未提供具体创作任务|处于需求引导阶段/;
