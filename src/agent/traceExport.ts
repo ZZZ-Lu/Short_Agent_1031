@@ -173,11 +173,15 @@ export function buildStructuredTraceExportObject(
   const firstStart = turns[0]?.startedAt || trace.createdAt;
   const lastEnd = turns.at(-1)?.completedAt || trace.updatedAt;
 
+  const resolvedGoal = trace.task?.goal || trace.goal || trace.task?.initialGoal || '';
+  const resolvedTitle = (trace.task?.title && trace.task.title !== '尚未命名')
+    ? trace.task.title
+    : (trace.task?.initialGoal || trace.goal || resolvedGoal);
   return {
     taskId: trace.taskId,
     traceId: trace.id,
-    title: trace.task?.title || trace.goal,
-    goal: trace.goal,
+    title: resolvedTitle,
+    goal: resolvedGoal,
     status: trace.task?.status || 'unknown',
     totalTurns: turns.length,
     totalDurationMs: lastEnd && firstStart && lastEnd >= firstStart ? lastEnd - firstStart : undefined,
@@ -272,8 +276,12 @@ export function formatRuntimeTraceExport(
     ? `单轮运行追踪（第 ${turns[0].turn} 轮）`
     : `任务运行追踪明细（共 ${turns.length} 轮）`;
 
-  lines.push(`# ${scopeTitle}：${trace.task?.title || trace.goal}`);
-  lines.push(`- **最终目标**：${trace.goal}`);
+  const resolvedGoal = trace.task?.goal || trace.goal || trace.task?.initialGoal || '';
+  const resolvedTitle = (trace.task?.title && trace.task.title !== '尚未命名')
+    ? trace.task.title
+    : (trace.task?.initialGoal || trace.goal || resolvedGoal);
+  lines.push(`# ${scopeTitle}：${resolvedTitle}`);
+  lines.push(`- **最终目标**：${resolvedGoal}`);
   lines.push(`- **任务状态**：${trace.task?.status || 'unknown'} · **总耗时**：${totalDuration}`);
   if (trace.task?.subGoal || trace.task?.progress) {
     lines.push(`- **最新进展**：${trace.task.progress || '无'}（小目标：${trace.task.subGoal || '无'}）`);

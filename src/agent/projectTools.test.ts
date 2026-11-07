@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { executeProjectReadTool, executeProjectAssetMutation, type ProjectData } from './projectTools';
 import { resolveVerifiedProvenance } from '../utils/assetProvenance';
 import { getAssetIdentificationText, getVersionIdentificationText, mergeMultiVersionAssetList } from '../utils/assetVersions';
+import { refreshTaskCardContext } from './cardContextBuilder';
 
 const project: ProjectData = { id: 'p1', scriptText: '第1集 开始\n你好\n第2集 继续\n再见', characters: [{ id: 'c1', name: 'Vivian', role: '主角', appearance: '长裙' }], locations: [{ id: 'l1', name: '车厢' }], props: [] };
 
@@ -11,11 +12,62 @@ test('后台剧本工具读取目录、分页正文和搜索结果', () => {
   assert.equal(directory.projectId, 'p1');
   assert.equal(directory.total, 2);
   assert.equal(directory.nextOffset, 1);
-  const page = executeProjectReadTool('script.read', { offset: 1, limit: 2 }, project);
-  assert.equal(page.content, '你好\n第2集 继续');
-  assert.equal(page.nextOffset, 3);
+  const ep1 = (directory.entries as any[])[0];
+  assert.equal(ep1.startLine, 1);
+  assert.equal(ep1.endLine, 2);
+  const pageFromLine1 = executeProjectReadTool('script.read', { offset: ep1.startLine, limit: 2 }, project);
+  assert.equal(pageFromLine1.content, '第1集 开始\n你好');
+  assert.equal(pageFromLine1.startLine, 1);
+  assert.equal(pageFromLine1.endLine, 2);
+  assert.equal(pageFromLine1.nextOffset, 3);
+  const pageFromLine2 = executeProjectReadTool('script.read', { offset: 2, limit: 2 }, project);
+  assert.equal(pageFromLine2.content, '你好\n第2集 继续');
+  assert.equal(pageFromLine2.nextOffset, 4);
   assert.deepEqual(executeProjectReadTool('script.search', { query: '再见' }, project).matches?.map(m => m.lineNumber), [4]);
   assert.throws(() => executeProjectReadTool('script.search', { query: '' }, project));
+
+  const multiEpProject: ProjectData = {
+    id: 'p_scope',
+    scriptText: [
+      '第一集',
+      '1-1 日 内 客厅',
+      '▲布拉姆走进客厅。',
+      '1-5 日 外 庄园',
+      '布拉姆：欢迎来到庄园。',
+      '第二集',
+      '2-1 夜 内 书房',
+      '布拉姆：加强庄园守卫，任何人都不许出去！',
+    ].join('\n'),
+    characters: [],
+    locations: [],
+    props: [],
+  };
+
+  // 全文搜索返回第 3、5、8 行，且连续序号为 1, 2, 3
+  const allMatches = executeProjectReadTool('script.search', { query: '布拉姆' }, multiEpProject);
+  assert.deepEqual(allMatches.matches?.map(m => m.lineNumber), [3, 5, 8]);
+  assert.deepEqual(allMatches.matches?.map(m => m.index), [1, 2, 3]);
+
+  // 按 episode="第一集" 或 episode=1 限定搜索，严格排除第二集第 8 行，且连续序号从 1..N 编号
+  const ep1ByCn = executeProjectReadTool('script.search', { query: '布拉姆', episode: '第一集' }, multiEpProject);
+  assert.deepEqual(ep1ByCn.matches?.map(m => m.lineNumber), [3, 5]);
+  assert.deepEqual(ep1ByCn.matches?.map(m => m.index), [1, 2]);
+  assert.deepEqual(ep1ByCn.scope, { episode: '第一集', startLine: 1, endLine: 5 });
+
+  const ep1ByNum = executeProjectReadTool('script.search', { query: '布拉姆', episode: 1 }, multiEpProject);
+  assert.deepEqual(ep1ByNum.matches?.map(m => m.lineNumber), [3, 5]);
+  assert.deepEqual(ep1ByNum.matches?.map(m => m.index), [1, 2]);
+
+  // 按 startLine / endLine 限定搜索范围
+  const lineRangeRes = executeProjectReadTool('script.search', { query: '布拉姆', startLine: 4, endLine: 5 }, multiEpProject);
+  assert.deepEqual(lineRangeRes.matches?.map(m => m.lineNumber), [5]);
+  assert.deepEqual(lineRangeRes.matches?.map(m => m.index), [1]);
+  assert.deepEqual(lineRangeRes.scope, { startLine: 4, endLine: 5 });
+
+  // 按场次编号（如 "1-5"）限定搜索
+  const sceneRes = executeProjectReadTool('script.search', { query: '布拉姆', episode: '1-5' }, multiEpProject);
+  assert.deepEqual(sceneRes.matches?.map(m => m.lineNumber), [5]);
+  assert.deepEqual(sceneRes.matches?.map(m => m.index), [1]);
 });
 
 test('资产工具按项目、类型和页码读取，并拒绝无效类型', () => {
@@ -719,5 +771,57 @@ test('asset.commitProvenance 跨集增量补充与重设测试：补充第二集
   assert.equal((overwriteRes.output as any).mode, 'overwrite');
   assert.equal(proj.characters[0].verifiedProvenance.length, 1);
 });
+
+test('refreshTaskCardContext：asset.create / asset.update 后动态刷新聚焦目标数量与属性摘要', () => {
+  let proj: ProjectData = {
+    id: 'p_refresh_ctx',
+    scriptText: '第一集\n1-5 日 内 布莱克伍德庄园\n▲布拉姆坐在主位。',
+    characters: [],
+    locations: [],
+    props: [],
+  };
+
+  let panelCardContext: Record<string, any> | undefined = {
+    targetId: 'assets.panel',
+    title: '资产清单面板',
+    markdownSummary: [
+      '【当前聚焦目标：资产清单面板 (assets.panel)】',
+      '- 角色数量: 0',
+      '- 场景数量: 0',
+      '- 道具数量: 0',
+    ].join('\n'),
+  };
+
+  const createRes = executeProjectAssetMutation('asset.create', {
+    type: 'characters',
+    name: '布拉姆',
+    description: '布莱克伍德家族家主',
+  }, proj);
+  proj = { ...proj, ...createRes.updatedProject };
+
+  panelCardContext = refreshTaskCardContext(panelCardContext, proj as any);
+  assert.ok(panelCardContext?.markdownSummary.includes('- 角色数量: 1'), 'asset.create 后应同步刷新角色数量为 1');
+  assert.ok(panelCardContext?.markdownSummary.includes('- 场景数量: 0'));
+  assert.ok(panelCardContext?.markdownSummary.includes('- 道具数量: 0'));
+
+  const bramId = proj.characters[0].id;
+  let itemCardContext: Record<string, any> | undefined = refreshTaskCardContext(
+    { targetId: `assets.item.character.${bramId}` },
+    proj as any
+  );
+  assert.ok(itemCardContext?.markdownSummary.includes('- 角色名: 布拉姆'));
+  assert.ok(itemCardContext?.markdownSummary.includes('- 资产识别描述: 布莱克伍德家族家主'));
+
+  const updateRes = executeProjectAssetMutation('asset.update', {
+    id: bramId,
+    type: 'characters',
+    description: '布莱克伍德家族家主，娜塔莉亚的教父',
+  }, proj);
+  proj = { ...proj, ...updateRes.updatedProject };
+
+  itemCardContext = refreshTaskCardContext(itemCardContext, proj as any);
+  assert.ok(itemCardContext?.markdownSummary.includes('娜塔莉亚的教父'), 'asset.update 后应同步刷新聚焦资产描述');
+});
+
 
 

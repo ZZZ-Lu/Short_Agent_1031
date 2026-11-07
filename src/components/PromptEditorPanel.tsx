@@ -17,14 +17,25 @@ interface TabConfig {
 const TABS: TabConfig[] = [
   {
     id: 'main',
-    label: '主循环 Agent Prompt',
+    label: '主循环（全局计划版）Prompt',
     icon: TerminalSquare,
     filename: 'systemPrompt.txt',
-    description: '配置主循环系统的思考与工具调用指令，改动将直接保存至 src/agent/systemPrompt.txt 与持久快照缓存。',
-    storageKey: 'mira_custom_system_prompt',
-    savedKey: 'mira_saved_prompt_main',
-    savedAtKey: 'mira_saved_at_main',
-    dirtyKey: 'mira_prompt_dirty_main',
+    description: '配置【全局计划与验收阶段】主循环系统的思考与工具调用指令，改动将直接保存至 src/agent/systemPrompt.txt 与持久快照缓存。',
+    storageKey: 'mira_custom_system_prompt_v2',
+    savedKey: 'mira_saved_prompt_main_v2',
+    savedAtKey: 'mira_saved_at_main_v2',
+    dirtyKey: 'mira_prompt_dirty_main_v2',
+  },
+  {
+    id: 'mainExecution',
+    label: '主循环（局部执行版）Prompt',
+    icon: TerminalSquare,
+    filename: 'systemPromptExecution.txt',
+    description: '配置【局部执行阶段】主循环系统的思考与工具调用指令，改动将直接保存至 src/agent/systemPromptExecution.txt 与持久快照缓存。',
+    storageKey: 'mira_custom_system_prompt_exec_v2',
+    savedKey: 'mira_saved_prompt_main_exec_v2',
+    savedAtKey: 'mira_saved_at_main_exec_v2',
+    dirtyKey: 'mira_prompt_dirty_main_exec_v2',
   },
   {
     id: 'state',
@@ -65,14 +76,16 @@ export const PromptEditorPanel = () => {
   const [activeTab, setActiveTab] = useState<PromptTabType>('main');
 
   const [prompts, setPrompts] = useState<Record<PromptTabType, string>>(() => ({
-    main: localStorage.getItem('mira_custom_system_prompt') || localStorage.getItem('mira_saved_prompt_main') || '',
+    main: localStorage.getItem('mira_custom_system_prompt_v2') || localStorage.getItem('mira_saved_prompt_main_v2') || '',
+    mainExecution: localStorage.getItem('mira_custom_system_prompt_exec_v2') || localStorage.getItem('mira_saved_prompt_main_exec_v2') || '',
     state: localStorage.getItem('mira_custom_state_prompt') || localStorage.getItem('mira_saved_prompt_state') || '',
     jsonAdapter: localStorage.getItem('mira_custom_json_adapter_prompt') || localStorage.getItem('mira_saved_prompt_jsonAdapter') || '',
     landmarks: localStorage.getItem('mira_custom_landmarks_prompt') || localStorage.getItem('mira_saved_prompt_landmarks') || '',
   }));
 
   const [dirties, setDirties] = useState<Record<PromptTabType, boolean>>(() => ({
-    main: localStorage.getItem('mira_prompt_dirty_main') === 'true',
+    main: localStorage.getItem('mira_prompt_dirty_main_v2') === 'true',
+    mainExecution: localStorage.getItem('mira_prompt_dirty_main_exec_v2') === 'true',
     state: localStorage.getItem('mira_prompt_dirty_state') === 'true',
     jsonAdapter: localStorage.getItem('mira_prompt_dirty_json_adapter') === 'true',
     landmarks: localStorage.getItem('mira_prompt_dirty_landmarks') === 'true',

@@ -108,7 +108,10 @@ export function AgentRuntimeTracePanel({ traces }: AgentRuntimeTracePanelProps) 
     const content = formatRuntimeTraceExport(trace, exportOptions);
     const ext = exportOptions.format === 'json' ? 'json' : 'md';
     const mime = exportOptions.format === 'json' ? 'application/json;charset=utf-8' : 'text/markdown;charset=utf-8';
-    const safeTitle = (trace.task.title || trace.goal || 'trace')
+    const rawTitle = (trace.task.title && trace.task.title !== '尚未命名')
+      ? trace.task.title
+      : (trace.task.initialGoal || trace.goal || 'trace');
+    const safeTitle = rawTitle
       .replace(/[\\/:*?"<>|\s]+/g, '_')
       .slice(0, 24);
     const filename = `trace_${safeTitle}_${turns.length}turns.${ext}`;
@@ -194,7 +197,9 @@ export function AgentRuntimeTracePanel({ traces }: AgentRuntimeTracePanelProps) 
                   <span>{isItemCopied ? '已复制' : '复制日志'}</span>
                 </button>
               </div>
-              <p className="mt-1 line-clamp-2 text-xs font-medium leading-5">{item.goal}</p>
+              <p className="mt-1 line-clamp-2 text-xs font-medium leading-5">
+                {(item.task?.title && item.task.title !== '尚未命名') ? item.task.title : (item.task?.initialGoal || item.goal)}
+              </p>
               <p className="mt-1 text-[10px] text-slate-400">{item.turns?.length || 0} 轮 · {statusLabel(item.task.status)}</p>
             </div>;
           })}
@@ -204,7 +209,9 @@ export function AgentRuntimeTracePanel({ traces }: AgentRuntimeTracePanelProps) 
       <aside className="flex w-80 shrink-0 flex-col border-r border-slate-200 bg-gray-100 dark:border-white/10 dark:bg-[#151517]">
         <div className="border-b border-slate-200 px-4 py-3 dark:border-white/10">
           <div className="flex items-center justify-between gap-2">
-            <p className="truncate text-xs font-semibold">{trace.task.title || trace.goal}</p>
+            <p className="truncate text-xs font-semibold">
+              {(trace.task.title && trace.task.title !== '尚未命名') ? trace.task.title : (trace.task.initialGoal || trace.goal)}
+            </p>
             {turns.length > 0 && (
               <span className="shrink-0 text-[10px] font-medium text-slate-400">
                 {(() => {
@@ -221,7 +228,7 @@ export function AgentRuntimeTracePanel({ traces }: AgentRuntimeTracePanelProps) 
               </span>
             )}
           </div>
-          <p className="mt-1 line-clamp-2 text-[11px] text-slate-400">最终目标：{trace.goal}</p>
+          <p className="mt-1 line-clamp-2 text-[11px] text-slate-400">最终目标：{trace.task.goal || trace.task.initialGoal || trace.goal}</p>
 
           {/* Task-level Export Action Bar */}
           <div className="mt-2.5 flex items-center gap-1.5">

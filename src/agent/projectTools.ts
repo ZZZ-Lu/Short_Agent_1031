@@ -1,4 +1,4 @@
-import { readScriptDirectory, searchScript } from './scriptTools';
+import { readScriptDirectory, searchScript, searchScriptWithScope } from './scriptTools';
 import {
   searchProvenanceCandidates,
   computeScriptSignature,
@@ -99,7 +99,7 @@ function findAssetInProject(
   return null;
 }
 
-export function executeProjectReadTool(name: string, args: Record<string, unknown>, project: ProjectData) {
+export function executeProjectReadTool(name: string, args: Record<string, unknown>, project: ProjectData): Record<string, any> {
   if (name === 'script.directory') {
     const all = readScriptDirectory(project.scriptText, {
       query: typeof args.query === 'string' ? args.query : undefined,
@@ -109,17 +109,72 @@ export function executeProjectReadTool(name: string, args: Record<string, unknow
     });
     const offset = pageNumber(args.offset, 0, Number.MAX_SAFE_INTEGER);
     const limit = Math.max(1, pageNumber(args.limit, 100, 200));
-    return { projectId: project.id, source: 'project', total: all.length, offset, entries: all.slice(offset, offset + limit), nextOffset: offset + limit < all.length ? offset + limit : null };
+    const entries = all.slice(offset, offset + limit).map((entry, idx) => ({
+      index: offset + idx + 1,
+      ...entry,
+      ...(Array.isArray(entry.scenes) && entry.scenes.length > 0
+        ? {
+            scenes: entry.scenes.map((sc, sIdx) => ({
+              index: sIdx + 1,
+              ...sc,
+            })),
+          }
+        : {}),
+    }));
+    return { projectId: project.id, source: 'project', total: all.length, offset, entries, nextOffset: offset + limit < all.length ? offset + limit : null };
   }
   if (name === 'script.read') {
     const lines = project.scriptText ? project.scriptText.split('\n') : [];
-    const offset = pageNumber(args.offset, 0, Number.MAX_SAFE_INTEGER);
+    const rawOffset = pageNumber(args.offset, 1, Number.MAX_SAFE_INTEGER);
+    // 统一采用 1-based 起始行号（与 script.directory 的 startLine、script.search 的 lineNumber 完全对齐；传 0 或 1 均从第 1 行开始）
+    const startLine = Math.max(1, rawOffset);
+    const startIndex = startLine - 1;
     const limit = Math.max(1, pageNumber(args.limit, 100, 200));
-    return { projectId: project.id, source: 'project', total: lines.length, offset, content: lines.slice(offset, offset + limit).join('\n'), nextOffset: offset + limit < lines.length ? offset + limit : null };
+    const slice = lines.slice(startIndex, startIndex + limit);
+    const endLine = slice.length > 0 ? startIndex + slice.length : startLine;
+    const nextOffset = startIndex + limit < lines.length ? startIndex + limit + 1 : null;
+    return {
+      projectId: project.id,
+      source: 'project',
+      total: lines.length,
+      offset: startLine,
+      startLine,
+      endLine,
+      content: slice.join('\n'),
+      nextOffset,
+    };
   }
   if (name === 'script.search') {
     if (typeof args.query !== 'string' || !args.query.trim()) throw new Error('搜索关键词不能为空。');
-    return { projectId: project.id, source: 'project', matches: searchScript(project.scriptText, args.query) };
+    const rawEpisode = args.episode ?? args.episodeId;
+    const episode =
+      typeof rawEpisode === 'string' || typeof rawEpisode === 'number'
+        ? rawEpisode
+        : undefined;
+    const scene = typeof args.scene === 'string' ? args.scene : undefined;
+    const rawStartLine = args.startLine ?? (Array.isArray(args.lineRange) ? args.lineRange[0] : undefined);
+    const rawEndLine = args.endLine ?? (Array.isArray(args.lineRange) ? args.lineRange[1] : undefined);
+    const startLine = Number.isFinite(Number(rawStartLine)) && Number(rawStartLine) >= 1 ? Math.floor(Number(rawStartLine)) : undefined;
+    const endLine = Number.isFinite(Number(rawEndLine)) && Number(rawEndLine) >= 1 ? Math.floor(Number(rawEndLine)) : undefined;
+    const limit = Number.isFinite(Number(args.limit)) && Number(args.limit) >= 1 ? Math.floor(Number(args.limit)) : undefined;
+
+    const searchRes = searchScriptWithScope(project.scriptText, args.query, {
+      episode,
+      scene,
+      startLine,
+      endLine,
+      limit,
+      scenePattern: project.tocConfig?.scenePattern,
+      flags: project.tocConfig?.flags,
+      precomputedScenes: Array.isArray(project.scenes) ? project.scenes : undefined,
+    });
+    return {
+      projectId: project.id,
+      source: 'project',
+      ...(searchRes.scope ? { scope: searchRes.scope } : {}),
+      total: searchRes.totalMatches,
+      matches: searchRes.matches,
+    };
   }
   if (name === 'asset.list') {
     let type = args.type;
@@ -236,7 +291,8 @@ export function executeProjectReadTool(name: string, args: Record<string, unknow
       } : undefined,
       searchedTerms,
       totalCandidates: candidates.length,
-      candidates: candidates.map(c => ({
+      candidates: candidates.map((c, idx) => ({
+        index: idx + 1,
         candidateId: c.candidateId,
         sceneTitle: c.sceneTitle,
         lineNumber: c.lineNumber,

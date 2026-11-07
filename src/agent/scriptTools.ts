@@ -164,8 +164,58 @@ export const readScriptDirectory = (
   }));
 };
 
+const CN_DIGITS: Record<string, number> = {
+  零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9,
+};
+
+export function parseChineseOrArabicNumber(raw: string | number | undefined): number | null {
+  if (typeof raw === 'number' && Number.isFinite(raw)) return Math.floor(raw);
+  if (typeof raw !== 'string') return null;
+  const cleaned = raw.trim().replace(/^(?:第|episode[-_\s]*|ep[-_\s]*#?)/i, '').replace(/[集话回幕场]$/g, '').trim();
+  if (!cleaned) return null;
+  if (/^\d+$/.test(cleaned)) return parseInt(cleaned, 10);
+
+  // Simple Chinese numeral parser up to 999
+  let total = 0;
+  let current = 0;
+  for (const ch of cleaned) {
+    if (ch in CN_DIGITS) {
+      current = CN_DIGITS[ch];
+    } else if (ch === '十') {
+      total += (current === 0 ? 1 : current) * 10;
+      current = 0;
+    } else if (ch === '百') {
+      total += (current === 0 ? 1 : current) * 100;
+      current = 0;
+    } else {
+      return null;
+    }
+  }
+  total += current;
+  return total > 0 || cleaned === '零' || cleaned === '〇' ? total : null;
+}
+
+export function findEpisodeByIdentifier(episodes: ScriptEpisode[], episodeId: string | number): ScriptEpisode | undefined {
+  const rawStr = String(episodeId).trim();
+  if (!rawStr) return undefined;
+  const targetNum = parseChineseOrArabicNumber(rawStr);
+  const stripped = rawStr.replace(/^第?|[集话回]$/g, '').trim();
+
+  return episodes.find(item => {
+    if (item.id.toLowerCase() === rawStr.toLowerCase()) return true;
+    if (item.title.toLowerCase() === rawStr.toLowerCase()) return true;
+    if (item.number === stripped) return true;
+    if (targetNum !== null) {
+      const itemNum = parseChineseOrArabicNumber(item.number) ?? parseChineseOrArabicNumber(item.title);
+      if (itemNum !== null && itemNum === targetNum) return true;
+    }
+    return false;
+  });
+}
+
 export const readScriptEpisode = (scriptText: string, episodeId: string, options: { mode?: 'full' | 'excerpt'; lineRange?: [number, number] } = {}) => {
-  const episode = parseScriptEpisodes(scriptText).find(item => item.id === episodeId || item.number === episodeId.replace(/^第?|[集话回]$/g, ''));
+  const episodes = parseScriptEpisodes(scriptText);
+  const episode = findEpisodeByIdentifier(episodes, episodeId);
   if (!episode) throw new Error(`未找到剧集：${episodeId}`);
   const lines = scriptText.split('\n');
   const start = options.lineRange ? Math.max(episode.startLine, options.lineRange[0]) : episode.startLine;
@@ -180,14 +230,166 @@ export const readScriptEpisode = (scriptText: string, episodeId: string, options
   };
 };
 
-export const searchScript = (scriptText: string, query: string, episodeId?: string) => {
+export interface ScriptSearchOptions {
+  episode?: string | number;
+  scene?: string;
+  startLine?: number;
+  endLine?: number;
+  limit?: number;
+  scenePattern?: string;
+  flags?: string;
+  precomputedScenes?: SceneChunk[];
+}
+
+export interface ScriptSearchScope {
+  episode?: string;
+  scene?: string;
+  startLine: number;
+  endLine: number;
+}
+
+export const searchScriptWithScope = (
+  scriptText: string,
+  query: string,
+  options: ScriptSearchOptions = {}
+): { matches: Array<{ index: number; lineNumber: number; column: number; snippet: string }>; totalMatches: number; scope?: ScriptSearchScope } => {
   const needle = query.trim();
   if (!needle) throw new Error('搜索关键词不能为空。');
-  const source = episodeId ? readScriptEpisode(scriptText, episodeId, { mode: 'full' }) : { content: scriptText, startLine: 1 };
-  return source.content.split('\n').flatMap((line, index) => {
-    const position = line.toLowerCase().indexOf(needle.toLowerCase());
-    return position < 0 ? [] : [{ lineNumber: source.startLine + index, column: position + 1, snippet: line.trim().slice(0, 300) }];
-  }).slice(0, 50);
+  if (!scriptText) return { matches: [], totalMatches: 0 };
+
+  const allLines = scriptText.split('\n');
+  let rangeStart = 1;
+  let rangeEnd = allLines.length;
+  let matchedEpisodeTitle: string | undefined;
+  let matchedSceneTitle: string | undefined;
+  let hasExplicitScope = false;
+
+  const episodes = parseScriptEpisodes(scriptText, {
+    scenePattern: options.scenePattern,
+    flags: options.flags,
+    precomputedScenes: options.precomputedScenes,
+  });
+
+  if (options.episode !== undefined && options.episode !== null && String(options.episode).trim() !== '') {
+    hasExplicitScope = true;
+    const epRaw = String(options.episode).trim();
+    const ep = findEpisodeByIdentifier(episodes, epRaw);
+    if (ep) {
+      rangeStart = Math.max(rangeStart, ep.startLine);
+      rangeEnd = Math.min(rangeEnd, ep.endLine);
+      matchedEpisodeTitle = ep.title;
+    } else {
+      // Also check if the user/Agent passed a scene identifier like "1-5" in episode
+      for (const candidateEp of episodes) {
+        const sc = candidateEp.scenes?.find(
+          s =>
+            s.sceneNumber === epRaw ||
+            s.id.toLowerCase() === epRaw.toLowerCase() ||
+            s.title.toLowerCase().includes(epRaw.toLowerCase())
+        );
+        if (sc) {
+          rangeStart = Math.max(rangeStart, sc.startLine);
+          rangeEnd = Math.min(rangeEnd, sc.endLine);
+          matchedEpisodeTitle = candidateEp.title;
+          matchedSceneTitle = sc.title;
+          break;
+        }
+      }
+    }
+  }
+
+  if (typeof options.scene === 'string' && options.scene.trim()) {
+    hasExplicitScope = true;
+    const scRaw = options.scene.trim();
+    for (const candidateEp of episodes) {
+      const sc = candidateEp.scenes?.find(
+        s =>
+          s.sceneNumber === scRaw ||
+          s.id.toLowerCase() === scRaw.toLowerCase() ||
+          s.title.toLowerCase().includes(scRaw.toLowerCase())
+      );
+      if (sc) {
+        rangeStart = Math.max(rangeStart, sc.startLine);
+        rangeEnd = Math.min(rangeEnd, sc.endLine);
+        matchedEpisodeTitle = matchedEpisodeTitle || candidateEp.title;
+        matchedSceneTitle = sc.title;
+        break;
+      }
+    }
+  }
+
+  if (typeof options.startLine === 'number' && Number.isFinite(options.startLine) && options.startLine >= 1) {
+    hasExplicitScope = true;
+    rangeStart = Math.max(rangeStart, Math.floor(options.startLine));
+  }
+  if (typeof options.endLine === 'number' && Number.isFinite(options.endLine) && options.endLine >= 1) {
+    hasExplicitScope = true;
+    rangeEnd = Math.min(rangeEnd, Math.floor(options.endLine));
+  }
+
+  if (rangeStart > rangeEnd) {
+    return {
+      matches: [],
+      totalMatches: 0,
+      ...(hasExplicitScope
+        ? {
+            scope: {
+              ...(matchedEpisodeTitle ? { episode: matchedEpisodeTitle } : {}),
+              ...(matchedSceneTitle ? { scene: matchedSceneTitle } : {}),
+              startLine: rangeStart,
+              endLine: rangeEnd,
+            },
+          }
+        : {}),
+    };
+  }
+
+  const maxLimit =
+    typeof options.limit === 'number' && Number.isFinite(options.limit)
+      ? Math.min(200, Math.max(1, Math.floor(options.limit)))
+      : 50;
+
+  const needleLower = needle.toLowerCase();
+  const allMatches: Array<{ index: number; lineNumber: number; column: number; snippet: string }> = [];
+
+  for (let lineNum = rangeStart; lineNum <= rangeEnd; lineNum++) {
+    const line = allLines[lineNum - 1] ?? '';
+    const position = line.toLowerCase().indexOf(needleLower);
+    if (position >= 0) {
+      allMatches.push({
+        index: allMatches.length + 1,
+        lineNumber: lineNum,
+        column: position + 1,
+        snippet: line.trim().slice(0, 300),
+      });
+    }
+  }
+
+  return {
+    matches: allMatches.slice(0, maxLimit),
+    totalMatches: allMatches.length,
+    ...(hasExplicitScope
+      ? {
+          scope: {
+            ...(matchedEpisodeTitle ? { episode: matchedEpisodeTitle } : {}),
+            ...(matchedSceneTitle ? { scene: matchedSceneTitle } : {}),
+            startLine: rangeStart,
+            endLine: rangeEnd,
+          },
+        }
+      : {}),
+  };
+};
+
+export const searchScript = (
+  scriptText: string,
+  query: string,
+  episodeOrOptions?: string | ScriptSearchOptions
+) => {
+  if (typeof episodeOrOptions === 'string') {
+    return searchScriptWithScope(scriptText, query, { episode: episodeOrOptions }).matches;
+  }
+  return searchScriptWithScope(scriptText, query, episodeOrOptions).matches;
 };
 
 export const readScriptMetadata = (scriptText: string, title: string, updatedAt: number) => {

@@ -1,4 +1,4 @@
-export type PromptTabType = 'main' | 'state' | 'jsonAdapter' | 'landmarks';
+export type PromptTabType = 'main' | 'mainExecution' | 'state' | 'jsonAdapter' | 'landmarks';
 
 export interface LocalPromptSnapshot {
   currentText: string;

@@ -161,3 +161,14 @@ test('single-turn filter exports only the specified turn', () => {
   assert.equal(md.includes('## 第 1 轮'), false);
   assert.ok(md.includes('状态提取节点输入'));
 });
+
+test('resolves final goal from trace.task.goal when top-level trace.goal was initially empty', () => {
+  const traceWithEmptyInitialGoal: AgentRuntimeTrace = {
+    ...mockTrace,
+    goal: '',
+  };
+  const opts = getPresetExportOptions('diagnostic', 'markdown');
+  const md = formatRuntimeTraceExport(traceWithEmptyInitialGoal, opts);
+  assert.ok(md.includes('- **最终目标**：提取第一集布拉姆的角色资产'));
+});
+

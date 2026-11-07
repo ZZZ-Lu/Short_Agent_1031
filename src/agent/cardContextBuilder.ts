@@ -282,7 +282,20 @@ export async function buildAutoInjectedCardContext(
     imageLabels.push(`图 ${images.length} (${refItem.label})`);
   }
 
-  // Format rich Markdown summary for System / User turn prompt
+  return formatSingleCardContextSync(targetCard, allCards, imageLabels, images);
+}
+
+/**
+ * Pure synchronous formatter for a single focused canvas card and its lineage/landmarks.
+ */
+export function formatSingleCardContextSync(
+  targetCard: CardData,
+  allCards: CardData[],
+  imageLabels: string[] = [],
+  images: string[] = []
+): InjectedCardContextResult {
+  const lineage = resolveCardLineage(targetCard, allCards);
+
   const lines: string[] = [
     `# 🎯 画布焦点与卡片谱系自动注入 (Focused Card & Lineage Context)`,
     ``,
@@ -538,3 +551,193 @@ export async function buildMultiCardInjectedContext(
     imageLabels,
   };
 }
+
+/**
+ * Pure, DOM-free helper that dynamically refreshes task.cardContext
+ * against the latest ScriptProject data and canvas CardData[] state.
+ */
+export function refreshTaskCardContext(
+  cardContext: Record<string, any> | undefined,
+  project: Pick<ScriptProject, 'name' | 'scriptText' | 'characters' | 'locations' | 'props'> | null | undefined,
+  allCards?: CardData[]
+): Record<string, any> | undefined {
+  if (!cardContext) return cardContext;
+
+  const rawTargetId = typeof cardContext.targetId === 'string'
+    ? cardContext.targetId
+    : (typeof cardContext.cardId === 'string' ? cardContext.cardId : '');
+  if (!rawTargetId) return cardContext;
+
+  // 1. Preserve custom provenance verification context as-is
+  if (typeof cardContext.title === 'string' && cardContext.title.startsWith('出处核验 · ')) {
+    return cardContext;
+  }
+
+  // 2. If target is a single canvas card in allCards, refresh its prompt, landmarks, and lineage
+  if (!cardContext.isMultiSelect && Array.isArray(allCards) && allCards.length > 0) {
+    const cleanCardId = rawTargetId.startsWith('canvas.card.') ? rawTargetId.slice('canvas.card.'.length) : rawTargetId;
+    const matchedCard = allCards.find(c => c.id === cleanCardId);
+    if (matchedCard) {
+      const refreshed = formatSingleCardContextSync(
+        matchedCard,
+        allCards,
+        Array.isArray(cardContext.imageLabels) ? cardContext.imageLabels : [],
+        Array.isArray(cardContext.images) ? cardContext.images : []
+      );
+      return {
+        ...cardContext,
+        ...refreshed.structuredContext,
+        markdownSummary: refreshed.markdownSummary,
+      };
+    }
+  }
+
+  if (!project) return cardContext;
+
+  let targetId = rawTargetId;
+  if (rawTargetId === 'script.panel' || rawTargetId === 'script.scene.indicator' || rawTargetId === 'script.tab.script') {
+    targetId = 'script.text';
+  }
+
+  if (targetId === 'assets.panel' || targetId.startsWith('assets.filter.') || targetId === 'script.tab.assets') {
+    return {
+      ...cardContext,
+      targetId: 'assets.panel',
+      title: '资产清单面板',
+      markdownSummary: [
+        `【当前聚焦目标：资产清单面板 (assets.panel)】`,
+        `- 角色数量: ${project.characters?.length || 0}`,
+        `- 场景数量: ${project.locations?.length || 0}`,
+        `- 道具数量: ${project.props?.length || 0}`,
+      ].join('\n'),
+    };
+  }
+
+  if (targetId.startsWith('assets.item.character.')) {
+    const charId = targetId.slice('assets.item.character.'.length);
+    let char: any = project.characters?.find(c => c.id === charId);
+    let parentChar: any = null;
+    if (!char && Array.isArray(project.characters)) {
+      for (const c of project.characters) {
+        const ver = Array.isArray(c.versions) ? c.versions.find((v: any) => v.id === charId) : null;
+        if (ver) {
+          char = ver;
+          parentChar = c;
+          break;
+        }
+      }
+    }
+    if (!char) return cardContext;
+    const name = parentChar ? `${parentChar.name}（${char?.name || charId}）` : (char?.name || charId);
+    const summaryLines = [
+      `【当前聚焦的剧本角色资产】`,
+      parentChar ? `- 版本ID: ${charId}` : `- 资产ID: ${charId}`,
+      parentChar ? `- 所属主资产ID: ${parentChar.id} (${parentChar.name})` : '',
+      `- 角色名: ${name}`,
+      char?.description ? `- 资产识别描述: ${char.description}` : '',
+      char?.role || parentChar?.role ? `- 身份/定位: ${char?.role || parentChar?.role}` : '',
+      char?.appearance ? `- 外貌与服装特征: ${char.appearance}` : '',
+      char?.personality ? `- 性格特征: ${char.personality}` : '',
+      char?.sourceScenes?.length ? `- 出场场次: ${char.sourceScenes.join('、')}` : '',
+    ].filter(Boolean);
+    return {
+      ...cardContext,
+      targetId,
+      title: `角色资产：${name}`,
+      markdownSummary: summaryLines.join('\n'),
+    };
+  }
+
+  if (targetId.startsWith('assets.item.location.')) {
+    const locId = targetId.slice('assets.item.location.'.length);
+    let loc: any = project.locations?.find(l => l.id === locId);
+    let parentLoc: any = null;
+    if (!loc && Array.isArray(project.locations)) {
+      for (const l of project.locations) {
+        const ver = Array.isArray(l.versions) ? l.versions.find((v: any) => v.id === locId) : null;
+        if (ver) {
+          loc = ver;
+          parentLoc = l;
+          break;
+        }
+      }
+    }
+    if (!loc) return cardContext;
+    const name = parentLoc ? `${parentLoc.name}（${loc?.name || locId}）` : (loc?.name || locId);
+    const summaryLines = [
+      `【当前聚焦的剧本场景资产】`,
+      parentLoc ? `- 版本ID: ${locId}` : `- 资产ID: ${locId}`,
+      parentLoc ? `- 所属主资产ID: ${parentLoc.id} (${parentLoc.name})` : '',
+      `- 场景名: ${name}`,
+      loc?.description ? `- 资产识别描述: ${loc.description}` : '',
+      loc?.type || parentLoc?.type ? `- 内外景: ${loc?.type || parentLoc?.type}` : '',
+      loc?.timeOfDay ? `- 时间段: ${loc.timeOfDay}` : '',
+      loc?.atmosphere ? `- 环境氛围: ${loc.atmosphere}` : '',
+      loc?.visualDetails ? `- 视觉细节: ${loc.visualDetails}` : '',
+      loc?.sourceScenes?.length ? `- 出场场次: ${loc.sourceScenes.join('、')}` : '',
+    ].filter(Boolean);
+    return {
+      ...cardContext,
+      targetId,
+      title: `场景资产：${name}`,
+      markdownSummary: summaryLines.join('\n'),
+    };
+  }
+
+  if (targetId.startsWith('assets.item.prop.')) {
+    const propId = targetId.slice('assets.item.prop.'.length);
+    let prop: any = project.props?.find(p => p.id === propId);
+    let parentProp: any = null;
+    if (!prop && Array.isArray(project.props)) {
+      for (const p of project.props) {
+        const ver = Array.isArray(p.versions) ? p.versions.find((v: any) => v.id === propId) : null;
+        if (ver) {
+          prop = ver;
+          parentProp = p;
+          break;
+        }
+      }
+    }
+    if (!prop) return cardContext;
+    const name = parentProp ? `${parentProp.name}（${prop?.name || propId}）` : (prop?.name || propId);
+    const summaryLines = [
+      `【当前聚焦的剧本道具资产】`,
+      parentProp ? `- 版本ID: ${propId}` : `- 资产ID: ${propId}`,
+      parentProp ? `- 所属主资产ID: ${parentProp.id} (${parentProp.name})` : '',
+      `- 道具名: ${name}`,
+      prop?.description ? `- 资产识别描述: ${prop.description}` : '',
+      prop?.owner || parentProp?.owner ? `- 归属者: ${prop?.owner || parentProp?.owner}` : '',
+      prop?.materialAndState ? `- 材质与状态: ${prop.materialAndState}` : '',
+      prop?.storySignificance ? `- 剧情辨识信息: ${prop.storySignificance}` : '',
+      prop?.sourceScenes?.length ? `- 出场场次: ${prop.sourceScenes.join('、')}` : '',
+    ].filter(Boolean);
+    return {
+      ...cardContext,
+      targetId,
+      title: `道具资产：${name}`,
+      markdownSummary: summaryLines.join('\n'),
+    };
+  }
+
+  if (targetId === 'script.text') {
+    if (typeof cardContext.markdownSummary === 'string' && cardContext.markdownSummary.includes('【当前聚焦的剧本正文片段】')) {
+      return cardContext;
+    }
+    const preview = (project.scriptText || '').slice(0, 1200);
+    return {
+      ...cardContext,
+      targetId: 'script.text',
+      title: `剧本正文：${project.name || '当前项目'}`,
+      markdownSummary: [
+        `【当前聚焦目标：剧本正文 (script.text)】`,
+        `- 项目名称: ${project.name || '未命名项目'}`,
+        `- 剧本总字数: ${(project.scriptText || '').length}`,
+        preview ? `- 剧本开头节选:\n${preview}` : '',
+      ].filter(Boolean).join('\n'),
+    };
+  }
+
+  return cardContext;
+}
+
+

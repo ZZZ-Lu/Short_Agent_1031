@@ -40,7 +40,7 @@ import { CanvasLineageOverlay } from './components/CanvasLineageOverlay';
 import { AGENT_TOOL_REGISTRY, getAgentToolConfig } from './agent/toolRegistry';
 import { initialAgentContext, mergeTaskNotes } from './agent/contextPolicy';
 import { getPageComponentDefinition, type MouseActionName } from './agent/pageComponentRegistry';
-import { buildAutoInjectedCardContext, buildMultiCardInjectedContext } from './agent/cardContextBuilder';
+import { buildAutoInjectedCardContext, buildMultiCardInjectedContext, refreshTaskCardContext } from './agent/cardContextBuilder';
 import { agentFocusManager, type AgentFocusSnapshot } from './agent/agentFocusManager';
 import { AnimatePresence, motion, useMotionValue, animate, useMotionValueEvent } from 'motion/react';
 import { CanvasGridBackground } from './components/CanvasGridBackground';
@@ -734,13 +734,19 @@ export default function App() {
       const base: AgentRuntimeTrace = existing || {
         id: `trace_${task.id}`,
         taskId: task.id,
-        goal: task.goal,
+        goal: task.initialGoal || task.goal,
         createdAt: now,
         updatedAt: now,
         task: taskSnapshot,
         turns: [],
       };
-      const next = update ? update({ ...base, task: taskSnapshot, updatedAt: now }) : { ...base, task: taskSnapshot, updatedAt: now };
+      const syncedBase: AgentRuntimeTrace = {
+        ...base,
+        goal: base.goal || taskSnapshot.initialGoal || taskSnapshot.goal,
+        task: taskSnapshot,
+        updatedAt: now,
+      };
+      const next = update ? update(syncedBase) : syncedBase;
       return [...current.filter(trace => trace.taskId !== task.id), next].slice(-12);
     });
   }, []);
@@ -2083,7 +2089,8 @@ export default function App() {
                 cardContext: taskCardContext,
                 modelType: agentModel,
                 requireTool: false,
-                systemPrompt: localStorage.getItem('mira_saved_prompt_main') || localStorage.getItem('mira_custom_system_prompt') || undefined,
+                systemPrompt: localStorage.getItem('mira_saved_prompt_main_v2') || localStorage.getItem('mira_custom_system_prompt_v2') || undefined,
+                systemExecutionPrompt: localStorage.getItem('mira_saved_prompt_main_exec_v2') || localStorage.getItem('mira_custom_system_prompt_exec_v2') || undefined,
               })
             });
             if (res.ok) {
@@ -5515,6 +5522,9 @@ export default function App() {
     if (call.name === 'asset.create' || call.name === 'asset.update' || call.name === 'asset.delete' || call.name === 'asset.commitProvenance') {
       const { updatedProject, output } = executeProjectAssetMutation(call.name, call.arguments, currentProjectRef.current);
       handleUpdateCurrentProject(updatedProject);
+      if (task.cardContext) {
+        task.cardContext = refreshTaskCardContext(task.cardContext, currentProjectRef.current, cardsRef.current);
+      }
       if (call.name === 'asset.commitProvenance') {
         const committedAssetId = String(call.arguments?.assetId || (output as any)?.assetId || '').trim();
         if (committedAssetId) {
@@ -6499,6 +6509,9 @@ export default function App() {
               : localStorage.getItem('deepseek_api_key');
 
             const proj = currentProjectRef.current;
+            if (task.cardContext) {
+              task.cardContext = refreshTaskCardContext(task.cardContext, proj, cardsRef.current);
+            }
             const latestUserMsg = task.negotiationLog?.filter(l => l.role === 'user').slice(-1)[0]?.content || task.goal;
             const requestBody = {
               userMessage: latestUserMsg,
@@ -6534,7 +6547,8 @@ export default function App() {
               enabledTools: AGENT_TOOL_REGISTRY.filter(tool => getAgentToolConfig()[tool.id]).map(tool => tool.id),
               contextSelection: task.context,
               requireTool,
-              systemPrompt: localStorage.getItem('mira_saved_prompt_main') || localStorage.getItem('mira_custom_system_prompt') || undefined,
+              systemPrompt: localStorage.getItem('mira_saved_prompt_main_v2') || localStorage.getItem('mira_custom_system_prompt_v2') || undefined,
+              systemExecutionPrompt: localStorage.getItem('mira_saved_prompt_main_exec_v2') || localStorage.getItem('mira_custom_system_prompt_exec_v2') || undefined,
               jsonAdapterModel,
               jsonAdapterKey,
               jsonAdapterPrompt: localStorage.getItem('mira_saved_prompt_jsonAdapter') || localStorage.getItem('mira_custom_json_adapter_prompt') || undefined,
@@ -6661,9 +6675,15 @@ export default function App() {
               }
               const rawMsg = error instanceof Error ? error.message : 'Agent 轮次失败';
               const isBalanceError = /insufficient\s*balance|quota|402|out\s*of\s*credit|余额不足|欠费/i.test(rawMsg);
+              const isUpstream500 = /Internal Server Error|上游模型服务出现临时错误|HTTP 500|HTTP 502|HTTP 503/i.test(rawMsg);
+              const isAuthError = /Authentication Fails|401|鉴权失败|api key is invalid/i.test(rawMsg);
               const displayMsg = isBalanceError
                 ? '⚠️ API Key 余额不足，请在设置中更新 Key'
-                : rawMsg;
+                : isAuthError
+                  ? '⚠️ API Key 无效或鉴权失败，请在设置中检查 API 密钥'
+                  : isUpstream500
+                    ? '⚠️ 上游大模型服务集群暂时抖动 (500)，请重试或在设置中切换模型'
+                    : rawMsg;
 
               if (Boolean(concurrentTaskCursorsRef.current[task.id])) {
                 setConcurrentTaskCursors(prev => {
@@ -6797,6 +6817,9 @@ export default function App() {
               const stateNodeUserMessage = userLogs.length > 1 && latestUserMsg !== firstUserMsg
                 ? `【初始任务总目标】：${firstUserMsg}\n【用户最新补充/回复】：${latestUserMsg}`
                 : (latestUserMsg || task.goal);
+              if (task.cardContext) {
+                task.cardContext = refreshTaskCardContext(task.cardContext, currentProjectRef.current, cardsRef.current);
+              }
               const executedTools = (task.events || [])
                 .filter(e => e.turnId === targetTurnId && e.type === 'tool')
                 .map(e => ({
@@ -6817,7 +6840,9 @@ export default function App() {
                     plan: task.plan,
                     notes: task.notes,
                     thinkingLevel: task.context?.level ?? task.thinkingLevel ?? 0,
+                    cardContext: task.cardContext,
                   },
+                  cardContext: task.cardContext,
                   userMessage: stateNodeUserMessage,
                   lastTurnOutput: {
                     narration: lastTurnResult.narration,
@@ -6885,6 +6910,9 @@ export default function App() {
             }
           },
           onTaskChange: (task) => {
+            if (task.cardContext) {
+              task.cardContext = refreshTaskCardContext(task.cardContext, currentProjectRef.current, cardsRef.current);
+            }
             updateAgentRuntimeTrace(task);
             const status = task.status;
             const isDetachedTask = Boolean(concurrentTaskCursorsRef.current[task.id]);
