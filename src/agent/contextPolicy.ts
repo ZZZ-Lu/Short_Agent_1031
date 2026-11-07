@@ -71,7 +71,7 @@ const CATEGORY_ALIASES: Record<string, string> = {
 
 export const PROMPT_MODULES: Record<string, { label: string; content: string }> = {
   script: { label: '剧本读取与分析', content: '剧本内容按需读取。目录中的集号可能跳号或重复，集数应按实际条目统计。长文本通过分页读取；基于工具返回内容回答。' },
-  assets: { label: '项目资产', content: '角色、场景和道具属于当前项目资产。依据剧本分析出的角色造型、场景或关键道具应及时沉淀保存到资产清单中；更新时保留已有设定，仅补全或修订差异。\n【资产识别描述（description）与多版本（versions）规范】\n1. 资产条目的浅色文本描述（description）严禁写空泛套话，核心目的是为了资产精准识别，避免混淆、重复、丢失：\n   - 道具（props）：必须写清首次出场位置（集/场）、归属者（谁的），以及能与其它相似道具区分的关键辨识信息（如“第17集17-1首现 · 戴安娜画给爸爸的生日蛋糕画作，区别于第8集铁链门画”）；若同一道具存在不同形态/状态（如损毁前/损毁后、开启/闭合等），必须按形态/状态区分版本。\n   - 场景（locations）：必须写清首次出场位置、空间归属与核心视觉辨识特征；若同一场景同时存在日景和夜景（或明显不同的时间光影状态），必须分开为两个版本。\n   - 角色（characters）：必须写清首次出场位置、核心身份与人物关系辨识点；若同一角色存在不同服装/造型，必须按服装区分版本。\n2. 单版本与多版本规则：单一版本的资产直接在一级卡片展示完整识别描述，严禁使用二级条目；仅当存在两个及以上版本时，才通过 versions 数组记录并在二级列表展示（每个版本包含各自的 name 如“日景/夜景”、“常服/晚礼服”或“完整态/损毁态”、description 及对应属性）。\n【出处工具使用规范与具体内容高亮准则】\n1. 出场唯一标准：分析剧本语境，判断该资产（或该特定版本）在此处是否真实出现在画面中——真实在场出现才算出场；若角色未在当前场次画面中登场、仅在他人台词中被侧面提及（口头提及），绝对不算出场，严禁提交为出处。\n2. 阅读即锚定（免重复检索）：当你已通过 script.read 阅读了某集剧本正文时，在调用 asset.create、asset.update 或 asset.commitProvenance 时直接通过 provenances 字段传入具体出场描写原句（如 provenances: [{ sceneTitle: "第二集 2-1", lineNumber: 93, evidenceText: "▲布拉姆看到塞莱特斯，眼神平静又带着几分冷漠。" }]）。evidenceText 必须摘抄体现该资产在画面中出场的具体动作、台词、造型或环境描写原句（支持代词指代），严禁摘抄“人物：XXX”名单行。对已读并锚定的集数无需再次调用检索工具。\n3. 增量补充与全量重设（mode 参数）：当为已有资产补充新集数/新场次的出处时，调用 asset.commitProvenance 或 asset.update 默认均为 mode: "append"（增量追加合并），系统会自动保留第一集等原有集数的出处并去重排序，无需重传旧集数出处；仅当发现旧出处有误、需要清空并全量重设时，才显式传入 mode: "overwrite"。\n4. 跨集检索工具（asset.searchProvenanceCandidates）的正确用法：当需要排查未读集数的跨集出场时，可调用 asset.searchProvenanceCandidates（支持传 aliases 别名列表，以及 scopeScenes 限定检索范围）。注意该工具返回的 candidates 仅是字面匹配候选，你必须逐条阅读 contextSnippet 剔除“未在场仅被他人口头提及”或“同名混淆”的条目，仅将确认在画面中真实出场的 candidateId（或原文句子 provenances）提交给 asset.commitProvenance。' },
+  assets: { label: '项目资产', content: '角色、场景和道具属于当前项目资产。依据剧本分析出的角色造型、场景或关键道具应及时沉淀保存到资产清单中；更新时保留已有设定，仅补全或修订差异。\n【资产识别描述（description）与多版本（versions）规范】\n1. 资产条目的浅色文本描述（description）严禁写空泛套话，核心目的是为了资产精准识别，避免混淆、重复、丢失：\n   - 道具（props）：必须写清首次出场位置（集/场）、归属者（谁的），以及能与其它相似道具区分的关键辨识信息（如“第17集17-1首现 · 戴安娜画给爸爸的生日蛋糕画作，区别于第8集铁链门画”）；若同一道具存在不同形态/状态（如损毁前/损毁后、开启/闭合等），必须按形态/状态区分版本。\n   - 场景（locations）：必须写清首次出场位置、空间归属与核心视觉辨识特征；若同一场景同时存在日景和夜景（或明显不同的时间光影状态），必须分开为两个版本。\n   - 角色（characters）：必须写清首次出场位置、核心身份与人物关系辨识点（其他角色台词或 OS 独白中对该角色的背景介绍归入 description）；若同一角色存在不同服装/造型，必须按服装区分版本。\n2. 单版本与多版本规则：单一版本的资产直接在一级卡片展示完整识别描述，严禁使用二级条目；仅当存在两个及以上版本时，才通过 versions 数组记录并在二级列表展示（每个版本包含各自的 name 如“日景/夜景”、“常服/晚礼服”或“完整态/损毁态”、description 及对应属性）。\n【出处工具使用规范与主体归属准则】\n1. 主体归属原则（区分 description 与 provenances）：provenances（出场表现锚点）仅锚定该资产在登场场次中“以自身为表现主体”的原文句子——对于角色，仅限直接描写该角色自身动作/神态/外貌的镜头行（▲...）与该角色本人说出的台词/OS（该角色名：...），同一场内不同行的动作描写按行号逐条保留；其他角色的台词或 OS 独白（如“某某OS：他是...”），其发声主体是其他角色，哪怕被谈论的角色当时同场在场，也只用于提炼 description 背景设定，严禁放入 provenances。\n2. 阅读即锚定（免重复检索）：当你已通过 script.read 阅读了某集剧本正文时，在调用 asset.create、asset.update 或 asset.commitProvenance 时直接通过 provenances 字段传入带行号的具体出场原句（如 provenances: [{ sceneTitle: "第二集 2-1", lineNumber: 93, evidenceText: "▲布拉姆看到塞莱特斯，眼神平静又带着几分冷漠。" }]），严禁摘抄“人物：XXX”名单行或他人台词/OS。对已读并锚定的集数无需再次调用检索工具。\n3. 增量补充与全量重设（mode 参数）：当为已有资产补充新集数/新场次的出处时，调用 asset.commitProvenance 或 asset.update 默认均为 mode: "append"（增量追加合并），系统会自动保留第一集等原有集数的出处并去重排序，无需重传旧集数出处；仅当发现旧出处有误、需要清空并全量重设时，才显式传入 mode: "overwrite"。\n4. 跨集检索工具（asset.searchProvenanceCandidates）的正确用法：当需要排查未读集数的跨集出场时，可调用 asset.searchProvenanceCandidates（支持传 aliases 别名列表，以及 scopeScenes 限定检索范围）。注意该工具返回的 candidates 仅是字面匹配候选，你必须逐条阅读 contextSnippet 剔除他人台词/OS 提及或同名混淆条目，仅将确认以该资产自身为表现主体的 candidateId（或原文句子 provenances）提交给 asset.commitProvenance。' },
   image: { label: '图像生成与卡片', content: '禁止覆盖资产卡片或已出图卡片；重新生成应使用现有复刻机制。只有工具返回 generating 才能宣称生成已启动；默认使用 Hy Image3.5 preview，并提供简短卡片名称。' },
   ui: { label: '页面观察与操作', content: '仅在需要演示或检查页面时使用页面操作。page.inspect 只描述可见界面；ui.actAndObserve 只能操作已观察的目标。' },
 };
@@ -139,8 +139,14 @@ export function resolveContext(selection: AgentContextSelection | undefined, ena
   };
 }
 
-export function validateSelection(args: Record<string, unknown>, enabled: readonly string[]): AgentContextSelection {
-  if (args.level !== 0 && args.level !== 1) throw new Error('level 必须为 0 或 1。');
+export function validateSelection(
+  args: Record<string, unknown>,
+  enabled: readonly string[],
+  previousCategories: readonly string[] = []
+): AgentContextSelection {
+  if (args.level !== undefined && args.level !== 0 && args.level !== 1) {
+    throw new Error('level 必须为 0 或 1。');
+  }
   if (args.tools !== undefined && (!Array.isArray(args.tools) || !args.tools.every(item => typeof item === 'string'))) {
     throw new Error('tools 必须是工具 ID 数组。');
   }
@@ -195,7 +201,12 @@ export function validateSelection(args: Record<string, unknown>, enabled: readon
     explicitPrompts.push(normalizedPrompt);
   }
 
-  // 1. 已选定具体业务工具 ID -> 切入 1 级执行层（仅装载所选具体工具）
+  const rememberedCategories = previousCategories
+    .map(c => CATEGORY_ALIASES[String(c).trim().toLowerCase()])
+    .filter((c): c is string => Boolean(c && TOOL_CATEGORIES[c]));
+  const mergedCategories = [...new Set([...rememberedCategories, ...resolvedCategories])];
+
+  // 1. 已选定具体业务工具 ID -> 自动切入局部执行阶段（level: 1，仅装载所选具体工具，同时记忆已展开分类）
   if (resolvedTools.size > 0) {
     const finalTools = [...resolvedTools];
     const finalPrompts = [...new Set([...explicitPrompts, ...derivePromptsFromTools(finalTools)])];
@@ -203,31 +214,31 @@ export function validateSelection(args: Record<string, unknown>, enabled: readon
       level: 1,
       tools: finalTools,
       prompts: finalPrompts,
-      categories: [...resolvedCategories],
+      categories: mergedCategories,
     };
   }
 
-  // 2. 仅选择了工具分类 categories（未选具体 tools） -> 保持在 0 级工具选择阶段，展开对应分类下的候选工具简表供下一轮挑选
+  // 2. 仅选择了工具分类 categories（未选具体 tools） -> 保持在全局计划阶段（level: 0），展开对应分类下的候选工具简表供下一轮挑选
   if (resolvedCategories.size > 0) {
     return {
       level: 0,
       tools: [],
       prompts: explicitPrompts,
-      categories: [...resolvedCategories],
+      categories: mergedCategories,
     };
   }
 
-  // 3. 未传 categories 与 tools 且目标为 0 级 -> 从 1 级执行完毕返回 0 级验收层（卸载全部业务工具）
-  if (args.level === 0) {
+  // 3. 未传 categories 与 tools 且未显式强制 level: 1 -> 退出局部执行阶段，返回全局计划与验收阶段（卸载全部业务工具，保留已展开分类记忆）
+  if (args.level === undefined || args.level === 0) {
     return {
       level: 0,
       tools: [],
       prompts: explicitPrompts,
-      categories: [],
+      categories: rememberedCategories,
     };
   }
 
-  throw new Error('切入 1 级执行层必须通过 tools 指定具体工具 ID 数组（若尚未展开分类，请先传 categories 展开候选工具简表）。');
+  throw new Error('进入局部执行阶段必须通过 tools 指定具体工具 ID 数组（若尚未展开分类，请先传 categories 展开候选工具简表）。');
 }
 
 const OBSOLETE_GREETING_NOTE_RE = /尚未明确具体任务|尚未提供具体创作任务|处于需求引导阶段/;

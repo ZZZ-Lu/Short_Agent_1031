@@ -237,15 +237,26 @@ export class AgentRuntime {
             (call.name === 'sys.endTask' && typeof call.arguments?.waitForUser === 'string' && Boolean(call.arguments.waitForUser))
           )
         );
+        const isOnlySelectContext = Array.isArray(result.toolCalls) &&
+          result.toolCalls.length > 0 &&
+          result.toolCalls.every(call => !call.validationError && call.name === 'sys.selectContext');
 
         // The debug transport snapshot is for the developer trace only. It
         // must never become part of the next model request's history.
-        // Results are delivered once, except when pausing on user.ask where the
-        // data read in the preceding turn must remain visible once the user replies.
-        const preservedObservations = hasUserAskTool
+        // Results are delivered once, except when pausing on user.ask or switching
+        // stages/tools via sys.selectContext where the business data read in the
+        // preceding turn must remain visible for the subsequent execution/review turn.
+        const preservedObservations = (hasUserAskTool || isOnlySelectContext)
           ? task.observations.filter(obs => {
-              const name = (obs.content as any)?.name;
-              return name !== 'sys.nudge' && name !== 'user.ask';
+              const content = obs.content as any;
+              const name = content?.name;
+              if (name === 'sys.nudge' || name === 'user.ask' || name === 'sys.selectContext') {
+                return false;
+              }
+              if (isOnlySelectContext && content?.status !== 'succeeded') {
+                return false;
+              }
+              return true;
             })
           : [];
         task.observations = [...preservedObservations];
@@ -477,22 +488,31 @@ export class AgentRuntime {
     
     if (call.name === 'sys.selectContext') {
       try {
-        const selection = validateSelection(call.arguments, this.options.enabledTools?.() ?? []);
+        const prevCategories = task.requestedCategories?.length
+          ? task.requestedCategories
+          : (task.context?.categories ?? []);
+        const explicitlyExpandedCategories = Array.isArray(call.arguments?.categories) && call.arguments.categories.length > 0;
+        const selection = validateSelection(call.arguments, this.options.enabledTools?.() ?? [], prevCategories);
         task.context = selection;
         task.thinkingLevel = selection.level;
-        if (Array.isArray(selection.categories)) {
+        if (Array.isArray(selection.categories) && selection.categories.length > 0) {
           task.requestedCategories = selection.categories;
         }
         let statusSummary = '';
+        let transition: 'enter_execution' | 'expand_categories' | 'return_to_plan' = 'return_to_plan';
         if (selection.level === 1 && selection.tools.length > 0) {
-          statusSummary = `已切换至 1 级执行层并装载具体工具: ${selection.tools.join(', ')}`;
-        } else if (selection.level === 0 && selection.categories && selection.categories.length > 0) {
-          statusSummary = `已展开工具分类 [${selection.categories.join(', ')}] 的候选简表，请挑选具体工具填入 tools 切入 1 级`;
+          transition = 'enter_execution';
+          statusSummary = `已进入局部执行阶段并装载具体工具: ${selection.tools.join(', ')}`;
+        } else if (explicitlyExpandedCategories && selection.categories && selection.categories.length > 0) {
+          transition = 'expand_categories';
+          statusSummary = `已展开工具分类 [${selection.categories.join(', ')}] 的候选简表，请挑选具体工具填入 tools 进入局部执行阶段`;
         } else {
-          statusSummary = '已返回 0 级规划与验收层（业务工具已卸载，可核对全局计划并调用 sys.endTask 结束任务）';
+          transition = 'return_to_plan';
+          statusSummary = '已返回全局计划与验收阶段（局部执行工具已卸载，可核对全局计划并推进下一步或调用 sys.endTask 结束任务）';
         }
-        this.updateLastTool(task, call.id, 'succeeded', statusSummary, { output: selection });
-        task.observations.push({ role: 'tool', content: { callId: call.id, name: call.name, status: 'succeeded', output: selection } });
+        const obsOutput = { ...selection, transition };
+        this.updateLastTool(task, call.id, 'succeeded', statusSummary, { output: obsOutput });
+        task.observations.push({ role: 'tool', content: { callId: call.id, name: call.name, status: 'succeeded', output: obsOutput } });
       } catch (error) {
         const message = error instanceof Error ? error.message : '上下文选择失败';
         this.updateLastTool(task, call.id, 'failed', `失败：${call.name} · ${message}`, { error: message });
@@ -596,7 +616,7 @@ export class AgentRuntime {
 
     if (call.name === 'sys.endTask') {
       if ((task.context?.level ?? 0) === 1) {
-        const errMsg = '当前处于 1 级执行层，不可直接调用 sys.endTask 结束任务。请先调用 sys.selectContext({"level": 0}) 返回 0 级核验全局计划后，再调用 sys.endTask。';
+        const errMsg = '当前处于局部执行阶段，不可直接调用 sys.endTask 结束任务。请先调用 sys.selectContext 返回全局计划与验收阶段核对全局计划后，再调用 sys.endTask。';
         this.updateLastTool(task, call.id, 'failed', `失败：${call.name} · ${errMsg}`, { error: errMsg });
         task.history.push({ role: 'tool', content: { callId: call.id, name: call.name, status: 'failed', error: errMsg } });
         task.observations.push({ role: 'tool', content: { callId: call.id, name: call.name, status: 'failed', error: errMsg } });

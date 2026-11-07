@@ -915,26 +915,42 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
       const configuredToolIds = Array.isArray(enabledTools)
         ? enabledTools.filter((tool): tool is string => typeof tool === 'string' && allToolIds.has(tool))
         : AGENT_TOOL_REGISTRY.map((tool) => tool.id);
-      const rawContext = contextSelection && (contextSelection.level === 0 || contextSelection.level === 1) && (Array.isArray(contextSelection.tools) || Array.isArray(contextSelection.categories))
-        ? contextSelection as AgentContextSelection : initialAgentContext();
+      const savedCategories = Array.isArray(task?.requestedCategories) ? task.requestedCategories : [];
+      const rawContext: AgentContextSelection = contextSelection && (contextSelection.level === 0 || contextSelection.level === 1) && (Array.isArray(contextSelection.tools) || Array.isArray(contextSelection.categories))
+        ? {
+            ...(contextSelection as AgentContextSelection),
+            categories: Array.from(new Set([
+              ...savedCategories,
+              ...(Array.isArray(contextSelection.categories) ? contextSelection.categories : []),
+            ])),
+          }
+        : {
+            ...initialAgentContext(),
+            categories: savedCategories,
+          };
       const turnContext = resolveContext(rawContext, configuredToolIds);
       const enabledToolIds = new Set<string>(turnContext.tools);
       const isLevel1 = turnContext.level === 1;
       const controlToolLines = isLevel1
         ? [
-            `- sys.selectContext：切换思考层级或调整工具（1 级无法结束任务；当 1 级执行步骤完成后，必须调用 {"level": 0} 返回 0 级验收后才可调用 sys.endTask）。\n  参数：{ level: 0 | 1, categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[] }`,
+            `- sys.selectContext：退出局部执行并返回全局计划阶段（当本阶段“当前小目标”执行完毕后，直接无参调用 {{调用 sys.selectContext}} 返回全局计划与验收阶段；若需在执行中调整工具，可传 {"tools": [...]}）。\n  参数：{ categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[], level?: 0 | 1 }`,
             `- user.ask：向用户提问并挂起任务等待回复（问题直接写在【用户沟通】中，无需传参）。\n  参数：{ question?: string }`,
           ]
         : [
-            `- sys.selectContext：切换思考层级与装载工具。规则：① 需使用业务工具时，先传 {"level": 0, "categories": [...]} 展开对应分类下的候选工具简表；② 从候选简表中按需挑选具体工具 ID 传 {"level": 1, "tools": [...]} 切入 1 级执行；③ 1 级执行完毕返回 0 级后可调用 sys.endTask 结束任务。\n  参数：{ level: 0 | 1, categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[] }`,
+            `- sys.selectContext：按需展开工具分类或装载具体工具进入执行阶段。规则：① 需展开新工具分类时，传 {"categories": [...]} 展开对应分类下的候选工具简表；② 从已展开的候选简表中按当前小目标实际需要挑选具体工具 ID 传 {"tools": [...]} 进入局部执行阶段。\n  参数：{ categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[], level?: 0 | 1 }`,
             `- user.ask：向用户提问并挂起任务等待回复（问题直接写在【用户沟通】中，无需传参）。\n  参数：{ question?: string }`,
-            `- sys.endTask：结束当前任务（仅限 0 级调用，最终汇报直接写在【用户沟通】中；若需等待异步任务可设 paused: true）。\n  参数：{ success?: boolean, paused?: boolean }`,
+            `- sys.endTask：结束当前任务（仅限在全局计划与验收阶段调用，最终汇报直接写在【用户沟通】中；若需等待异步任务可设 paused: true）。\n  参数：{ success?: boolean, paused?: boolean }`,
           ];
       const injectedBusinessTools = AGENT_TOOL_REGISTRY
         .filter((tool) => enabledToolIds.has(tool.id) && !CONTROL_TOOLS.includes(tool.id))
         .map((tool) => `- ${tool.id}：${tool.description}\n  参数：${tool.input}`);
       const candidateToolLines = (turnContext.candidateTools || [])
         .map((tool) => `- ${tool.id}：${tool.summary}`);
+      const expandedCategorySet = new Set(turnContext.categories || []);
+      const unexpandedCategoryLines = Object.values(TOOL_CATEGORIES)
+        .filter(cat => !expandedCategorySet.has(cat.id) && cat.tools.some(t => configuredToolIds.includes(t)))
+        .map(cat => `- ${cat.id}（${cat.label}）：${cat.description}`)
+        .join('\n');
       const categoryLines = Object.values(TOOL_CATEGORIES)
         .filter(cat => cat.tools.some(t => configuredToolIds.includes(t)))
         .map(cat => `- ${cat.id}（${cat.label}）：${cat.description}`)
@@ -948,13 +964,20 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
         if (candidateToolLines.length > 0) {
           assembledToolSections.push(
             ``,
-            `## 已展开分类 [${turnContext.categories.join(', ')}] 的候选工具简表（请按当前任务实际需要挑选具体工具 ID 填入 tools，调用 sys.selectContext({"level": 1, "tools": [...]}) 切入 1 级执行）`,
+            `## 已展开分类 [${turnContext.categories.join(', ')}] 的候选工具简表（若需进入下一阶段局部执行，可直接从下方挑选具体工具 ID 填入 tools，调用 sys.selectContext({"tools": [...]}) 进入执行阶段；若当前聚焦目标已明确某类资产数量为 0，无需重复挑选列表查询工具）`,
             ...candidateToolLines,
           );
+          if (unexpandedCategoryLines) {
+            assembledToolSections.push(
+              ``,
+              `## 其它尚未展开的工具分类（如需使用其它分类的工具，可传 {"categories": [...]} 补充展开）`,
+              unexpandedCategoryLines,
+            );
+          }
         } else {
           assembledToolSections.push(
             ``,
-            `## 可装载的工具分类（需调用业务工具时，先调用 sys.selectContext({"level": 0, "categories": [...]}) 展开对应分类下的候选工具简表）`,
+            `## 可装载的工具分类（需调用业务工具时，先调用 sys.selectContext({"categories": [...]}) 展开对应分类下的候选工具简表）`,
             categoryLines || '无',
           );
         }
@@ -1073,18 +1096,24 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
             if (name === 'sys.nudge') {
               return;
             }
-            // sys.selectContext 成功时输出单行简明确认，明确区分“展开分类候选简表”、“切入1级装载具体工具”与“返回0级验收”三种状态
+            // sys.selectContext 成功时输出单行简明确认，明确区分“展开分类候选简表”、“进入局部执行阶段”与“返回全局计划与验收阶段”三种状态
             if (name === 'sys.selectContext' && status === 'succeeded') {
               const selOut = (output && typeof output === 'object') ? (output as any) : {};
               const level = selOut.level ?? 0;
               const tools = Array.isArray(selOut.tools) ? selOut.tools : [];
               const cats = Array.isArray(selOut.categories) ? selOut.categories : [];
-              if (level === 1 && tools.length > 0) {
-                toolObs.push(`【工具 sys.selectContext 执行成功】已切换至 1 级执行层，已精确装载工具：${tools.join(', ')}`);
+              const transition = selOut.transition;
+              if (transition === 'enter_execution' || (level === 1 && tools.length > 0)) {
+                toolObs.push(`【工具 sys.selectContext 执行成功】已进入局部执行阶段，当前已装载工具：${tools.join(', ')}`);
+              } else if (transition === 'expand_categories') {
+                toolObs.push(`【工具 sys.selectContext 执行成功】已展开工具分类 [${cats.join(', ')}] 的候选工具简表（请从上方候选简表中按需挑选本次执行所需的具体工具 ID 填入 tools，调用 sys.selectContext({"tools": [...]}) 进入局部执行阶段）`);
+              } else if (transition === 'return_to_plan') {
+                const rememberedHint = cats.length > 0 ? `；此前已展开分类 [${cats.join(', ')}] 的候选工具简表已在上方就绪，如需进入下一阶段执行可直接从中挑选 tools` : '';
+                toolObs.push(`【工具 sys.selectContext 执行成功】已返回全局计划与验收阶段（局部执行工具已卸载${rememberedHint}；若所有目标已全部完成，请调用 sys.endTask 结束任务）`);
               } else if (level === 0 && cats.length > 0 && tools.length === 0) {
-                toolObs.push(`【工具 sys.selectContext 执行成功】已展开工具分类 [${cats.join(', ')}] 的候选工具简表（当前处于 0 级，请从上方候选简表中挑选本次任务真正需要的具体工具 ID 填入 tools，并调用 sys.selectContext({"level": 1, "tools": [...]}) 切入 1 级执行）`);
+                toolObs.push(`【工具 sys.selectContext 执行成功】已展开工具分类 [${cats.join(', ')}] 的候选工具简表（请从上方候选简表中按需挑选本次执行所需的具体工具 ID 填入 tools，调用 sys.selectContext({"tools": [...]}) 进入局部执行阶段）`);
               } else {
-                toolObs.push(`【工具 sys.selectContext 执行成功】已返回 0 级规划与验收层（业务工具已卸载，请核对全局计划与执行结果，确认全部完成后调用 sys.endTask 结束任务）`);
+                toolObs.push(`【工具 sys.selectContext 执行成功】已返回全局计划与验收阶段（局部执行工具已卸载，请核对全局计划与上一阶段结果，确认全部完成后调用 sys.endTask 结束任务）`);
               }
               return;
             }
@@ -1100,6 +1129,14 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
               pageObs.push(`【UI交互成功】动作 ${output.action} 作用于 ${output.targetId}。\n${pageText}`);
             } else if (name === 'guide.lookup') {
               toolObs.push(`【操作指南查询结果】\n查询词：${output.query || '未提供'}\n指南内容：${output.guidance}`);
+            } else if (name === 'script.read' && output && typeof output === 'object' && typeof (output as any).content === 'string') {
+              const readOut = output as any;
+              const baseOffset = typeof readOut.offset === 'number' && Number.isFinite(readOut.offset) ? Math.max(0, Math.floor(readOut.offset)) : 0;
+              const rawLines = String(readOut.content).split('\n');
+              const numberedText = rawLines.map((line: string, idx: number) => `[第${baseOffset + idx + 1}行] ${line}`).join('\n');
+              const startLineNum = baseOffset + 1;
+              const endLineNum = baseOffset + rawLines.length;
+              toolObs.push(`【工具 script.read 执行成功】（总行数: ${readOut.total ?? '未知'} | 当前显示: 第 ${startLineNum}～${endLineNum} 行 | nextOffset: ${readOut.nextOffset ?? 'null'}）\n${numberedText}`);
             } else if (name === 'user.ask') {
               // 当 # 用户指令 已通过 negotiationLog 完整呈现多轮对话与最新回复时，不在 # 工具执行结果 中重复输出 user.ask
               if (hasMultiTurnDialogue) {
@@ -1195,45 +1232,80 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       const hasToolResults = Boolean(formattedObs.toolResults && formattedObs.toolResults.trim() && formattedObs.toolResults.trim() !== '无');
       const hasPageObs = Boolean(formattedObs.pageObservations && formattedObs.pageObservations.trim() && formattedObs.pageObservations.trim() !== '无');
 
-      const promptSections: string[] = [
-        `# 背景`,
-        `你位于一个短剧协作平台中，负责协助用户从剧本到生图到视频的流程，你的名字是“Mira”`,
-        ``,
-        `# 用户指令`,
-        `## 当前聚焦目标`,
-        cardContextInjection || '无',
-        `## 用户输入原文`,
-        displayUserMessage,
-        ``,
-        `# 工作指南`,
-        `默认优先使用后台工具读取项目数据并执行任务；需要演示或核验界面时使用 UI。基于工具返回的事实验证推进，严禁把未执行视为成功。`,
-        `0 级负责宏观规划、分步选择工具（先传 categories 展开候选简表，再传 tools 装载具体工具切入 1 级）与终局验收结案；1 级仅负责局部细化执行且无法调用 sys.endTask，执行完毕后必须调用 sys.selectContext({"level": 0}) 回到 0 级才能结束任务。`,
-        `称用户为“你”，口吻亲和随意；遇需用户决策或信息补充的事项，在用户沟通中明确说明。`,
-        `严谨求证，聚焦当前核心目标，根据工具结果动态更新计划与笔记。`,
-        `工具调用统一采用标准 JSON 参数格式：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）。`,
-        `# 输出格式`,
-        `状态检查：`,
-        `{回顾并检查上面的“认知状态”。`,
-        `- 最终目标是什么？`,
-        `- 当前小目标是什么？`,
-        `- 小目标是否解决？`,
-        `- 不用思考，靠直觉回答你当前的注意力焦点是什么？`,
-        `- 小目标是否调整？`,
-        `- 当前已装载的工具或页面中可能和小目标有关的组件是什么？`,
-        `- 是否需要切换思考层级/装载其它工具，或跳转其它页面/组件获取更多信息？`,
-        `- 当前进度是否需要更新？`,
-        `- 是否需要调整计划？`,
-        `- 是否在“工具执行结果”或“页面观察”中发现了需要记录到“重点笔记”中的线索或信息？}`,
-        `思考：`,
-        `{你应该使用内心独白的方式，基于当前工具执行结果或页面观察进行下一步操作的逻辑推演。如果需要，请调用工具，系统会自动执行你的操作。}`,
-        `工具调用：`,
-        `{{调用 工具名称, {"参数名": "参数值"}}}`,
-        `用户沟通：`,
-        `{`,
-        `- 对用户说的话（完整版）：“如果需要，此处插入完整的描述，但也要尽可能简洁，注意，调用了工具不等于完成任务，要等工具返回结果并检查”`,
-        `- 对用户说的话（简版）：“插入对用户说的话，介绍当前任务状态、汇报结果或向用户提问。需要用户回复时直接在此简版提问并调用 user.ask 挂起等待，无需在工具调用中重复回复，口语化，控制在30字以内”`,
-        `}`,
-      ];
+      const promptSections: string[] = isLevel1
+        ? [
+            `# 背景`,
+            `你位于一个短剧协作平台中，负责协助用户从剧本到生图到视频的流程，你的名字是“Mira”。`,
+            `当前你处于【局部执行阶段】，你的核心职责是：调用已装载的业务工具，专注解决“当前小目标”，并在完成后返回全局计划阶段。`,
+            ``,
+            `# 用户指令`,
+            `## 当前聚焦目标`,
+            cardContextInjection || '无',
+            `## 用户输入原文`,
+            displayUserMessage,
+            ``,
+            `# 工作指南`,
+            `基于工具返回的事实验证推进，严禁把未执行视为成功。`,
+            `读取剧本或项目数据后，严格遵循“主体归属原则”区分资产设定简介（description）与出场表现锚点（provenances）：其他角色台词或 OS 独白中提及的背景信息归入 description；仅将以目标资产自身为表现主体的画面动作/外貌描写行（▲...）及该角色本人说出的台词行（角色名：...）逐条带行号整理到状态检查中，作为 provenances 锚点（同一场内不同行的相似动作描写须按行号逐条保留，不可合并遗漏）。`,
+            `当写入或修改工具（如 asset.create、asset.update）已返回完整创建结果与校验状态时，即为执行并核验成功，无需再次调用列表工具重复查询。`,
+            `当“当前小目标”对应的读写操作均已完成后，调用 {{调用 sys.selectContext}} 退出当前执行阶段，返回全局计划阶段进行整体验收。`,
+            `称用户为“你”，口吻亲和随意；工具调用统一采用标准 JSON 参数格式：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）。`,
+            `# 输出格式`,
+            `状态检查：`,
+            `{回顾并检查上面的“认知状态”与本轮“工具执行结果”。`,
+            `- 当前正在执行的“当前小目标”是什么？`,
+            `- 本轮工具返回了哪些具体结果？基于这些结果，当前小目标是否已经彻底解决？`,
+            `- 如果尚未解决，当前已装载的工具中下一步该直接调用哪个工具完成什么操作？（若发现缺少某工具，可调用 sys.selectContext 补充装载或退回计划阶段选配）`,
+            `- 如果当前小目标已经解决，准备调用 sys.selectContext 退出执行并返回全局计划阶段。`,
+            `- 当前进度需要更新为什么？`,
+            `- 本轮在“工具执行结果”或“页面观察”中发现了哪些需要记录到“重点笔记”中的具体事实、ID，或以目标资产自身为主体的“▲动作/状态描写”与“本人台词”原句（含对应行号，排除他人台词/OS）？请在此逐条带行号明确列出。}`,
+            `思考：`,
+            `{使用内心独白的方式，基于当前工具执行结果进行下一步具体操作的逻辑推演。若读取了剧本准备创建或更新资产，在此按行号核对即将传入的 description（含他人介绍的背景）与 provenances（仅限以自身为主体的 ▲ 动作描写与本人台词）；若当前小目标已完成，准备退出执行阶段返回全局计划。}`,
+            `工具调用：`,
+            `{{调用 工具名称, {"参数名": "参数值"}}}`,
+            `用户沟通：`,
+            `{`,
+            `- 对用户说的话（完整版）：“如果需要，此处插入完整的描述，但也要尽可能简洁，注意，调用了工具不等于完成任务，要等工具返回结果并检查”`,
+            `- 对用户说的话（简版）：“插入对用户说的话，介绍当前执行进展或向用户提问。需要用户回复时直接在此简版提问并调用 user.ask 挂起等待，无需在工具调用中重复回复，口语化，控制在30字以内”`,
+            `}`,
+          ]
+        : [
+            `# 背景`,
+            `你位于一个短剧协作平台中，负责协助用户从剧本到生图到视频的流程，你的名字是“Mira”。`,
+            `当前你处于【全局计划与验收阶段】，你的核心职责是：理解并锚定最终目标、审视全局计划、验收上一阶段成果、设定下一步小目标并按需挑选工具进入执行，或在全部目标达成后结束任务。`,
+            ``,
+            `# 用户指令`,
+            `## 当前聚焦目标`,
+            cardContextInjection || '无',
+            `## 用户输入原文`,
+            displayUserMessage,
+            ``,
+            `# 工作指南`,
+            `默认优先使用后台工具读取项目数据并执行任务；需要演示或核验界面时使用 UI。基于工具返回的事实验证推进，严禁把未执行视为成功。`,
+            `若需调用业务工具推进下一步小目标，按两步准备工具：① 先传 {"categories": [...]} 展开对应分类下的候选工具简表；② 从候选简表中按需挑选本次真正需要的具体工具 ID 传 {"tools": [...]} 进入执行阶段（若“当前聚焦目标”已明确说明某类资产数量为 0，则无需重复挑选列表查询工具）。`,
+            `若刚从执行阶段返回，请对照“最终目标”与“当前计划”核验工具执行结果；确认所有读写目标均已真实达成后，调用 sys.endTask 结束任务并向用户完整汇报。`,
+            `称用户为“你”，口吻亲和随意；遇需用户决策或信息补充的事项，在用户沟通中明确说明。`,
+            `工具调用统一采用标准 JSON 参数格式：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）。`,
+            `# 输出格式`,
+            `状态检查：`,
+            `{回顾并检查上面的“认知状态”。`,
+            `- 最终目标是什么？（若上方认知状态中最终目标为“暂无”，请结合“当前聚焦目标”与“用户输入原文”总结归纳出完整的最终目标）`,
+            `- 对照“当前计划”与“工具执行结果”，上一阶段的小目标是否已经解决？整体计划有哪些步骤已完成、哪些待推进？`,
+            `- 最终目标的所有要求（包含读取、提取、写入或修改面板等）是否已经全部达成？`,
+            `- 如果全部达成，准备调用 sys.endTask 结束任务；如果尚未全部达成，下一步的“当前小目标”应该设定为什么？`,
+            `- 为完成下一步小目标，需要先展开哪些工具分类（categories），或从上方已展开的候选简表中挑选哪些具体工具（tools）进入执行？（注意剔除当前上下文已知无需调用的工具）`,
+            `- 当前进度与当前计划是否需要更新？`,
+            `- 是否有新的关键结论或验收信息需要补充到“重点笔记”中？}`,
+            `思考：`,
+            `{使用内心独白的方式，围绕全局目标、计划推进与工具准备进行逻辑推演。如果需要展开分类、装载工具进入执行或结束任务，请调用对应工具，系统会自动执行你的操作。}`,
+            `工具调用：`,
+            `{{调用 工具名称, {"参数名": "参数值"}}}`,
+            `用户沟通：`,
+            `{`,
+            `- 对用户说的话（完整版）：“如果需要，此处插入完整的描述，但也要尽可能简洁，注意，调用了工具不等于完成任务，要等工具返回结果并检查”`,
+            `- 对用户说的话（简版）：“插入对用户说的话，介绍当前任务状态、汇报结果或向用户提问。需要用户回复时直接在此简版提问并调用 user.ask 挂起等待，无需在工具调用中重复回复，口语化，控制在30字以内”`,
+            `}`,
+          ];
 
       const dedupedNotes = task?.notes ? mergeTaskNotes(undefined, task.notes, 'overwrite') : '';
       promptSections.push(
@@ -1262,7 +1334,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
 
       if (effectiveRequireTool) {
         if (isLevel1) {
-          finalPrompt += `\n\n【⚠️ 系统重要提示：本轮必须调用工具】上一轮未检测到任何 {{调用 ...}} 工具指令。当前处于 1 级执行层（不可直接调用 sys.endTask），请在【状态检查】与【思考】后，直接输出具体的业务工具调用指令推进执行；若 1 级执行步骤已全部完成，请调用 {{调用 sys.selectContext, {"level": 0}}} 返回 0 级验收后再结束任务。严禁遗漏工具调用！\n`;
+          finalPrompt += `\n\n【⚠️ 系统重要提示：本轮必须调用工具】上一轮未检测到任何 {{调用 ...}} 工具指令。当前处于【局部执行阶段】，请在【状态检查】与【思考】后，直接输出具体的业务工具调用指令推进“当前小目标”；若本阶段小目标已执行完毕，请调用 {{调用 sys.selectContext}} 返回全局计划阶段验收后再结束任务。严禁遗漏工具调用！\n`;
         } else {
           finalPrompt += `\n\n【⚠️ 系统重要提示：本轮必须调用工具】上一轮未检测到任何 {{调用 ...}} 工具指令，当前任务尚未结束。请在【状态检查】与【思考】后，务必直接输出具体的 {{调用 工具名, {参数}}} 指令推进任务。若所有目标已确实完成，请显式调用 {{调用 sys.endTask}}，结束汇报直接写在【用户沟通】中。严禁在【思考】后遗漏工具调用！\n`;
         }
@@ -1665,21 +1737,26 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
           if (typeof argsObj.prompts === 'string') {
             argsObj.prompts = argsObj.prompts.split(/[,，\s]+/).map((s: string) => s.trim()).filter(Boolean);
           }
-          if (argsObj.level !== 0 && argsObj.level !== 1) {
-            schemaError = '【参数校验错误】sys.selectContext 必需参数 "level" 必须为数字 0（全局规划）或 1（局部执行）。';
+          if (argsObj.level !== undefined && argsObj.level !== 0 && argsObj.level !== 1) {
+            schemaError = '【参数校验错误】sys.selectContext 参数 "level" 若提供则必须为 0（全局计划阶段）或 1（局部执行阶段）。';
           } else if (argsObj.categories !== undefined && !Array.isArray(argsObj.categories)) {
             schemaError = '【参数校验错误】sys.selectContext 参数 "categories" 必须为字符串数组，如 ["script", "asset"]。';
           } else if (argsObj.tools !== undefined && !Array.isArray(argsObj.tools)) {
             schemaError = '【参数校验错误】sys.selectContext 参数 "tools" 必须为字符串数组。';
           } else if (argsObj.prompts !== undefined && !Array.isArray(argsObj.prompts)) {
             schemaError = '【参数校验错误】sys.selectContext 参数 "prompts" 必须为提示词模块字符串数组。';
-          } else if (argsObj.categories === undefined && argsObj.tools === undefined) {
-            argsObj.categories = [];
-            argsObj.tools = [];
+          } else {
+            if (argsObj.categories === undefined && argsObj.tools === undefined) {
+              argsObj.categories = [];
+              argsObj.tools = [];
+            }
+            if (argsObj.level === undefined) {
+              argsObj.level = (Array.isArray(argsObj.tools) && argsObj.tools.length > 0) ? 1 : 0;
+            }
           }
         } else if (normalizedName === 'sys.endTask') {
           if (isLevel1) {
-            schemaError = '【层级权限拦截】当前处于 1 级执行层，不可直接调用 sys.endTask 结束任务。请先调用 sys.selectContext({"level": 0}) 返回 0 级核验全局计划后，再调用 sys.endTask。';
+            schemaError = '【阶段权限拦截】当前处于局部执行阶段，不可直接调用 sys.endTask 结束任务。请先调用 {{调用 sys.selectContext}} 返回全局计划与验收阶段核对全局计划后，再调用 sys.endTask。';
           }
           delete argsObj.finalResponse;
           if (argsObj.success === undefined) {
@@ -1815,6 +1892,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
 - 重点笔记: {{taskNotes}}
 
 【本轮最新输入与主循环输出】
+- 本轮所处阶段: {{currentStage}}
 - 用户指令/回复: {{userMessage}}
 - Agent 主循环输出:
 {{lastTurnOutput}}
@@ -1825,12 +1903,12 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
   "stateCheck": "一句话核对本轮增量：上一步小目标是否已解决？本轮主循环在状态检查中提出了哪些进度/计划调整？发现了哪些需要并入重点笔记的新线索？",
   "taskTitle": "8字以内的任务简短标题（已有明确标题时保持不变）",
   "goal": "根据主循环在状态检查与思考中总结归纳出的最终目标（若处于多轮对话补充阶段，保留并融合已有最终目标）",
-  "subGoal": "更新后的当前小目标（对应主循环状态检查中确认的当前/下一步小目标）",
+  "subGoal": "更新后的当前小目标（对应主循环状态检查中确认的下一步小目标；若本轮刚从局部执行阶段调用 sys.selectContext 返回全局计划阶段，则设为‘全局核验上一阶段执行结果并推进下一步或结案’）",
   "progress": "更新后的当前进度（合并已完成事项与当前正在推进的事项）",
   "plan": [
     {"id": "1", "title": "计划步骤标题", "status": "completed | pending"}
   ],
-  "notes": "合并整理后的重点笔记：将【上一轮重点笔记】与主循环本轮在【状态检查/思考/沟通】中发现的新线索合并；保留主循环已列出的具体数据、ID、行号或原文引文（主循环写了什么就保留什么，未提及的内容不做扩写），剔除已过时的过程状态与重复项",
+  "notes": "合并整理后的重点笔记：完整保留【上一轮重点笔记】中已记录的所有具体事实、资产ID、行号与原文原句（即使本轮是阶段切换轮、未重复提及这些原句，也严禁删减或将不同行的相似原句合并），在此基础上并入主循环本轮新发现的线索，仅剔除‘准备读取/待核对’等已过时的过程状态描述",
   "notesMode": "overwrite"
 }`;
 
@@ -1841,6 +1919,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         !statePromptTemplate ||
         !statePromptTemplate.trim() ||
         !statePromptTemplate.includes('根据主循环在状态检查与思考中总结归纳出的最终目标') ||
+        !statePromptTemplate.includes('即使本轮是阶段切换轮') ||
         statePromptTemplate.includes('必须在 notes 中原样保留')
       ) {
         statePromptTemplate = defaultDeltaMergeStatePrompt;
@@ -1868,6 +1947,10 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         formattedLastTurnOutput = '无';
       }
 
+      const currentStageLabel = currentTask?.thinkingLevel === 1
+        ? '局部执行阶段'
+        : '全局计划与验收阶段';
+
       const prompt = statePromptTemplate
         .replace('{{taskTitle}}', currentTask?.title || '尚未命名')
         .replace('{{taskGoal}}', (typeof currentTask?.goal === 'string' && currentTask.goal.trim()) ? currentTask.goal.trim() : '暂无')
@@ -1875,6 +1958,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         .replace('{{taskProgress}}', currentTask?.progress || '刚刚开始')
         .replace('{{taskPlan}}', JSON.stringify(currentTask?.plan || []))
         .replace('{{taskNotes}}', currentTask?.notes || '暂无笔记')
+        .replace('{{currentStage}}', currentStageLabel)
         .replace('{{userMessage}}', userMessage || '（无新指令）')
         .replace('{{lastTurnOutput}}', formattedLastTurnOutput);
 

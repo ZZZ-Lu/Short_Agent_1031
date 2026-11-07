@@ -6816,6 +6816,7 @@ export default function App() {
                     progress: task.progress,
                     plan: task.plan,
                     notes: task.notes,
+                    thinkingLevel: task.context?.level ?? task.thinkingLevel ?? 0,
                   },
                   userMessage: stateNodeUserMessage,
                   lastTurnOutput: {

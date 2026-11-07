@@ -71,6 +71,33 @@ test('两步漏斗：0级选categories先展开候选工具简表，再传具体
   const resolvedStep2 = resolveContext(step2, enabled);
   assert.equal(resolvedStep2.level, 1);
   assert.deepEqual(resolvedStep2.tools, ['sys.selectContext', 'script.directory', 'script.read', 'asset.create', 'user.ask']);
+
+  // 自然阶段流转（省略 level 参数）：传 categories 保持 0 级，传 tools 自动进入 1 级执行，无参调用自动退回 0 级计划阶段
+  const autoExpand = validateSelection({ categories: ['script'] }, enabled);
+  assert.equal(autoExpand.level, 0);
+  assert.deepEqual(autoExpand.categories, ['script']);
+
+  const autoExecute = validateSelection({ tools: ['script.read'] }, enabled);
+  assert.equal(autoExecute.level, 1);
+  assert.deepEqual(autoExecute.tools, ['script.read']);
+
+  const autoExit = validateSelection({}, enabled);
+  assert.equal(autoExit.level, 0);
+  assert.deepEqual(autoExit.tools, []);
+
+  // 工具箱展开记忆机制：传入已展开分类 previousCategories 时，进出局部执行阶段后自动保留已展开分类及候选工具简表
+  const enterExecWithMemory = validateSelection({ tools: ['script.read'] }, enabled, ['script', 'asset']);
+  assert.equal(enterExecWithMemory.level, 1);
+  assert.deepEqual(enterExecWithMemory.categories, ['script', 'asset']);
+
+  const exitExecWithMemory = validateSelection({}, enabled, enterExecWithMemory.categories);
+  assert.equal(exitExecWithMemory.level, 0);
+  assert.deepEqual(exitExecWithMemory.categories, ['script', 'asset']);
+  const resolvedAfterExit = resolveContext(exitExecWithMemory, enabled);
+  assert.deepEqual(
+    resolvedAfterExit.candidateTools.map(t => t.id),
+    ['script.directory', 'script.read', 'script.search', 'asset.create', 'asset.delete']
+  );
 });
 
 test('mergeTaskNotes 按行去重并在进入具体任务后剔除开场占位笔记', () => {

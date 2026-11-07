@@ -70,7 +70,7 @@ export const parseScriptEpisodes = (
         locationName: sc.locationName,
         characterNames: sc.characterNames,
         startLine: sc.startLine ?? epStartLine,
-        endLine: sc.endLine ?? endLine,
+        endLine: Math.min(sc.endLine ?? endLine, endLine),
       }));
 
     return {

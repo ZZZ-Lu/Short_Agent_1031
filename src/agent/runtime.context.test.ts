@@ -200,10 +200,10 @@ test('updateStateNode 在本轮工具（如 sys.selectContext）执行完成后�
       if (task.turn === 4) {
         assert.equal(task.context.level, 1);
         assert.equal((task.observations[0].content as any).status, 'failed');
-        assert.ok(String((task.observations[0].content as any).error).includes('1 级执行层，不可直接调用 sys.endTask'));
+        assert.ok(String((task.observations[0].content as any).error).includes('局部执行阶段，不可直接调用 sys.endTask'));
         return {
-          narration: ['第4轮：调用 sys.selectContext 返回 0 级'],
-          toolCalls: [{ id: 'back_0', name: 'sys.selectContext', arguments: { level: 0 } }],
+          narration: ['第4轮：无参调用 sys.selectContext 返回全局计划阶段'],
+          toolCalls: [{ id: 'back_0', name: 'sys.selectContext', arguments: {} }],
           complete: false,
         };
       }
@@ -236,5 +236,95 @@ test('updateStateNode 在本轮工具（如 sys.selectContext）执行完成后�
   assert.deepEqual(seenInStateNode[2], { turn: 3, level: 1, toolStatus: 'failed' });
   assert.deepEqual(seenInStateNode[3], { turn: 4, level: 0, toolStatus: 'succeeded' });
 });
+
+test('跨阶段观察保持与工具箱展开记忆：调用 sys.selectContext 切换阶段时保留上一阶段读取的业务数据与已展开分类', async () => {
+  const runtime = new AgentRuntime({
+    enabledTools: () => ['script.read', 'asset.create', 'sys.endTask', 'user.ask'],
+    requestTurn: async task => {
+      if (task.turn === 1) {
+        return {
+          narration: ['展开 script 和 asset 分类'],
+          toolCalls: [{ id: 'c1', name: 'sys.selectContext', arguments: { categories: ['script', 'asset'] } }],
+          complete: false,
+        };
+      }
+      if (task.turn === 2) {
+        assert.deepEqual(task.context.categories, ['script', 'asset']);
+        return {
+          narration: ['先装载 script.read 进入执行阶段读取剧本'],
+          toolCalls: [{ id: 'c2', name: 'sys.selectContext', arguments: { tools: ['script.read'] } }],
+          complete: false,
+        };
+      }
+      if (task.turn === 3) {
+        assert.equal(task.context.level, 1);
+        return {
+          narration: ['调用 script.read 读取第一集'],
+          toolCalls: [{ id: 'c3', name: 'script.read', arguments: { offset: 52, limit: 35 } }],
+          complete: false,
+        };
+      }
+      if (task.turn === 4) {
+        // 第4轮看到 script.read 结果后，退出局部执行返回计划阶段准备切换 asset.create
+        assert.equal(task.observations.some(o => (o.content as any).name === 'script.read'), true);
+        return {
+          narration: ['读取完毕，返回计划阶段切换 asset.create'],
+          toolCalls: [{ id: 'c4', name: 'sys.selectContext', arguments: {} }],
+          complete: false,
+        };
+      }
+      if (task.turn === 5) {
+        // 关键验证1：返回全局计划阶段后，第1轮展开的 ['script', 'asset'] 分类依然保留，无需再次展开分类！
+        assert.equal(task.context.level, 0);
+        assert.deepEqual(task.context.categories, ['script', 'asset']);
+        // 关键验证2：第3轮读取的 script.read 观察结果在跨阶段切换后依然保留！
+        assert.equal(task.observations.some(o => (o.content as any).name === 'script.read'), true);
+        return {
+          narration: ['直接从已展开的候选简表装载 asset.create 进入执行阶段'],
+          toolCalls: [{ id: 'c5', name: 'sys.selectContext', arguments: { tools: ['asset.create'] } }],
+          complete: false,
+        };
+      }
+      if (task.turn === 6) {
+        // 关键验证3：进入 asset.create 执行阶段时，script.read 的原文观察结果依然在当前视野中，无需盲写！
+        assert.equal(task.context.level, 1);
+        assert.equal(task.observations.some(o => (o.content as any).name === 'script.read'), true);
+        return {
+          narration: ['对照原文直接调用 asset.create'],
+          toolCalls: [{ id: 'c6', name: 'asset.create', arguments: { type: 'characters', name: '布拉姆' } }],
+          complete: false,
+        };
+      }
+      if (task.turn === 7) {
+        // 调用业务工具 asset.create 后，旧的 script.read 已被消费替换，当前观察为 asset.create
+        const obsNames = task.observations.map(o => (o.content as any).name);
+        assert.deepEqual(obsNames, ['asset.create']);
+        return {
+          narration: ['创建完成，返回全局计划阶段'],
+          toolCalls: [{ id: 'c7', name: 'sys.selectContext', arguments: {} }],
+          complete: false,
+        };
+      }
+      // 第8轮全局计划阶段依然能直接看到 asset.create 的执行结果并结案
+      assert.equal(task.observations.some(o => (o.content as any).name === 'asset.create'), true);
+      return {
+        narration: ['全局验收通过，结案'],
+        toolCalls: [{ id: 'c8', name: 'sys.endTask', arguments: { success: true } }],
+        complete: false,
+      };
+    },
+    executeTool: async call => {
+      if (call.name === 'script.read') return { offset: 52, total: 100, content: '▲布拉姆打量着娜塔莉亚。' };
+      if (call.name === 'asset.create') return { success: true, createdCount: 1 };
+      return { ok: true };
+    },
+  });
+
+  const task = runtime.createTask({ id: 'task_cross_stage', sessionId: 'proj_1', goal: '提取角色布拉姆' });
+  const finished = await runtime.wake(task.id);
+  assert.equal(finished.status, 'completed');
+  assert.equal(finished.turn, 8);
+});
+
 
 
