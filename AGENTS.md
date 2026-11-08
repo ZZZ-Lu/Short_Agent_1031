@@ -17,6 +17,23 @@ Agent 默认通过后台工具按需读取当前项目数据、操作和生成�
 
 Agent 自主选择工具，Runtime 不按任务标题编排固定步骤，也不要求所有任务执行鼠标动作。工具结果和错误进入任务记录。详细原则见 docs/agent/06-backend-first.md。
 
+## 🧠 Mira Agent 认知可靠性与全链路状态同步规范 (Cognitive Reliability & State Sync)
+
+新增或修改任何 Agent 工具、上下文注入、状态节点或提示词时，必须严格遵守以下五项系统设计准则（完整规范见 `docs/agent/11-agent-cognitive-reliability-and-sync-spec.md`）：
+
+1. **机制优先于补丁（数据结构防漏）**：
+   - 凡是返回列表/数组的读取或搜索工具，必须在每项顶层提供 `1-based` 连续序号 `index: 1..N` 与顶层 `total`，消除模型在离散行号/ID 上的跳号漏检。
+   - 凡涉及行号、页码、范围的工具契约，全局统一为 `1-based` 闭区间语义，并在工具层原生支持范围过滤参数（如 `episode`、`scene`、`startLine/endLine`）。
+2. **指针化与全链路对称同步（杜绝认知分裂）**：
+   - 区分“不可变意图快照”（用户初始指令、划词片段）与“可变环境真值”（聚焦面板计数、聚焦资产属性、聚焦卡片 `prompt`/`landmarks`/`lineage`）。可变真值以 `targetId` 指针为准，通过纯函数 `refreshTaskCardContext` 从唯一数据源实时派生。
+   - 遵循**“写后即刷 + 读前必刷”**：Mutation 工具落盘后立即刷新 `task.cardContext`；主循环（`requestTurn`）、认知状态节点（`updateStateNode`）、UI 任务面板（`onTaskChange`）和追踪快照（`RuntimeTrace`）必须对称接收同一份最新上下文与工具执行摘要。
+3. **正向单一判准与信息分流**：
+   - Prompt 中只写正向操作步骤与唯一判定标准，不堆砌负面禁令清单；为被过滤但有价值的背景信息（如他人台词/OS 提及）提供明确的字段分流出口（归入 `description` 而非 `provenances`）。
+4. **分层认知与确定性阶段注入**：
+   - 0 级全局规划（`systemPrompt.txt`）与 1 级局部执行（`systemPromptExecution.txt` + 按需挂载的领域指南）严格解耦；`stateNode` 依靠 Runtime 注入的确定性 `currentStage` 判断阶段去向。
+5. **证据链驱动与最短路径基准验证**：
+   - 新能力不仅要验证结果正确，还必须通过 `trace.md` 验证连续多次运行稳定收敛在“理论最短轮次（0 冗余重查、0 状态折返）”。
+
 ## 🚀 性能优化圣经：意图驱动懒恢复 (Intent-Driven Lazy Restoration)
 
 在处理类似“无限画布（Infinite Canvas）”这种包含大量 DOM 节点和重度 CSS 特效（如 `box-shadow`, `backdrop-filter`）的场景时，GPU 的栅格化（Rasterization）和过渡动画（Transition）往往是导致缩放和拖拽卡顿的根本原因。

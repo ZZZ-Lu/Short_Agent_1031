@@ -70,8 +70,8 @@ const CATEGORY_ALIASES: Record<string, string> = {
 };
 
 export const PROMPT_MODULES: Record<string, { label: string; content: string }> = {
-  script: { label: '剧本读取与分析', content: '剧本内容按需读取。目录中的集号可能跳号或重复，集数应按实际条目统计。长文本通过分页读取；基于工具返回内容回答。' },
-  assets: { label: '项目资产', content: '角色、场景和道具属于当前项目资产。依据剧本分析出的角色造型、场景或关键道具应及时沉淀保存到资产清单中；更新时保留已有设定，仅补全或修订差异。\n【资产识别描述（description）与多版本（versions）规范】\n1. 资产条目的浅色文本描述（description）严禁写空泛套话，核心目的是为了资产精准识别，避免混淆、重复、丢失：\n   - 道具（props）：必须写清首次出场位置（集/场）、归属者（谁的），以及能与其它相似道具区分的关键辨识信息（如“第17集17-1首现 · 戴安娜画给爸爸的生日蛋糕画作，区别于第8集铁链门画”）；若同一道具存在不同形态/状态（如损毁前/损毁后、开启/闭合等），必须按形态/状态区分版本。\n   - 场景（locations）：必须写清首次出场位置、空间归属与核心视觉辨识特征；若同一场景同时存在日景和夜景（或明显不同的时间光影状态），必须分开为两个版本。\n   - 角色（characters）：必须写清首次出场位置、核心身份与人物关系辨识点（其他角色台词或 OS 心理独白中提及该角色的背景信息归入 description）；若同一角色存在不同服装/造型，必须按服装区分版本。\n2. 单版本与多版本规则：单一版本的资产直接在一级卡片展示完整识别描述，严禁使用二级条目；仅当存在两个及以上版本时，才通过 versions 数组记录并在二级列表展示（每个版本包含各自的 name 如“日景/夜景”、“常服/晚礼服”或“完整态/损毁态”、description 及对应属性）。\n【出处工具使用规范】\n1. 唯一锚定标准（根据剧本描述是否出现在画面中）：provenances（出场锚点）以“根据该行剧本描述，该资产是否直接出现在当前画面中”作为唯一判断标准——凡是剧本描述中直接呈现该资产在当前画面里的视觉出场/外貌/状态/动作行（▲...）以及该角色当场说出的台词行，均逐行计入 provenances（排除场首“人物：XXX”名单行，以及他人台词或 OS 心理独白中回顾背景、谈论该资产而非直接描写当前画面的行，后者归入 description）。\n2. 阅读即锚定（免重复检索）：当你已通过 script.read 阅读了某集剧本正文时，在调用 asset.create、asset.update 或 asset.commitProvenance 时直接通过 provenances 字段传入带行号的具体出场原句，对已读并锚定的集数无需再次调用检索工具。\n3. 增量补充与全量重设（mode 参数）：当为已有资产补充新集数/新场次的出处时，调用 asset.commitProvenance 或 asset.update 默认均为 mode: "append"（增量追加合并），系统会自动保留原有集数的出处并去重排序；仅当需要清空并全量重设时，才显式传入 mode: "overwrite"。\n4. 跨集检索工具（asset.searchProvenanceCandidates）的正确用法：当需要排查未读集数的跨集出场时，可调用 asset.searchProvenanceCandidates。注意该工具返回的 candidates 仅是字面匹配候选，你必须逐条阅读 contextSnippet，以“根据该行剧本描述，该资产是否直接出现在当前画面中”为唯一标准剔除他人台词/OS 背景提及或同名混淆条目，再提交给 asset.commitProvenance。' },
+  script: { label: '剧本读取与分析', content: '剧本数据按“集数（episodes）-> 场次（scenes）-> 段落（paragraphs）”三层结构组织（段落判定标准：换行即为下一段落，没有换行就是一个段落；场次头与场首人物名单已收敛为场次属性，paragraphs 仅包含实质正文段落及对应的场内 1-based 段落序号 index）。script.read 支持直接传入 episode、scene、paragraph 读取三层结构化正文；目录中的集号可能跳号或重复，总集数按实际条目统计。' },
+  assets: { label: '项目资产', content: '角色、场景和道具属于当前项目资产。依据剧本分析出的角色造型、场景或关键道具应及时沉淀保存到资产清单中；更新时保留已有设定，仅补全或修订差异。\n【资产识别描述（description）与多版本（versions）规范】\n1. 资产条目的浅色文本描述（description）严禁写空泛套话，核心目的是为了资产精准识别，避免混淆、重复、丢失：\n   - 道具（props）：必须写清首次出场位置（集/场）、归属者（谁的），以及能与其它相似道具区分的关键辨识信息；若同一道具存在不同形态/状态（如损毁前/损毁后、开启/闭合等），必须按形态/状态区分版本。\n   - 场景（locations）：必须写清首次出场位置、空间归属与核心视觉辨识特征；若同一场景同时存在日景和夜景（或明显不同的时间光影状态），必须分开为两个版本。\n   - 角色（characters）：必须写清首次出场位置、核心身份与人物关系辨识点（未在画面中呈现、仅在台词或独白中提及的背景信息归入 description）；若同一角色存在视觉上的不同造型（含不同年龄阶段或不同服装造型），必须按视觉上的不同造型直接区分版本（versions），无需向用户提问是否单独新建角色。\n2. 单版本与多版本规则：单一版本直接写在一级属性；若资产存在多个版本（如角色在视觉上的不同造型、场景的日夜景、道具的不同形态），必须在 versions 数组中同时传入初始版本与所有变体版本（确保 versions 数组长度至少为 2，且每个版本分别绑定各自对应造型的 provenances 出处与 aliases 别名），或使用 parentId 为变体版本独立创建衍生卡片。' },
   image: { label: '图像生成与卡片', content: '禁止覆盖资产卡片或已出图卡片；重新生成应使用现有复刻机制。只有工具返回 generating 才能宣称生成已启动；默认使用 Hy Image3.5 preview，并提供简短卡片名称。' },
   ui: { label: '页面观察与操作', content: '仅在需要演示或检查页面时使用页面操作。page.inspect 只描述可见界面；ui.actAndObserve 只能操作已观察的目标。' },
 };
@@ -109,7 +109,7 @@ export function resolveContext(selection: AgentContextSelection | undefined, ena
   const injectedIds = injected.map(tool => tool.id);
 
   const candidateToolIds = new Set<AgentToolName>();
-  if (!isLevel1 && Array.isArray(context.categories)) {
+  if (Array.isArray(context.categories)) {
     for (const rawCat of context.categories) {
       const catKey = CATEGORY_ALIASES[String(rawCat).trim().toLowerCase()];
       const cat = catKey ? TOOL_CATEGORIES[catKey] : undefined;
@@ -142,7 +142,8 @@ export function resolveContext(selection: AgentContextSelection | undefined, ena
 export function validateSelection(
   args: Record<string, unknown>,
   enabled: readonly string[],
-  previousCategories: readonly string[] = []
+  previousCategories: readonly string[] = [],
+  previousLevel1Tools: readonly AgentToolName[] = []
 ): AgentContextSelection {
   if (args.level !== undefined && args.level !== 0 && args.level !== 1) {
     throw new Error('level 必须为 0 或 1。');
@@ -206,9 +207,12 @@ export function validateSelection(
     .filter((c): c is string => Boolean(c && TOOL_CATEGORIES[c]));
   const mergedCategories = [...new Set([...rememberedCategories, ...resolvedCategories])];
 
-  // 1. 已选定具体业务工具 ID -> 自动切入局部执行阶段（level: 1，仅装载所选具体工具，同时记忆已展开分类）
+  // 1. 已选定具体业务工具 ID -> 自动切入或保持在局部执行阶段（level: 1，若当前已在 1 级则增量合并已装载工具，同时记忆已展开分类）
   if (resolvedTools.size > 0) {
-    const finalTools = [...resolvedTools];
+    const validPrevTools = previousLevel1Tools.filter(
+      t => known.has(t) && (available.has(t) || t === 'sys.selectContext')
+    );
+    const finalTools = [...new Set([...validPrevTools, ...resolvedTools])];
     const finalPrompts = [...new Set([...explicitPrompts, ...derivePromptsFromTools(finalTools)])];
     return {
       level: 1,
@@ -323,7 +327,6 @@ export function cleanToolOutputForPrompt(val: unknown, depth = 0): unknown {
           const p = item as Record<string, unknown>;
           const slim: Record<string, unknown> = {};
           if (typeof p.sceneTitle === 'string' && p.sceneTitle.trim()) slim.sceneTitle = p.sceneTitle.trim();
-          if (typeof p.lineNumber === 'number') slim.lineNumber = p.lineNumber;
           const evText = typeof p.evidenceText === 'string' && p.evidenceText.trim()
             ? p.evidenceText.trim()
             : (typeof p.matchedTerm === 'string' && p.matchedTerm.trim() ? p.matchedTerm.trim() : undefined);

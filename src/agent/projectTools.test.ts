@@ -13,17 +13,15 @@ test('后台剧本工具读取目录、分页正文和搜索结果', () => {
   assert.equal(directory.total, 2);
   assert.equal(directory.nextOffset, 1);
   const ep1 = (directory.entries as any[])[0];
-  assert.equal(ep1.startLine, 1);
-  assert.equal(ep1.endLine, 2);
-  const pageFromLine1 = executeProjectReadTool('script.read', { offset: ep1.startLine, limit: 2 }, project);
+  assert.equal(ep1.id, 'episode-1');
+  assert.equal(ep1.title, '第1集 开始');
+  const pageFromLine1 = executeProjectReadTool('script.read', { offset: 1, limit: 2 }, project);
   assert.equal(pageFromLine1.content, '第1集 开始\n你好');
-  assert.equal(pageFromLine1.startLine, 1);
-  assert.equal(pageFromLine1.endLine, 2);
   assert.equal(pageFromLine1.nextOffset, 3);
   const pageFromLine2 = executeProjectReadTool('script.read', { offset: 2, limit: 2 }, project);
   assert.equal(pageFromLine2.content, '你好\n第2集 继续');
   assert.equal(pageFromLine2.nextOffset, 4);
-  assert.deepEqual(executeProjectReadTool('script.search', { query: '再见' }, project).matches?.map(m => m.lineNumber), [4]);
+  assert.deepEqual(executeProjectReadTool('script.search', { query: '再见' }, project).matches?.map(m => m.index), [1]);
   assert.throws(() => executeProjectReadTool('script.search', { query: '' }, project));
 
   const multiEpProject: ProjectData = {
@@ -43,30 +41,19 @@ test('后台剧本工具读取目录、分页正文和搜索结果', () => {
     props: [],
   };
 
-  // 全文搜索返回第 3、5、8 行，且连续序号为 1, 2, 3
   const allMatches = executeProjectReadTool('script.search', { query: '布拉姆' }, multiEpProject);
-  assert.deepEqual(allMatches.matches?.map(m => m.lineNumber), [3, 5, 8]);
   assert.deepEqual(allMatches.matches?.map(m => m.index), [1, 2, 3]);
 
-  // 按 episode="第一集" 或 episode=1 限定搜索，严格排除第二集第 8 行，且连续序号从 1..N 编号
+  // 按 episode="第一集" 或 episode=1 限定搜索，并且连续序号从 1..N 编号
   const ep1ByCn = executeProjectReadTool('script.search', { query: '布拉姆', episode: '第一集' }, multiEpProject);
-  assert.deepEqual(ep1ByCn.matches?.map(m => m.lineNumber), [3, 5]);
   assert.deepEqual(ep1ByCn.matches?.map(m => m.index), [1, 2]);
-  assert.deepEqual(ep1ByCn.scope, { episode: '第一集', startLine: 1, endLine: 5 });
+  assert.deepEqual(ep1ByCn.scope, { episode: '第一集' });
 
   const ep1ByNum = executeProjectReadTool('script.search', { query: '布拉姆', episode: 1 }, multiEpProject);
-  assert.deepEqual(ep1ByNum.matches?.map(m => m.lineNumber), [3, 5]);
   assert.deepEqual(ep1ByNum.matches?.map(m => m.index), [1, 2]);
-
-  // 按 startLine / endLine 限定搜索范围
-  const lineRangeRes = executeProjectReadTool('script.search', { query: '布拉姆', startLine: 4, endLine: 5 }, multiEpProject);
-  assert.deepEqual(lineRangeRes.matches?.map(m => m.lineNumber), [5]);
-  assert.deepEqual(lineRangeRes.matches?.map(m => m.index), [1]);
-  assert.deepEqual(lineRangeRes.scope, { startLine: 4, endLine: 5 });
 
   // 按场次编号（如 "1-5"）限定搜索
   const sceneRes = executeProjectReadTool('script.search', { query: '布拉姆', episode: '1-5' }, multiEpProject);
-  assert.deepEqual(sceneRes.matches?.map(m => m.lineNumber), [5]);
   assert.deepEqual(sceneRes.matches?.map(m => m.index), [1]);
 });
 
@@ -823,5 +810,522 @@ test('refreshTaskCardContext：asset.create / asset.update 后动态刷新聚焦
   assert.ok(itemCardContext?.markdownSummary.includes('娜塔莉亚的教父'), 'asset.update 后应同步刷新聚焦资产描述');
 });
 
+test('script.read 集数-场次-段落三层结构化输出与按换行划分段落标准测试', () => {
+  const nataliaScript = [
+    '第一集',
+    '1-1 日 内 黑暗房间',
+    '人物 玛莉',
+    '▲黑暗的房间里，玛莉缩在墙角写信。',
+    '玛莉OS：娜塔莉亚，千万别来这里！',
+    '1-2',
+    '日 内 医院办公室',
+    '人物 娜塔莉亚 焦恩',
+    '▲医院办公室里，娜塔莉亚死死握着姐姐寄来的书信，眼泪落在照片上。',
+    '娜塔莉亚（悲痛）：姐姐，我一定会查明真相！',
+    '焦恩（担心）：娜塔莉亚，那里太危险了。',
+    '第二集',
+    '2-1 夜 外 庄园大门',
+    '人物 娜塔莉亚 管家',
+    '▲娜塔莉亚撑着黑伞站在暴雨中的庄园大门前。',
+  ].join('\n');
+
+  const natProj: ProjectData = {
+    id: 'p_natalia_3tier',
+    scriptText: nataliaScript,
+    characters: [
+      {
+        id: 'char_bram',
+        name: '布拉姆',
+        role: '庄园家主',
+        description: '第一集首现 · 审视娜塔莉亚的庄园家主',
+      },
+    ],
+    locations: [],
+    props: [],
+  };
+
+  // 1. script.directory 场次摘要包含 paragraphCount 与 paragraphs
+  const dirRes = executeProjectReadTool('script.directory', {}, natProj) as any;
+  assert.equal(dirRes.total, 2);
+  assert.equal(dirRes.entries[0].sceneCount, 2);
+  assert.equal(dirRes.entries[0].scenes[0].sceneNumber, '1-1');
+  assert.equal(dirRes.entries[0].scenes[0].paragraphCount, 2, '1-1 除去场次头和人物表后应有 2 个正文段落');
+  assert.equal(dirRes.entries[0].scenes[1].sceneNumber, '1-2');
+  assert.equal(dirRes.entries[0].scenes[1].paragraphCount, 3, '1-2 除去跨行场次头和人物表后应有 3 个正文段落');
+
+  // 2. script.read 按 episode=1 读取，返回 集 -> 场 -> 段落 三层结构（场次头与人物表已收敛到场次属性）
+  const readEp1 = executeProjectReadTool('script.read', { episode: 1 }, natProj) as any;
+  assert.equal(readEp1.episodeCount, 1);
+  assert.equal(readEp1.sceneCount, 2);
+  assert.equal(readEp1.paragraphCount, 5);
+  const ep1 = readEp1.episodes[0];
+  assert.equal(ep1.title, '第一集');
+  assert.equal(ep1.scenes.length, 2);
+  assert.equal(ep1.scenes[0].sceneNumber, '1-1');
+  assert.deepEqual(
+    ep1.scenes[0].paragraphs.map((p: any) => ({ index: p.index, text: p.text })),
+    [
+      { index: 1, text: '▲黑暗的房间里，玛莉缩在墙角写信。' },
+      { index: 2, text: '玛莉OS：娜塔莉亚，千万别来这里！' },
+    ]
+  );
+  assert.equal(ep1.scenes[1].sceneNumber, '1-2');
+  assert.deepEqual(
+    ep1.scenes[1].paragraphs.map((p: any) => ({ index: p.index, text: p.text })),
+    [
+      { index: 1, text: '▲医院办公室里，娜塔莉亚死死握着姐姐寄来的书信，眼泪落在照片上。' },
+      { index: 2, text: '娜塔莉亚（悲痛）：姐姐，我一定会查明真相！' },
+      { index: 3, text: '焦恩（担心）：娜塔莉亚，那里太危险了。' },
+    ]
+  );
+
+  // 3. script.read 支持直接按 scene="1-2" 与 paragraph=1 精确定位单段
+  const readScene12Para1 = executeProjectReadTool('script.read', { scene: '1-2', paragraph: 1 }, natProj) as any;
+  assert.equal(readScene12Para1.sceneCount, 1);
+  assert.equal(readScene12Para1.paragraphCount, 1);
+  assert.equal(
+    readScene12Para1.episodes[0].scenes[0].paragraphs[0].text,
+    '▲医院办公室里，娜塔莉亚死死握着姐姐寄来的书信，眼泪落在照片上。'
+  );
+
+  // 4. asset.list 的 query 仅匹配资产主标识（name/role/aliases），不会因为布拉姆 description 提及“娜塔莉亚”而误命中
+  const searchNataliaAsset = executeProjectReadTool('asset.list', { type: 'characters', query: '娜塔莉亚' }, natProj) as any;
+  assert.equal(searchNataliaAsset.total, 0);
+  const searchBramAsset = executeProjectReadTool('asset.list', { type: 'characters', query: '布拉姆' }, natProj) as any;
+  assert.equal(searchBramAsset.total, 1);
+});
+
+test('短剧多项数据自适应分步操作与数据量预警机制测试：script.search 与 script.read 跨场次高密度预警', () => {
+  // 构建一个跨 3 个场次、包含 18 处“娜塔莉亚”与 28 个段落的短剧剧本
+  const multiSceneScript = [
+    '第一集',
+    '1-1 夜 内 储藏室',
+    '▲黑暗中，玛莉急促呼吸。',
+    '玛莉：娜塔莉亚，你在哪？',
+    '▲娜塔莉亚推开铁门，快步走入。',
+    '娜塔莉亚：我在这里，玛莉。',
+    '玛莉：娜塔莉亚，你看这个盒子。',
+    '娜塔莉亚：这是母亲留下的。',
+    '1-2 日 内 客厅',
+    '▲阳光洒在客厅地毯上，娜塔莉亚端着茶杯沉思。',
+    '管家：娜塔莉亚小姐，霍克先生来了。',
+    '霍克：娜塔莉亚，好久不见。',
+    '娜塔莉亚：霍克叔叔，请坐。',
+    '霍克：听说你在找布拉姆？',
+    '娜塔莉亚（警惕）：布拉姆是我的管家。',
+    '霍克：娜塔莉亚，你不知道他的过去。',
+    '娜塔莉亚：无论他过去是谁，他现在效忠于我。',
+    '1-3 夜 外 庄园后山',
+    '▲暴雨倾盆，娜塔莉亚撑着黑伞站在泥泞中。',
+    '▲布拉姆一身黑衣，从树林中走出。',
+    '布拉姆：小姐，这里危险。',
+    '娜塔莉亚：布拉姆，你隐瞒了我什么？',
+    '布拉姆：我只为保护娜塔莉亚小姐。',
+    '娜塔莉亚：保护我？还是监视我？',
+    '布拉姆：小姐以后自会明白。',
+    '▲娜塔莉亚转身离去，风雨交加。',
+    '▲布拉姆注视着娜塔莉亚的背影，眼神复杂。',
+    '娜塔莉亚OS：我一定会查清一切。',
+  ].join('\n');
+
+  const testProj: ProjectData = {
+    id: 'p_multiscene',
+    scriptText: multiSceneScript,
+    characters: [],
+    locations: [],
+    props: [],
+  };
+
+  // 1. 全局搜索“娜塔莉亚”：共命中 19 次，跨 3 个场次，应当触发 hasVolumeWarning: true 并返回 scenesSummary
+  const searchResult = executeProjectReadTool('script.search', { query: '娜塔莉亚' }, testProj) as any;
+  assert.equal(searchResult.total, 19);
+  assert.equal(searchResult.hasVolumeWarning, true);
+  assert.ok(typeof (searchResult.notice || searchResult.warning) === 'string' && (searchResult.notice || searchResult.warning).includes('3 个场次'));
+  assert.equal(searchResult.scenesSummary.length, 3);
+  assert.equal(searchResult.scenesSummary[0].sceneNumber, '1-1');
+  assert.equal(searchResult.scenesSummary[0].matchCount, 5);
+  assert.equal(searchResult.scenesSummary[1].sceneNumber, '1-2');
+  assert.equal(searchResult.scenesSummary[1].matchCount, 7);
+  assert.equal(searchResult.scenesSummary[2].sceneNumber, '1-3');
+  assert.equal(searchResult.scenesSummary[2].matchCount, 7);
+
+  // 2. 局部单场搜索“娜塔莉亚”（指定 scene: "1-1"）：仅 5 处命中，不应触发预警
+  const scopedSearchResult = executeProjectReadTool('script.search', { query: '娜塔莉亚', scene: '1-1' }, testProj) as any;
+  assert.equal(scopedSearchResult.total, 5);
+  assert.equal(scopedSearchResult.hasVolumeWarning, false);
+  assert.equal(scopedSearchResult.scenesSummary.length, 1);
+  assert.equal(scopedSearchResult.scenesSummary[0].sceneNumber, '1-1');
+
+  // 3. 全局读取剧本：总计 24 个段落跨 3 场，触发 hasVolumeWarning: true 与场景分布概览
+  const readResult = executeProjectReadTool('script.read', {}, testProj) as any;
+  assert.equal(readResult.paragraphCount, 24); // 非空段落总数
+  assert.equal(readResult.hasVolumeWarning, true);
+  assert.ok(typeof (readResult.notice || readResult.warning) === 'string' && (readResult.notice || readResult.warning).includes('24 个段落'));
+  assert.equal(readResult.scenesSummary.length, 3);
+
+  // 4. 按单场读取（scene: "1-1"）：不触发大体积预警
+  const scopedReadResult = executeProjectReadTool('script.read', { scene: '1-1' }, testProj) as any;
+  assert.equal(scopedReadResult.hasVolumeWarning, false);
+});
+
+test('多场次自适应分步机制与版本追加保护：script.directory 数据量预警、歧义场次多场预警与 asset.update 版本增量合并', () => {
+  const multiSceneScript = [
+    '第一集',
+    '1-1 日 内 储藏室',
+    '▲阳光斜照。',
+    '1-2 日 内 客厅',
+    '▲沙发整洁。',
+    '1-5 日 内 娜塔莉亚家',
+    '▲娜塔莉亚坐在书桌前。',
+    '娜塔莉亚：这是我的日记。',
+    '1-5 夜 外 庄园',
+    '▲暴雨倾盆。',
+    '布拉姆：小姐，快回去。',
+    '娜塔莉亚：我不走。',
+  ].join('\n');
+
+  const testProj: ProjectData = {
+    id: 'p_test_multi',
+    scriptText: multiSceneScript,
+    characters: [],
+    locations: [],
+    props: [],
+  };
+
+  // 1. script.directory 数据量预警
+  const dirRes = executeProjectReadTool('script.directory', {}, testProj) as any;
+  assert.equal(dirRes.hasVolumeWarning, true);
+  assert.equal(dirRes.totalScenes, 4);
+  assert.ok(Array.isArray(dirRes.scenesSummary) && dirRes.scenesSummary.length === 4);
+  assert.ok((dirRes.notice || dirRes.warning).includes('4 个场次'));
+
+  // 2. 歧义场次匹配（scene: "1-5" 匹配到 "1-5 日 内 娜塔莉亚家" 与 "1-5 夜 外 庄园" 两场）触发预警
+  const ambigRead = executeProjectReadTool('script.read', { scene: '1-5' }, testProj) as any;
+  assert.equal(ambigRead.hasVolumeWarning, true);
+  assert.equal(ambigRead.sceneCount, 2);
+  assert.ok((ambigRead.notice || ambigRead.warning).includes('匹配到 2 个场次'));
+
+  // 3. asset.update 增量追加版本：已有“幼年形态”，传入“成年形态”，两者共存且已有出处不被清空
+  const projWithChar: ProjectData = {
+    ...testProj,
+    characters: [
+      {
+        id: 'char_nat',
+        name: '娜塔莉亚',
+        role: '女主角',
+        versions: [
+          {
+            id: 'ver_child',
+            name: '幼年形态',
+            description: '10岁的小女孩',
+            verifiedProvenance: [
+              { lineNumber: 7, text: '▲娜塔莉亚坐在书桌前。' } as any,
+            ],
+          },
+        ],
+      },
+    ],
+  };
+
+  const updateRes = executeProjectAssetMutation(
+    'asset.update',
+    {
+      id: 'char_nat',
+      updates: {
+        versions: [
+          {
+            name: '成年形态',
+            description: '20岁的成熟千金',
+            provenances: [
+              { lineNumber: 12, evidenceText: '娜塔莉亚：我不走。' },
+            ],
+          },
+        ],
+      },
+    },
+    projWithChar
+  );
+
+  assert.equal(updateRes.output.success, true);
+  const updatedChar = updateRes.updatedProject.characters[0];
+  assert.equal(updatedChar.versions.length, 2);
+  assert.equal(updatedChar.versions[0].name, '幼年形态');
+  assert.equal(updatedChar.versions[0].description, '10岁的小女孩');
+  assert.equal(updatedChar.versions[1].name, '成年形态');
+  assert.equal(updatedChar.versions[1].description, '20岁的成熟千金');
+});
+
+test('段落序号 (paragraphIndices / paragraphIndex) 自动映射物理行号与原文出处测试', () => {
+  const scriptText = [
+    '【第1集】',
+    '1-1 夜 内 宅邸',
+    '人物 娜塔莉亚 布拉姆',
+    '▲娜塔莉亚紧张地握紧了简历。',
+    '娜塔莉亚OS：布莱克伍德家族，我来了。',
+    '▲布拉姆冰冷地靠在讲台上，端着红酒杯。',
+  ].join('\n');
+
+  const project: ProjectData = {
+    id: 'proj_para_test',
+    scriptText,
+    characters: [],
+    locations: [],
+    props: [],
+  };
+
+  // 1. 通过 paragraphIndices 直接创建资产出处
+  const createRes = executeProjectAssetMutation(
+    'asset.create',
+    {
+      type: 'characters',
+      name: '娜塔莉亚',
+      role: '女主角',
+      provenances: [
+        { sceneTitle: '1-1', paragraphIndices: [1, 2] },
+      ],
+    },
+    project
+  );
+
+  assert.equal(createRes.output.success, true);
+  const charItem = createRes.updatedProject.characters![0];
+  assert.equal(charItem.provenanceStatus, 'verified');
+  assert.equal(charItem.verifiedProvenance.length, 2);
+  assert.equal(charItem.verifiedProvenance[0].lineNumber, 4);
+  assert.equal(charItem.verifiedProvenance[0].evidenceText, '▲娜塔莉亚紧张地握紧了简历。');
+  assert.equal(charItem.verifiedProvenance[1].lineNumber, 5);
+  assert.equal(charItem.verifiedProvenance[1].evidenceText, '娜塔莉亚OS：布莱克伍德家族，我来了。');
+
+  // 2. 通过 top-level paragraphIndices 提交出处锚点
+  const updatedProject = { ...project, characters: createRes.updatedProject.characters! };
+  const commitRes = executeProjectAssetMutation(
+    'asset.commitProvenance',
+    {
+      id: charItem.id,
+      sceneTitle: '1-1',
+      paragraphIndices: [3],
+    },
+    updatedProject
+  );
+
+  assert.equal(commitRes.output.success, true);
+  const updatedCharItem = commitRes.updatedProject.characters![0];
+  assert.equal(updatedCharItem.verifiedProvenance.length, 3);
+  assert.equal(updatedCharItem.verifiedProvenance[2].lineNumber, 6);
+  assert.equal(updatedCharItem.verifiedProvenance[2].evidenceText, '▲布拉姆冰冷地靠在讲台上，端着红酒杯。');
+});
+
+test('跨行场次副标题匹配、同集重名场次(1-5内外景)隔离、跨集子串防误匹配(1-2 vs 21-2/31-2)与禁止全剧兜底污染回归测试', () => {
+  const dramaScript = [
+    '第一集',
+    '1-1',
+    '日 内 黑暗房间',
+    '人物 玛莉',
+    '▲黑暗的房间里，玛莉缩在墙角（此行物理行号为第5行）。',
+    '玛莉：救命！',
+    '1-2',
+    '日 内 医院办公室',
+    '人物 娜塔莉亚 院长',
+    '▲医院的门被推开，院长看着手机上的信息。',
+    '▲画面一转，娜塔莉亚穿着白大褂正在整理桌上的病历。',
+    '院长：娜塔莉亚，你姐姐出事了。',
+    '▲娜塔莉亚闻言一怔，手中的病历滑落。',
+    '娜塔莉亚（震惊）：你说什么？！',
+    '1-5',
+    '日 内 娜塔莉亚家',
+    '人物 娜塔莉亚 焦恩',
+    '▲娜塔莉亚在收拾皮包。',
+    '焦恩：太危险了。',
+    '娜塔莉亚：我必须去。',
+    '1-5',
+    '日 外 布莱克伍德庄园',
+    '人物 娜塔莉亚 布拉姆',
+    '▲庄园大门缓缓打开。',
+    '▲娜塔莉亚走进庄园大厅。',
+    '布拉姆：欢迎来到庄园。',
+    '第二十一集',
+    '21-2',
+    '夜 内 书房',
+    '人物 布拉姆 莱恩',
+    '▲书房内灯火通明。',
+    '布拉姆：把文件拿过来。',
+    '第三十一集',
+    '31-2',
+    '日 内 走廊',
+    '人物 塞莱特斯',
+    '▲塞莱特斯快步走过走廊。',
+    '塞莱特斯：快走！',
+  ].join('\n');
+
+  let proj: ProjectData = {
+    id: 'p_natalia_regression',
+    scriptText: dramaScript,
+    characters: [],
+    locations: [],
+    props: [],
+  };
+
+  // 1. 传入 script.directory / script.read 形态的完整标题（如 "1-2 日 内 医院办公室" 及两个不同的 "1-5 ..."），
+  // 必须精准匹配各自场次，绝不触发全剧广播兜底，且两个 1-5 内外景场次互不串台
+  const createRes = executeProjectAssetMutation(
+    'asset.create',
+    {
+      type: 'characters',
+      name: '娜塔莉亚',
+      role: '女主角',
+      provenances: [
+        { sceneTitle: '1-2 日 内 医院办公室', paragraphIndices: [2, 4, 5] },
+        { sceneTitle: '1-5 日 内 娜塔莉亚家', paragraphIndices: [1, 3] },
+        { sceneTitle: '1-5 日 外 布莱克伍德庄园', paragraphIndices: [2] },
+      ],
+    },
+    proj
+  );
+
+  proj = { ...proj, ...createRes.updatedProject };
+  const natalia = proj.characters[0];
+  assert.equal(natalia.verifiedProvenance.length, 6, '应仅精准提取 3+2+1=6 条出处，严禁全剧广播污染');
+  assert.deepEqual(
+    natalia.verifiedProvenance.map((vp: any) => vp.evidenceText),
+    [
+      '▲画面一转，娜塔莉亚穿着白大褂正在整理桌上的病历。',
+      '▲娜塔莉亚闻言一怔，手中的病历滑落。',
+      '娜塔莉亚（震惊）：你说什么？！',
+      '▲娜塔莉亚在收拾皮包。',
+      '娜塔莉亚：我必须去。',
+      '▲娜塔莉亚走进庄园大厅。',
+    ]
+  );
+
+  // 验证 1-1 第 5 行（玛莉的段落，物理行号=5，段落序号=1）绝不会被 paragraphIndices: [2, 4, 5] 中的 5 误命中
+  assert.equal(
+    natalia.verifiedProvenance.some((vp: any) => vp.evidenceText.includes('玛莉')),
+    false
+  );
+
+  // 2. 传入短场次号 "1-2" 重设时，必须严格按数字边界匹配 1-2，绝不误命中 "21-2" 或 "31-2"
+  const commitShortRes = executeProjectAssetMutation(
+    'asset.commitProvenance',
+    {
+      id: natalia.id,
+      mode: 'overwrite',
+      sceneTitle: '1-2',
+      paragraphIndices: [2, 4, 5],
+    },
+    proj
+  );
+  proj = { ...proj, ...commitShortRes.updatedProject };
+  const afterShort = proj.characters[0];
+  assert.equal(afterShort.verifiedProvenance.length, 3);
+  assert.equal(
+    afterShort.verifiedProvenance.some((vp: any) => vp.sceneTitle.includes('21-2') || vp.sceneTitle.includes('31-2')),
+    false,
+    '"1-2" 绝不能子串误匹配 "21-2" 或 "31-2"'
+  );
+
+  // 3. 传入不存在的场次名时，应返回 0 处匹配，绝不退化为全剧所有场次广播
+  const commitInvalidScene = executeProjectAssetMutation(
+    'asset.commitProvenance',
+    {
+      id: natalia.id,
+      mode: 'overwrite',
+      sceneTitle: '99-9 不存在的场次',
+      paragraphIndices: [1, 2],
+    },
+    proj
+  );
+  assert.equal((commitInvalidScene.output as any).submittedCount, 0);
+  assert.equal((commitInvalidScene.output as any).verifiedCount, 0);
+
+  // 4. 传入内外景一字之差的 "1-5 日 内 布莱克伍德庄园"（原文为 "1-5 日 外 布莱克伍德庄园"）时，按地点核心词容错命中庄园场次
+  const commitTypoScene = executeProjectAssetMutation(
+    'asset.commitProvenance',
+    {
+      id: natalia.id,
+      mode: 'overwrite',
+      sceneTitle: '1-5 日 内 布莱克伍德庄园',
+      paragraphIndices: [2, 3],
+    },
+    proj
+  );
+  assert.equal((commitTypoScene.output as any).verifiedCount, 2);
+
+  // 5. script.read 传入连写无空格的 scene: "1-5布莱克伍德庄园" 能精准命中，且 content 仅包含该场次而非全剧
+  const readConcatScene = executeProjectReadTool('script.read', { episode: '第一集', scene: '1-5布莱克伍德庄园' }, proj) as any;
+  assert.equal(readConcatScene.sceneCount, 1);
+  assert.equal(readConcatScene.episodes[0].scenes[0].locationName, '布莱克伍德庄园');
+  assert.equal(readConcatScene.content.includes('第三十一集'), false, 'content 不应包含未命中的其它分集全文');
+
+  // 6. provenances 传入拆分字段 { scene: "1-5", location: "娜塔莉亚家", paragraphs: [1, 3] } 时能自动组合地点精确命中
+  const updateSplitSceneRes = executeProjectAssetMutation(
+    'asset.update',
+    {
+      id: natalia.id,
+      mode: 'overwrite',
+      provenances: [{ scene: '1-5', location: '娜塔莉亚家', paragraphs: [1, 3] }],
+    },
+    proj
+  );
+  assert.equal((updateSplitSceneRes.output as any).verifiedCount, 2);
+  proj = { ...proj, ...updateSplitSceneRes.updatedProject };
+
+  // 7. 向原本无 versions 的单版本主资产通过 asset.update 追加单个变体版本（如 "小娜塔莉亚/8岁"）时，
+  // 必须自动将原主资产转为初始版本 versions[0]（"常服"），确保 versions.length === 2 从而前端正常展示二级列表；
+  // 后续对主资产调用 asset.update 追加成年场次出处时，同步更新 versions[0] 且不污染 versions[1]，verifiedCount 汇总全部版本真实出场数
+  const addChildViaUpdateRes = executeProjectAssetMutation(
+    'asset.update',
+    {
+      id: natalia.id,
+      description: '1-2首现 · 心理医生，含成年与8岁幼年（小娜塔莉亚）两个时期造型',
+      versions: [
+        {
+          name: '小娜塔莉亚/8岁',
+          role: '幼年时期的娜塔莉亚',
+          appearance: '8岁小女孩造型',
+          provenances: [{ sceneTitle: '1-5 日 外 布莱克伍德庄园', paragraphIndices: [2] }],
+        },
+      ],
+    },
+    proj
+  );
+  proj = { ...proj, ...addChildViaUpdateRes.updatedProject };
+  assert.equal(proj.characters[0].versions.length, 2, '向单版本资产追加变体版本后 versions 长度必须为 2');
+  assert.equal(proj.characters[0].versions[0].id, natalia.id);
+  assert.equal(proj.characters[0].versions[0].name, '常服');
+  assert.equal(proj.characters[0].versions[1].name, '小娜塔莉亚/8岁');
+  assert.equal((addChildViaUpdateRes.output as any).verifiedCount, 3, '成年 2 处 + 幼年 1 处应汇总为 3 处');
+
+  const appendParentRes = executeProjectAssetMutation(
+    'asset.update',
+    {
+      id: natalia.id,
+      mode: 'append',
+      provenances: [{ sceneTitle: '1-2 日 内 医院办公室', paragraphIndices: [2, 4, 5] }],
+    },
+    proj
+  );
+  proj = { ...proj, ...appendParentRes.updatedProject };
+  assert.equal((appendParentRes.output as any).verifiedCount, 6, '成年 5 处 + 幼年 1 处应汇总为 6 处');
+  assert.equal(
+    proj.characters[0].versions[0].verifiedProvenance.length,
+    proj.characters[0].verifiedProvenance.length,
+    '主资产更新出处后，默认版本 versions[0] 的 verifiedProvenance 应保持同步（仅含成年场次 5 处）'
+  );
+  assert.equal(
+    proj.characters[0].versions[1].verifiedProvenance.length,
+    1,
+    '幼年版本 versions[1] 的 verifiedProvenance 应保持独立（仅含幼年场次 1 处）'
+  );
+
+  // 8. 历史单元素 versions 存档兼容保护：mergeMultiVersionAssetList 自动将带有独立父级出处的单变体条目补齐为 2 个版本
+  const legacySingleVerItem = {
+    ...proj.characters[0],
+    versions: [proj.characters[0].versions[1]], // 模拟旧存档仅含 1 个 "小娜塔莉亚/8岁" 版本
+  };
+  const repairedList = mergeMultiVersionAssetList('characters', [legacySingleVerItem]);
+  assert.equal(repairedList[0].versions.length, 2);
+  assert.equal(repairedList[0].versions[0].name, '常服');
+  assert.equal(repairedList[0].versions[1].name, '小娜塔莉亚/8岁');
+});
 
 

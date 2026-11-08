@@ -1,4 +1,4 @@
-import { SceneChunk } from '../types/script';
+import { SceneChunk, ScriptParagraph } from '../types/script';
 
 const DEFAULT_EPISODE_RX =
   /^(?:【\s*第?\s*([0-9一二三四五六七八九十百千]+)\s*[集话回][^】]*】|第\s*([0-9一二三四五六七八九十百千]+)\s*[集话回].*|(?:[一二三四五六七八九十百千]+|[0-9]+)\s*集\s*$|(?:#+\s*)?(?:EPISODE|EP)\s*#?\s*\d+.*)/i;
@@ -111,6 +111,57 @@ export function parseRosterCharacters(lines: string[]): string[] {
   return [];
 }
 
+/**
+ * 提取场次内的段落列表（标准：换行即为下一段落，没有换行就是一个段落）。
+ * 自动跳过场首的集标题行、场次标题行（如 "1-2"、"日 内 医院办公室"）与场首人物名单行（"人物：..."），
+ * 将场次内的每个非空自然行作为独立段落并赋予 1-based 连续序号 index 与原剧本 1-based 行号 lineNumber。
+ */
+export function extractSceneParagraphs(
+  allLines: string[],
+  startLine: number,
+  endLine: number,
+  options?: { consumedNextLine?: boolean; skipHeaderCheck?: boolean }
+): ScriptParagraph[] {
+  const safeStart = Math.max(1, Math.floor(startLine));
+  const safeEnd = Math.min(allLines.length, Math.floor(endLine));
+  if (safeStart > safeEnd) return [];
+
+  const paragraphs: ScriptParagraph[] = [];
+  let consumedHeaderLines = 0;
+  let rosterSkipped = false;
+
+  if (!options?.skipHeaderCheck) {
+    const firstTrimmed = (allLines[safeStart - 1] || '').trim();
+    const secondTrimmed = safeStart < safeEnd ? (allLines[safeStart] || '').trim() : '';
+    if (DEFAULT_SCENE_RX.test(firstTrimmed)) {
+      const meta = parseSceneHeaderMetadata(firstTrimmed, secondTrimmed);
+      consumedHeaderLines = meta.consumedNextLine || options?.consumedNextLine ? 2 : 1;
+    } else if (DEFAULT_EPISODE_RX.test(firstTrimmed) && !/^\d+\s*[-—–]\s*\d+/.test(firstTrimmed)) {
+      consumedHeaderLines = 1;
+    }
+  }
+
+  for (let lineNum = safeStart + consumedHeaderLines; lineNum <= safeEnd; lineNum++) {
+    const rawLine = allLines[lineNum - 1] ?? '';
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+
+    // 跳过场首前几行的人物名单行（已提取至 scene.characterNames）
+    if (!rosterSkipped && lineNum - safeStart <= 5 && ROSTER_LINE_RX.test(trimmed)) {
+      rosterSkipped = true;
+      continue;
+    }
+
+    paragraphs.push({
+      index: paragraphs.length + 1,
+      lineNumber: lineNum,
+      text: trimmed,
+    });
+  }
+
+  return paragraphs;
+}
+
 export function sliceScriptIntoScenes(
   scriptText: string,
   scenePattern?: string,
@@ -152,6 +203,7 @@ export function sliceScriptIntoScenes(
       timeOfDay?: string;
       type?: 'INT' | 'EXT' | 'MIXED';
       locationName?: string;
+      consumedNextLine?: boolean;
     }
 
     const sceneStarts: RawSceneStart[] = [];
@@ -183,6 +235,7 @@ export function sliceScriptIntoScenes(
           timeOfDay: meta.timeOfDay,
           type: meta.type,
           locationName: meta.locationName,
+          consumedNextLine: meta.consumedNextLine,
         });
       }
     }
@@ -190,10 +243,23 @@ export function sliceScriptIntoScenes(
     for (let idx = 0; idx < sceneStarts.length; idx++) {
       const curr = sceneStarts[idx];
       const next = sceneStarts[idx + 1];
-      const endLineIdx = next ? next.lineIdx - 1 : lines.length - 1;
-      const endCharIndex = next ? next.charIndex : scriptText.length;
+      let endLineIdx = next ? next.lineIdx - 1 : lines.length - 1;
+      // 如果当前场与下一场之间夹着新的一集标题行（如“第二集”），将当前场的结束行收缩到新集标题行之前
+      for (let checkIdx = curr.lineIdx + 1; checkIdx <= endLineIdx; checkIdx++) {
+        const checkTrimmed = lines[checkIdx].trim();
+        if (checkTrimmed && DEFAULT_EPISODE_RX.test(checkTrimmed) && !/^\d+\s*[-—–]\s*\d+/.test(checkTrimmed)) {
+          endLineIdx = checkIdx - 1;
+          break;
+        }
+      }
+      const endCharIndex = endLineIdx + 1 < lines.length ? lineOffsets[endLineIdx + 1] : scriptText.length;
       const sceneLines = lines.slice(curr.lineIdx, endLineIdx + 1);
       const characterNames = parseRosterCharacters(sceneLines);
+      const startLine = curr.lineIdx + 1;
+      const endLine = endLineIdx + 1;
+      const paragraphs = extractSceneParagraphs(lines, startLine, endLine, {
+        consumedNextLine: curr.consumedNextLine,
+      });
 
       const displayTitle = curr.sceneNumber
         ? [
@@ -217,11 +283,13 @@ export function sliceScriptIntoScenes(
         locationName: curr.locationName,
         timeOfDay: curr.timeOfDay,
         characterNames: characterNames.length > 0 ? characterNames : undefined,
-        startLine: curr.lineIdx + 1,
-        endLine: endLineIdx + 1,
+        startLine,
+        endLine,
         charIndex: curr.charIndex,
         endCharIndex,
         rawText: sceneLines.join('\n'),
+        paragraphCount: paragraphs.length,
+        paragraphs,
       });
     }
 

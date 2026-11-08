@@ -73,11 +73,19 @@ export interface VerifiedAnchorRecord {
   lineNumber?: number;
 }
 
+import { extractSceneParagraphs } from './slicer';
+
 export type ProvenanceEvidenceInput =
   | string
   | {
       sceneTitle?: string;
+      sceneId?: string;
+      scene?: string;
       lineNumber?: number;
+      paragraphIndex?: number;
+      paragraphIndices?: number[];
+      paragraph?: number | [number, number] | number[];
+      paragraphs?: number | [number, number] | number[];
       evidenceText?: string;
       text?: string;
       snippet?: string;
@@ -275,9 +283,16 @@ function getFlatSearchSections(
   for (const g of groups) {
     if (g.scenes.length > 0) {
       for (const sc of g.scenes) {
+        const scWithSub =
+          sc.subTitle && !sc.title.includes(sc.subTitle)
+            ? `${sc.title} ${sc.subTitle}`.trim()
+            : sc.title;
         flat.push({
           ...sc,
-          title: g.episode && !sc.title.includes(g.episode.title) ? `${g.episode.title} ${sc.title}`.trim() : sc.title,
+          title:
+            g.episode && !scWithSub.includes(g.episode.title)
+              ? `${g.episode.title} ${scWithSub}`.trim()
+              : scWithSub,
         });
       }
     } else if (g.episode) {
@@ -295,6 +310,151 @@ function getFlatSearchSections(
     });
   }
   return flat;
+}
+
+function normalizeSceneMatchText(raw: string): string {
+  return (raw || '')
+    .replace(/[【】]/g, ' ')
+    .replace(/[—–]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractSceneNumberToken(text: string): string | null {
+  const norm = normalizeSceneMatchText(text);
+  const dashMatch = norm.match(/(?:^|[^\d])(\d+)\s*-\s*(\d+)(?!\d)/);
+  if (dashMatch) {
+    return `${dashMatch[1]}-${dashMatch[2]}`;
+  }
+  const cnSceneMatch = norm.match(/第\s*([0-9一二三四五六七八九十百千]+)\s*[场幕]/);
+  if (cnSceneMatch) {
+    return `第${cnSceneMatch[1]}场`;
+  }
+  return null;
+}
+
+function extractSceneMetaAfterNumber(text: string): string {
+  const norm = normalizeSceneMatchText(text);
+  const dashMatch = norm.match(/(?:^|[^\d])(\d+)\s*-\s*(\d+)(?!\d)(.*)$/);
+  if (dashMatch && dashMatch[3]) {
+    return dashMatch[3].trim();
+  }
+  const cnSceneMatch = norm.match(/第\s*[0-9一二三四五六七八九十百千]+\s*[场幕](.*)$/);
+  if (cnSceneMatch && cnSceneMatch[1]) {
+    return cnSceneMatch[1].trim();
+  }
+  return '';
+}
+
+function extractEpisodeToken(text: string): string | null {
+  const norm = normalizeSceneMatchText(text);
+  const m = norm.match(
+    /(?:第\s*([0-9一二三四五六七八九十百千]+)\s*[集话回]|(?:^|\s)([一二三四五六七八九十百千]+|\d+)\s*集(?:\s|$))/i
+  );
+  if (m) {
+    return (m[1] || m[2] || '').trim();
+  }
+  return null;
+}
+
+/**
+ * Matches script sections by sceneId and/or sceneTitle hint with strict scene-number boundaries
+ * (preventing "1-2" from matching "21-2" or "31-2") and subtitle disambiguation (distinguishing
+ * duplicate scene numbers like "1-5 日 内 娜塔莉亚家" vs "1-5 日 外 布莱克伍德庄园").
+ */
+function matchSectionsBySceneHint(
+  sections: ProvenanceSection[],
+  hintSceneTitle?: string,
+  hintSceneId?: string
+): ProvenanceSection[] {
+  if (hintSceneId && hintSceneId.trim()) {
+    const idHits = sections.filter(s => s.id === hintSceneId.trim());
+    if (idHits.length > 0) return idHits;
+  }
+  if (!hintSceneTitle || !hintSceneTitle.trim()) {
+    return [];
+  }
+
+  const rawTrimmed = hintSceneTitle.trim();
+  const directIdHits = sections.filter(s => s.id === rawTrimmed);
+  if (directIdHits.length > 0) return directIdHits;
+
+  const normHint = normalizeSceneMatchText(rawTrimmed);
+  if (!normHint) return [];
+
+  // 1. Exact full title or scene-without-episode title match
+  const exactMatches = sections.filter(s => {
+    const normSec = normalizeSceneMatchText(s.title);
+    if (normSec === normHint) return true;
+    const secNum = extractSceneNumberToken(normSec);
+    const secMeta = extractSceneMetaAfterNumber(normSec);
+    if (secNum) {
+      const secWithoutEp = secMeta ? `${secNum} ${secMeta}` : secNum;
+      if (secWithoutEp === normHint) return true;
+    }
+    return false;
+  });
+  if (exactMatches.length > 0) return exactMatches;
+
+  // 2. Boundary-safe scene number match (e.g. "1-2", "第一集 1-2", "1-5 日 外 布莱克伍德庄园")
+  const hintSceneNum = extractSceneNumberToken(normHint);
+  if (hintSceneNum) {
+    const sameNumSecs = sections.filter(
+      s => extractSceneNumberToken(s.title) === hintSceneNum
+    );
+    if (sameNumSecs.length === 0) return [];
+
+    const hintMeta = extractSceneMetaAfterNumber(normHint);
+    if (hintMeta) {
+      const metaFiltered = sameNumSecs.filter(s => {
+        const secMeta = extractSceneMetaAfterNumber(s.title);
+        if (!secMeta) return false;
+        if (secMeta.includes(hintMeta) || hintMeta.includes(secMeta)) return true;
+        const hintTokens = hintMeta.split(/\s+/).filter(Boolean);
+        return hintTokens.length > 0 && hintTokens.every(t => secMeta.includes(t));
+      });
+      if (metaFiltered.length > 0) return metaFiltered;
+
+      // Fallback: if generic INT/EXT or time-of-day token had a typo (e.g. "1-5 日 内 布莱克伍德庄园" vs "1-5 日 外 布莱克伍德庄园"),
+      // match by non-generic location tokens
+      const genericTokens = new Set(['日', '夜', '内', '外', '晨', '昏', '早', '晚', '黄昏', '清晨', '傍晚', '白天', '夜晚', '内外', '内/外', 'int', 'ext']);
+      const specificTokens = hintMeta
+        .split(/\s+/)
+        .map(t => t.replace(/^(?:日|夜|内|外|晨|昏)+/, '').trim())
+        .filter(t => t.length > 0 && !genericTokens.has(t.toLowerCase()));
+      if (specificTokens.length > 0) {
+        const locationFiltered = sameNumSecs.filter(s => {
+          const secMeta = extractSceneMetaAfterNumber(s.title);
+          if (!secMeta) return false;
+          return specificTokens.every(t => secMeta.includes(t));
+        });
+        if (locationFiltered.length > 0) return locationFiltered;
+      }
+
+      if (sameNumSecs.some(s => Boolean(extractSceneMetaAfterNumber(s.title)))) {
+        return [];
+      }
+    }
+    return sameNumSecs;
+  }
+
+  // 3. Episode-scoped or general title match (without scene number)
+  const hintEp = extractEpisodeToken(normHint);
+  if (hintEp) {
+    const sameEpSecs = sections.filter(s => extractEpisodeToken(s.title) === hintEp);
+    if (sameEpSecs.length > 0) {
+      const further = sameEpSecs.filter(s => {
+        const normSec = normalizeSceneMatchText(s.title);
+        return normSec.includes(normHint) || normHint.includes(normSec);
+      });
+      return further.length > 0 ? further : sameEpSecs;
+    }
+  }
+
+  return sections.filter(s => {
+    const normSec = normalizeSceneMatchText(s.title);
+    return normSec === normHint || normSec.includes(normHint) || normHint.includes(normSec);
+  });
 }
 
 /**
@@ -652,6 +812,26 @@ export function buildVerifiedProvenanceFromEvidence(
     const entry = rawInputs[i];
     if (!entry) continue;
 
+    const targetParagraphIndices: number[] = [];
+    if (typeof entry === 'object' && entry !== null) {
+      const pushNum = (val: unknown) => {
+        if (typeof val === 'number' && Number.isFinite(val) && val >= 1) {
+          targetParagraphIndices.push(Math.floor(val));
+        }
+      };
+      pushNum((entry as any).paragraphIndex);
+      pushNum((entry as any).paragraph);
+      if (Array.isArray((entry as any).paragraphIndices)) {
+        for (const p of (entry as any).paragraphIndices) pushNum(p);
+      }
+      if (Array.isArray((entry as any).paragraph)) {
+        for (const p of (entry as any).paragraph) pushNum(p);
+      }
+      if (Array.isArray((entry as any).paragraphs)) {
+        for (const p of (entry as any).paragraphs) pushNum(p);
+      }
+    }
+
     const rawText =
       typeof entry === 'string'
         ? entry
@@ -660,19 +840,96 @@ export function buildVerifiedProvenanceFromEvidence(
       typeof entry === 'object' && typeof entry.lineNumber === 'number' && Number.isFinite(entry.lineNumber)
         ? Math.floor(entry.lineNumber)
         : undefined;
-    const hintSceneTitle =
-      typeof entry === 'object' && typeof entry.sceneTitle === 'string' && entry.sceneTitle.trim()
-        ? entry.sceneTitle.trim()
-        : undefined;
+    const rawSceneHint = typeof entry === 'object' ? (entry.sceneTitle || entry.scene || entry.sceneId) : undefined;
+    const rawLocationHint =
+      typeof entry === 'object' && typeof (entry as any).location === 'string'
+        ? (entry as any).location.trim()
+        : '';
+    const baseSceneTitle =
+      typeof rawSceneHint === 'string' && rawSceneHint.trim()
+        ? rawSceneHint.trim()
+        : '';
+    const combinedSceneTitle =
+      baseSceneTitle && rawLocationHint && !baseSceneTitle.includes(rawLocationHint)
+        ? `${baseSceneTitle} ${rawLocationHint}`
+        : baseSceneTitle || rawLocationHint;
+    const hintSceneTitle = combinedSceneTitle ? combinedSceneTitle : undefined;
 
     const cleaned = cleanSnippetText(rawText);
+
+    // Priority 0: Resolve paragraph indices if provided in entry
+    if (targetParagraphIndices.length > 0) {
+      const explicitSceneId = typeof entry === 'object' && typeof entry.sceneId === 'string' ? entry.sceneId : undefined;
+      const hasSceneConstraint = Boolean(hintSceneTitle || explicitSceneId);
+      const candidateSecs = hasSceneConstraint
+        ? matchSectionsBySceneHint(sections, hintSceneTitle, explicitSceneId)
+        : sections;
+      const effectiveSecs = hasSceneConstraint
+        ? candidateSecs.length > 0
+          ? candidateSecs
+          : sections.length === 1 && sections[0].id === 'sec-full'
+            ? sections
+            : []
+        : sections;
+
+      let resolvedAnyByIndex = false;
+      for (const sec of effectiveSecs) {
+        const secStartLine = sec.lineNumber;
+        const endCharOffset =
+          sec.endCharIndex > sec.charIndex && scriptText[sec.endCharIndex - 1] === '\n'
+            ? sec.endCharIndex - 1
+            : sec.endCharIndex;
+        const secEndLine = scriptText.slice(0, endCharOffset).split('\n').length;
+        const sceneParas = extractSceneParagraphs(lines, secStartLine, secEndLine);
+
+        for (const pIdx of targetParagraphIndices) {
+          const matchedPara = sceneParas.find(p => p.index === pIdx);
+          if (matchedPara && matchedPara.text) {
+            const lineNum = matchedPara.lineNumber;
+            if (lineNum >= 1 && lineNum <= lines.length) {
+              const lineOffset = lineStartOffsets[lineNum - 1];
+              const span = extractConcreteEvidenceSpan(scriptText, lineOffset, matchedPara.text);
+              if (span.text.length > 0) {
+                resolvedAnyByIndex = true;
+                const matchStart = span.charIndex;
+                const matchEnd = span.charIndex + span.text.length;
+                if (!seenPositions.has(matchStart)) {
+                  seenPositions.add(matchStart);
+                  const anchorStart = Math.max(sec.charIndex, matchStart - 14);
+                  const anchorEnd = Math.min(sec.endCharIndex, matchEnd + 14);
+                  const anchorText = scriptText.slice(anchorStart, anchorEnd);
+                  const offsetInAnchor = matchStart - anchorStart;
+
+                  records.push({
+                    id: `vp_${assetId}_para_${pIdx}_${matchStart}`,
+                    sceneId: sec.id,
+                    sceneTitle: sec.title || hintSceneTitle || '正文',
+                    matchedTerm: span.text,
+                    evidenceText: span.text,
+                    anchorText,
+                    offsetInAnchor,
+                    fallbackCharIndex: matchStart,
+                    lineNumber: lineNum,
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+      if (resolvedAnyByIndex || hasSceneConstraint) {
+        continue;
+      }
+    }
+
     if (!cleaned && !hintLineNumber) continue;
 
     // Locate target section if hintSceneTitle is given
-    const targetSec = hintSceneTitle
-      ? sections.find(s => s.title === hintSceneTitle) ||
-        sections.find(s => s.title.includes(hintSceneTitle) || hintSceneTitle.includes(s.title))
-      : undefined;
+    const explicitSceneId = typeof entry === 'object' && typeof entry.sceneId === 'string' ? entry.sceneId : undefined;
+    const targetSec =
+      hintSceneTitle || explicitSceneId
+        ? matchSectionsBySceneHint(sections, hintSceneTitle, explicitSceneId)[0]
+        : undefined;
 
     let matchStart = -1;
     let matchEnd = -1;
@@ -765,9 +1022,12 @@ export function buildVerifiedProvenanceFromEvidence(
       targetSec ||
       sections[0];
 
-    // Check if the matched line is a static character roster line; if so, upgrade to concrete scene content
+    // Check if the matched line is a static character roster line or scene header line; if so, upgrade to concrete scene content
     const initialSpan = extractConcreteEvidenceSpan(scriptText, matchStart);
-    if (isCharacterRosterLine(initialSpan.lineText) && ownerSec) {
+    const isSceneHeaderLine =
+      /^(?:【\s*)?(?:\d+\s*[-—–]\s*\d+|第\s*[0-9一二三四五六七八九十百千]+\s*[场幕集话回])(?:\s*[^▲：:]*)?(?:】)?$/i.test(initialSpan.lineText) ||
+      NEXT_LINE_SCENE_META_RX.test(initialSpan.lineText);
+    if ((isCharacterRosterLine(initialSpan.lineText) || isSceneHeaderLine) && ownerSec) {
       const upgraded = upgradeRosterAnchorToSceneContent(
         scriptText,
         ownerSec.charIndex,
@@ -834,14 +1094,19 @@ export function searchProvenanceCandidates(
   if (uniqueTerms.length === 0) return [];
 
   const sections = getFlatSearchSections(scriptText, tocItems);
-  const scopeSet = Array.isArray(scopeSceneTitles) && scopeSceneTitles.length > 0
-    ? new Set(scopeSceneTitles.map(s => s.trim().toLowerCase()))
-    : null;
+  const allowedSecIds =
+    Array.isArray(scopeSceneTitles) && scopeSceneTitles.length > 0
+      ? new Set(
+          scopeSceneTitles.flatMap(hint =>
+            matchSectionsBySceneHint(sections, hint).map(s => s.id)
+          )
+        )
+      : null;
 
   const candidates: ProvenanceCandidateItem[] = [];
 
   for (const sec of sections) {
-    if (scopeSet && !scopeSet.has(sec.title.toLowerCase())) {
+    if (allowedSecIds && !allowedSecIds.has(sec.id)) {
       continue;
     }
 
@@ -1008,13 +1273,7 @@ export function resolveVerifiedProvenance(
     if (!anchor) continue;
 
     // 1. Find matching section by sceneId or sceneTitle
-    const targetSec =
-      sections.find(
-        s => (anchor.sceneId && s.id === anchor.sceneId) || s.title === anchor.sceneTitle
-      ) ||
-      sections.find(
-        s => s.title.includes(anchor.sceneTitle) || anchor.sceneTitle.includes(s.title)
-      );
+    const targetSec = matchSectionsBySceneHint(sections, anchor.sceneTitle, anchor.sceneId)[0];
 
     let matchGlobalIndex = -1;
 
@@ -1247,10 +1506,14 @@ export function resolveVerifiedProvenance(
           );
           const primaryAnchor = sortedSceneAnchors[0];
           const firstSpan = entry.spans[0];
-          const fullSceneTitle =
-            group.episode && !entry.scene.title.includes(group.episode.title)
-              ? `${group.episode.title} ${entry.scene.title}`.trim()
+          const sceneWithSub =
+            entry.scene.subTitle && !entry.scene.title.includes(entry.scene.subTitle)
+              ? `${entry.scene.title} ${entry.scene.subTitle}`.trim()
               : entry.scene.title;
+          const fullSceneTitle =
+            group.episode && !sceneWithSub.includes(group.episode.title)
+              ? `${group.episode.title} ${sceneWithSub}`.trim()
+              : sceneWithSub;
 
           results.push({
             id: primaryAnchor?.id || `prov-sc-${entry.scene.id}`,

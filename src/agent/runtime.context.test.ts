@@ -326,5 +326,228 @@ test('跨阶段观察保持与工具箱展开记忆：调用 sys.selectContext �
   assert.equal(finished.turn, 8);
 });
 
+test('执行阶段持续推进：script.read 读取剧本后若先调用 asset.list 查重，未消费的 script.read 原文观察自动保留至 asset.create', async () => {
+  const runtime = new AgentRuntime({
+    enabledTools: () => ['script.read', 'asset.list', 'asset.create', 'sys.endTask', 'user.ask'],
+    requestTurn: async task => {
+      if (task.turn === 1) {
+        return {
+          narration: ['展开分类并制定计划'],
+          plan: [
+            { id: 's1', title: '读取第一集剧本并核查娜塔莉亚出场段落' },
+            { id: 's2', title: '查重并创建娜塔莉亚角色资产' },
+          ],
+          toolCalls: [{ id: 'c1', name: 'sys.selectContext', arguments: { categories: ['script', 'asset'], tools: ['script.read', 'asset.list', 'asset.create'] } }],
+          complete: false,
+        };
+      }
+      if (task.turn === 2) {
+        assert.equal(task.context.level, 1);
+        assert.equal(task.plan.length, 2);
+        return {
+          narration: ['读取第一集结构化剧本'],
+          toolCalls: [{ id: 'c2', name: 'script.read', arguments: { episode: 1 } }],
+          complete: false,
+        };
+      }
+      if (task.turn === 3) {
+        // 第3轮：看到 script.read 结果后，在执行阶段调用 asset.list 检查是否已存在同名资产
+        assert.equal(task.observations.some(o => (o.content as any).name === 'script.read'), true);
+        return {
+          narration: ['先调用 asset.list 检查娜塔莉亚是否已存在'],
+          toolCalls: [{ id: 'c3', name: 'asset.list', arguments: { type: 'characters', query: '娜塔莉亚' } }],
+          complete: false,
+        };
+      }
+      if (task.turn === 4) {
+        // 关键验证：即使第3轮调用了 asset.list，尚未被写入消费的 script.read 结构化原文依然保留在 task.observations 中！
+        const obsNames = task.observations.map(o => (o.content as any).name);
+        assert.deepEqual(obsNames, ['script.read', 'asset.list']);
+        return {
+          narration: ['对照保留的 script.read 原文段落直接创建娜塔莉亚资产'],
+          toolCalls: [{ id: 'c4', name: 'asset.create', arguments: { type: 'characters', name: '娜塔莉亚' } }],
+          complete: false,
+        };
+      }
+      if (task.turn === 5) {
+        // asset.create 执行后，之前的只读观察被消费替换，当前观察为 asset.create
+        const obsNames = task.observations.map(o => (o.content as any).name);
+        assert.deepEqual(obsNames, ['asset.create']);
+        return {
+          narration: ['计划步骤全部完成，返回0级结案'],
+          toolCalls: [{ id: 'c5', name: 'sys.selectContext', arguments: {} }],
+          complete: false,
+        };
+      }
+      return {
+        narration: ['验收通过，结束任务'],
+        toolCalls: [{ id: 'c6', name: 'sys.endTask', arguments: { success: true } }],
+        complete: false,
+      };
+    },
+    executeTool: async call => {
+      if (call.name === 'script.read') return { totalEpisodes: 1, totalScenes: 1, totalParagraphs: 1, episodes: [] };
+      if (call.name === 'asset.list') return { total: 0, items: [] };
+      if (call.name === 'asset.create') return { success: true, createdCount: 1 };
+      return { ok: true };
+    },
+  });
+
+  const task = runtime.createTask({ id: 'task_keep_script_obs', sessionId: 'proj_1', goal: '提取娜塔莉亚角色' });
+  const finished = await runtime.wake(task.id);
+  assert.equal(finished.status, 'completed');
+  assert.equal(finished.turn, 6);
+});
+
+test('短剧多项数据自适应分步操作与数据量预警全链路测试：0级宏观探查 -> 1级数据量预警 -> 0级动态重规划 -> 1级分场执行 -> 0级完结', async () => {
+  const recordedPlans: string[][] = [];
+
+  const runtime = new AgentRuntime({
+    enabledTools: () => ['script.search', 'script.read', 'asset.create', 'asset.update', 'sys.endTask', 'user.ask'],
+    requestTurn: async task => {
+      // 记录当前轮次的计划标题
+      recordedPlans.push((task.plan || []).map(p => p.title));
+
+      if (task.turn === 1) {
+        // 第1轮：0级全局规划，建立宏观探查计划
+        return {
+          narration: ['制定宏观探查计划，先下探剧本检索数据'],
+          plan: [
+            { id: 'step_1', title: '探查剧本数据', status: 'pending' },
+            { id: 'step_2', title: '提取资产', status: 'pending' },
+            { id: 'step_3', title: '全局核验', status: 'pending' },
+          ],
+          toolCalls: [{ id: 'c1', name: 'sys.selectContext', arguments: { tools: ['script.search'] } }],
+          complete: false,
+        };
+      }
+
+      if (task.turn === 2) {
+        // 第2轮：1级执行阶段，调用 script.search 进行探查
+        assert.equal(task.plan[0].title, '探查剧本数据');
+        return {
+          narration: ['搜索剧本中娜塔莉亚的相关段落'],
+          toolCalls: [{ id: 'c2', name: 'script.search', arguments: { query: '娜塔莉亚' } }],
+          complete: false,
+        };
+      }
+
+      if (task.turn === 3) {
+        // 第3轮：由于工具 script.search 触发预警，Runtime 已自动直接切回 0 级全局规划！
+        assert.equal(task.context?.level, 0, '工具预警后 Runtime 必须已自动切回 0 级全局规划');
+        assert.equal(task.thinkingLevel, 0, 'thinkingLevel 必须已同步为 0');
+        const searchObs = task.observations.find(o => (o.content as any).name === 'script.search')?.content as any;
+        assert.equal(searchObs.output.hasVolumeWarning, true);
+        assert.equal(searchObs.output.autoReturnedToLevel0, true, '输出中必须标记 autoReturnedToLevel0 为 true');
+        assert.equal(searchObs.output.scenesSummary.length, 2);
+
+        // 0级直接基于 scenesSummary 进行按场次动态重规划，省去多余的一轮 sys.selectContext 往返
+        return {
+          narration: ['检测到系统因数据量预警自动切回0级，根据场景分布概览细化拆解计划为按场次执行与增量提交'],
+          plan: [
+            { id: 'step_1', title: '探查剧本数据 (已完成，发现跨2场共18处)', status: 'completed' },
+            { id: 'step_2', title: '提取第1-1场娜塔莉亚信息并创建资产', status: 'pending' },
+            { id: 'step_3', title: '提取第1-2场娜塔莉亚信息并增量更新资产', status: 'pending' },
+            { id: 'step_4', title: '全局核验并结束', status: 'pending' },
+          ],
+          toolCalls: [{ id: 'c3', name: 'sys.selectContext', arguments: { tools: ['asset.create', 'asset.update'] } }],
+          complete: false,
+        };
+      }
+
+      if (task.turn === 4) {
+        // 第4轮：1级执行第1-1场
+        return {
+          narration: ['执行第1-1场娜塔莉亚提取并创建资产'],
+          toolCalls: [{ id: 'c4', name: 'asset.create', arguments: { type: 'characters', name: '娜塔莉亚' } }],
+          complete: false,
+        };
+      }
+
+      if (task.turn === 5) {
+        // 第5轮：1级分场执行中调用 script.read（如读取 1-5 匹配到 2 个同名场次返回 hasVolumeWarning: true），
+        // 由于此前已完成预警拆解并已进入分步执行，不应再次强制踢回 0 级
+        return {
+          narration: ['读取第1-2场剧本正文'],
+          toolCalls: [
+            { id: 'c5_0', name: 'script.read', arguments: { scene: '1-5' } },
+          ],
+          complete: false,
+        };
+      }
+
+      if (task.turn === 6) {
+        // 第6轮：验证上一轮 script.read 未被强制踢回 0 级，仍保持在 1 级直接执行 asset.update
+        assert.equal(task.context?.level, 1, '已进入分步执行阶段后，script.read 不应重复强制踢回 0 级');
+        assert.equal(task.thinkingLevel, 1, 'thinkingLevel 应保持在 1 级');
+        const readObs = task.observations.find(o => (o.content as any).name === 'script.read')?.content as any;
+        assert.equal(Boolean(readObs.output.autoReturnedToLevel0), false, '不应标记 autoReturnedToLevel0');
+        return {
+          narration: ['执行第1-2场娜塔莉亚提取并增量追加'],
+          toolCalls: [
+            { id: 'c5_1', name: 'asset.update', arguments: { id: 'char_nat', mode: 'append' } },
+            { id: 'c5_2', name: 'sys.selectContext', arguments: {} },
+          ],
+          complete: false,
+        };
+      }
+
+      if (task.turn === 7) {
+        // 第7轮：0级全局核验，完结任务
+        return {
+          narration: ['核验完成，结束任务'],
+          plan: [
+            { id: 'step_1', title: '探查剧本数据 (已完成，发现跨2场共18处)', status: 'completed' },
+            { id: 'step_2', title: '提取第1-1场娜塔莉亚信息并创建资产', status: 'completed' },
+            { id: 'step_3', title: '提取第1-2场娜塔莉亚信息并增量更新资产', status: 'completed' },
+            { id: 'step_4', title: '全局核验并结束', status: 'completed' },
+          ],
+          toolCalls: [{ id: 'c6', name: 'sys.endTask', arguments: { success: true } }],
+          complete: false,
+        };
+      }
+
+      throw new Error(`Unexpected turn ${task.turn}`);
+    },
+    executeTool: async call => {
+      if (call.name === 'script.search') {
+        return {
+          total: 18,
+          hasVolumeWarning: true,
+          warning: '⚠️ 检测到检索结果数据量较大（共 18 项，跨 2 个场次）。',
+          scenesSummary: [
+            { sceneNumber: '1-1', sceneTitle: '1-1 夜 内 储藏室', matchCount: 8, lineRange: [3, 8], matchIndices: [1, 2, 3, 4, 5, 6, 7, 8] },
+            { sceneNumber: '1-2', sceneTitle: '1-2 日 内 客厅', matchCount: 10, lineRange: [10, 18], matchIndices: [9, 10, 11, 12, 13, 14, 15, 16, 17, 18] },
+          ],
+          results: [],
+        };
+      }
+      if (call.name === 'script.read') {
+        return {
+          sceneCount: 2,
+          paragraphCount: 42,
+          hasVolumeWarning: true,
+          warning: '匹配到 2 个场次共 42 个段落',
+          episodes: [],
+        };
+      }
+      if (call.name === 'asset.create') return { success: true, createdId: 'char_nat' };
+      if (call.name === 'asset.update') return { success: true, updatedId: 'char_nat' };
+      return { ok: true };
+    },
+  });
+
+  const task = runtime.createTask({ id: 'task_adaptive_replanning', sessionId: 'proj_adapt', goal: '提取娜塔莉亚角色' });
+  const finished = await runtime.wake(task.id);
+  assert.equal(finished.status, 'completed');
+  assert.equal(finished.turn, 7);
+  // 验证计划动态细化生效：第1轮提交宏观计划后第2轮持有3项，第3轮重规划后第4轮细化为4项且包含场次分步
+  assert.equal(recordedPlans[1].length, 3);
+  assert.equal(recordedPlans[3].length, 4);
+  assert.ok(recordedPlans[3][1].includes('第1-1场'));
+  assert.ok(recordedPlans[3][2].includes('第1-2场'));
+});
+
+
 
 

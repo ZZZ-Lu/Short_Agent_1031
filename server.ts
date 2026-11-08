@@ -6,6 +6,7 @@ import dotenv from "dotenv";
 import { AGENT_TOOL_REGISTRY } from './src/agent/toolRegistry';
 import { initialAgentContext, PROMPT_MODULES, TOOL_CATEGORIES, resolveContext, CONTROL_TOOLS, cleanToolOutputForPrompt, mergeTaskNotes, type AgentContextSelection } from './src/agent/contextPolicy';
 import { mcpRouter } from './src/server/mcpRouter';
+import { autoCloseJsonString, robustParseJson } from './src/utils/jsonParser';
 dotenv.config();
 const defaultPromptFilePath = path.join(process.cwd(), "src/agent/systemPrompt.txt");
 const defaultExecutionPromptFilePath = path.join(process.cwd(), "src/agent/systemPromptExecution.txt");
@@ -40,7 +41,11 @@ function isObsoleteMainPrompt(text: string): boolean {
   return (
     text.includes('0 级负责宏观规划与架构分解') ||
     text.includes('即将传入的 description') ||
-    text.includes('严格遵循“主体归属原则”区分资产设定简介')
+    text.includes('严格遵循“主体归属原则”区分资产设定简介') ||
+    text.includes('当写入或修改类工具已返回完整执行结果与成功状态时') ||
+    text.includes('专注解决“当前小目标”，并在该小目标完成后返回全局计划阶段') ||
+    text.includes('若需调用业务工具推进下一步小目标，按两步准备工具') ||
+    text.includes('3. 提取第1-3场幼年回忆并增量更新资产出处')
   );
 }
 
@@ -138,7 +143,19 @@ const parametersForTool = (toolId: string) => {
   const schemas: Record<string, { properties: Record<string, unknown>; required?: string[] }> = {
     'sys.selectContext': { properties: { level: { type: 'integer', enum: [0, 1] }, tools: { type: 'array', items: { type: 'string' } }, prompts: { type: 'array', items: { type: 'string' } } }, required: ['level', 'tools', 'prompts'] },
     'script.directory': { properties: { query: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 200 } } },
-    'script.read': { properties: { offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 200 } } },
+    'script.read': {
+      properties: {
+        episode: { type: 'string', description: '可选，按分集筛选读取（如 "第一集"、"1"）' },
+        scene: { type: 'string', description: '可选，按场次筛选读取（如 "1-2"、"1-5" 或场次序号）' },
+        paragraph: { type: 'integer', minimum: 1, description: '可选，按场内 1-based 段落序号筛选读取' },
+        startParagraph: { type: 'integer', minimum: 1, description: '可选，场内 1-based 起始段落序号（含）' },
+        endParagraph: { type: 'integer', minimum: 1, description: '可选，场内 1-based 结束段落序号（含）' },
+        startLine: { type: 'integer', minimum: 1, description: '可选，按剧本 1-based 起始行号筛选（含）' },
+        endLine: { type: 'integer', minimum: 1, description: '可选，按剧本 1-based 结束行号筛选（含）' },
+        offset: { type: 'integer', minimum: 0, description: '可选，按行分页起始行号（1-based）' },
+        limit: { type: 'integer', minimum: 1, maximum: 200, description: '可选，按行分页最大行数' },
+      },
+    },
     'script.search': {
       properties: {
         query: { type: 'string', description: '搜索关键词（必填）' },
@@ -160,9 +177,9 @@ const parametersForTool = (toolId: string) => {
     'asset.create': {
       properties: {
         type: { type: 'string', enum: ['characters', 'locations', 'props'], description: '资产类型（必填）：characters（角色）、locations（场景）、props（道具）' },
-        parentId: { type: 'string', description: '可选，若向已有资产追加二级版本（如新服装、夜景版），填入父资产 ID' },
+        parentId: { type: 'string', description: '可选，若向已有资产追加二级版本（如视觉上的不同造型、夜景版），填入父资产 ID' },
         name: { type: 'string', description: '资产名称（如"戴安娜"、"伯爵大厅"、"画（生日蛋糕）"）' },
-        description: { type: 'string', description: '资产识别浅色描述（防混淆、防重复、防丢失必填）：道具写明首次出场、谁的、与相似道具区分点；场景写明首次出场、归属及日夜景区分；角色写明首次出场、核心身份关系与多服装区分' },
+        description: { type: 'string', description: '资产识别浅色描述（防混淆、防重复、防丢失必填）：道具写明首次出场、谁的、与相似道具区分点；场景写明首次出场、归属及日夜景区分；角色写明首次出场、核心身份关系与视觉上的不同造型区分' },
         role: { type: 'string', description: '角色身份设定（角色适用，如"女主/列车掌权者"）' },
         appearance: { type: 'string', description: '外貌、服装穿搭与细节特征（角色适用）' },
         age: { type: 'string', description: '角色年龄' },
@@ -181,12 +198,12 @@ const parametersForTool = (toolId: string) => {
         provenances: {
           type: 'array',
           items: { type: 'object' },
-          description: '剧本原文中的具体出场描写句列表（每项如 { sceneTitle: "1-5", lineNumber: 56, evidenceText: "▲布拉姆衣着华丽，随意把玩着手中的手枪。" }，严禁传“人物：XXX”名单行或未在场的口头提及句）'
+          description: '剧本原文中的具体出场段落锚点列表（直接传 { sceneTitle: "1-5 日 外 布莱克伍德庄园", paragraphIndices: [2, 3, 5] } 即可自动还原原文，无需手填 evidenceText；严禁传“人物：XXX”名单行或未在场的口头提及句）'
         },
         versions: {
           type: 'array',
           items: { type: 'object' },
-          description: '多版本二级列表（场景若有日景和夜景须拆分为两个版本；角色若有不同服装须拆分为不同版本；每项含 name、description、provenances 及对应外貌/光影/场次字段）'
+          description: '多版本二级列表（场景若有日景和夜景须拆分为两个版本；角色若有视觉上的不同造型须按视觉上的不同造型区分版本；每项含 name、description、aliases、provenances 及对应外貌/光影/场次字段）'
         },
         items: { type: 'array', items: { type: 'object' }, description: '批量创建资产对象列表（每个对象可包含 name, description, provenances, versions, sourceScenes 及各分类属性）' }
       },
@@ -196,10 +213,10 @@ const parametersForTool = (toolId: string) => {
       properties: {
         id: { type: 'string', description: '要修改的目标资产 ID 或二级版本 ID（如 "char_xxx", "loc_xxx", "prop_xxx"）' },
         type: { type: 'string', enum: ['characters', 'locations', 'props'], description: '资产类型（可选）' },
-        mode: { type: 'string', enum: ['append', 'overwrite'], description: '出处更新模式：默认 "append"（增量追加合并，保留已有其它集数出处）；传 "overwrite" 则清空旧出处全量重设' },
+        mode: { type: 'string', enum: ['append', 'overwrite'], description: '出处与版本更新模式：默认 "append"（增量追加合并 provenances 与 versions，保留已有其它集数出处）；传 "overwrite" 则清空旧出处全量重设' },
         updates: { type: 'object', description: '待更新的属性键值对（如 name, description, provenances, versions, appearance, role, sourceScenes 等）' },
         name: { type: 'string', description: '直接修改资产或版本名称' },
-        description: { type: 'string', description: '直接修改资产识别浅色描述（首次出场、所属人、区分特征等）' },
+        description: { type: 'string', description: '修改资产识别浅色描述（注意：传入此字段会替换原 description，须保留已有核心设定并融合新增信息，若仅追加出处请勿传残缺的单场描述）' },
         role: { type: 'string', description: '直接修改角色身份' },
         appearance: { type: 'string', description: '直接修改角色外貌/服装' },
         atmosphere: { type: 'string', description: '直接修改场景氛围' },
@@ -210,9 +227,9 @@ const parametersForTool = (toolId: string) => {
         provenances: {
           type: 'array',
           items: { type: 'object' },
-          description: '补充或重设的具体出场描写原句列表（如 [{ sceneTitle: "2-1", lineNumber: 93, evidenceText: "..." }]）'
+          description: '补充或重设的出场段落锚点列表（直接传 [{ sceneTitle: "1-5 日 外 布莱克伍德庄园", paragraphIndices: [2, 3] }] 即可，无需手填 evidenceText）'
         },
-        versions: { type: 'array', items: { type: 'object' }, description: '更新该资产的多版本二级列表（如不同服装版本、日景/夜景版本）' }
+        versions: { type: 'array', items: { type: 'object' }, description: '更新该资产的多版本二级列表（如角色按视觉上的不同造型区分版本、场景日景/夜景版本）' }
       },
       required: ['id']
     },
@@ -335,114 +352,7 @@ const parametersForTool = (toolId: string) => {
   return { type: 'object', properties: schema.properties, ...(schema.required ? { required: schema.required } : {}) };
 };
 
-function robustParseJson<T = any>(str: string): T | null {
-  if (!str || typeof str !== 'string') return null;
-
-  let cleaned = str.trim();
-  // 1. Strip Markdown code block if wrapped in ```json ... ```
-  const mdMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-  if (mdMatch) {
-    cleaned = mdMatch[1].trim();
-  }
-
-  // First direct try
-  try {
-    return JSON.parse(cleaned);
-  } catch {}
-
-  const autoRepairSuffixes = ['}', ']', '}]', '}]}', '"}]}', '"]}', '"}', '"'];
-  for (const s of autoRepairSuffixes) {
-    try {
-      return JSON.parse(cleaned + s);
-    } catch {}
-  }
-
-  // 2. Find boundaries of outer JSON structure ({ ... } or [ ... ])
-  const firstBrace = cleaned.indexOf('{');
-  const firstBracket = cleaned.indexOf('[');
-  let startIdx = -1;
-  let isObject = true;
-
-  if (firstBrace !== -1 && (firstBracket === -1 || firstBrace < firstBracket)) {
-    startIdx = firstBrace;
-    isObject = true;
-  } else if (firstBracket !== -1) {
-    startIdx = firstBracket;
-    isObject = false;
-  }
-
-  if (startIdx !== -1) {
-    const lastChar = isObject ? '}' : ']';
-    const endIdx = cleaned.lastIndexOf(lastChar);
-    if (endIdx > startIdx) {
-      cleaned = cleaned.slice(startIdx, endIdx + 1);
-    }
-  }
-
-  try {
-    return JSON.parse(cleaned);
-  } catch {}
-
-  for (const s of autoRepairSuffixes) {
-    try {
-      return JSON.parse(cleaned + s);
-    } catch {}
-  }
-
-  // 3. Repair common LLM JSON formatting defects:
-  let repaired = cleaned;
-
-  // a) Missing commas between array elements (e.g. ["a" "b"] or ["a"\n"b"]):
-  repaired = repaired
-    .replace(/(["\d\]}])\s*\n\s*(["\d\[{])/g, '$1,\n$2')
-    .replace(/(")\s+(")/g, '$1, $2')
-    .replace(/(\})\s+(\{)/g, '$1, $2')
-    .replace(/(\])\s+(\[)/g, '$1, $2');
-
-  // b) Trailing commas before closing braces/brackets
-  repaired = repaired.replace(/,\s*([}\]])/g, '$1');
-
-  // c) Unquoted keys: { key: "val" } -> { "key": "val" }
-  repaired = repaired.replace(/([{,]\s*)([a-zA-Z0-9_$]+)\s*:/g, '$1"$2":');
-
-  // d) Single-quoted strings to double-quoted strings
-  repaired = repaired.replace(/:\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, ':"$1"');
-
-  try {
-    return JSON.parse(repaired);
-  } catch {}
-
-  for (const s of autoRepairSuffixes) {
-    try {
-      return JSON.parse(repaired + s);
-    } catch {}
-  }
-
-  // 4. Fallback: extract tool_calls using regex if it's a tool_calls payload
-  try {
-    const toolCallRegex = /"name"\s*:\s*"([^"]+)"[\s\S]*?"arguments"\s*:\s*(\{[\s\S]*?\})/g;
-    const extractedCalls: any[] = [];
-    let match;
-    while ((match = toolCallRegex.exec(cleaned)) !== null) {
-      const name = match[1];
-      const argsRaw = match[2];
-      try {
-        const args = JSON.parse(argsRaw.replace(/,\s*([}\]])/g, '$1'));
-        extractedCalls.push({ name, arguments: args });
-      } catch {
-        const repairedArgs = robustParseJson(argsRaw);
-        if (repairedArgs) {
-          extractedCalls.push({ name, arguments: repairedArgs });
-        }
-      }
-    }
-    if (extractedCalls.length > 0) {
-      return { tool_calls: extractedCalls } as any;
-    }
-  } catch {}
-
-  return null;
-}
+export { autoCloseJsonString, robustParseJson };
 
 function trySanitizeAndParseJson(str: string): Record<string, any> | null {
   const result = robustParseJson(str);
@@ -972,11 +882,11 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
       const isLevel1 = turnContext.level === 1;
       const controlToolLines = isLevel1
         ? [
-            `- sys.selectContext：退出局部执行并返回全局计划阶段（当本阶段“当前小目标”执行完毕后，直接无参调用 {{调用 sys.selectContext}} 返回全局计划与验收阶段；若需在执行中调整工具，可传 {"tools": [...]}）。\n  参数：{ categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[], level?: 0 | 1 }`,
+            `- sys.selectContext：补充装载工具或退出局部执行返回全局计划阶段（当前计划的后续步骤如需补充装载工具，可传 {"tools": [...]} 增量合并装载，已装载工具会自动保留；当“当前计划”中的所有步骤均已执行完毕后，直接无参调用 {{调用 sys.selectContext}} 返回全局计划与验收阶段）。\n  参数：{ categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[], level?: 0 | 1 }`,
             `- user.ask：向用户提问并挂起任务等待回复（问题直接写在【用户沟通】中，无需传参）。\n  参数：{ question?: string }`,
           ]
         : [
-            `- sys.selectContext：按需展开工具分类或装载具体工具进入执行阶段。规则：① 需展开新工具分类时，传 {"categories": [...]} 展开对应分类下的候选工具简表；② 从已展开的候选简表中按当前小目标实际需要挑选具体工具 ID 传 {"tools": [...]} 进入局部执行阶段。\n  参数：{ categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[], level?: 0 | 1 }`,
+            `- sys.selectContext：按需展开工具分类或装载具体工具进入执行阶段。规则：① 需展开新工具分类时，传 {"categories": [...]} 展开对应分类下的候选工具简表；② 结合“当前计划”中的各个步骤，从已展开的候选简表中一次性挑选执行该计划所需的具体工具 ID 传 {"tools": [...]} 进入局部执行阶段。\n  参数：{ categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[], level?: 0 | 1 }`,
             `- user.ask：向用户提问并挂起任务等待回复（问题直接写在【用户沟通】中，无需传参）。\n  参数：{ question?: string }`,
             `- sys.endTask：结束当前任务（仅限在全局计划与验收阶段调用，最终汇报直接写在【用户沟通】中；若需等待异步任务可设 paused: true）。\n  参数：{ success?: boolean, paused?: boolean }`,
           ];
@@ -984,6 +894,9 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
         .filter((tool) => enabledToolIds.has(tool.id) && !CONTROL_TOOLS.includes(tool.id))
         .map((tool) => `- ${tool.id}：${tool.description}\n  参数：${tool.input}`);
       const candidateToolLines = (turnContext.candidateTools || [])
+        .map((tool) => `- ${tool.id}：${tool.summary}`);
+      const remainingCandidateToolLines = (turnContext.candidateTools || [])
+        .filter((tool) => !enabledToolIds.has(tool.id))
         .map((tool) => `- ${tool.id}：${tool.summary}`);
       const expandedCategorySet = new Set(turnContext.categories || []);
       const unexpandedCategoryLines = Object.values(TOOL_CATEGORIES)
@@ -1003,7 +916,7 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
         if (candidateToolLines.length > 0) {
           assembledToolSections.push(
             ``,
-            `## 已展开分类 [${turnContext.categories.join(', ')}] 的候选工具简表（若需进入下一阶段局部执行，可直接从下方挑选本次实际需要的具体工具 ID 填入 tools，调用 sys.selectContext({"tools": [...]}) 进入执行阶段）`,
+            `## 已展开分类 [${turnContext.categories.join(', ')}] 的候选工具简表（结合当前计划的各个步骤，可从下方一次性挑选执行该计划所需的具体工具 ID 填入 tools，调用 sys.selectContext({"tools": [...]}) 进入执行阶段）`,
             ...candidateToolLines,
           );
           if (unexpandedCategoryLines) {
@@ -1020,6 +933,12 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
             categoryLines || '无',
           );
         }
+      } else if (remainingCandidateToolLines.length > 0) {
+        assembledToolSections.push(
+          ``,
+          `## 候选工具简表（若当前计划的后续步骤需要补充装载以下工具，可直接调用 sys.selectContext({"tools": [...]}) 补充装载，已装载工具会自动保留）`,
+          ...remainingCandidateToolLines,
+        );
       }
       const assembledToolPrompt = assembledToolSections.join('\n');
 
@@ -1127,6 +1046,14 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
           return text.trim();
         };
 
+        const formatWarningHeader = (out: any) => {
+          if (!out || typeof out !== 'object' || !out.hasVolumeWarning) return '';
+          const noticeText = out.notice || out.warning;
+          if (!noticeText) return '';
+          const isAutoReturned = Boolean(out.autoReturnedToLevel0);
+          return `💡【数据量提醒${isAutoReturned ? ' · 已处于 0 级全局阶段' : ''}】${noticeText}\n\n`;
+        };
+
         if (obsList && obsList.length) {
           obsList.forEach(obs => {
             if (obs.role !== 'tool' || !obs.content) return;
@@ -1168,16 +1095,42 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
               pageObs.push(`【UI交互成功】动作 ${output.action} 作用于 ${output.targetId}。\n${pageText}`);
             } else if (name === 'guide.lookup') {
               toolObs.push(`【操作指南查询结果】\n查询词：${output.query || '未提供'}\n指南内容：${output.guidance}`);
-            } else if (name === 'script.read' && output && typeof output === 'object' && typeof (output as any).content === 'string') {
+            } else if (name === 'script.directory' && output && typeof output === 'object') {
+              const dirOut = output as any;
+              const warningHeader = formatWarningHeader(dirOut);
+              const summaryLine = Array.isArray(dirOut.scenesSummary) && dirOut.scenesSummary.length > 0
+                ? ` | 场次分布: ${dirOut.scenesSummary.join('、')}`
+                : '';
+              toolObs.push(
+                `${warningHeader}【工具 script.directory 执行成功】（共 ${dirOut.total ?? 0} 个集数条目 | 场次总计: ${dirOut.totalScenes ?? '未知'} | 段落总计: ${dirOut.totalParagraphs ?? '未知'}${summaryLine}）\n${serializeCleanOutput(output)}`
+              );
+            } else if (name === 'script.read' && output && typeof output === 'object') {
               const readOut = output as any;
-              // 统一采用 1-based 起始行号（兼容旧数据 offset=0 时按第 1 行处理）
-              const startLineNum = typeof readOut.startLine === 'number' && readOut.startLine >= 1
-                ? Math.floor(readOut.startLine)
-                : (typeof readOut.offset === 'number' && Number.isFinite(readOut.offset) ? Math.max(1, Math.floor(readOut.offset)) : 1);
-              const rawLines = String(readOut.content).split('\n');
-              const numberedText = rawLines.map((line: string, idx: number) => `[第${startLineNum + idx}行] ${line}`).join('\n');
-              const endLineNum = startLineNum + rawLines.length - 1;
-              toolObs.push(`【工具 script.read 执行成功】（总行数: ${readOut.total ?? '未知'} | 当前显示: 第 ${startLineNum}～${endLineNum} 行 | nextOffset: ${readOut.nextOffset ?? 'null'}）\n${numberedText}`);
+              const warningHeader = formatWarningHeader(readOut);
+              if (Array.isArray(readOut.episodes)) {
+                const { content: _omittedFlatContent, ...structuredReadOut } = readOut;
+                toolObs.push(
+                  `${warningHeader}【工具 script.read 执行成功】（按“集数 -> 场次 -> 段落”三层结构返回 | 集数: ${readOut.episodeCount ?? readOut.episodes.length} | 场次数: ${readOut.sceneCount ?? '未知'} | 段落数: ${readOut.paragraphCount ?? '未知'} | 行范围: 第 ${readOut.startLine ?? 1}～${readOut.endLine ?? 1} 行 | nextOffset: ${readOut.nextOffset ?? 'null'}）\n${serializeCleanOutput(structuredReadOut)}`
+                );
+              } else if (typeof readOut.content === 'string') {
+                const startLineNum = typeof readOut.startLine === 'number' && readOut.startLine >= 1
+                  ? Math.floor(readOut.startLine)
+                  : (typeof readOut.offset === 'number' && Number.isFinite(readOut.offset) ? Math.max(1, Math.floor(readOut.offset)) : 1);
+                const rawLines = String(readOut.content).split('\n');
+                const numberedText = rawLines.map((line: string, idx: number) => `[第${startLineNum + idx}行] ${line}`).join('\n');
+                const endLineNum = startLineNum + rawLines.length - 1;
+                toolObs.push(`${warningHeader}【工具 script.read 执行成功】（总行数: ${readOut.total ?? '未知'} | 当前显示: 第 ${startLineNum}～${endLineNum} 行 | nextOffset: ${readOut.nextOffset ?? 'null'}）\n${numberedText}`);
+              } else {
+                toolObs.push(`${warningHeader}【工具 script.read 执行成功】\n${serializeCleanOutput(output)}`);
+              }
+            } else if (name === 'script.search' && output && typeof output === 'object') {
+              const searchOut = output as any;
+              const warningHeader = formatWarningHeader(searchOut);
+              toolObs.push(`${warningHeader}【工具 script.search 执行成功】（匹配结果数: ${searchOut.total ?? (Array.isArray(searchOut.results) ? searchOut.results.length : 0)}）\n${serializeCleanOutput(output)}`);
+            } else if (name === 'asset.searchProvenanceCandidates' && output && typeof output === 'object') {
+              const candOut = output as any;
+              const warningHeader = formatWarningHeader(candOut);
+              toolObs.push(`${warningHeader}【工具 asset.searchProvenanceCandidates 执行成功】\n${serializeCleanOutput(output)}`);
             } else if (name === 'user.ask') {
               // 当 # 用户指令 已通过 negotiationLog 完整呈现多轮对话与最新回复时，不在 # 工具执行结果 中重复输出 user.ask
               if (hasMultiTurnDialogue) {
@@ -1188,7 +1141,8 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
               const aText = askOut.answer ?? serializeCleanOutput(output);
               toolObs.push(`【工具 user.ask 执行成功（用户已回复）】\n提问内容：${qText}\n用户最新回答：${aText}`);
             } else {
-              toolObs.push(`【工具 ${name} 执行成功】\n${serializeCleanOutput(output)}`);
+              const warningHeader = formatWarningHeader(output);
+              toolObs.push(`${warningHeader}【工具 ${name} 执行成功】\n${serializeCleanOutput(output)}`);
             }
           });
         }
@@ -1277,7 +1231,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       const defaultPlanningTemplate = [
         `# 背景`,
         `你位于一个短剧协作平台中，负责协助用户从剧本到生图到视频的流程，你的名字是“Mira”。`,
-        `当前你处于【全局计划与验收阶段】，你的核心职责是：理解并锚定最终目标、审视全局计划、验收上一阶段成果、设定下一步小目标并按需准备工具进入执行，或在全部目标达成后结束任务。`,
+        `当前你处于【全局计划与验收阶段】，你的核心职责是：理解并锚定最终目标、制定完整的“当前计划”并将其传入执行阶段、装载执行计划所需的工具进入执行，或在计划全部达成后验收结束任务。`,
         ``,
         `# 用户指令`,
         `## 当前聚焦目标`,
@@ -1287,8 +1241,10 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         ``,
         `# 工作指南`,
         `默认优先使用后台工具读取项目数据并执行任务；需要演示或核验界面时使用 UI。基于工具返回的事实验证推进，严禁把未执行视为成功。`,
-        `若需调用业务工具推进下一步小目标，按两步准备工具：① 先传 {"categories": [...]} 展开对应分类下的候选工具简表；② 从候选简表中按需挑选本次小目标真正需要调用的具体工具 ID 传 {"tools": [...]} 进入执行阶段（结合当前聚焦目标与认知状态中已知的上下文事实，仅挑选本阶段缺失信息或待执行动作对应的工具，避免冗余查询）。`,
-        `若刚从执行阶段返回，请对照“最终目标”与“当前计划”核验上一阶段工具执行结果；确认所有子目标均已真实达成后，调用 sys.endTask 结束任务并向用户完整汇报。`,
+        `在进入执行阶段前，先制定清晰的步骤化“当前计划”，该计划将传入执行阶段并持续存在，驱动后续步骤连续执行直至完成：`,
+        `- 若上方尚未展开所需工具分类，先调用 sys.selectContext({"categories": [...]}) 展开对应分类下的候选工具简表；`,
+        `- 若上方候选工具简表已就绪，结合“当前计划”中的各个步骤，一次性挑选完成该计划所需的具体工具 ID 传 {"tools": [...]} 进入执行阶段（结合当前聚焦目标与认知状态中已知的上下文事实按需挑选，避免装载无关工具）。`,
+        `若刚从执行阶段返回，请对照“最终目标”与“当前计划”核验所有计划步骤是否均已真实达成；确认全部达成后，调用 sys.endTask 结束任务并向用户完整汇报。`,
         `称用户为“你”，口吻亲和随意；遇需用户决策或信息补充的事项，在用户沟通中明确说明。`,
         `工具调用统一采用标准 JSON 参数格式：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）。`,
         ``,
@@ -1296,14 +1252,14 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         `状态检查：`,
         `{回顾并检查上面的“认知状态”。`,
         `- 最终目标是什么？（若上方认知状态中最终目标为“暂无”，请结合“当前聚焦目标”与“用户输入原文”总结归纳出完整的最终目标）`,
-        `- 对照“当前计划”与“工具执行结果”，上一阶段的小目标是否已经解决？整体计划有哪些步骤已完成、哪些待推进？`,
-        `- 最终目标的所有要求是否已经全部达成？`,
-        `- 如果全部达成，准备调用 sys.endTask 结束任务；如果尚未全部达成，下一步的“当前小目标”应该设定为什么？`,
-        `- 为完成下一步小目标，需要先展开哪些工具分类（categories），或从上方已展开的候选简表中挑选哪些具体工具（tools）进入执行？（结合已知上下文按需精简挑选，不装载已知无需调用的工具）`,
+        `- 对照“当前计划”与“工具执行结果”，当前计划有哪些步骤已完成（[x]）、哪些待推进（[ ]）？`,
+        `- 最终目标与当前计划的所有要求是否已经全部达成？`,
+        `- 如果全部达成，准备调用 sys.endTask 结束任务；如果尚未全部达成，当前计划接下来要推进的步骤与“当前小目标”是什么？`,
+        `- 为执行当前计划，需要先展开哪些工具分类（categories），或从上方已展开的候选简表中一次性挑选哪些具体工具（tools）进入执行阶段？`,
         `- 当前进度与当前计划是否需要更新？`,
         `- 是否有新的关键结论或验收信息需要补充到“重点笔记”中？}`,
         `思考：`,
-        `{使用内心独白的方式，围绕全局目标、计划推进与工具准备进行逻辑推演。如果需要展开分类、装载工具进入执行或结束任务，请调用对应工具，系统会自动执行你的操作。}`,
+        `{使用内心独白的方式，围绕全局目标、计划制定与工具准备进行逻辑推演。如果需要展开分类、装载工具进入执行或结束任务，请调用对应工具，系统会自动执行你的操作。}`,
         `工具调用：`,
         `{{调用 工具名称, {"参数名": "参数值"}}}`,
         `用户沟通：`,
@@ -1327,7 +1283,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       const defaultExecutionTemplate = [
         `# 背景`,
         `你位于一个短剧协作平台中，负责协助用户从剧本到生图到视频的流程，你的名字是“Mira”。`,
-        `当前你处于【局部执行阶段】，你的核心职责是：使用当前已装载的业务工具，专注解决“当前小目标”，并在该小目标完成后返回全局计划阶段。`,
+        `当前你处于【局部执行阶段】，你的核心职责是：依据规划阶段制定并持续存在的“当前计划”，按步骤连续调用工具推进执行，直到计划中的所有步骤全部完成。`,
         ``,
         `# 用户指令`,
         `## 当前聚焦目标`,
@@ -1337,21 +1293,23 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         ``,
         `# 工作指南`,
         `基于工具返回的事实验证推进，严禁把未执行视为成功。`,
-        `调用或准备调用任何具体工具时，必须严格遵守下方【可用工具】中该工具的参数定义与业务规则说明。`,
-        `当写入或修改类工具已返回完整执行结果与成功状态时，即代表该操作已落盘完成，无需再次调用查询工具重复核验同一结果。`,
-        `当“当前小目标”对应的操作已完成，或下一步动作所需的工具不在当前【可用工具 -> 当前可直接调用】列表中时，调用 {{调用 sys.selectContext}} 退出当前执行阶段，返回全局计划阶段进行验收或切换下一阶段工具。`,
+        `调用任何具体工具时，必须严格遵守下方【可用工具】中该工具的参数定义与业务规则说明；若调用某工具所需的客观事实或原文依据尚未在当前上下文中就绪，必须先调用读取或检索工具获取真实数据，严禁无依据猜测或用概括语代替客观数据。`,
+        `对照【认知状态 -> 当前计划】按序连续推进：`,
+        `- 当计划中的某一步骤完成后，紧接着推进“当前计划”中的下一个未完成步骤（[ ]）；`,
+        `- 若下一步骤所需的工具已在下方【当前可直接调用】列表中，直接调用该工具继续执行，无需频繁退回全局计划阶段；`,
+        `- 若下一步骤所需的工具不在【当前可直接调用】列表中，可从【候选工具简表】挑选所需工具直接调用 {{调用 sys.selectContext, {"tools": [...]}}} 切换工具，或在“当前计划”所有步骤全部执行完毕后无参调用 {{调用 sys.selectContext}} 返回全局计划阶段进行验收结案。`,
         `称用户为“你”，口吻亲和随意；工具调用统一采用标准 JSON 参数格式：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）。`,
         ``,
         `# 输出格式`,
         `状态检查：`,
         `{回顾并检查上面的“认知状态”与本轮“工具执行结果 / 页面观察”。`,
-        `- 当前正在执行的“当前小目标”是什么？`,
-        `- 本轮工具返回了哪些具体结果？对照“当前小目标”，该小目标是否已经解决？`,
-        `- 本轮在“工具执行结果”或“页面观察”中发现了哪些对后续步骤有用的关键事实、ID 或原文线索？（若有，请在此按照工具说明要求完整、准确地整理列出，以便沉淀到“重点笔记”供后续阶段直接使用）`,
-        `- 当前进度需要更新为什么？`,
-        `- 下一步行动判断：若当前小目标尚未解决且所需工具已在下方【当前可直接调用】列表中，下一步调用哪个已装载工具？若当前小目标已经解决，或下一步所需工具尚未装载，准备调用 sys.selectContext 返回全局计划阶段。}`,
+        `- 对照“当前计划”，当前正在执行哪一步骤（以及对应的“当前小目标”）？`,
+        `- 本轮工具返回了哪些具体结果？当前步骤是否已经完成？“当前计划”中还有哪些后续步骤待推进？`,
+        `- 本轮在“工具执行结果”或“页面观察”中发现了哪些对后续步骤有用的关键事实、ID 或原文线索？（若有，请按照工具说明要求完整、准确地整理列出，以便沉淀到“重点笔记”供后续步骤直接使用）`,
+        `- 当前计划的各步骤状态与当前进度需要更新为什么？`,
+        `- 下一步行动判断：若“当前计划”仍有未完成步骤且所需工具已在下方【当前可直接调用】列表中，下一步调用哪个已装载工具继续推进？若需切换工具或“当前计划”全部步骤均已完成，准备调用 sys.selectContext。}`,
         `思考：`,
-        `{使用内心独白的方式，结合当前【工具执行结果】中的原始明细数据、认知状态与下方已装载工具的参数说明进行逻辑推演（传参前直接对照【工具执行结果】中的原始数据逐项核对，避免仅凭摘要遗漏细节），确定本轮要调用的工具与具体参数（或调用 sys.selectContext 返回全局计划阶段）。}`,
+        `{使用内心独白的方式，结合当前【工具执行结果】中的原始明细数据、【认知状态 -> 当前计划】与下方已装载工具的参数说明进行逻辑推演，核对参数依据是否完整就绪，确定本轮要调用的工具与具体参数。}`,
         `工具调用：`,
         `{{调用 工具名称, {"参数名": "参数值"}}}`,
         `用户沟通：`,
@@ -1726,14 +1684,29 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
             inner = text.slice(startIdx + 2, blockEnd - 2).trim();
             pos = blockEnd;
           } else {
-            // Fallback for non-closed {{ block
-            const matchFallback = text.slice(startIdx).match(/^\{\{([\s\S]*?)\}\}/);
-            if (matchFallback) {
-              rawSpan = matchFallback[0];
-              inner = matchFallback[1].trim();
-              pos = startIdx + rawSpan.length;
+            // Fallback for non-closed or imperfectly closed {{ block:
+            // Find candidate boundary (before next {{ or next semantic section header)
+            const remaining = text.slice(startIdx + 2);
+            const nextBoundaryMatch = remaining.search(/\n\s*\{\{|\n\s*(?:用户沟通|状态检查|思考|小目标|全局核验|行动|进展)[:：]/);
+            const candidateLen = nextBoundaryMatch !== -1 ? nextBoundaryMatch : remaining.length;
+            const candidateChunk = remaining.slice(0, candidateLen).trimEnd();
+
+            const lastDouble = candidateChunk.lastIndexOf('}}');
+            if (lastDouble !== -1) {
+              inner = candidateChunk.slice(0, lastDouble).trim();
+              rawSpan = text.slice(startIdx, startIdx + 2 + lastDouble + 2);
+              pos = startIdx + 2 + lastDouble + 2;
             } else {
-              pos = startIdx + 2;
+              const lastSingle = candidateChunk.lastIndexOf('}');
+              if (lastSingle !== -1) {
+                inner = candidateChunk.slice(0, lastSingle).trim();
+                rawSpan = text.slice(startIdx, startIdx + 2 + lastSingle + 1);
+                pos = startIdx + 2 + lastSingle + 1;
+              } else {
+                inner = candidateChunk.trim();
+                rawSpan = text.slice(startIdx, startIdx + 2 + candidateLen);
+                pos = startIdx + 2 + candidateLen;
+              }
             }
           }
 
@@ -1802,7 +1775,8 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
               const qStr = typeof parsed === 'string' ? parsed : cleanedArgs.replace(/^[“"'\s]+|[”"'\s]+$/g, '');
               argsObj = qStr ? { question: qStr } : {};
             } else {
-              const err = `【参数语法错误】工具调用参数必须为合法的 JSON 对象格式 {"参数名": "参数值"}。当前输入的内容无法解析为对象：${cleanedArgs.slice(0, 100)}。请按 Schema 规范重构参数。`;
+              const snippet = cleanedArgs.length > 160 ? `${cleanedArgs.slice(0, 90)}...${cleanedArgs.slice(-70)}` : cleanedArgs;
+              const err = `【参数语法错误】工具 "${normalizedName}" 调用参数解析失败（无法解析为合法的 JSON 对象）。当前输入片段：${snippet}。建议排查：1. 确认引号、花括号和方括号是否完整闭合；2. 建议扁平化传参（可直接传入顶层字段如 description、appearance、role、versions，无需包裹在 updates 对象中）；3. 若数据量较大，可拆分为精简单条分步提交。`;
               validationErrors.push({ name: normalizedName, error: err, rawArgs: cleanedArgs });
               toolCalls.push({ id: callId, name: normalizedName, arguments: {}, validationError: err });
               continue;
@@ -1994,7 +1968,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
   "subGoal": "下一轮要推进的当前小目标（仅当【阶段状态与下一轮去向】明确显示本轮已实际执行 sys.selectContext 返回【全局计划与验收阶段】时，才更新为‘全局核验上一阶段执行结果并推进下一步或结案’；若下一轮仍处于【局部执行阶段】，必须保持为当前局部执行的具体小目标，严禁因主循环文字中预告‘完成后将返回全局阶段’而提前改为全局核验）",
   "progress": "更新后的当前进度（合并已完成事项与当前正在推进的事项）",
   "plan": [
-    {"id": "1", "title": "计划步骤标题（若【本轮执行的工具动作】已完成数据落盘且【当前聚焦目标实时状态】已同步更新，应将关联的创建/更新面板步骤一并标为 completed）", "status": "completed | pending"}
+    {"id": "1", "title": "计划步骤标题：若主循环提出了动态重规划（如根据数据量预警或 scenesSummary 场次分布细化为分步子任务列表），必须完整采纳并替换为该细化计划列表；若【本轮执行的工具动作】已完成某步数据落盘且【当前聚焦目标实时状态】已同步更新，应将对应步骤一并标为 completed", "status": "completed | pending"}
   ],
   "notes": "合并整理后的重点笔记：完整保留【上一轮重点笔记】中已记录的所有具体事实、资产ID、行号与原文原句（即使本轮是阶段切换轮、未重复提及这些原句，也严禁删减或将不同行的相似原句合并），在此基础上并入主循环本轮新发现的线索，仅剔除‘准备读取/待核对’等已过时的过程状态描述",
   "notesMode": "overwrite"

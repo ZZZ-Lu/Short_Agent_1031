@@ -240,12 +240,15 @@ export class AgentRuntime {
         const isOnlySelectContext = Array.isArray(result.toolCalls) &&
           result.toolCalls.length > 0 &&
           result.toolCalls.every(call => !call.validationError && call.name === 'sys.selectContext');
+        const isAuxAssetCheckOnly = Array.isArray(result.toolCalls) &&
+          result.toolCalls.length > 0 &&
+          result.toolCalls.every(call => !call.validationError && (call.name === 'asset.list' || call.name === 'sys.selectContext'));
 
         // The debug transport snapshot is for the developer trace only. It
         // must never become part of the next model request's history.
-        // Results are delivered once, except when pausing on user.ask or switching
-        // stages/tools via sys.selectContext where the business data read in the
-        // preceding turn must remain visible for the subsequent execution/review turn.
+        // Results are delivered once, except when pausing on user.ask, switching
+        // stages/tools via sys.selectContext, or checking existing assets via asset.list
+        // before consuming previously read script/provenance evidence.
         const preservedObservations = (hasUserAskTool || isOnlySelectContext)
           ? task.observations.filter(obs => {
               const content = obs.content as any;
@@ -258,7 +261,16 @@ export class AgentRuntime {
               }
               return true;
             })
-          : [];
+          : isAuxAssetCheckOnly
+            ? task.observations.filter(obs => {
+                const content = obs.content as any;
+                const name = content?.name;
+                return (
+                  content?.status === 'succeeded' &&
+                  (name === 'script.read' || name === 'script.search' || name === 'asset.searchProvenanceCandidates')
+                );
+              })
+            : [];
         task.observations = [...preservedObservations];
         result.narration.forEach(text => this.addEvent(task, { turnId, type: 'thought', text }));
         const fullAnswer = result.response || result.speak || result.fullAnswer;
@@ -491,8 +503,15 @@ export class AgentRuntime {
         const prevCategories = task.requestedCategories?.length
           ? task.requestedCategories
           : (task.context?.categories ?? []);
+        const wasLevel1 = (task.context?.level ?? 0) === 1;
+        const prevLevel1Tools = wasLevel1 ? (task.context?.tools ?? []) : [];
         const explicitlyExpandedCategories = Array.isArray(call.arguments?.categories) && call.arguments.categories.length > 0;
-        const selection = validateSelection(call.arguments, this.options.enabledTools?.() ?? [], prevCategories);
+        const selection = validateSelection(
+          call.arguments,
+          this.options.enabledTools?.() ?? [],
+          prevCategories,
+          prevLevel1Tools
+        );
         task.context = selection;
         task.thinkingLevel = selection.level;
         if (Array.isArray(selection.categories) && selection.categories.length > 0) {
@@ -502,7 +521,9 @@ export class AgentRuntime {
         let transition: 'enter_execution' | 'expand_categories' | 'return_to_plan' = 'return_to_plan';
         if (selection.level === 1 && selection.tools.length > 0) {
           transition = 'enter_execution';
-          statusSummary = `已进入局部执行阶段并装载具体工具: ${selection.tools.join(', ')}`;
+          statusSummary = wasLevel1
+            ? `已补充装载局部执行工具（当前可用业务工具: ${selection.tools.join(', ')}）`
+            : `已进入局部执行阶段并装载具体工具: ${selection.tools.join(', ')}`;
         } else if (explicitlyExpandedCategories && selection.categories && selection.categories.length > 0) {
           transition = 'expand_categories';
           statusSummary = `已展开工具分类 [${selection.categories.join(', ')}] 的候选简表，请挑选具体工具填入 tools 进入局部执行阶段`;
@@ -680,6 +701,49 @@ export class AgentRuntime {
     try {
       const output = await this.options.executeTool(call, task, signal);
       if (task.status === 'paused' || task.status === 'waiting_user' || terminal.has(task.status) || signal?.aborted) return;
+
+      const hasWarning = Boolean(output && typeof output === 'object' && (output as any).hasVolumeWarning);
+      const isLevel1 = (task.context?.level ?? 0) === 1 || task.thinkingLevel === 1;
+
+      const hasPriorVolumeWarning = task.events.some(
+        e => e.type === 'system' && e.turnId !== turnId && typeof e.text === 'string' && e.text.includes('【数据量预警自动触发】')
+      );
+      const hasExecutedAssetMutation = task.events.some(
+        e =>
+          e.type === 'tool' &&
+          e.status === 'succeeded' &&
+          (e.toolName === 'asset.create' || e.toolName === 'asset.update' || e.toolName === 'asset.commitProvenance' || e.toolName === 'asset.delete')
+      );
+      const hasCompletedPlanStep = Array.isArray(task.plan) && task.plan.some(p => p && p.status === 'completed');
+      const suppressRepeatReadReturn =
+        call.name === 'script.read' && (hasPriorVolumeWarning || hasExecutedAssetMutation || hasCompletedPlanStep);
+
+      if (hasWarning && isLevel1 && !suppressRepeatReadReturn) {
+        // 工具已预警：Runtime 直接执行切回 0 级全局规划，无需通过 Agent Prompt 触发
+        const prevCategories = task.requestedCategories?.length
+          ? task.requestedCategories
+          : (task.context?.categories ?? []);
+        task.context = {
+          level: 0,
+          tools: [],
+          prompts: [],
+          categories: prevCategories,
+        };
+        task.thinkingLevel = 0;
+        if (output && typeof output === 'object') {
+          (output as any).autoReturnedToLevel0 = true;
+        }
+        this.addEvent(task, {
+          turnId,
+          type: 'system',
+          text: `【数据量预警自动触发】检测到工具 ${call.name} 返回数据量较大，系统已直接切回 0 级全局规划阶段，请在当前 0 级直接根据数据分布细化分步执行计划。`,
+        });
+      } else if (hasWarning && suppressRepeatReadReturn && output && typeof output === 'object') {
+        delete (output as any).hasVolumeWarning;
+        delete (output as any).notice;
+        delete (output as any).warning;
+      }
+
       this.updateLastTool(task, call.id, 'succeeded', `已完成：${call.name}`, { output });
       task.observations.push({ role: 'tool', content: { callId: call.id, name: call.name, status: 'succeeded', output } });
     } catch (error) {

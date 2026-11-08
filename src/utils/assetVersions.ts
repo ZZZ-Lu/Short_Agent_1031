@@ -220,6 +220,20 @@ export function parseBaseAndVersionName(rawName: string): { baseName: string; ve
   return null;
 }
 
+export function getDefaultAssetVersionName(
+  type: AssetCollectionType,
+  item?: Record<string, any> | null
+): string {
+  if (type === 'locations') {
+    const tod = typeof item?.timeOfDay === 'string' && item.timeOfDay.trim() ? item.timeOfDay.trim() : '';
+    return tod || '日景';
+  }
+  if (type === 'characters') {
+    return '常服';
+  }
+  return '初始态';
+}
+
 export function itemToVersion(type: AssetCollectionType, item: Record<string, any>, fallbackVersionName: string): ScriptAssetVersion {
   const ver: ScriptAssetVersion = {
     id: String(item.id || `${type}_ver_${Date.now()}`),
@@ -246,6 +260,53 @@ export function itemToVersion(type: AssetCollectionType, item: Record<string, an
   return ver;
 }
 
+function ensureInitialVersionWhenSingleVariant<T extends Record<string, any>>(
+  type: AssetCollectionType,
+  items: T[]
+): T[] {
+  if (!Array.isArray(items) || items.length === 0) return items;
+  let mutated = false;
+  const normalized = items.map(item => {
+    if (!item || !Array.isArray(item.versions) || item.versions.length !== 1) return item;
+    const onlyVer = item.versions[0];
+    if (!onlyVer || onlyVer.id === item.id || onlyVer.name === item.name) return item;
+    const parentProvs: any[] = Array.isArray(item.verifiedProvenance) ? item.verifiedProvenance : [];
+    if (parentProvs.length === 0) return item;
+    const verProvs: any[] = Array.isArray(onlyVer.verifiedProvenance) ? onlyVer.verifiedProvenance : [];
+    const verPosSet = new Set(
+      verProvs.map(
+        a =>
+          typeof a?.fallbackCharIndex === 'number' && a.fallbackCharIndex >= 0
+            ? `pos:${a.fallbackCharIndex}`
+            : `${a?.sceneTitle || ''}:${a?.lineNumber || ''}:${a?.evidenceText || ''}`
+      )
+    );
+    const hasDistinctParentProvs = parentProvs.some(a => {
+      const key =
+        typeof a?.fallbackCharIndex === 'number' && a.fallbackCharIndex >= 0
+          ? `pos:${a.fallbackCharIndex}`
+          : `${a?.sceneTitle || ''}:${a?.lineNumber || ''}:${a?.evidenceText || ''}`;
+      return !verPosSet.has(key);
+    });
+    if (!hasDistinctParentProvs) return item;
+
+    mutated = true;
+    const defaultName = getDefaultAssetVersionName(type, item);
+    const parentVer = itemToVersion(type, item, defaultName);
+    const parentOnlyScenes = Array.from(
+      new Set(parentProvs.map(a => a?.sceneTitle).filter(Boolean))
+    );
+    if (parentOnlyScenes.length > 0) {
+      parentVer.sourceScenes = parentOnlyScenes;
+    }
+    return {
+      ...item,
+      versions: [parentVer, onlyVer],
+    } as T;
+  });
+  return mutated ? normalized : items;
+}
+
 /**
  * Automatically merges multi-version assets in a list when:
  * 1. Two or more items share the same base name via `BaseName（VersionName）` (e.g., "伯爵大厅（日景）" + "伯爵大厅（夜景）"), OR
@@ -258,13 +319,14 @@ export function mergeMultiVersionAssetList<T extends Record<string, any>>(
   type: AssetCollectionType,
   items: T[]
 ): T[] {
-  if (!Array.isArray(items) || items.length <= 1) return items;
+  const preNormalized = ensureInitialVersionWhenSingleVariant(type, items);
+  if (!Array.isArray(preNormalized) || preNormalized.length <= 1) return preNormalized;
 
   // Count how many items map to each candidate baseName
   const baseNameCounts = new Map<string, number>();
   const exactNameSet = new Set<string>();
 
-  for (const item of items) {
+  for (const item of preNormalized) {
     if (!item || typeof item.name !== 'string') continue;
     const rawName = item.name.trim();
     exactNameSet.add(rawName);
@@ -282,13 +344,13 @@ export function mergeMultiVersionAssetList<T extends Record<string, any>>(
   }
 
   if (multiVersionBaseNames.size === 0) {
-    return items;
+    return preNormalized;
   }
 
   const groupedByBase = new Map<string, T>();
   const output: T[] = [];
 
-  for (const item of items) {
+  for (const item of preNormalized) {
     if (!item || typeof item.name !== 'string') {
       output.push(item);
       continue;

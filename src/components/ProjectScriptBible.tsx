@@ -675,6 +675,7 @@ export function ProjectScriptBible({
     id: string;
     name: string;
     category: 'character' | 'location' | 'prop';
+    isVersion?: boolean;
     sourceScenes?: string[];
     yTop?: number;
     cardHeight?: number;
@@ -691,7 +692,12 @@ export function ProjectScriptBible({
     forceActivate: boolean = false,
     parentName?: string
   ) => {
-    if (!forceActivate && activeAssetHighlight?.id === item.id) {
+    const isVersionClick = Boolean(parentName);
+    if (
+      !forceActivate &&
+      activeAssetHighlight?.id === item.id &&
+      Boolean(activeAssetHighlight?.isVersion) === isVersionClick
+    ) {
       setActiveAssetHighlight(null);
       setActiveMultiHighlightSpans([]);
       setActiveProvenanceTargetChar(null);
@@ -722,6 +728,7 @@ export function ProjectScriptBible({
         id: item.id,
         name: displayName,
         category,
+        isVersion: isVersionClick,
         sourceScenes: item.sourceScenes,
         yTop: rawY,
         cardHeight: cardH,
@@ -1460,7 +1467,7 @@ export function ProjectScriptBible({
 
   const liveHighlightedAsset = useMemo(() => {
     if (!activeAssetHighlight) return null;
-    const { id, category } = activeAssetHighlight;
+    const { id, category, isVersion } = activeAssetHighlight;
     const sourceList =
       category === 'character'
         ? displayCharacters
@@ -1469,21 +1476,44 @@ export function ProjectScriptBible({
           : displayProps;
 
     for (const entry of sourceList) {
-      if (entry.id === id) {
-        if (
-          (!Array.isArray(entry.verifiedProvenance) || entry.verifiedProvenance.length === 0) &&
-          Array.isArray(entry.versions) &&
-          entry.versions.length > 0
-        ) {
-          const aggregatedAnchors = entry.versions.flatMap((v: any) =>
-            Array.isArray(v.verifiedProvenance) ? v.verifiedProvenance : []
+      if (isVersion && Array.isArray(entry.versions)) {
+        const ver = entry.versions.find((v: any) => v.id === id);
+        if (ver) {
+          return {
+            ...ver,
+            name: `${entry.name}（${ver.name}）`,
+          };
+        }
+      }
+      if (!isVersion && entry.id === id) {
+        if (Array.isArray(entry.versions) && entry.versions.length > 0) {
+          const parentAnchors = Array.isArray(entry.verifiedProvenance) ? entry.verifiedProvenance : [];
+          const versionAnchors = entry.versions.flatMap((v: any) =>
+            Array.isArray(v?.verifiedProvenance) ? v.verifiedProvenance : []
           );
-          if (aggregatedAnchors.length > 0) {
-            return {
-              ...entry,
-              provenanceStatus: 'verified' as const,
-              verifiedProvenance: aggregatedAnchors,
-            };
+          if (versionAnchors.length > 0) {
+            const mergedMap = new Map<string, any>();
+            for (const a of [...parentAnchors, ...versionAnchors]) {
+              if (!a) continue;
+              const key =
+                typeof a.fallbackCharIndex === 'number' && a.fallbackCharIndex >= 0
+                  ? `pos:${a.fallbackCharIndex}`
+                  : `${a.sceneTitle || ''}:${a.lineNumber || ''}:${a.anchorText || a.evidenceText || a.id || ''}`;
+              const prev = mergedMap.get(key);
+              if (!prev || (a.evidenceText && (!prev.evidenceText || a.evidenceText.length > prev.evidenceText.length))) {
+                mergedMap.set(key, a);
+              }
+            }
+            const aggregatedAnchors = Array.from(mergedMap.values()).sort(
+              (a, b) => (a.fallbackCharIndex ?? 0) - (b.fallbackCharIndex ?? 0)
+            );
+            if (aggregatedAnchors.length > 0) {
+              return {
+                ...entry,
+                provenanceStatus: 'verified' as const,
+                verifiedProvenance: aggregatedAnchors,
+              };
+            }
           }
         }
         return entry;
@@ -3265,7 +3295,7 @@ export function ProjectScriptBible({
                       {(assetFilter === 'all' || assetFilter === 'characters') && displayCharacters.map((char) => {
                         const prompt = `Cinematic character portrait of ${char.name}, ${char.role}, ${char.age}. ${char.appearance}. Style: ${currentProject.universe.artStyle}, ${currentProject.universe.colorTone}, 35mm photograph, hyperdetailed master film still.`;
                         const isSelected = selectedAssetIds.has(char.id);
-                        const isHighlightActive = activeAssetHighlight?.id === char.id;
+                        const isHighlightActive = activeAssetHighlight?.id === char.id && !activeAssetHighlight?.isVersion;
                         const isAgentFocused = isTargetAgentFocused(`assets.item.character.${char.id}`);
                         const identText = getAssetIdentificationText('character', char);
                         const versions: ScriptAssetVersion[] = Array.isArray(char.versions) ? char.versions : [];
@@ -3393,7 +3423,7 @@ export function ProjectScriptBible({
                             {hasMultipleVersions && !isCollapsed && (
                               <div className="ml-5 pl-2.5 border-l border-gray-200/80 dark:border-neutral-700/80 flex flex-col gap-1 mt-1 mb-1.5">
                                 {versions.map((ver) => {
-                                  const verHighlight = activeAssetHighlight?.id === ver.id;
+                                  const verHighlight = activeAssetHighlight?.id === ver.id && Boolean(activeAssetHighlight?.isVersion);
                                   const verFocused = isTargetAgentFocused(`assets.item.character.${ver.id}`);
                                   const verIdent = getVersionIdentificationText('character', ver);
                                   return (
@@ -3474,7 +3504,7 @@ export function ProjectScriptBible({
                       {(assetFilter === 'all' || assetFilter === 'locations') && displayLocations.map((loc) => {
                         const prompt = `Cinematic wide environment establishing shot of ${loc.name}, ${loc.type}, ${loc.timeOfDay}. Atmosphere: ${loc.atmosphere}. Details: ${loc.visualDetails}. Style: ${currentProject.universe.artStyle}, ${currentProject.universe.cinematography}, film still.`;
                         const isSelected = selectedAssetIds.has(loc.id);
-                        const isHighlightActive = activeAssetHighlight?.id === loc.id;
+                        const isHighlightActive = activeAssetHighlight?.id === loc.id && !activeAssetHighlight?.isVersion;
                         const isAgentFocused = isTargetAgentFocused(`assets.item.location.${loc.id}`);
                         const identText = getAssetIdentificationText('location', loc);
                         const versions: ScriptAssetVersion[] = Array.isArray(loc.versions) ? loc.versions : [];
@@ -3602,7 +3632,7 @@ export function ProjectScriptBible({
                             {hasMultipleVersions && !isCollapsed && (
                               <div className="ml-5 pl-2.5 border-l border-gray-200/80 dark:border-neutral-700/80 flex flex-col gap-1 mt-1 mb-1.5">
                                 {versions.map((ver) => {
-                                  const verHighlight = activeAssetHighlight?.id === ver.id;
+                                  const verHighlight = activeAssetHighlight?.id === ver.id && Boolean(activeAssetHighlight?.isVersion);
                                   const verFocused = isTargetAgentFocused(`assets.item.location.${ver.id}`);
                                   const verIdent = getVersionIdentificationText('location', ver);
                                   return (
@@ -3683,7 +3713,7 @@ export function ProjectScriptBible({
                       {(assetFilter === 'all' || assetFilter === 'props') && displayProps.map((prop) => {
                         const prompt = `Close-up studio cinematography shot of ${prop.name}. Material and state: ${prop.materialAndState}. Significant story object. Style: ${currentProject.universe.artStyle}, ${currentProject.universe.colorTone}, pristine high detail.`;
                         const isSelected = selectedAssetIds.has(prop.id);
-                        const isHighlightActive = activeAssetHighlight?.id === prop.id;
+                        const isHighlightActive = activeAssetHighlight?.id === prop.id && !activeAssetHighlight?.isVersion;
                         const isAgentFocused = isTargetAgentFocused(`assets.item.prop.${prop.id}`);
                         const identText = getAssetIdentificationText('prop', prop);
                         const versions: ScriptAssetVersion[] = Array.isArray(prop.versions) ? prop.versions : [];
@@ -3811,7 +3841,7 @@ export function ProjectScriptBible({
                             {hasMultipleVersions && !isCollapsed && (
                               <div className="ml-5 pl-2.5 border-l border-gray-200/80 dark:border-neutral-700/80 flex flex-col gap-1 mt-1 mb-1.5">
                                 {versions.map((ver) => {
-                                  const verHighlight = activeAssetHighlight?.id === ver.id;
+                                  const verHighlight = activeAssetHighlight?.id === ver.id && Boolean(activeAssetHighlight?.isVersion);
                                   const verFocused = isTargetAgentFocused(`assets.item.prop.${ver.id}`);
                                   const verIdent = getVersionIdentificationText('prop', ver);
                                   return (
@@ -4324,7 +4354,7 @@ export function ProjectScriptBible({
                       <div className="flex flex-col gap-1.5">
                         {(assetFilter === 'all' || assetFilter === 'characters') && displayCharacters.map((char) => {
                           const isSelected = selectedAssetIds.has(char.id);
-                          const isHighlightActive = activeAssetHighlight?.id === char.id;
+                          const isHighlightActive = activeAssetHighlight?.id === char.id && !activeAssetHighlight?.isVersion;
                           const isAgentFocused = isTargetAgentFocused(`assets.item.character.${char.id}`);
                           const identText = getAssetIdentificationText('character', char);
                           const versions: ScriptAssetVersion[] = Array.isArray(char.versions) ? char.versions : [];
@@ -4399,7 +4429,7 @@ export function ProjectScriptBible({
                               {hasMultipleVersions && !isCollapsed && (
                                 <div className="ml-4 pl-2.5 border-l border-gray-200/80 dark:border-neutral-700/80 flex flex-col gap-1 mt-1 mb-1.5">
                                   {versions.map((ver) => {
-                                    const verHighlight = activeAssetHighlight?.id === ver.id;
+                                    const verHighlight = activeAssetHighlight?.id === ver.id && Boolean(activeAssetHighlight?.isVersion);
                                     const verFocused = isTargetAgentFocused(`assets.item.character.${ver.id}`);
                                     const verIdent = getVersionIdentificationText('character', ver);
                                     return (
@@ -4444,7 +4474,7 @@ export function ProjectScriptBible({
 
                         {(assetFilter === 'all' || assetFilter === 'locations') && displayLocations.map((loc) => {
                           const isSelected = selectedAssetIds.has(loc.id);
-                          const isHighlightActive = activeAssetHighlight?.id === loc.id;
+                          const isHighlightActive = activeAssetHighlight?.id === loc.id && !activeAssetHighlight?.isVersion;
                           const isAgentFocused = isTargetAgentFocused(`assets.item.location.${loc.id}`);
                           const identText = getAssetIdentificationText('location', loc);
                           const versions: ScriptAssetVersion[] = Array.isArray(loc.versions) ? loc.versions : [];
@@ -4519,7 +4549,7 @@ export function ProjectScriptBible({
                               {hasMultipleVersions && !isCollapsed && (
                                 <div className="ml-4 pl-2.5 border-l border-gray-200/80 dark:border-neutral-700/80 flex flex-col gap-1 mt-1 mb-1.5">
                                   {versions.map((ver) => {
-                                    const verHighlight = activeAssetHighlight?.id === ver.id;
+                                    const verHighlight = activeAssetHighlight?.id === ver.id && Boolean(activeAssetHighlight?.isVersion);
                                     const verFocused = isTargetAgentFocused(`assets.item.location.${ver.id}`);
                                     const verIdent = getVersionIdentificationText('location', ver);
                                     return (
@@ -4564,7 +4594,7 @@ export function ProjectScriptBible({
 
                         {(assetFilter === 'all' || assetFilter === 'props') && displayProps.map((prop) => {
                           const isSelected = selectedAssetIds.has(prop.id);
-                          const isHighlightActive = activeAssetHighlight?.id === prop.id;
+                          const isHighlightActive = activeAssetHighlight?.id === prop.id && !activeAssetHighlight?.isVersion;
                           const isAgentFocused = isTargetAgentFocused(`assets.item.prop.${prop.id}`);
                           const identText = getAssetIdentificationText('prop', prop);
                           const versions: ScriptAssetVersion[] = Array.isArray(prop.versions) ? prop.versions : [];
@@ -4639,7 +4669,7 @@ export function ProjectScriptBible({
                               {hasMultipleVersions && !isCollapsed && (
                                 <div className="ml-4 pl-2.5 border-l border-gray-200/80 dark:border-neutral-700/80 flex flex-col gap-1 mt-1 mb-1.5">
                                   {versions.map((ver) => {
-                                    const verHighlight = activeAssetHighlight?.id === ver.id;
+                                    const verHighlight = activeAssetHighlight?.id === ver.id && Boolean(activeAssetHighlight?.isVersion);
                                     const verFocused = isTargetAgentFocused(`assets.item.prop.${ver.id}`);
                                     const verIdent = getVersionIdentificationText('prop', ver);
                                     return (
@@ -4983,7 +5013,7 @@ export function ProjectScriptBible({
                       ? '例: 第17集17-1首现 · 戴安娜画给爸爸的生日蛋糕画，区别于第8集铁链门画'
                       : addCategory === 'location'
                         ? '例: 第1集1-1首现 · 伯爵宅邸核心主厅，区分日景与夜景两个版本'
-                        : '例: 第1集1-1首现 · 伯爵幼女/娜塔莉亚妹妹，按不同服装区分版本'
+                        : '例: 第1集1-1首现 · 伯爵幼女/娜塔莉亚妹妹，按视觉上的不同造型区分版本'
                   }
                   className="w-full px-3 py-1.5 rounded-xl bg-gray-50 dark:bg-neutral-900 border border-gray-200 dark:border-neutral-700 text-gray-900 dark:text-neutral-100 focus:outline-none focus:ring-1 focus:ring-blue-500"
                 />

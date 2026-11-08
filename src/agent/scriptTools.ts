@@ -1,6 +1,7 @@
-import { sliceScriptIntoScenes } from '../utils/slicer';
-import { SceneChunk } from '../types/script';
+import { sliceScriptIntoScenes, extractSceneParagraphs } from '../utils/slicer';
+import { SceneChunk, ScriptParagraph } from '../types/script';
 
+export type { ScriptParagraph };
 export type ScriptView = 'script' | 'directory' | 'assets' | 'universe' | 'cards';
 
 export interface ScriptSceneSummary {
@@ -13,6 +14,8 @@ export interface ScriptSceneSummary {
   characterNames?: string[];
   startLine: number;
   endLine: number;
+  paragraphCount?: number;
+  paragraphs?: ScriptParagraph[];
 }
 
 export interface ScriptEpisode {
@@ -24,6 +27,7 @@ export interface ScriptEpisode {
   startChar: number;
   endChar: number;
   sceneCount?: number;
+  paragraphCount?: number;
   scenes?: ScriptSceneSummary[];
 }
 
@@ -31,7 +35,7 @@ const episodeHeader = /^(?:【\s*)?(?:第\s*([0-9]+|[一二三四五六七八九
 
 export const parseScriptEpisodes = (
   scriptText: string,
-  options?: { scenePattern?: string; flags?: string; precomputedScenes?: SceneChunk[] }
+  options?: { scenePattern?: string; flags?: string; precomputedScenes?: SceneChunk[]; includeParagraphs?: boolean }
 ): ScriptEpisode[] => {
   if (!scriptText) return [];
   const lines = scriptText.split('\n');
@@ -61,17 +65,28 @@ export const parseScriptEpisodes = (
         const scLine = sc.startLine ?? 0;
         return scLine >= epStartLine && scLine <= endLine;
       })
-      .map(sc => ({
-        id: sc.id || `scene-${sc.index}`,
-        sceneNumber: sc.sceneNumber,
-        title: sc.title,
-        type: sc.type,
-        timeOfDay: sc.timeOfDay,
-        locationName: sc.locationName,
-        characterNames: sc.characterNames,
-        startLine: sc.startLine ?? epStartLine,
-        endLine: Math.min(sc.endLine ?? endLine, endLine),
-      }));
+      .map(sc => {
+        const sStart = sc.startLine ?? epStartLine;
+        const sEnd = Math.min(sc.endLine ?? endLine, endLine);
+        const paragraphs = Array.isArray(sc.paragraphs)
+          ? sc.paragraphs.filter(p => p.lineNumber >= sStart && p.lineNumber <= sEnd)
+          : extractSceneParagraphs(lines, sStart, sEnd);
+        return {
+          id: sc.id || `scene-${sc.index}`,
+          sceneNumber: sc.sceneNumber,
+          title: sc.title,
+          type: sc.type,
+          timeOfDay: sc.timeOfDay,
+          locationName: sc.locationName,
+          characterNames: sc.characterNames,
+          startLine: sStart,
+          endLine: sEnd,
+          paragraphCount: paragraphs.length,
+          ...(options?.includeParagraphs ? { paragraphs } : {}),
+        };
+      });
+
+    const totalParagraphs = epScenes.reduce((acc, s) => acc + (s.paragraphCount ?? 0), 0);
 
     return {
       id: `episode-${epStartLine}`,
@@ -82,6 +97,7 @@ export const parseScriptEpisodes = (
       startChar: start.startChar,
       endChar,
       sceneCount: epScenes.length,
+      ...(epScenes.length > 0 ? { paragraphCount: totalParagraphs } : {}),
       scenes: epScenes.length > 0 ? epScenes : undefined,
     };
   });
@@ -98,10 +114,12 @@ export const readScriptDirectory = (
     precomputedScenes?: SceneChunk[];
   } = {}
 ) => {
+  const lines = scriptText ? scriptText.split('\n') : [];
   let entries = parseScriptEpisodes(scriptText, {
     scenePattern: options.scenePattern,
     flags: options.flags,
     precomputedScenes: options.precomputedScenes,
+    includeParagraphs: false,
   });
 
   // Fallback: if script has no explicit episode headers but has scenes, expose scenes as directory entries
@@ -110,29 +128,38 @@ export const readScriptDirectory = (
       options.precomputedScenes && options.precomputedScenes.length > 0
         ? options.precomputedScenes
         : sliceScriptIntoScenes(scriptText, options.scenePattern, options.flags);
-    entries = scenes.map(sc => ({
-      id: sc.id || `scene-${sc.index}`,
-      number: sc.sceneNumber || String(sc.index),
-      title: sc.title,
-      startLine: sc.startLine ?? 1,
-      endLine: sc.endLine ?? 1,
-      startChar: sc.charIndex ?? 0,
-      endChar: sc.endCharIndex ?? scriptText.length,
-      sceneCount: 1,
-      scenes: [
-        {
-          id: sc.id || `scene-${sc.index}`,
-          sceneNumber: sc.sceneNumber,
-          title: sc.title,
-          type: sc.type,
-          timeOfDay: sc.timeOfDay,
-          locationName: sc.locationName,
-          characterNames: sc.characterNames,
-          startLine: sc.startLine ?? 1,
-          endLine: sc.endLine ?? 1,
-        },
-      ],
-    }));
+    entries = scenes.map(sc => {
+      const sStart = sc.startLine ?? 1;
+      const sEnd = sc.endLine ?? 1;
+      const pCount = Array.isArray(sc.paragraphs)
+        ? sc.paragraphs.length
+        : extractSceneParagraphs(lines, sStart, sEnd).length;
+      return {
+        id: sc.id || `scene-${sc.index}`,
+        number: sc.sceneNumber || String(sc.index),
+        title: sc.title,
+        startLine: sStart,
+        endLine: sEnd,
+        startChar: sc.charIndex ?? 0,
+        endChar: sc.endCharIndex ?? scriptText.length,
+        sceneCount: 1,
+        paragraphCount: pCount,
+        scenes: [
+          {
+            id: sc.id || `scene-${sc.index}`,
+            sceneNumber: sc.sceneNumber,
+            title: sc.title,
+            type: sc.type,
+            timeOfDay: sc.timeOfDay,
+            locationName: sc.locationName,
+            characterNames: sc.characterNames,
+            startLine: sStart,
+            endLine: sEnd,
+            paragraphCount: pCount,
+          },
+        ],
+      };
+    });
   }
 
   if (options.query?.trim()) {
@@ -153,14 +180,26 @@ export const readScriptDirectory = (
   }
   if (options.tailOnly) entries = entries.slice(-1);
   if (options.range) entries = entries.slice(Math.max(0, options.range[0] - 1), Math.max(0, options.range[1]));
-  return entries.map(({ id, number, title, startLine, endLine, sceneCount, scenes }) => ({
+  return entries.map(({ id, number, title, sceneCount, paragraphCount, scenes }) => ({
     id,
     number,
     title,
-    startLine,
-    endLine,
     ...(typeof sceneCount === 'number' ? { sceneCount } : {}),
-    ...(scenes && scenes.length > 0 ? { scenes } : {}),
+    ...(typeof paragraphCount === 'number' ? { paragraphCount } : {}),
+    ...(scenes && scenes.length > 0
+      ? {
+          scenes: scenes.map(s => ({
+            id: s.id,
+            sceneNumber: s.sceneNumber,
+            title: s.title,
+            type: s.type,
+            timeOfDay: s.timeOfDay,
+            locationName: s.locationName,
+            characterNames: s.characterNames,
+            paragraphCount: s.paragraphCount,
+          })),
+        }
+      : {}),
   }));
 };
 
@@ -213,8 +252,385 @@ export function findEpisodeByIdentifier(episodes: ScriptEpisode[], episodeId: st
   });
 }
 
+export function matchesSceneIdentifier(scene: ScriptSceneSummary, sceneIndex: number, rawTarget: string | number): boolean {
+  const targetStr = String(rawTarget).trim();
+  if (!targetStr) return false;
+  const targetLower = targetStr.toLowerCase();
+  const normalizedDash = targetLower.replace(/[—–]/g, '-');
+
+  if (scene.id.toLowerCase() === targetLower) return true;
+  if (scene.sceneNumber && scene.sceneNumber.toLowerCase().replace(/[—–]/g, '-') === normalizedDash) return true;
+  const normTitle = scene.title.toLowerCase().replace(/[—–]/g, '-');
+  if (normTitle.includes(normalizedDash)) return true;
+  if (scene.locationName && scene.locationName.toLowerCase().includes(targetLower)) return true;
+
+  // Support concatenated or partially specified scene number + location (e.g. "1-5布莱克伍德庄园" or "1-5 日 内 布莱克伍德庄园")
+  const dashMatch = normalizedDash.match(/^(\d+\s*-\s*\d+)(.+)$/);
+  if (dashMatch) {
+    const targetNum = dashMatch[1].replace(/\s+/g, '');
+    const targetRest = dashMatch[2].trim();
+    const sceneNum = (scene.sceneNumber || '').toLowerCase().replace(/[—–\s]/g, '-');
+    if (sceneNum === targetNum && targetRest) {
+      const genericTokens = new Set(['日', '夜', '内', '外', '晨', '昏', '早', '晚', 'int', 'ext']);
+      const specificTokens = targetRest
+        .split(/\s+/)
+        .map(t => t.replace(/^(?:日|夜|内|外|晨|昏)+/, '').trim())
+        .filter(t => t.length > 0 && !genericTokens.has(t));
+      if (specificTokens.length > 0 && specificTokens.every(t => normTitle.includes(t) || (scene.locationName && scene.locationName.toLowerCase().includes(t)))) {
+        return true;
+      }
+    }
+  }
+
+  const num = parseChineseOrArabicNumber(targetStr);
+  if (num !== null && sceneIndex === num) return true;
+
+  return false;
+}
+
+export interface ScriptReadStructuredOptions {
+  episode?: string | number | Array<string | number>;
+  scene?: string | number | Array<string | number>;
+  paragraph?: number | [number, number] | number[];
+  startParagraph?: number;
+  endParagraph?: number;
+  startLine?: number;
+  endLine?: number;
+  offset?: number;
+  limit?: number;
+  scenePattern?: string;
+  flags?: string;
+  precomputedScenes?: SceneChunk[];
+}
+
+/**
+ * 按“集数 (episodes) -> 场次 (scenes) -> 段落 (paragraphs)”三层结构化输出剧本内容。
+ * 段落判定标准：换行即为下一段落，没有换行就是一个段落。
+ */
+export function readScriptStructured(
+  scriptText: string,
+  options: ScriptReadStructuredOptions = {}
+) {
+  const lines = scriptText ? scriptText.split('\n') : [];
+  if (lines.length === 0 || !scriptText.trim()) {
+    return {
+      total: lines.length,
+      offset: 1,
+      startLine: 1,
+      endLine: 1,
+      nextOffset: null,
+      episodeCount: 0,
+      sceneCount: 0,
+      paragraphCount: 0,
+      episodes: [],
+      content: '',
+    };
+  }
+
+  let allEpisodes = parseScriptEpisodes(scriptText, {
+    scenePattern: options.scenePattern,
+    flags: options.flags,
+    precomputedScenes: options.precomputedScenes,
+    includeParagraphs: true,
+  });
+
+  // 若整个剧本没有显式的“第X集”标题，将剧本整体视为默认第 1 集並挂载场次与段落
+  if (allEpisodes.length === 0) {
+    const fallbackScenes =
+      options.precomputedScenes && options.precomputedScenes.length > 0
+        ? options.precomputedScenes
+        : sliceScriptIntoScenes(scriptText, options.scenePattern, options.flags);
+
+    if (fallbackScenes.length > 0) {
+      const mappedScenes: ScriptSceneSummary[] = fallbackScenes.map(sc => {
+        const sStart = sc.startLine ?? 1;
+        const sEnd = sc.endLine ?? lines.length;
+        const paragraphs = Array.isArray(sc.paragraphs)
+          ? sc.paragraphs
+          : extractSceneParagraphs(lines, sStart, sEnd);
+        return {
+          id: sc.id || `scene-${sc.index}`,
+          sceneNumber: sc.sceneNumber,
+          title: sc.title,
+          type: sc.type,
+          timeOfDay: sc.timeOfDay,
+          locationName: sc.locationName,
+          characterNames: sc.characterNames,
+          startLine: sStart,
+          endLine: sEnd,
+          paragraphCount: paragraphs.length,
+          paragraphs,
+        };
+      });
+      allEpisodes = [
+        {
+          id: 'episode-1',
+          number: '1',
+          title: '第1集',
+          startLine: 1,
+          endLine: lines.length,
+          startChar: 0,
+          endChar: scriptText.length,
+          sceneCount: mappedScenes.length,
+          paragraphCount: mappedScenes.reduce((acc, s) => acc + (s.paragraphCount ?? 0), 0),
+          scenes: mappedScenes,
+        },
+      ];
+    } else {
+      const paragraphs = extractSceneParagraphs(lines, 1, lines.length, { skipHeaderCheck: true });
+      allEpisodes = [
+        {
+          id: 'episode-1',
+          number: '1',
+          title: '正文',
+          startLine: 1,
+          endLine: lines.length,
+          startChar: 0,
+          endChar: scriptText.length,
+          sceneCount: 1,
+          paragraphCount: paragraphs.length,
+          scenes: [
+            {
+              id: 'scene-1',
+              sceneNumber: '1-1',
+              title: '正文',
+              startLine: 1,
+              endLine: lines.length,
+              paragraphCount: paragraphs.length,
+              paragraphs,
+            },
+          ],
+        },
+      ];
+    }
+  } else {
+    // 确保每个分集下都有三层结构（若某集内未写显式场次标题，则将该集正文作为默认场次 1）
+    allEpisodes = allEpisodes.map(ep => {
+      if (Array.isArray(ep.scenes) && ep.scenes.length > 0) {
+        return ep;
+      }
+      const paragraphs = extractSceneParagraphs(lines, ep.startLine, ep.endLine);
+      const defaultScene: ScriptSceneSummary = {
+        id: `${ep.id}-scene-1`,
+        sceneNumber: `${ep.number}-1`,
+        title: ep.title,
+        startLine: ep.startLine,
+        endLine: ep.endLine,
+        paragraphCount: paragraphs.length,
+        paragraphs,
+      };
+      return {
+        ...ep,
+        sceneCount: 1,
+        paragraphCount: paragraphs.length,
+        scenes: [defaultScene],
+      };
+    });
+  }
+
+  const episodeFilters =
+    options.episode !== undefined && options.episode !== null && String(options.episode).trim() !== ''
+      ? (Array.isArray(options.episode) ? options.episode : [options.episode])
+      : [];
+  const sceneFilters =
+    options.scene !== undefined && options.scene !== null && String(options.scene).trim() !== ''
+      ? (Array.isArray(options.scene) ? options.scene : [options.scene])
+      : [];
+
+  let paraStart: number | undefined =
+    typeof options.startParagraph === 'number' && Number.isFinite(options.startParagraph)
+      ? Math.max(1, Math.floor(options.startParagraph))
+      : undefined;
+  let paraEnd: number | undefined =
+    typeof options.endParagraph === 'number' && Number.isFinite(options.endParagraph)
+      ? Math.max(1, Math.floor(options.endParagraph))
+      : undefined;
+
+  if (typeof options.paragraph === 'number' && Number.isFinite(options.paragraph)) {
+    const p = Math.max(1, Math.floor(options.paragraph));
+    paraStart = p;
+    paraEnd = p;
+  } else if (Array.isArray(options.paragraph) && options.paragraph.length > 0) {
+    if (options.paragraph.length === 2) {
+      paraStart = Math.max(1, Math.floor(Number(options.paragraph[0]) || 1));
+      paraEnd = Math.max(paraStart, Math.floor(Number(options.paragraph[1]) || paraStart));
+    } else {
+      const p = Math.max(1, Math.floor(Number(options.paragraph[0]) || 1));
+      paraStart = p;
+      paraEnd = p;
+    }
+  }
+
+  const hasStructuredFilter =
+    episodeFilters.length > 0 ||
+    sceneFilters.length > 0 ||
+    paraStart !== undefined ||
+    paraEnd !== undefined ||
+    (typeof options.startLine === 'number' && Number.isFinite(options.startLine)) ||
+    (typeof options.endLine === 'number' && Number.isFinite(options.endLine));
+
+  let effectiveStartLine = 1;
+  let effectiveEndLine = lines.length;
+  let nextOffset: number | null = null;
+
+  if (!hasStructuredFilter) {
+    // 兼容按 offset / limit 行号分页读取
+    const rawOffset = typeof options.offset === 'number' && Number.isFinite(options.offset) ? Math.floor(options.offset) : 1;
+    effectiveStartLine = Math.max(1, rawOffset);
+    const limit =
+      typeof options.limit === 'number' && Number.isFinite(options.limit)
+        ? Math.min(200, Math.max(1, Math.floor(options.limit)))
+        : 100;
+    const startIdx = effectiveStartLine - 1;
+    const sliceLen = Math.min(limit, Math.max(0, lines.length - startIdx));
+    effectiveEndLine = sliceLen > 0 ? startIdx + sliceLen : effectiveStartLine;
+    nextOffset = startIdx + limit < lines.length ? startIdx + limit + 1 : null;
+  } else {
+    if (typeof options.startLine === 'number' && Number.isFinite(options.startLine)) {
+      effectiveStartLine = Math.max(1, Math.floor(options.startLine));
+    }
+    if (typeof options.endLine === 'number' && Number.isFinite(options.endLine)) {
+      effectiveEndLine = Math.min(lines.length, Math.floor(options.endLine));
+    }
+  }
+
+  // 如果用户在 episode 参数中传了类似 "1-5" 的场次号，自动识别并并入 sceneFilters
+  const resolvedEpisodeIds = new Set<string>();
+  const implicitSceneFilters: Array<string | number> = [...sceneFilters];
+
+  for (const epFilter of episodeFilters) {
+    const matchedEp = findEpisodeByIdentifier(allEpisodes, epFilter);
+    if (matchedEp) {
+      resolvedEpisodeIds.add(matchedEp.id);
+    } else {
+      implicitSceneFilters.push(epFilter);
+    }
+  }
+
+  const filteredEpisodes = allEpisodes
+    .filter(ep => {
+      if (resolvedEpisodeIds.size > 0 && !resolvedEpisodeIds.has(ep.id)) {
+        return false;
+      }
+      if (ep.endLine < effectiveStartLine || ep.startLine > effectiveEndLine) {
+        return false;
+      }
+      return true;
+    })
+    .map((ep, epIdx) => {
+      const rawScenes = ep.scenes || [];
+      const filteredScenes = rawScenes
+        .filter((sc, scIdx) => {
+          if (sc.endLine < effectiveStartLine || sc.startLine > effectiveEndLine) {
+            return false;
+          }
+          if (implicitSceneFilters.length > 0) {
+            return implicitSceneFilters.some(sf => matchesSceneIdentifier(sc, scIdx + 1, sf));
+          }
+          return true;
+        })
+        .map((sc, scIdx) => {
+          const rawParas = sc.paragraphs || [];
+          const filteredParas = rawParas
+            .filter(p => {
+              if (p.lineNumber < effectiveStartLine || p.lineNumber > effectiveEndLine) {
+                return false;
+              }
+              if (paraStart !== undefined && p.index < paraStart) return false;
+              if (paraEnd !== undefined && p.index > paraEnd) return false;
+              return true;
+            })
+            .map((p, pIdx) => ({
+              index: pIdx + 1,
+              text: p.text,
+            }));
+
+          return {
+            index: scIdx + 1,
+            id: sc.id,
+            ...(sc.sceneNumber ? { sceneNumber: sc.sceneNumber } : {}),
+            title: sc.title,
+            ...(sc.type ? { type: sc.type } : {}),
+            ...(sc.timeOfDay ? { timeOfDay: sc.timeOfDay } : {}),
+            ...(sc.locationName ? { locationName: sc.locationName } : {}),
+            ...(sc.characterNames && sc.characterNames.length > 0 ? { characterNames: sc.characterNames } : {}),
+            paragraphCount: filteredParas.length,
+            paragraphs: filteredParas,
+          };
+        })
+        .filter(sc => implicitSceneFilters.length === 0 || sc.paragraphCount >= 0);
+
+      const epParaCount = filteredScenes.reduce((acc, s) => acc + s.paragraphCount, 0);
+      return {
+        index: epIdx + 1,
+        id: ep.id,
+        number: ep.number,
+        title: ep.title,
+        sceneCount: filteredScenes.length,
+        paragraphCount: epParaCount,
+        scenes: filteredScenes,
+      };
+    })
+    .filter(ep => ep.sceneCount > 0);
+
+  if (hasStructuredFilter && filteredEpisodes.length > 0) {
+    const matchedRanges = filteredEpisodes.flatMap(ep => {
+      const origEp = allEpisodes.find(e => e.id === ep.id);
+      return (ep.scenes || []).map(sc => {
+        const origSc = origEp?.scenes?.find(s => s.id === sc.id);
+        return origSc ? { startLine: origSc.startLine, endLine: origSc.endLine } : null;
+      });
+    }).filter((r): r is { startLine: number; endLine: number } => r !== null);
+    if (matchedRanges.length > 0) {
+      effectiveStartLine = Math.min(...matchedRanges.map(r => r.startLine));
+      effectiveEndLine = Math.max(...matchedRanges.map(r => r.endLine));
+    }
+  } else if (hasStructuredFilter && filteredEpisodes.length === 0) {
+    effectiveStartLine = 1;
+    effectiveEndLine = 0;
+  }
+
+  const totalScenes = filteredEpisodes.reduce((acc, ep) => acc + ep.sceneCount, 0);
+  const totalParagraphs = filteredEpisodes.reduce((acc, ep) => acc + ep.paragraphCount, 0);
+  const contentSlice = effectiveEndLine >= effectiveStartLine
+    ? lines.slice(Math.max(0, effectiveStartLine - 1), effectiveEndLine).join('\n')
+    : '';
+
+  const scenesSummary = filteredEpisodes.flatMap(ep =>
+    (ep.scenes || []).map(sc => ({
+      sceneNumber: sc.sceneNumber || String(sc.index),
+      title: sc.title,
+      paragraphCount: sc.paragraphCount,
+    }))
+  );
+
+  const isMultiSceneMatch = totalScenes > 1;
+  const hasVolumeWarning = isMultiSceneMatch
+    ? (totalParagraphs >= 15 || totalScenes >= 2)
+    : (totalParagraphs > 30 && !options.paragraph);
+  const notice = hasVolumeWarning
+    ? (isMultiSceneMatch && options.scene
+        ? `我发现当前条件 "${options.scene}" 共匹配到 ${totalScenes} 个场次（${scenesSummary.map(s => `"${s.title}" ${s.paragraphCount}段`).join('、')}，共 ${totalParagraphs} 个段落），内容较多。本次已将全部原文返回在下方，当前处于 Stage 0 阶段，建议拆分为多轮计划处理。`
+        : `我发现当前读取范围包含 ${totalScenes} 个场次共 ${totalParagraphs} 个段落，内容较多。本次已将全部原文返回在下方，当前处于 Stage 0 阶段，建议拆分为多轮计划处理。`)
+    : undefined;
+
+  return {
+    total: lines.length,
+    offset: effectiveStartLine,
+    nextOffset,
+    episodeCount: filteredEpisodes.length,
+    sceneCount: totalScenes,
+    paragraphCount: totalParagraphs,
+    hasVolumeWarning,
+    ...(notice ? { notice, warning: notice } : {}),
+    ...(hasVolumeWarning ? { scenesSummary } : {}),
+    episodes: filteredEpisodes,
+    content: contentSlice,
+  };
+}
+
 export const readScriptEpisode = (scriptText: string, episodeId: string, options: { mode?: 'full' | 'excerpt'; lineRange?: [number, number] } = {}) => {
-  const episodes = parseScriptEpisodes(scriptText);
+  const episodes = parseScriptEpisodes(scriptText, { includeParagraphs: true });
   const episode = findEpisodeByIdentifier(episodes, episodeId);
   if (!episode) throw new Error(`未找到剧集：${episodeId}`);
   const lines = scriptText.split('\n');
@@ -244,18 +660,33 @@ export interface ScriptSearchOptions {
 export interface ScriptSearchScope {
   episode?: string;
   scene?: string;
-  startLine: number;
-  endLine: number;
+}
+
+export interface ScriptSearchSceneSummary {
+  sceneId?: string;
+  sceneNumber: string;
+  sceneTitle: string;
+  matchCount: number;
+  matchIndices: number[];
+}
+
+export interface ScriptSearchResult {
+  matches: Array<{ index: number; paragraphIndex?: number; sceneTitle?: string; snippet: string }>;
+  totalMatches: number;
+  scope?: ScriptSearchScope;
+  hasVolumeWarning?: boolean;
+  warning?: string;
+  scenesSummary?: ScriptSearchSceneSummary[];
 }
 
 export const searchScriptWithScope = (
   scriptText: string,
   query: string,
   options: ScriptSearchOptions = {}
-): { matches: Array<{ index: number; lineNumber: number; column: number; snippet: string }>; totalMatches: number; scope?: ScriptSearchScope } => {
+): ScriptSearchResult => {
   const needle = query.trim();
   if (!needle) throw new Error('搜索关键词不能为空。');
-  if (!scriptText) return { matches: [], totalMatches: 0 };
+  if (!scriptText) return { matches: [], totalMatches: 0, hasVolumeWarning: false };
 
   const allLines = scriptText.split('\n');
   let rangeStart = 1;
@@ -331,13 +762,12 @@ export const searchScriptWithScope = (
     return {
       matches: [],
       totalMatches: 0,
+      hasVolumeWarning: false,
       ...(hasExplicitScope
         ? {
             scope: {
               ...(matchedEpisodeTitle ? { episode: matchedEpisodeTitle } : {}),
               ...(matchedSceneTitle ? { scene: matchedSceneTitle } : {}),
-              startLine: rangeStart,
-              endLine: rangeEnd,
             },
           }
         : {}),
@@ -350,31 +780,91 @@ export const searchScriptWithScope = (
       : 50;
 
   const needleLower = needle.toLowerCase();
-  const allMatches: Array<{ index: number; lineNumber: number; column: number; snippet: string }> = [];
+  const rawMatches: Array<{ index: number; lineNumber: number; snippet: string }> = [];
 
   for (let lineNum = rangeStart; lineNum <= rangeEnd; lineNum++) {
     const line = allLines[lineNum - 1] ?? '';
     const position = line.toLowerCase().indexOf(needleLower);
     if (position >= 0) {
-      allMatches.push({
-        index: allMatches.length + 1,
+      rawMatches.push({
+        index: rawMatches.length + 1,
         lineNumber: lineNum,
-        column: position + 1,
         snippet: line.trim().slice(0, 300),
       });
     }
   }
 
+  // 聚合各场次命中分布与段落序号
+  const sceneSummaryMap = new Map<string, ScriptSearchSceneSummary>();
+  const flatScenes: Array<{ epTitle: string; scene: ScriptSceneSummary }> = [];
+  for (const ep of episodes) {
+    for (const sc of ep.scenes || []) {
+      flatScenes.push({ epTitle: ep.title, scene: sc });
+    }
+  }
+
+  const allMatches: Array<{ index: number; paragraphIndex?: number; sceneTitle?: string; snippet: string }> = [];
+
+  for (const m of rawMatches) {
+    const matchedScene = flatScenes.find(
+      item => m.lineNumber >= item.scene.startLine && m.lineNumber <= item.scene.endLine
+    );
+    const sceneKey = matchedScene
+      ? matchedScene.scene.id || `${matchedScene.epTitle}-${matchedScene.scene.sceneNumber || matchedScene.scene.title}`
+      : 'other';
+    const sceneNum = matchedScene?.scene.sceneNumber || '未知场次';
+    const sceneTitle = matchedScene?.scene.title || matchedScene?.epTitle || '未归类场次';
+
+    let paragraphIndex: number | undefined;
+    if (matchedScene) {
+      const sceneParas = Array.isArray(matchedScene.scene.paragraphs)
+        ? matchedScene.scene.paragraphs
+        : extractSceneParagraphs(allLines, matchedScene.scene.startLine, matchedScene.scene.endLine);
+      const foundP = sceneParas.find(p => p.lineNumber === m.lineNumber);
+      if (foundP) {
+        paragraphIndex = foundP.index;
+      }
+    }
+
+    allMatches.push({
+      index: m.index,
+      snippet: m.snippet,
+      ...(paragraphIndex !== undefined ? { paragraphIndex } : {}),
+      ...(matchedScene ? { sceneTitle } : {}),
+    });
+
+    const existing = sceneSummaryMap.get(sceneKey);
+    if (!existing) {
+      sceneSummaryMap.set(sceneKey, {
+        sceneId: matchedScene?.scene.id,
+        sceneNumber: sceneNum,
+        sceneTitle,
+        matchCount: 1,
+        matchIndices: [m.index],
+      });
+    } else {
+      existing.matchCount += 1;
+      existing.matchIndices.push(m.index);
+    }
+  }
+
+  const scenesSummary = Array.from(sceneSummaryMap.values());
+  const hasVolumeWarning = allMatches.length > 15 || (scenesSummary.length >= 2 && allMatches.length >= 12);
+  const notice = hasVolumeWarning
+    ? `我发现检索到 ${allMatches.length} 条匹配，跨越 ${scenesSummary.length} 个场次，内容较多。本次已将全部匹配结果返回在下方，当前处于 Stage 0 阶段，建议拆分为多轮计划处理。`
+    : undefined;
+
   return {
     matches: allMatches.slice(0, maxLimit),
     totalMatches: allMatches.length,
+    hasVolumeWarning,
+    ...(notice ? { notice, warning: notice } : {}),
+    ...(scenesSummary.length > 0 ? { scenesSummary } : {}),
     ...(hasExplicitScope
       ? {
           scope: {
             ...(matchedEpisodeTitle ? { episode: matchedEpisodeTitle } : {}),
             ...(matchedSceneTitle ? { scene: matchedSceneTitle } : {}),
-            startLine: rangeStart,
-            endLine: rangeEnd,
           },
         }
       : {}),

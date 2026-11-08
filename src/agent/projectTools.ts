@@ -1,4 +1,4 @@
-import { readScriptDirectory, searchScript, searchScriptWithScope } from './scriptTools';
+import { readScriptDirectory, readScriptStructured, searchScript, searchScriptWithScope } from './scriptTools';
 import {
   searchProvenanceCandidates,
   computeScriptSignature,
@@ -7,7 +7,12 @@ import {
   type ProvenanceEvidenceInput,
   type VerifiedAnchorRecord,
 } from '../utils/assetProvenance';
-import { normalizeAssetVersions, mergeMultiVersionAssetList, itemToVersion } from '../utils/assetVersions';
+import {
+  normalizeAssetVersions,
+  mergeMultiVersionAssetList,
+  itemToVersion,
+  getDefaultAssetVersionName,
+} from '../utils/assetVersions';
 
 export type ProjectData = {
   id: string;
@@ -121,27 +126,70 @@ export function executeProjectReadTool(name: string, args: Record<string, unknow
           }
         : {}),
     }));
-    return { projectId: project.id, source: 'project', total: all.length, offset, entries, nextOffset: offset + limit < all.length ? offset + limit : null };
-  }
-  if (name === 'script.read') {
-    const lines = project.scriptText ? project.scriptText.split('\n') : [];
-    const rawOffset = pageNumber(args.offset, 1, Number.MAX_SAFE_INTEGER);
-    // 统一采用 1-based 起始行号（与 script.directory 的 startLine、script.search 的 lineNumber 完全对齐；传 0 或 1 均从第 1 行开始）
-    const startLine = Math.max(1, rawOffset);
-    const startIndex = startLine - 1;
-    const limit = Math.max(1, pageNumber(args.limit, 100, 200));
-    const slice = lines.slice(startIndex, startIndex + limit);
-    const endLine = slice.length > 0 ? startIndex + slice.length : startLine;
-    const nextOffset = startIndex + limit < lines.length ? startIndex + limit + 1 : null;
+    const totalScenes = all.reduce((acc, ep) => acc + (ep.sceneCount ?? (ep.scenes ? ep.scenes.length : 0)), 0);
+    const totalParagraphs = all.reduce(
+      (acc, ep) =>
+        acc +
+        (ep.paragraphCount ??
+          (ep.scenes ? ep.scenes.reduce((pAcc, sc) => pAcc + (sc.paragraphCount ?? 0), 0) : 0)),
+      0
+    );
+    const allScenesList = all.flatMap(ep => (Array.isArray(ep.scenes) ? ep.scenes : []));
+    const scenesSummary = allScenesList.map(
+      s => `${s.title || s.sceneNumber || s.id} (${s.paragraphCount ?? 0}段)`
+    );
+
+    const hasVolumeWarning = totalScenes >= 3 || totalParagraphs >= 20;
+    const notice = hasVolumeWarning
+      ? `我发现当前剧集目录包含 ${totalScenes} 个场次共 ${totalParagraphs} 个段落，内容较多。本次已将全部目录信息返回在下方，当前处于 Stage 0 阶段，建议拆分为多轮计划处理。`
+      : undefined;
+
     return {
       projectId: project.id,
       source: 'project',
-      total: lines.length,
-      offset: startLine,
+      total: all.length,
+      offset,
+      entries,
+      nextOffset: offset + limit < all.length ? offset + limit : null,
+      totalScenes,
+      totalParagraphs,
+      scenesSummary,
+      hasVolumeWarning,
+      ...(notice ? { notice, warning: notice } : {}),
+    };
+  }
+  if (name === 'script.read') {
+    const rawEpisode = args.episode ?? args.episodeId ?? args.episodes;
+    const rawScene = args.scene ?? args.sceneId ?? args.scenes;
+    const rawParagraph = args.paragraph ?? args.paragraphs;
+    const rawStartLine = args.startLine ?? (Array.isArray(args.lineRange) ? args.lineRange[0] : undefined);
+    const rawEndLine = args.endLine ?? (Array.isArray(args.lineRange) ? args.lineRange[1] : undefined);
+    const startLine = Number.isFinite(Number(rawStartLine)) && Number(rawStartLine) >= 1 ? Math.floor(Number(rawStartLine)) : undefined;
+    const endLine = Number.isFinite(Number(rawEndLine)) && Number(rawEndLine) >= 1 ? Math.floor(Number(rawEndLine)) : undefined;
+    const startParagraph = Number.isFinite(Number(args.startParagraph)) && Number(args.startParagraph) >= 1 ? Math.floor(Number(args.startParagraph)) : undefined;
+    const endParagraph = Number.isFinite(Number(args.endParagraph)) && Number(args.endParagraph) >= 1 ? Math.floor(Number(args.endParagraph)) : undefined;
+    const offset = args.offset !== undefined ? Math.max(1, pageNumber(args.offset, 1, Number.MAX_SAFE_INTEGER)) : undefined;
+    const limit = args.limit !== undefined ? Math.max(1, pageNumber(args.limit, 100, 200)) : undefined;
+
+    const structured = readScriptStructured(project.scriptText, {
+      episode: rawEpisode as any,
+      scene: rawScene as any,
+      paragraph: rawParagraph as any,
+      startParagraph,
+      endParagraph,
       startLine,
       endLine,
-      content: slice.join('\n'),
-      nextOffset,
+      offset,
+      limit,
+      scenePattern: project.tocConfig?.scenePattern,
+      flags: project.tocConfig?.flags,
+      precomputedScenes: Array.isArray(project.scenes) ? project.scenes : undefined,
+    });
+
+    return {
+      projectId: project.id,
+      source: 'project',
+      ...structured,
     };
   }
   if (name === 'script.search') {
@@ -173,6 +221,9 @@ export function executeProjectReadTool(name: string, args: Record<string, unknow
       source: 'project',
       ...(searchRes.scope ? { scope: searchRes.scope } : {}),
       total: searchRes.totalMatches,
+      hasVolumeWarning: Boolean(searchRes.hasVolumeWarning),
+      ...(searchRes.warning ? { warning: searchRes.warning } : {}),
+      ...(searchRes.scenesSummary ? { scenesSummary: searchRes.scenesSummary } : {}),
       matches: searchRes.matches,
     };
   }
@@ -195,21 +246,20 @@ export function executeProjectReadTool(name: string, args: Record<string, unknow
       const q = args.query.trim().toLowerCase();
       items = items.filter((entry: any) => {
         const target = entry.item ? entry.item : entry;
-        const topText = Object.values(target)
-          .filter(v => typeof v === 'string')
-          .join(' ')
-          .toLowerCase();
-        const verText = Array.isArray(target.versions)
-          ? target.versions
-              .map((ver: any) =>
-                Object.values(ver || {})
-                  .filter(v => typeof v === 'string')
-                  .join(' ')
-              )
-              .join(' ')
-              .toLowerCase()
-          : '';
-        return topText.includes(q) || verText.includes(q);
+        const primaryParts: string[] = [
+          target.id,
+          target.name,
+          target.role,
+          ...(Array.isArray(target.aliases) ? target.aliases : []),
+          ...(Array.isArray(target.versions)
+            ? target.versions.flatMap((ver: any) => [
+                ver?.id,
+                ver?.name,
+                ...(Array.isArray(ver?.aliases) ? ver.aliases : []),
+              ])
+            : []),
+        ].filter((v): v is string => typeof v === 'string' && Boolean(v.trim()));
+        return primaryParts.some(p => p.toLowerCase().includes(q));
       });
     }
 
@@ -269,6 +319,23 @@ export function executeProjectReadTool(name: string, args: Record<string, unknow
       });
     }
 
+    const sceneCandidateMap = new Map<string, { sceneTitle: string; candidateCount: number; candidateIndices: number[] }>();
+    candidates.forEach((c, idx) => {
+      const sTitle = c.sceneTitle || '未知场次';
+      const existing = sceneCandidateMap.get(sTitle);
+      if (!existing) {
+        sceneCandidateMap.set(sTitle, { sceneTitle: sTitle, candidateCount: 1, candidateIndices: [idx + 1] });
+      } else {
+        existing.candidateCount += 1;
+        existing.candidateIndices.push(idx + 1);
+      }
+    });
+    const candidateScenesSummary = Array.from(sceneCandidateMap.values());
+    const hasVolumeWarning = candidates.length > 15 || (candidateScenesSummary.length >= 2 && candidates.length >= 12);
+    const notice = hasVolumeWarning
+      ? `我发现候选出处共 ${candidates.length} 条，跨越 ${candidateScenesSummary.length} 个场次，内容较多。本次已将全部候选出处返回在下方，当前处于 Stage 0 阶段，建议拆分为多轮计划处理。`
+      : undefined;
+
     return {
       projectId: project.id,
       source: 'project',
@@ -291,6 +358,9 @@ export function executeProjectReadTool(name: string, args: Record<string, unknow
       } : undefined,
       searchedTerms,
       totalCandidates: candidates.length,
+      hasVolumeWarning,
+      ...(notice ? { notice, warning: notice } : {}),
+      ...(hasVolumeWarning ? { scenesSummary: candidateScenesSummary } : {}),
       candidates: candidates.map((c, idx) => ({
         index: idx + 1,
         candidateId: c.candidateId,
@@ -300,7 +370,7 @@ export function executeProjectReadTool(name: string, args: Record<string, unknow
         evidenceText: c.evidenceText,
         contextSnippet: c.contextSnippet,
       })),
-      instruction: '请结合 assetProfile 逐一审阅每条 candidate 的 contextSnippet，分析剧本判断该资产（或该特定版本）在此处是否需要出现在画面中：需要出现在画面中则算作出场；若角色未在场且仅在他人台词中被侧面提及（口头提及）则绝对不算出场，严禁提交。随后调用 asset.commitProvenance 提交真实出场的 verifiedCandidateIds（也可在 provenances 中直接提交原文具体出场描写句 evidenceText，包含代词指代或特定服装/状态描写句）。',
+      instruction: '请结合 assetProfile 与 contextSnippet，按“根据段落内容，如果资产可能在画面中呈现出来，即判定该段落为出处”筛选，并调用 asset.commitProvenance 或 asset.create/update 提交。',
     };
   }
   throw new Error(`未知项目工具：${name}`);
@@ -308,16 +378,46 @@ export function executeProjectReadTool(name: string, args: Record<string, unknow
 
 function extractRawEvidenceInputs(obj: Record<string, unknown> | undefined | null): ProvenanceEvidenceInput[] {
   if (!obj || typeof obj !== 'object') return [];
-  const rawList =
-    Array.isArray(obj.provenances)
-      ? obj.provenances
-      : Array.isArray(obj.evidenceSnippets)
-        ? obj.evidenceSnippets
-        : Array.isArray(obj.evidenceTexts)
-          ? obj.evidenceTexts
-          : typeof obj.evidenceText === 'string' && obj.evidenceText.trim()
-            ? [obj.evidenceText.trim()]
-            : [];
+  const rawList: any[] = [];
+  if (Array.isArray(obj.provenances)) {
+    rawList.push(...obj.provenances);
+  } else if (Array.isArray(obj.evidenceSnippets)) {
+    rawList.push(...obj.evidenceSnippets);
+  } else if (Array.isArray(obj.evidenceTexts)) {
+    rawList.push(...obj.evidenceTexts);
+  }
+
+  if (Array.isArray(obj.paragraphIndicesByScene)) {
+    rawList.push(...obj.paragraphIndicesByScene);
+  }
+
+  const topSceneTitle = typeof obj.sceneTitle === 'string' && obj.sceneTitle.trim()
+    ? obj.sceneTitle.trim()
+    : typeof obj.scene === 'string' && obj.scene.trim()
+      ? obj.scene.trim()
+      : undefined;
+
+  if (
+    obj.paragraphIndex !== undefined ||
+    obj.paragraphIndices !== undefined ||
+    obj.paragraph !== undefined ||
+    obj.paragraphs !== undefined
+  ) {
+    rawList.push({
+      sceneTitle: topSceneTitle,
+      paragraphIndex: obj.paragraphIndex,
+      paragraphIndices: obj.paragraphIndices,
+      paragraph: obj.paragraph,
+      paragraphs: obj.paragraphs,
+      evidenceText: typeof obj.evidenceText === 'string' ? obj.evidenceText : undefined,
+    });
+  } else if (typeof obj.evidenceText === 'string' && obj.evidenceText.trim() && rawList.length === 0) {
+    rawList.push({
+      sceneTitle: topSceneTitle,
+      evidenceText: obj.evidenceText.trim(),
+    });
+  }
+
   return rawList.filter((item): item is ProvenanceEvidenceInput =>
     typeof item === 'string' ? Boolean(item.trim()) : Boolean(item && typeof item === 'object')
   );
@@ -380,6 +480,26 @@ function attachDirectProvenancesToItem(
   if (finalScenes.length > 0) {
     targetItem.sourceScenes = finalScenes;
   }
+}
+
+function countTotalVerifiedProvenance(item: Record<string, any> | null | undefined): number {
+  if (!item || typeof item !== 'object') return 0;
+  const parentAnchors: any[] = Array.isArray(item.verifiedProvenance) ? item.verifiedProvenance : [];
+  const versionAnchors: any[] = Array.isArray(item.versions)
+    ? item.versions.flatMap((v: any) => (Array.isArray(v?.verifiedProvenance) ? v.verifiedProvenance : []))
+    : [];
+  const all = [...parentAnchors, ...versionAnchors];
+  if (all.length === 0) return 0;
+  const keys = new Set<string>();
+  all.forEach((a, idx) => {
+    if (!a) return;
+    const key =
+      typeof a.fallbackCharIndex === 'number' && a.fallbackCharIndex >= 0
+        ? `pos:${a.fallbackCharIndex}`
+        : `${a.sceneTitle || ''}:${a.lineNumber || ''}:${a.anchorText || a.evidenceText || a.text || idx}`;
+    keys.add(key);
+  });
+  return keys.size;
 }
 
 export interface ProjectAssetMutationResult {
@@ -500,10 +620,16 @@ export function executeProjectAssetMutation(
 
       let builtObj: Record<string, any>;
       if (type === 'characters') {
+        let resolvedRole = typeof item.role === 'string' && item.role.trim() ? item.role.trim() : '';
+        if (!resolvedRole || resolvedRole === '剧中角色') {
+          const desc = typeof item.description === 'string' ? item.description : '';
+          const matchRole = desc.match(/(心理医生|教父|管家|养父|养母|家主|警探|医生|护士|杀手|保镖|秘书|司机)/);
+          resolvedRole = matchRole ? matchRole[1] : (resolvedRole || '剧中角色');
+        }
         const charObj: Record<string, any> = {
           id,
           name: itemName,
-          role: typeof item.role === 'string' && item.role.trim() ? item.role.trim() : '剧中角色',
+          role: resolvedRole,
         };
         if (typeof item.description === 'string' && item.description.trim()) charObj.description = item.description.trim();
         if (typeof item.appearance === 'string' && item.appearance.trim()) charObj.appearance = item.appearance.trim();
@@ -547,9 +673,23 @@ export function executeProjectAssetMutation(
       // Attach direct provenances if provided on the top-level item
       attachDirectProvenancesToItem(builtObj, item, currentScriptText, currentScriptHash, itemName);
 
+      // If only 1 variant version was provided while top-level item has its own distinct provenances, prepend the default version
+      if (
+        normalizedVersions &&
+        normalizedVersions.length === 1 &&
+        normalizedVersions[0].id !== builtObj.id &&
+        normalizedVersions[0].name !== builtObj.name &&
+        Array.isArray(builtObj.verifiedProvenance) &&
+        builtObj.verifiedProvenance.length > 0
+      ) {
+        const defaultVerName = getDefaultAssetVersionName(type, builtObj);
+        const defaultVer = itemToVersion(type, builtObj, defaultVerName);
+        builtObj.versions = [defaultVer, ...normalizedVersions];
+      }
+
       // If child versions have verified provenance, sync sourceScenes onto parent
-      if (normalizedVersions && normalizedVersions.length > 0) {
-        const verScenes = normalizedVersions.flatMap(v => (Array.isArray(v.sourceScenes) ? v.sourceScenes : []));
+      if (Array.isArray(builtObj.versions) && builtObj.versions.length > 0) {
+        const verScenes = builtObj.versions.flatMap((v: any) => (Array.isArray(v.sourceScenes) ? v.sourceScenes : []));
         if (verScenes.length > 0) {
           builtObj.sourceScenes = Array.from(
             new Set([...(Array.isArray(builtObj.sourceScenes) ? builtObj.sourceScenes : []), ...verScenes])
@@ -655,7 +795,67 @@ export function executeProjectAssetMutation(
           );
         }
       });
-      updates.versions = normVers;
+      if (args.mode === 'overwrite') {
+        updates.versions = normVers;
+      } else {
+        // Default / append mode: preserve existing versions on originalItem, merging or appending incoming versions
+        let existingVersions = Array.isArray(originalItem.versions) ? [...originalItem.versions] : [];
+        if (
+          existingVersions.length === 0 &&
+          normVers.length === 1 &&
+          normVers[0].id !== originalItem.id &&
+          normVers[0].name !== originalItem.name
+        ) {
+          const defaultVersionName = getDefaultAssetVersionName(foundType, originalItem);
+          existingVersions = [itemToVersion(foundType, originalItem, defaultVersionName)];
+        }
+        if (existingVersions.length === 0) {
+          updates.versions = normVers;
+        } else {
+          const mergedVersions = [...existingVersions];
+          for (const newVer of normVers) {
+            const vMatchIdx = mergedVersions.findIndex(
+              ev => (newVer.id && ev.id === newVer.id) || (newVer.name && ev.name === newVer.name)
+            );
+            if (vMatchIdx >= 0) {
+              const existingV = mergedVersions[vMatchIdx] as any;
+              const targetNewVer = newVer as any;
+              const mergedV: Record<string, any> = {
+                ...existingV,
+                ...targetNewVer,
+              };
+              if (Array.isArray(existingV.provenances) && !Array.isArray(targetNewVer.provenances)) {
+                mergedV.provenances = existingV.provenances;
+              } else if (Array.isArray(existingV.provenances) && Array.isArray(targetNewVer.provenances)) {
+                const provMap = new Map<string, any>();
+                existingV.provenances.forEach((p: any) => {
+                  provMap.set(`${p.lineNumber}:${p.evidenceText || ''}`, p);
+                });
+                targetNewVer.provenances.forEach((p: any) => {
+                  provMap.set(`${p.lineNumber}:${p.evidenceText || ''}`, p);
+                });
+                mergedV.provenances = Array.from(provMap.values());
+              }
+              if (Array.isArray(existingV.verifiedProvenance) && !Array.isArray(targetNewVer.verifiedProvenance)) {
+                mergedV.verifiedProvenance = existingV.verifiedProvenance;
+              } else if (Array.isArray(existingV.verifiedProvenance) && Array.isArray(targetNewVer.verifiedProvenance)) {
+                const anchorMap = new Map<string, any>();
+                existingV.verifiedProvenance.forEach((a: any) => {
+                  anchorMap.set(`${a.lineNumber}:${a.text || a.evidenceText || ''}`, a);
+                });
+                targetNewVer.verifiedProvenance.forEach((a: any) => {
+                  anchorMap.set(`${a.lineNumber}:${a.text || a.evidenceText || ''}`, a);
+                });
+                mergedV.verifiedProvenance = Array.from(anchorMap.values());
+              }
+              mergedVersions[vMatchIdx] = mergedV;
+            } else {
+              mergedVersions.push(newVer);
+            }
+          }
+          updates.versions = mergedVersions;
+        }
+      }
     }
     const updatedItem: Record<string, any> = {
       ...originalItem,
@@ -672,8 +872,45 @@ export function executeProjectAssetMutation(
       currentScriptHash,
       updatedItem.name
     );
+
+    // Sync default version versions[0] if it shares the parent asset ID
+    if (
+      Array.isArray(updatedItem.versions) &&
+      updatedItem.versions.length > 0 &&
+      updatedItem.versions[0]?.id === updatedItem.id &&
+      Array.isArray(updatedItem.verifiedProvenance)
+    ) {
+      const ver0Scenes = Array.from(
+        new Set(updatedItem.verifiedProvenance.map((a: any) => a?.sceneTitle).filter(Boolean))
+      );
+      const syncedVer0 = {
+        ...updatedItem.versions[0],
+        ...(typeof updatedItem.appearance === 'string' && updatedItem.appearance.trim()
+          ? { appearance: updatedItem.appearance.trim() }
+          : {}),
+        ...(typeof updatedItem.role === 'string' && updatedItem.role.trim()
+          ? { role: updatedItem.role.trim() }
+          : {}),
+        verifiedProvenance: updatedItem.verifiedProvenance,
+        provenanceStatus: updatedItem.provenanceStatus,
+        verifiedScriptHash: updatedItem.verifiedScriptHash,
+        ...(ver0Scenes.length > 0 ? { sourceScenes: ver0Scenes } : {}),
+      };
+      updatedItem.versions = [syncedVer0, ...updatedItem.versions.slice(1)];
+    }
+
+    // Sync sourceScenes from versions if present
+    if (Array.isArray(updatedItem.versions) && updatedItem.versions.length > 0) {
+      const verScenes = updatedItem.versions.flatMap((v: any) => (Array.isArray(v.sourceScenes) ? v.sourceScenes : []));
+      if (verScenes.length > 0) {
+        updatedItem.sourceScenes = Array.from(
+          new Set([...(Array.isArray(updatedItem.sourceScenes) ? updatedItem.sourceScenes : []), ...verScenes])
+        );
+      }
+    }
     currentList[found.index] = updatedItem;
 
+    const verifiedCount = countTotalVerifiedProvenance(updatedItem);
     return {
       updatedProject: {
         [foundType]: currentList,
@@ -682,8 +919,10 @@ export function executeProjectAssetMutation(
         success: true,
         type: foundType,
         id,
+        verifiedCount,
+        ...(Array.isArray(updatedItem.sourceScenes) ? { sourceScenes: updatedItem.sourceScenes } : {}),
         item: updatedItem,
-        message: `成功更新资产 [${updatedItem.name || id}]。`,
+        message: `成功更新资产 [${updatedItem.name || id}]（当前累计确认 ${verifiedCount} 处真实出场）。`,
       },
     };
   }
@@ -774,7 +1013,19 @@ export function executeProjectAssetMutation(
         }
       }
 
-      // 4. Fallback sceneTitle match if caller passed a scene title directly
+      // 4. Paragraph index formats: p_1, para_1, paragraph_1, [1], or 1
+      const paraMatch = rawId.match(/^(?:p|para|paragraph)_?(\d+)$/i) || rawId.match(/^\[?(\d+)\]?$/);
+      if (paraMatch) {
+        const pIdx = Number(paraMatch[1]);
+        const topScene = typeof args.sceneTitle === 'string' ? args.sceneTitle : (typeof args.scene === 'string' ? args.scene : undefined);
+        unmatchedRawStrings.push({
+          sceneTitle: topScene,
+          paragraphIndex: pIdx,
+        } as any);
+        continue;
+      }
+
+      // 5. Fallback sceneTitle match if caller passed a scene title directly
       let matchedScene = false;
       for (const c of primaryCandidates) {
         if (c.sceneTitle === rawId) {
@@ -882,6 +1133,21 @@ export function executeProjectAssetMutation(
       }
       currentList[found.index] = parentCopy;
     } else {
+      if (
+        Array.isArray(updatedItem.versions) &&
+        updatedItem.versions.length > 0 &&
+        updatedItem.versions[0]?.id === updatedItem.id
+      ) {
+        const syncedVer0 = {
+          ...updatedItem.versions[0],
+          aliases: finalAliases,
+          sourceScenes: verifiedScenes,
+          provenanceStatus: 'verified' as const,
+          verifiedProvenance,
+          verifiedScriptHash: currentScriptHash,
+        };
+        updatedItem.versions = [syncedVer0, ...updatedItem.versions.slice(1)];
+      }
       currentList[found.index] = updatedItem;
     }
 

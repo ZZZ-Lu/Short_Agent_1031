@@ -103,6 +103,12 @@ export interface ScriptProp {
   versions?: ScriptAssetVersion[]; // 多状态版本二级列表
 }
 
+export interface ScriptParagraph {
+  index: number;      // 场次内 1-based 连续段落序号（换行即为下一段落，没有换行就是一个段落）
+  lineNumber: number; // 对应原剧本 1-based 行号
+  text: string;       // 段落原文（单行无换行）
+}
+
 export interface SceneChunk {
   index: number;
   id?: string;
@@ -119,6 +125,8 @@ export interface SceneChunk {
   charIndex?: number;
   endCharIndex?: number;
   rawText: string;
+  paragraphCount?: number;
+  paragraphs?: ScriptParagraph[];
 }
 
 export interface ScriptTocConfig {

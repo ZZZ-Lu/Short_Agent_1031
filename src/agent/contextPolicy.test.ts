@@ -98,6 +98,16 @@ test('两步漏斗：0级选categories先展开候选工具简表，再传具体
     resolvedAfterExit.candidateTools.map(t => t.id),
     ['script.directory', 'script.read', 'script.search', 'asset.create', 'asset.delete']
   );
+
+  // 1 级执行阶段补充装载工具：保留已装载的业务工具并合并新选工具，避免卸载旧工具引发乒乓重装
+  const supplementInLevel1 = validateSelection(
+    { tools: ['script.read'] },
+    enabled,
+    ['script', 'asset'],
+    ['asset.create', 'asset.delete']
+  );
+  assert.equal(supplementInLevel1.level, 1);
+  assert.deepEqual(supplementInLevel1.tools, ['asset.create', 'asset.delete', 'script.read']);
 });
 
 test('mergeTaskNotes 按行去重并在进入具体任务后剔除开场占位笔记', () => {
@@ -140,7 +150,6 @@ test('cleanToolOutputForPrompt 裁剪 verifiedProvenance 内部锚点字段与 v
   assert.deepEqual(cleaned.items[0].verifiedProvenance, [
     {
       sceneTitle: '第一集 1-2',
-      lineNumber: 14,
       evidenceText: '▲娜塔莉亚死死握着书信，眼泪落在照片上。',
     },
   ]);
