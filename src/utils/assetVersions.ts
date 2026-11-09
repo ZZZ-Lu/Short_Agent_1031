@@ -147,21 +147,47 @@ export function getVersionIdentificationText(
 export function normalizeAssetVersions(
   type: AssetCollectionType,
   parentId: string,
-  rawVersions: unknown[]
+  rawVersions: unknown[],
+  existingVersions?: ScriptAssetVersion[]
 ): ScriptAssetVersion[] {
   const prefix = type === 'characters' ? 'charv' : type === 'locations' ? 'locv' : 'propv';
   const result: ScriptAssetVersion[] = [];
+  const usedIds = new Set<string>();
+  let maxSuffix = 0;
 
-  rawVersions.forEach((raw, idx) => {
+  if (Array.isArray(existingVersions)) {
+    for (const ev of existingVersions) {
+      if (ev && typeof ev.id === 'string' && ev.id.trim()) {
+        const eid = ev.id.trim();
+        usedIds.add(eid);
+        const suffixMatch = eid.match(new RegExp(`_${prefix}_(\\d+)$`));
+        if (suffixMatch) {
+          maxSuffix = Math.max(maxSuffix, Number(suffixMatch[1]) || 0);
+        }
+      }
+    }
+  }
+
+  rawVersions.forEach(raw => {
     if (!raw || typeof raw !== 'object') return;
     const v = raw as Record<string, any>;
     const rawName = String(v.name || v.versionName || v.timeOfDay || '').trim();
     if (!rawName) return;
 
-    const id =
-      typeof v.id === 'string' && v.id.trim()
-        ? v.id.trim()
-        : `${parentId}_${prefix}_${idx + 1}`;
+    let id = typeof v.id === 'string' && v.id.trim() ? v.id.trim() : '';
+    if (!id && Array.isArray(existingVersions)) {
+      const matchedByName = existingVersions.find(ev => ev && ev.name && ev.name.trim() === rawName);
+      if (matchedByName && matchedByName.id) {
+        id = matchedByName.id;
+      }
+    }
+    if (!id) {
+      do {
+        maxSuffix += 1;
+        id = `${parentId}_${prefix}_${maxSuffix}`;
+      } while (usedIds.has(id));
+    }
+    usedIds.add(id);
 
     const verObj: ScriptAssetVersion = {
       id,
@@ -192,6 +218,37 @@ export function normalizeAssetVersions(
   });
 
   return result;
+}
+
+/**
+ * Checks whether an incoming appended version is actually an explicit refinement/renaming
+ * of the auto-promoted default version (versions[0] with generic name like "常服").
+ */
+export function isSameInitialVersionLook(
+  autoPromotedVer: ScriptAssetVersion,
+  incomingVer: Partial<ScriptAssetVersion>,
+  parentItem?: Record<string, any>
+): boolean {
+  const incName = (incomingVer.name || '').trim();
+  const parentAge = typeof parentItem?.age === 'string' ? parentItem.age.trim() : '';
+  const ageMatch = parentAge.match(/^(\d+\s*岁)/);
+  if (ageMatch && incName.includes(ageMatch[1].replace(/\s+/g, ''))) {
+    return true;
+  }
+
+  const autoApp = (autoPromotedVer.appearance || parentItem?.appearance || '').trim();
+  const incApp = (incomingVer.appearance || '').trim();
+  if (autoApp && incApp) {
+    const primaryClause = autoApp.split(/[；;]/)[0] || autoApp;
+    const tokens = primaryClause
+      .split(/[，。、：,\s（）()]+/)
+      .map(s => s.trim())
+      .filter(s => s.length >= 2);
+    const overlapCount = tokens.filter(tok => incApp.includes(tok)).length;
+    if (overlapCount >= 2) return true;
+  }
+
+  return false;
 }
 
 /**

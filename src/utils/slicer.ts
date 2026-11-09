@@ -4,10 +4,10 @@ const DEFAULT_EPISODE_RX =
   /^(?:【\s*第?\s*([0-9一二三四五六七八九十百千]+)\s*[集话回][^】]*】|第\s*([0-9一二三四五六七八九十百千]+)\s*[集话回].*|(?:[一二三四五六七八九十百千]+|[0-9]+)\s*集\s*$|(?:#+\s*)?(?:EPISODE|EP)\s*#?\s*\d+.*)/i;
 
 const DEFAULT_SCENE_RX =
-  /^(?:【\s*(?:场|场景|场次)?\s*[0-9一二三四五六七八九十百千]+(?:\s*[-—–]\s*[0-9]+)?[^】]*】|\d+\s*[-—–]\s*\d+(?:\s*(?:[日夜晨昏早晚内外景INTEXT.\s].*)?)|第\s*[0-9一二三四五六七八九十百千]+\s*[场幕].*|(?:SCENE)\s*#?\s*\d+.*|[0-9]+[.\-、]\s*(?:内景|外景|内|外).*|(?:内景|外景|INT\.|EXT\.)\s+.*)/i;
+  /^(?:【\s*(?:场|场景|场次)?\s*[0-9一二三四五六七八九十百千]+(?:\s*[-—–]\s*[0-9]+)?[^】]*】|\d+\s*[-—–]\s*\d+(?=(?:\s|[日夜晨昏早晚黄昏清晨白昼午夜内外景]|$))[^▲：:]*|第\s*[0-9一二三四五六七八九十百千]+\s*[场幕].*|(?:SCENE)\s*#?\s*\d+.*|[0-9]+[.\-、]\s*(?:内景|外景|内|外).*|(?:内景|外景|INT\.|EXT\.)\s+.*)/i;
 
 const NEXT_LINE_META_RX =
-  /^(?:([日夜晨昏早晚黄昏清晨白昼午夜]+)\s+([内外]+景?|内外|内\/外)\s*(.*)|([内外]+景?|内外|内\/外)\s+([日夜晨昏早晚黄昏清晨白昼午夜]+)\s*(.*))$/;
+  /^(?:([日夜晨昏早晚黄昏清晨白昼午夜]+)[\s/·]+([内外]+景?|内外|内\/外)\s*(.*)|([内外]+景?|内外|内\/外)[\s/·]+([日夜晨昏早晚黄昏清晨白昼午夜]+)\s*(.*))$/;
 
 const ROSTER_LINE_RX =
   /^(?:【\s*(?:出场)?(?:人物|角色)\s*】|(?:出场)?(?:人物|角色)\s*(?:[:：]|[\s　]+))(.*)$/i;
@@ -101,11 +101,51 @@ export function parseRosterCharacters(lines: string[]): string[] {
     const trimmed = lines[i].trim();
     const m = trimmed.match(ROSTER_LINE_RX);
     if (m && m[1]) {
-      return m[1]
-        .replace(/[、，,；;：:]/g, ' ')
-        .split(/[\s　]+/)
-        .map(s => s.trim())
-        .filter(Boolean);
+      const rawContent = m[1].trim();
+      const rawTokens: string[] = [];
+      let current = '';
+      let parenDepth = 0;
+
+      for (let cIdx = 0; cIdx < rawContent.length; cIdx++) {
+        const ch = rawContent[cIdx];
+        if (ch === '（' || ch === '(') {
+          parenDepth++;
+          current += ch;
+        } else if (ch === '）' || ch === ')') {
+          parenDepth = Math.max(0, parenDepth - 1);
+          current += ch;
+        } else if (parenDepth === 0 && /[\s　、，,；;：:]/.test(ch)) {
+          if (current.trim()) {
+            rawTokens.push(current.trim());
+            current = '';
+          }
+        } else {
+          current += ch;
+        }
+      }
+      if (current.trim()) {
+        rawTokens.push(current.trim());
+      }
+
+      const merged: string[] = [];
+      for (const tok of rawTokens) {
+        if (
+          merged.length > 0 &&
+          /^(?:\d+\s*岁|[（(][^）)]+[）)])$/.test(tok)
+        ) {
+          const cleanNote = tok.replace(/^[（(]\s*|\s*[）)]$/g, '').trim();
+          const prev = merged[merged.length - 1];
+          if (/[（(][^）)]*[）)]$/.test(prev)) {
+            merged[merged.length - 1] = prev.replace(/[）)]$/, ` ${cleanNote}）`);
+          } else {
+            merged[merged.length - 1] = `${prev}（${cleanNote}）`;
+          }
+        } else {
+          merged.push(tok);
+        }
+      }
+
+      return merged;
     }
   }
   return [];

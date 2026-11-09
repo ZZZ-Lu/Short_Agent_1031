@@ -74,3 +74,29 @@ test('robustParseJson - repairs common LLM syntax deviations', () => {
   const withLeadingText = 'Here is the result:\n{"status": "ok", "count": 5}';
   assert.deepEqual(robustParseJson(withLeadingText), { status: 'ok', count: 5 });
 });
+
+test('robustParseJson - heals truncated state node JSON with multiline notes and unclosed strings', () => {
+  // Error 0 style: truncated mid-word in notes
+  const truncated0 = '{"stateCheck":"本轮成功","taskTitle":"提取角色娜塔莉亚","goal":"从剧本提取","subGoal":"创建资产","progress":"进行中","plan":[{"id":"1","title":"探查","status":"completed"}],"notes":"- 用户指令：提取角色娜塔莉亚...- 本轮已装载 script.read、asset.create、ass';
+  const res0 = robustParseJson(truncated0);
+  assert.ok(res0);
+  assert.equal(res0.taskTitle, '提取角色娜塔莉亚');
+  assert.equal(res0.subGoal, '创建资产');
+  assert.equal(res0.plan.length, 1);
+  assert.ok(res0.notes.endsWith('ass'));
+
+  // Error 1 style: truncated with raw newline inside string
+  const truncated1 = '{"stateCheck":"本轮成功","taskTitle":"提取角色娜塔莉亚","goal":"从剧本提取","subGoal":"创建资产","progress":"进行中","plan":[{"id":"1","title":"探查","status":"completed"}],"notes":"- 用户指令...段6为“【闪回】”，均非其出场。\n';
+  const res1 = robustParseJson(truncated1);
+  assert.ok(res1);
+  assert.equal(res1.taskTitle, '提取角色娜塔莉亚');
+  assert.equal(res1.subGoal, '创建资产');
+  assert.ok(res1.notes.includes('【闪回】'));
+
+  // Raw literal newlines inside complete JSON string
+  const multilineNotes = '{"stateCheck": "ok", "notes": "line1\nline2\nline3"}';
+  const res2 = robustParseJson(multilineNotes);
+  assert.ok(res2);
+  assert.equal(res2.notes, 'line1\nline2\nline3');
+});
+

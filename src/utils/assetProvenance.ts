@@ -468,6 +468,29 @@ export function isCharacterRosterLine(lineText: string): boolean {
 }
 
 /**
+ * Detects pure structural, editing, or transition meta lines (such as "【闪回】", "【闪回结束】",
+ * "▲切镜。", "（to制作：照片定格转场）") that do not depict any visual asset in the frame.
+ */
+export function isPureStructuralMetaLine(lineText: string): boolean {
+  const trimmed = (lineText || '').trim();
+  if (!trimmed) return true;
+  if (isCharacterRosterLine(trimmed)) return true;
+  if (/^【\s*(?:闪回|回忆|梦境|幻想|插叙|倒叙|序幕|尾声)(?:开始|结束|开启|终止|片段)?\s*】$/i.test(trimmed)) {
+    return true;
+  }
+  if (
+    /^(?:▲\s*)?(?:切镜|转场|黑屏|白屏|闪白|淡入|淡出|叠化|定格)(?:[。！!….\s]|$)/i.test(trimmed) &&
+    trimmed.replace(/^[▲\s]+|[。！!….\s]+$/g, '').length <= 4
+  ) {
+    return true;
+  }
+  if (/^[（(【]\s*(?:to\s*制作|致制作|制作备注|后期备注|后期|字幕说明)\s*[:：]?[^）)】]*[）)】]$/i.test(trimmed)) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Parses character names from a static character roster line (e.g. "人物 娜塔莉亚 布拉姆 安保若干")
  */
 export function parseSceneRosterCharacters(lineText: string): string[] {
@@ -532,13 +555,23 @@ export function isCharacterPresentInScene(
     }
   }
 
-  // Check 2: Action lines starting with ▲ mentioning character or alias
+  // Check 2: Action lines mentioning character or alias (if script has ▲ markers, check ▲ lines; otherwise check non-meta narrative lines)
+  const hasTriangleAction = lines.some(l => l.trim().startsWith('▲'));
   for (const line of lines) {
     const trimmed = line.trim();
-    if (trimmed.startsWith('▲')) {
-      const lower = trimmed.toLowerCase();
-      if (rawTerms.some(name => lower.includes(name))) {
-        return true;
+    if (hasTriangleAction) {
+      if (trimmed.startsWith('▲')) {
+        const lower = trimmed.toLowerCase();
+        if (rawTerms.some(name => lower.includes(name))) {
+          return true;
+        }
+      }
+    } else {
+      if (!trimmed.startsWith('【') && !isCharacterRosterLine(trimmed) && !extractSpeakerFromDialogueLine(trimmed)) {
+        const lower = trimmed.toLowerCase();
+        if (rawTerms.some(name => lower.includes(name))) {
+          return true;
+        }
       }
     }
   }
@@ -873,18 +906,29 @@ export function buildVerifiedProvenanceFromEvidence(
         : sections;
 
       let resolvedAnyByIndex = false;
-      for (const sec of effectiveSecs) {
-        const secStartLine = sec.lineNumber;
-        const endCharOffset =
-          sec.endCharIndex > sec.charIndex && scriptText[sec.endCharIndex - 1] === '\n'
-            ? sec.endCharIndex - 1
-            : sec.endCharIndex;
-        const secEndLine = scriptText.slice(0, endCharOffset).split('\n').length;
-        const sceneParas = extractSceneParagraphs(lines, secStartLine, secEndLine);
+      const isEpisodeWideHintWithoutSceneNumber =
+        effectiveSecs.length > 1 &&
+        !explicitSceneId &&
+        !extractSceneNumberToken(hintSceneTitle || '');
+
+      if (isEpisodeWideHintWithoutSceneNumber) {
+        const firstSec = effectiveSecs[0];
+        const lastSec = effectiveSecs[effectiveSecs.length - 1];
+        const epStartLine = Math.max(1, firstSec.lineNumber - 1);
+        const lastEndCharOffset =
+          lastSec.endCharIndex > lastSec.charIndex && scriptText[lastSec.endCharIndex - 1] === '\n'
+            ? lastSec.endCharIndex - 1
+            : lastSec.endCharIndex;
+        const epEndLine = scriptText.slice(0, lastEndCharOffset).split('\n').length;
+        const epParas = extractSceneParagraphs(lines, epStartLine, epEndLine);
 
         for (const pIdx of targetParagraphIndices) {
-          const matchedPara = sceneParas.find(p => p.index === pIdx);
+          const matchedPara = epParas.find(p => p.index === pIdx);
           if (matchedPara && matchedPara.text) {
+            if (isPureStructuralMetaLine(matchedPara.text)) {
+              resolvedAnyByIndex = true;
+              continue;
+            }
             const lineNum = matchedPara.lineNumber;
             if (lineNum >= 1 && lineNum <= lines.length) {
               const lineOffset = lineStartOffsets[lineNum - 1];
@@ -895,15 +939,18 @@ export function buildVerifiedProvenanceFromEvidence(
                 const matchEnd = span.charIndex + span.text.length;
                 if (!seenPositions.has(matchStart)) {
                   seenPositions.add(matchStart);
-                  const anchorStart = Math.max(sec.charIndex, matchStart - 14);
-                  const anchorEnd = Math.min(sec.endCharIndex, matchEnd + 14);
+                  const ownerSec =
+                    effectiveSecs.find(s => matchStart >= s.charIndex && matchStart < s.endCharIndex) ||
+                    firstSec;
+                  const anchorStart = Math.max(ownerSec.charIndex, matchStart - 14);
+                  const anchorEnd = Math.min(ownerSec.endCharIndex, matchEnd + 14);
                   const anchorText = scriptText.slice(anchorStart, anchorEnd);
                   const offsetInAnchor = matchStart - anchorStart;
 
                   records.push({
                     id: `vp_${assetId}_para_${pIdx}_${matchStart}`,
-                    sceneId: sec.id,
-                    sceneTitle: sec.title || hintSceneTitle || '正文',
+                    sceneId: ownerSec.id,
+                    sceneTitle: ownerSec.title || hintSceneTitle || '正文',
                     matchedTerm: span.text,
                     evidenceText: span.text,
                     anchorText,
@@ -911,6 +958,55 @@ export function buildVerifiedProvenanceFromEvidence(
                     fallbackCharIndex: matchStart,
                     lineNumber: lineNum,
                   });
+                }
+              }
+            }
+          }
+        }
+      } else {
+        for (const sec of effectiveSecs) {
+          const secStartLine = sec.lineNumber;
+          const endCharOffset =
+            sec.endCharIndex > sec.charIndex && scriptText[sec.endCharIndex - 1] === '\n'
+              ? sec.endCharIndex - 1
+              : sec.endCharIndex;
+          const secEndLine = scriptText.slice(0, endCharOffset).split('\n').length;
+          const sceneParas = extractSceneParagraphs(lines, secStartLine, secEndLine);
+
+          for (const pIdx of targetParagraphIndices) {
+            const matchedPara = sceneParas.find(p => p.index === pIdx);
+            if (matchedPara && matchedPara.text) {
+              if (isPureStructuralMetaLine(matchedPara.text)) {
+                resolvedAnyByIndex = true;
+                continue;
+              }
+              const lineNum = matchedPara.lineNumber;
+              if (lineNum >= 1 && lineNum <= lines.length) {
+                const lineOffset = lineStartOffsets[lineNum - 1];
+                const span = extractConcreteEvidenceSpan(scriptText, lineOffset, matchedPara.text);
+                if (span.text.length > 0) {
+                  resolvedAnyByIndex = true;
+                  const matchStart = span.charIndex;
+                  const matchEnd = span.charIndex + span.text.length;
+                  if (!seenPositions.has(matchStart)) {
+                    seenPositions.add(matchStart);
+                    const anchorStart = Math.max(sec.charIndex, matchStart - 14);
+                    const anchorEnd = Math.min(sec.endCharIndex, matchEnd + 14);
+                    const anchorText = scriptText.slice(anchorStart, anchorEnd);
+                    const offsetInAnchor = matchStart - anchorStart;
+
+                    records.push({
+                      id: `vp_${assetId}_para_${pIdx}_${matchStart}`,
+                      sceneId: sec.id,
+                      sceneTitle: sec.title || hintSceneTitle || '正文',
+                      matchedTerm: span.text,
+                      evidenceText: span.text,
+                      anchorText,
+                      offsetInAnchor,
+                      fallbackCharIndex: matchStart,
+                      lineNumber: lineNum,
+                    });
+                  }
                 }
               }
             }
@@ -1022,8 +1118,12 @@ export function buildVerifiedProvenanceFromEvidence(
       targetSec ||
       sections[0];
 
-    // Check if the matched line is a static character roster line or scene header line; if so, upgrade to concrete scene content
+    // Check if the matched line is a static character roster line, scene header line, or pure structural marker;
+    // if roster/header, upgrade to concrete scene content; if pure structural transition marker, skip.
     const initialSpan = extractConcreteEvidenceSpan(scriptText, matchStart);
+    if (!isCharacterRosterLine(initialSpan.lineText) && isPureStructuralMetaLine(initialSpan.lineText)) {
+      continue;
+    }
     const isSceneHeaderLine =
       /^(?:【\s*)?(?:\d+\s*[-—–]\s*\d+|第\s*[0-9一二三四五六七八九十百千]+\s*[场幕集话回])(?:\s*[^▲：:]*)?(?:】)?$/i.test(initialSpan.lineText) ||
       NEXT_LINE_SCENE_META_RX.test(initialSpan.lineText);
@@ -1319,6 +1419,9 @@ export function resolveVerifiedProvenance(
 
     const spanInfo = extractConcreteEvidenceSpan(scriptText, matchGlobalIndex, anchor.evidenceText);
     const isRoster = isCharacterRosterLine(spanInfo.lineText);
+    if (!isRoster && isPureStructuralMetaLine(spanInfo.lineText)) {
+      continue;
+    }
     const isActionLine = spanInfo.lineText.startsWith('▲');
     const priority = isRoster
       ? 0

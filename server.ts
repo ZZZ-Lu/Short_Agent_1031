@@ -45,7 +45,19 @@ function isObsoleteMainPrompt(text: string): boolean {
     text.includes('当写入或修改类工具已返回完整执行结果与成功状态时') ||
     text.includes('专注解决“当前小目标”，并在该小目标完成后返回全局计划阶段') ||
     text.includes('若需调用业务工具推进下一步小目标，按两步准备工具') ||
-    text.includes('3. 提取第1-3场幼年回忆并增量更新资产出处')
+    text.includes('3. 提取第1-3场幼年回忆并增量更新资产出处') ||
+    text.includes('严禁将他人的台词/动作、纯画外音（vo）或纯心理活动（OS）') ||
+    text.includes('随读随写增量闭环（严禁全读完再单次囤积写入）') ||
+    text.includes('优先采用场次数组批量读取与一次性齐套建卡') ||
+    text.includes('批量读取与齐套写入（最短路径闭环）') ||
+    text.includes('逐条显式列出') ||
+    text.includes('按序号逐条显式列出') ||
+    text.includes('核对参数依据是否完整就绪，确定本轮要调用的工具与具体参数') ||
+    text.includes('严禁跳段') ||
+    text.includes('若该资产在当前画面中有明确可见的自身动作') ||
+    text.includes('提取出处时须自上而下逐段核对剧本原文') ||
+    text.includes('如果资产可能在画面中呈现出来') ||
+    text.includes('出处（provenances）判定规则：')
   );
 }
 
@@ -198,7 +210,7 @@ const parametersForTool = (toolId: string) => {
         provenances: {
           type: 'array',
           items: { type: 'object' },
-          description: '剧本原文中的具体出场段落锚点列表（直接传 { sceneTitle: "1-5 日 外 布莱克伍德庄园", paragraphIndices: [2, 3, 5] } 即可自动还原原文，无需手填 evidenceText；严禁传“人物：XXX”名单行或未在场的口头提及句）'
+          description: '剧本出处段落锚点列表（直接传 { sceneTitle: "1-5 日 外 布莱克伍德庄园", paragraphIndices: [2, 3, 5] } 即可自动还原原文）'
         },
         versions: {
           type: 'array',
@@ -227,7 +239,7 @@ const parametersForTool = (toolId: string) => {
         provenances: {
           type: 'array',
           items: { type: 'object' },
-          description: '补充或重设的出场段落锚点列表（直接传 [{ sceneTitle: "1-5 日 外 布莱克伍德庄园", paragraphIndices: [2, 3] }] 即可，无需手填 evidenceText）'
+          description: '补充或重设的出处段落锚点列表（直接传 [{ sceneTitle: "1-5 日 外 布莱克伍德庄园", paragraphIndices: [2, 3] }] 即可自动还原原文）'
         },
         versions: { type: 'array', items: { type: 'object' }, description: '更新该资产的多版本二级列表（如角色按视觉上的不同造型区分版本、场景日景/夜景版本）' }
       },
@@ -263,12 +275,12 @@ const parametersForTool = (toolId: string) => {
         verifiedCandidateIds: {
           type: 'array',
           items: { type: 'string' },
-          description: '经你逐条核验 contextSnippet 后确认为该资产在画面中真实出场的 candidateId 列表（如 ["cand_L56_2825"]，严禁包含未在场仅被他人口头提及的候选）'
+          description: '结合 contextSnippet 核验通过的 candidateId 列表（如 ["cand_L56_2825"]）'
         },
         provenances: {
           type: 'array',
           items: { type: 'object' },
-          description: '直接提交已读剧本中该资产在画面中真实出场的具体描写原句列表（每项如 { sceneTitle: "第二集 2-1", lineNumber: 93, evidenceText: "▲布拉姆看到塞莱特斯，眼神平静又带着几分冷漠。" }）'
+          description: '直接提交核验通过的出处段落列表（可传 { sceneTitle: "第二集 2-1", paragraphIndices: [1, 3] }）'
         },
         summary: { type: 'string', description: '核验结论与排除说明摘要' }
       },
@@ -886,7 +898,7 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
             `- user.ask：向用户提问并挂起任务等待回复（问题直接写在【用户沟通】中，无需传参）。\n  参数：{ question?: string }`,
           ]
         : [
-            `- sys.selectContext：按需展开工具分类或装载具体工具进入执行阶段。规则：① 需展开新工具分类时，传 {"categories": [...]} 展开对应分类下的候选工具简表；② 结合“当前计划”中的各个步骤，从已展开的候选简表中一次性挑选执行该计划所需的具体工具 ID 传 {"tools": [...]} 进入局部执行阶段。\n  参数：{ categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[], level?: 0 | 1 }`,
+            `- sys.selectContext：按需展开工具分类或装载具体工具进入执行阶段。规则：① 需展开新工具分类时，传 {"categories": [...]} 展开对应分类下的候选工具简表；② 结合“当前计划”中的各个步骤，从已展开的候选简表中一次性挑选执行该计划所需的具体工具 ID 传 {"tools": [...]} 进入局部执行阶段（装配原则：工具须成组配套，若任务涉及资产提取且需分步追加，须同时装配 [asset.create, asset.update]；探查阶段推荐同时装载并并发调用 [directory, search, list]）。\n  参数：{ categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[], level?: 0 | 1 }`,
             `- user.ask：向用户提问并挂起任务等待回复（问题直接写在【用户沟通】中，无需传参）。\n  参数：{ question?: string }`,
             `- sys.endTask：结束当前任务（仅限在全局计划与验收阶段调用，最终汇报直接写在【用户沟通】中；若需等待异步任务可设 paused: true）。\n  参数：{ success?: boolean, paused?: boolean }`,
           ];
@@ -916,27 +928,27 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
         if (candidateToolLines.length > 0) {
           assembledToolSections.push(
             ``,
-            `## 已展开分类 [${turnContext.categories.join(', ')}] 的候选工具简表（结合当前计划的各个步骤，可从下方一次性挑选执行该计划所需的具体工具 ID 填入 tools，调用 sys.selectContext({"tools": [...]}) 进入执行阶段）`,
+            `## 候选工具简表（已展开分类: [${turnContext.categories.join(', ')}]）`,
             ...candidateToolLines,
           );
           if (unexpandedCategoryLines) {
             assembledToolSections.push(
               ``,
-              `## 其它尚未展开的工具分类（如需使用其它分类的工具，可传 {"categories": [...]} 补充展开）`,
+              `## 其它未展开的工具分类（可传 categories 补充展开）`,
               unexpandedCategoryLines,
             );
           }
         } else {
           assembledToolSections.push(
             ``,
-            `## 可装载的工具分类（需调用业务工具时，先调用 sys.selectContext({"categories": [...]}) 展开对应分类下的候选工具简表）`,
+            `## 可装载的工具分类（传 categories 展开对应候选工具简表）`,
             categoryLines || '无',
           );
         }
       } else if (remainingCandidateToolLines.length > 0) {
         assembledToolSections.push(
           ``,
-          `## 候选工具简表（若当前计划的后续步骤需要补充装载以下工具，可直接调用 sys.selectContext({"tools": [...]}) 补充装载，已装载工具会自动保留）`,
+          `## 候选工具简表（后续步骤如需使用，可调 sys.selectContext 补充装载）`,
           ...remainingCandidateToolLines,
         );
       }
@@ -1231,7 +1243,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       const defaultPlanningTemplate = [
         `# 背景`,
         `你位于一个短剧协作平台中，负责协助用户从剧本到生图到视频的流程，你的名字是“Mira”。`,
-        `当前你处于【全局计划与验收阶段】，你的核心职责是：理解并锚定最终目标、制定完整的“当前计划”并将其传入执行阶段、装载执行计划所需的工具进入执行，或在计划全部达成后验收结束任务。`,
+        `当前你处于【全局计划与验收阶段】，你的核心职责是：理解并锚定最终目标、制定传入执行阶段的“当前计划”、按需装载工具切入执行，并在计划全部达成后核验结案。`,
         ``,
         `# 用户指令`,
         `## 当前聚焦目标`,
@@ -1240,24 +1252,25 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         `{{userMessage}}`,
         ``,
         `# 工作指南`,
-        `默认优先使用后台工具读取项目数据并执行任务；需要演示或核验界面时使用 UI。基于工具返回的事实验证推进，严禁把未执行视为成功。`,
-        `在进入执行阶段前，先制定清晰的步骤化“当前计划”，该计划将传入执行阶段并持续存在，驱动后续步骤连续执行直至完成：`,
-        `- 若上方尚未展开所需工具分类，先调用 sys.selectContext({"categories": [...]}) 展开对应分类下的候选工具简表；`,
-        `- 若上方候选工具简表已就绪，结合“当前计划”中的各个步骤，一次性挑选完成该计划所需的具体工具 ID 传 {"tools": [...]} 进入执行阶段（结合当前聚焦目标与认知状态中已知的上下文事实按需挑选，避免装载无关工具）。`,
-        `若刚从执行阶段返回，请对照“最终目标”与“当前计划”核验所有计划步骤是否均已真实达成；确认全部达成后，调用 sys.endTask 结束任务并向用户完整汇报。`,
-        `称用户为“你”，口吻亲和随意；遇需用户决策或信息补充的事项，在用户沟通中明确说明。`,
-        `工具调用统一采用标准 JSON 参数格式：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）。`,
+        `默认优先使用后台工具读取项目数据；需要演示或核验界面时使用 UI。基于工具返回的事实推进，严禁把未执行视为成功。`,
+        `进入执行阶段前，必须制定步骤化的“当前计划”，驱动执行阶段连续执行：`,
+        `1. 探查期安全原则（数据未知时）：制定宏观探查计划，调用 sys.selectContext 仅装载只读探查工具（建议 script.directory、script.search、asset.list 配套并发调用以建立全局视野），严禁提前装载写入工具；`,
+        `2. 动态重规划原则（获知数据分布后）：当触发数据量预警或上一轮返回了场次分布概览（scenesSummary）时，必须在“当前计划”中将宏观任务细化为按场次/实体的具体子步骤（分步精读推进：首场读取正文并建卡、后续场次分步读取正文并增量追加）；切入执行时一次性成套装载所需的读写工具组（如 [script.read, asset.create, asset.update]），严禁跳过正文读取或单步盲目硬吞；`,
+        `3. 工具装载与流转：结合“当前计划”所需工具，通过 sys.selectContext 展开分类或装载 tools 进入执行阶段；`,
+        `4. 全局核验与结案：从执行阶段返回后，对照“最终目标”与“当前计划”核验所有步骤；确认全部真实达成后，调用 sys.endTask 结束任务并向用户汇报。`,
+        `称用户为“你”，口吻亲和随意；遇需用户决策事项在用户沟通中说明。工具调用统一采用标准 JSON 参数格式：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）。`,
         ``,
         `# 输出格式`,
         `状态检查：`,
         `{回顾并检查上面的“认知状态”。`,
-        `- 最终目标是什么？（若上方认知状态中最终目标为“暂无”，请结合“当前聚焦目标”与“用户输入原文”总结归纳出完整的最终目标）`,
-        `- 对照“当前计划”与“工具执行结果”，当前计划有哪些步骤已完成（[x]）、哪些待推进（[ ]）？`,
-        `- 最终目标与当前计划的所有要求是否已经全部达成？`,
-        `- 如果全部达成，准备调用 sys.endTask 结束任务；如果尚未全部达成，当前计划接下来要推进的步骤与“当前小目标”是什么？`,
-        `- 为执行当前计划，需要先展开哪些工具分类（categories），或从上方已展开的候选简表中一次性挑选哪些具体工具（tools）进入执行阶段？`,
-        `- 当前进度与当前计划是否需要更新？`,
-        `- 是否有新的关键结论或验收信息需要补充到“重点笔记”中？}`,
+        `- 最终目标是什么？（若认知状态中为“暂无”，结合当前聚焦目标与用户输入归纳）`,
+        `- 对照“当前计划”与“工具执行结果”核验推进：`,
+        `  * 初次规划：列出宏观探查计划（如：[ ] 1. 探查数据现状；[ ] 2. 提取/创建资产；[ ] 3. 全局核验）；`,
+        `  * 动态重规划：若触发数据量预警或已知场次分布，在此处将旧宏观步骤直接替换输出为细化后的分步子任务列表（标记 [x] 已完成、[ ] 待推进）；`,
+        `  * 常规推进：列出当前计划各步骤完成状态（[x] / [ ]）。`,
+        `- 最终目标与当前计划是否全部达成？若全部达成，准备调用 sys.endTask 结案；若未完成，下一步推进哪个步骤与小目标？`,
+        `- 为执行当前计划，需要先展开哪些分类（categories），或挑选哪些具体工具（tools）进入执行阶段？`,
+        `- 是否有关键结论需要沉淀到“重点笔记”？}`,
         `思考：`,
         `{使用内心独白的方式，围绕全局目标、计划制定与工具准备进行逻辑推演。如果需要展开分类、装载工具进入执行或结束任务，请调用对应工具，系统会自动执行你的操作。}`,
         `工具调用：`,
@@ -1283,7 +1296,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       const defaultExecutionTemplate = [
         `# 背景`,
         `你位于一个短剧协作平台中，负责协助用户从剧本到生图到视频的流程，你的名字是“Mira”。`,
-        `当前你处于【局部执行阶段】，你的核心职责是：依据规划阶段制定并持续存在的“当前计划”，按步骤连续调用工具推进执行，直到计划中的所有步骤全部完成。`,
+        `当前你处于【局部执行阶段】，你的核心职责是：依据全局规划阶段制定并持续存在的“当前计划”，按步骤连续调用工具推进执行，直到计划中的所有步骤全部完成。`,
         ``,
         `# 用户指令`,
         `## 当前聚焦目标`,
@@ -1292,12 +1305,19 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         `{{userMessage}}`,
         ``,
         `# 工作指南`,
-        `基于工具返回的事实验证推进，严禁把未执行视为成功。`,
-        `调用任何具体工具时，必须严格遵守下方【可用工具】中该工具的参数定义与业务规则说明；若调用某工具所需的客观事实或原文依据尚未在当前上下文中就绪，必须先调用读取或检索工具获取真实数据，严禁无依据猜测或用概括语代替客观数据。`,
-        `对照【认知状态 -> 当前计划】按序连续推进：`,
-        `- 当计划中的某一步骤完成后，紧接着推进“当前计划”中的下一个未完成步骤（[ ]）；`,
-        `- 若下一步骤所需的工具已在下方【当前可直接调用】列表中，直接调用该工具继续执行，无需频繁退回全局计划阶段；`,
-        `- 若下一步骤所需的工具不在【当前可直接调用】列表中，可从【候选工具简表】挑选所需工具直接调用 {{调用 sys.selectContext, {"tools": [...]}}} 切换工具，或在“当前计划”所有步骤全部执行完毕后无参调用 {{调用 sys.selectContext}} 返回全局计划阶段进行验收结案。`,
+        `依据【认知状态 -> 当前计划】连续调用工具推进执行，严禁无依据猜测或把未执行视为成功。`,
+        `1. 真实依据原则：`,
+        `   - 提取资产前必须先调用 script.read 读取目标场次的完整剧本正文，基于上下文中的真实事实与原文段落进行提取；`,
+        `2. 分步精读与随读随写增量闭环（严禁跳过正文读取或单次囤积写入）：`,
+        `   - 执行多场次任务时遵循“精读一批、落地一批”：读完首场正文后立即调用 asset.create 落地资产；后续场次通过 script.read 读完正文核验后，立即调用 asset.update(mode: "append") 或 asset.commitProvenance(mode: "append") 增量追加出处、新造型版本与补充设定；`,
+        `   - 若单次 script.read 同时返回了同名场次的多个子场次（如两个 1-5），当轮可在 provenances 数组中并列提交已读出的这两个子场次段落，无需重复读取。`,
+        `3. 参数纯净与多版本规范：`,
+        `   - 场次参数 scene 必须为纯净编号（如 "1-5"）；`,
+        `   - asset.update 支持在顶层直接传参；向已有资产追加新版本时直接传入 versions 数组（各版本分别绑定对应造型的 provenances 出处段落）；落盘返回即为真值，无需调用 asset.list 回查。`,
+        `4. 连续推进与工具流转：`,
+        `   - 当前步骤完成后紧接着推进“当前计划”中的下一个未完成步骤（[ ]）；`,
+        `   - 所需工具已在【当前可直接调用】列表中，直接连续调用，无需频繁退回全局计划阶段；`,
+        `   - 若需补充工具可从候选简表中调 sys.selectContext({"tools": [...]}) 补充装载；所有计划全部完成后无参调用 sys.selectContext 返回全局计划阶段结案。`,
         `称用户为“你”，口吻亲和随意；工具调用统一采用标准 JSON 参数格式：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）。`,
         ``,
         `# 输出格式`,
@@ -1305,11 +1325,11 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         `{回顾并检查上面的“认知状态”与本轮“工具执行结果 / 页面观察”。`,
         `- 对照“当前计划”，当前正在执行哪一步骤（以及对应的“当前小目标”）？`,
         `- 本轮工具返回了哪些具体结果？当前步骤是否已经完成？“当前计划”中还有哪些后续步骤待推进？`,
-        `- 本轮在“工具执行结果”或“页面观察”中发现了哪些对后续步骤有用的关键事实、ID 或原文线索？（若有，请按照工具说明要求完整、准确地整理列出，以便沉淀到“重点笔记”供后续步骤直接使用）`,
-        `- 当前计划的各步骤状态与当前进度需要更新为什么？`,
-        `- 下一步行动判断：若“当前计划”仍有未完成步骤且所需工具已在下方【当前可直接调用】列表中，下一步调用哪个已装载工具继续推进？若需切换工具或“当前计划”全部步骤均已完成，准备调用 sys.selectContext。}`,
+        `- 本轮在“工具执行结果”中发现了哪些对后续步骤有用的关键事实、ID 或原文线索？（整理列出以便沉淀到“重点笔记”）`,
+        `- 当前计划各步骤状态（[x] / [ ]）与当前进度需要更新为什么？`,
+        `- 下一步行动判断：若计划未完成且工具已装载，下一步调用哪个工具继续推进？若需补充工具或计划全部完成，准备调用 sys.selectContext。}`,
         `思考：`,
-        `{使用内心独白的方式，结合当前【工具执行结果】中的原始明细数据、【认知状态 -> 当前计划】与下方已装载工具的参数说明进行逻辑推演，核对参数依据是否完整就绪，确定本轮要调用的工具与具体参数。}`,
+        `{使用内心独白的方式，结合当前【工具执行结果】中的原始明细数据、【认知状态 -> 当前计划】与已装载工具的参数说明进行逻辑推演，核对参数依据与场次段落是否完整就绪，确定本轮要调用的工具与具体参数。}`,
         `工具调用：`,
         `{{调用 工具名称, {"参数名": "参数值"}}}`,
         `用户沟通：`,
@@ -1970,7 +1990,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
   "plan": [
     {"id": "1", "title": "计划步骤标题：若主循环提出了动态重规划（如根据数据量预警或 scenesSummary 场次分布细化为分步子任务列表），必须完整采纳并替换为该细化计划列表；若【本轮执行的工具动作】已完成某步数据落盘且【当前聚焦目标实时状态】已同步更新，应将对应步骤一并标为 completed", "status": "completed | pending"}
   ],
-  "notes": "合并整理后的重点笔记：完整保留【上一轮重点笔记】中已记录的所有具体事实、资产ID、行号与原文原句（即使本轮是阶段切换轮、未重复提及这些原句，也严禁删减或将不同行的相似原句合并），在此基础上并入主循环本轮新发现的线索，仅剔除‘准备读取/待核对’等已过时的过程状态描述",
+  "notes": "合并整理后的重点笔记：保留已记录的核心事实、资产ID、出处行号与人物结论（即使本轮是阶段切换轮也予以保留），在此基础上并入主循环本轮新发现的关键线索，剔除已过时的过程状态描述与冗余重复文本，保持精炼条理",
   "notesMode": "overwrite"
 }`;
 
@@ -2062,6 +2082,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       const requestPayload = {
         model: actualModel,
         response_format: { type: 'json_object' },
+        max_tokens: 4096,
         thinking: { type: 'disabled' },
         extra_body: { thinking: { type: 'disabled' } },
         messages: [
@@ -2098,11 +2119,10 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       }
 
       const data = await parseChatCompletionResponse(response, false);
-      let parsed: any = {};
-      try {
-        parsed = JSON.parse(data.content || '{}');
-      } catch {
+      let parsed: any = robustParseJson(data.content || '{}');
+      if (!parsed || typeof parsed !== 'object') {
         console.warn('Failed to parse json from state node output:', data.content);
+        parsed = {};
       }
 
       const resolvedNotesMode = parsed.notesMode === 'append' ? 'append' : 'overwrite';
@@ -2326,10 +2346,8 @@ ${effectiveRequirement}
       }
 
       const data = await parseChatCompletionResponse(response, false);
-      let parsed: any = {};
-      try {
-        parsed = JSON.parse(data.content || '{}');
-      } catch {
+      let parsed: any = robustParseJson(data.content || '{}');
+      if (!parsed || typeof parsed !== 'object') {
         console.warn('Failed to parse landmarks json:', data.content);
         parsed = generateFallbackLandmarks(effectiveRequirement);
       }

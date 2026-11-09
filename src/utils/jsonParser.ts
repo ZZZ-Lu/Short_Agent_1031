@@ -9,51 +9,75 @@ export function autoCloseJsonString(input: string): string {
   let stringChar = '';
   let escaped = false;
   const stack: string[] = [];
+  let out = '';
 
   for (let i = 0; i < s.length; i++) {
     const char = s[i];
     if (escaped) {
       escaped = false;
+      out += char;
       continue;
     }
     if (char === '\\' && inString) {
       escaped = true;
+      out += char;
       continue;
     }
     if (inString) {
       if (char === stringChar) {
         inString = false;
+        out += char;
+        continue;
       }
+      if (char === '\n') {
+        out += '\\n';
+        continue;
+      }
+      if (char === '\r') {
+        out += '\\r';
+        continue;
+      }
+      if (char === '\t') {
+        out += '\\t';
+        continue;
+      }
+      out += char;
       continue;
     }
     if (char === '"' || char === "'") {
       inString = true;
       stringChar = char;
+      out += char;
       continue;
     }
     if (char === '{') {
       stack.push('}');
+      out += char;
       continue;
     }
     if (char === '[') {
       stack.push(']');
+      out += char;
       continue;
     }
     if (char === '}') {
       if (stack.length > 0 && stack[stack.length - 1] === '}') {
         stack.pop();
       }
+      out += char;
       continue;
     }
     if (char === ']') {
       if (stack.length > 0 && stack[stack.length - 1] === ']') {
         stack.pop();
       }
+      out += char;
       continue;
     }
+    out += char;
   }
 
-  let repaired = s;
+  let repaired = out;
   if (inString) {
     repaired += (stringChar || '"');
   }

@@ -7196,7 +7196,7 @@ export default function App() {
     ].map(v => (typeof v === 'string' ? v.trim() : '')).filter(Boolean);
     const descText = Array.from(new Set(descParts)).join('；');
     const existingAliases = Array.isArray(item.aliases) && item.aliases.length > 0 ? item.aliases.join('、') : '待推断';
-    const verifyPrompt = `请核验${categoryLabel}资产「${item.name}」（assetId: "${item.id}", category: "${category}"）在当前剧本中的真实出处。请先根据资产名称「${item.name}」与设定描述「${descText}」（已有别名：${existingAliases}）推断其可能的剧本别名或版本特征词（aliases），调用 asset.searchProvenanceCandidates 检索候选片段（若已知所在集/场且涉及代词指代也可配合 script.read 查阅），逐一分析剧本：判断该资产（或该特定版本）在此处是否需要出现在画面中（需要出现则算作出场；若角色未在场且仅在他人台词中被侧面提及则绝对不算出场，严禁提交），最后调用 asset.commitProvenance 提交核验通过的 verifiedCandidateIds 或包含具体出场描写原句的 provenances（严禁将“人物：XXX”名单行作为出处内容）。`;
+    const verifyPrompt = `请核验${categoryLabel}资产「${item.name}」（assetId: "${item.id}", category: "${category}"）在当前剧本中的真实出处。请先根据资产名称「${item.name}」与设定描述「${descText}」（已有别名：${existingAliases}）推断其可能的剧本别名或版本特征词（aliases），调用 asset.searchProvenanceCandidates 检索候选片段（若已知所在集/场且涉及代词指代也可配合 script.read 查阅），筛选后调用 asset.commitProvenance 提交核验通过的 verifiedCandidateIds 或 provenances。`;
 
     const primaryBusy = Boolean(
       isAgentRunningRef.current ||

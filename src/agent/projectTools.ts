@@ -12,6 +12,7 @@ import {
   mergeMultiVersionAssetList,
   itemToVersion,
   getDefaultAssetVersionName,
+  isSameInitialVersionLook,
 } from '../utils/assetVersions';
 
 export type ProjectData = {
@@ -370,7 +371,7 @@ export function executeProjectReadTool(name: string, args: Record<string, unknow
         evidenceText: c.evidenceText,
         contextSnippet: c.contextSnippet,
       })),
-      instruction: '请结合 assetProfile 与 contextSnippet，按“根据段落内容，如果资产可能在画面中呈现出来，即判定该段落为出处”筛选，并调用 asset.commitProvenance 或 asset.create/update 提交。',
+      instruction: '请结合 assetProfile 与 contextSnippet 筛选符合出处判定规则的候选段落，并调用 asset.commitProvenance 或 asset.create/update 提交。',
     };
   }
   throw new Error(`未知项目工具：${name}`);
@@ -551,7 +552,7 @@ export function executeProjectAssetMutation(
         const defaultVersionName = type === 'locations' ? '日景' : type === 'characters' ? '常服' : '初始态';
         currentVersions = [itemToVersion(type, parentItem, defaultVersionName)];
       }
-      const addedVersions = normalizeAssetVersions(type, parentItem.id, rawItems);
+      const addedVersions = normalizeAssetVersions(type, parentItem.id, rawItems, currentVersions);
       addedVersions.forEach((ver, vIdx) => {
         if (rawItems[vIdx]) {
           attachDirectProvenancesToItem(
@@ -750,6 +751,13 @@ export function executeProjectAssetMutation(
       delete updatedVersion.provenances;
       delete updatedVersion.evidenceSnippets;
       delete updatedVersion.evidenceTexts;
+      delete updatedVersion.mode;
+      delete updatedVersion.provenanceMode;
+      delete updatedVersion.replace;
+      delete updatedVersion.paragraphIndex;
+      delete updatedVersion.paragraphIndices;
+      delete updatedVersion.sceneTitle;
+      delete updatedVersion.verifiedCandidateIds;
       attachDirectProvenancesToItem(
         updatedVersion,
         updates,
@@ -758,11 +766,17 @@ export function executeProjectAssetMutation(
         parentItem.name
       );
       versions[found.versionIndex] = updatedVersion;
+      const verScenes = versions.flatMap((v: any) => (Array.isArray(v?.sourceScenes) ? v.sourceScenes : []));
+      const mergedParentScenes = Array.from(
+        new Set([...(Array.isArray(parentItem.sourceScenes) ? parentItem.sourceScenes : []), ...verScenes])
+      );
       const updatedParent = {
         ...parentItem,
+        ...(mergedParentScenes.length > 0 ? { sourceScenes: mergedParentScenes } : {}),
         versions,
       };
       currentList[found.index] = updatedParent;
+      const verifiedCount = countTotalVerifiedProvenance(updatedParent);
 
       return {
         updatedProject: {
@@ -773,8 +787,9 @@ export function executeProjectAssetMutation(
           type: foundType,
           id,
           parentId: parentItem.id,
+          verifiedCount,
           item: updatedVersion,
-          message: `成功更新资产【${parentItem.name}】的版本 [${updatedVersion.name || id}]。`,
+          message: `成功更新资产【${parentItem.name}】的版本 [${updatedVersion.name || id}]（当前累计确认 ${verifiedCount} 处真实出场）。`,
         },
       };
     }
@@ -782,7 +797,27 @@ export function executeProjectAssetMutation(
     const originalItem = currentList[found.index];
     if (Array.isArray(updates.versions)) {
       const rawVers = updates.versions as unknown[];
-      const normVers = normalizeAssetVersions(foundType, id, rawVers);
+      let existingVersions = Array.isArray(originalItem.versions) ? [...originalItem.versions] : [];
+      const defaultVersionName = getDefaultAssetVersionName(foundType, originalItem);
+      if (
+        args.mode !== 'overwrite' &&
+        existingVersions.length === 0 &&
+        rawVers.length === 1
+      ) {
+        const firstRaw = rawVers[0] as Record<string, any> | undefined;
+        const firstRawId = typeof firstRaw?.id === 'string' ? firstRaw.id.trim() : '';
+        const firstRawName = String(firstRaw?.name || firstRaw?.versionName || firstRaw?.timeOfDay || '').trim();
+        if (firstRawName && firstRawId !== originalItem.id && firstRawName !== originalItem.name) {
+          existingVersions = [itemToVersion(foundType, originalItem, defaultVersionName)];
+        }
+      }
+
+      const normVers = normalizeAssetVersions(
+        foundType,
+        id,
+        rawVers,
+        args.mode === 'overwrite' ? undefined : existingVersions
+      );
       normVers.forEach((ver, vIdx) => {
         const rawVer = rawVers[vIdx];
         if (rawVer && typeof rawVer === 'object') {
@@ -797,64 +832,79 @@ export function executeProjectAssetMutation(
       });
       if (args.mode === 'overwrite') {
         updates.versions = normVers;
+      } else if (existingVersions.length === 0) {
+        updates.versions = normVers;
       } else {
-        // Default / append mode: preserve existing versions on originalItem, merging or appending incoming versions
-        let existingVersions = Array.isArray(originalItem.versions) ? [...originalItem.versions] : [];
-        if (
-          existingVersions.length === 0 &&
-          normVers.length === 1 &&
-          normVers[0].id !== originalItem.id &&
-          normVers[0].name !== originalItem.name
-        ) {
-          const defaultVersionName = getDefaultAssetVersionName(foundType, originalItem);
-          existingVersions = [itemToVersion(foundType, originalItem, defaultVersionName)];
-        }
-        if (existingVersions.length === 0) {
-          updates.versions = normVers;
-        } else {
-          const mergedVersions = [...existingVersions];
-          for (const newVer of normVers) {
-            const vMatchIdx = mergedVersions.findIndex(
-              ev => (newVer.id && ev.id === newVer.id) || (newVer.name && ev.name === newVer.name)
-            );
-            if (vMatchIdx >= 0) {
-              const existingV = mergedVersions[vMatchIdx] as any;
-              const targetNewVer = newVer as any;
-              const mergedV: Record<string, any> = {
-                ...existingV,
-                ...targetNewVer,
-              };
-              if (Array.isArray(existingV.provenances) && !Array.isArray(targetNewVer.provenances)) {
-                mergedV.provenances = existingV.provenances;
-              } else if (Array.isArray(existingV.provenances) && Array.isArray(targetNewVer.provenances)) {
-                const provMap = new Map<string, any>();
-                existingV.provenances.forEach((p: any) => {
-                  provMap.set(`${p.lineNumber}:${p.evidenceText || ''}`, p);
-                });
-                targetNewVer.provenances.forEach((p: any) => {
-                  provMap.set(`${p.lineNumber}:${p.evidenceText || ''}`, p);
-                });
-                mergedV.provenances = Array.from(provMap.values());
-              }
-              if (Array.isArray(existingV.verifiedProvenance) && !Array.isArray(targetNewVer.verifiedProvenance)) {
-                mergedV.verifiedProvenance = existingV.verifiedProvenance;
-              } else if (Array.isArray(existingV.verifiedProvenance) && Array.isArray(targetNewVer.verifiedProvenance)) {
-                const anchorMap = new Map<string, any>();
-                existingV.verifiedProvenance.forEach((a: any) => {
-                  anchorMap.set(`${a.lineNumber}:${a.text || a.evidenceText || ''}`, a);
-                });
-                targetNewVer.verifiedProvenance.forEach((a: any) => {
-                  anchorMap.set(`${a.lineNumber}:${a.text || a.evidenceText || ''}`, a);
-                });
-                mergedV.verifiedProvenance = Array.from(anchorMap.values());
-              }
-              mergedVersions[vMatchIdx] = mergedV;
-            } else {
-              mergedVersions.push(newVer);
-            }
+        const mergedVersions = [...existingVersions];
+        for (const newVer of normVers) {
+          let vMatchIdx = mergedVersions.findIndex(
+            ev => (newVer.id && ev.id === newVer.id) || (newVer.name && ev.name === newVer.name)
+          );
+          if (
+            vMatchIdx < 0 &&
+            mergedVersions.length > 0 &&
+            mergedVersions[0].id === originalItem.id &&
+            mergedVersions[0].name === defaultVersionName &&
+            isSameInitialVersionLook(mergedVersions[0], newVer, originalItem)
+          ) {
+            vMatchIdx = 0;
           }
-          updates.versions = mergedVersions;
+          if (vMatchIdx >= 0) {
+            const existingV = mergedVersions[vMatchIdx] as any;
+            const targetNewVer = newVer as any;
+            const mergedV: Record<string, any> = {
+              ...existingV,
+              ...targetNewVer,
+              id: existingV.id,
+            };
+            if (Array.isArray(existingV.provenances) && !Array.isArray(targetNewVer.provenances)) {
+              mergedV.provenances = existingV.provenances;
+            } else if (Array.isArray(existingV.provenances) && Array.isArray(targetNewVer.provenances)) {
+              const provMap = new Map<string, any>();
+              existingV.provenances.forEach((p: any) => {
+                provMap.set(`${p.lineNumber}:${p.evidenceText || ''}`, p);
+              });
+              targetNewVer.provenances.forEach((p: any) => {
+                provMap.set(`${p.lineNumber}:${p.evidenceText || ''}`, p);
+              });
+              mergedV.provenances = Array.from(provMap.values());
+            }
+            if (Array.isArray(existingV.verifiedProvenance) && !Array.isArray(targetNewVer.verifiedProvenance)) {
+              mergedV.verifiedProvenance = existingV.verifiedProvenance;
+            } else if (Array.isArray(existingV.verifiedProvenance) && Array.isArray(targetNewVer.verifiedProvenance)) {
+              const anchorMap = new Map<string, any>();
+              const toAnchorKey = (a: any) =>
+                typeof a?.fallbackCharIndex === 'number' && a.fallbackCharIndex >= 0
+                  ? `pos:${a.fallbackCharIndex}`
+                  : `${a?.lineNumber || ''}:${a?.text || a?.evidenceText || ''}`;
+              existingV.verifiedProvenance.forEach((a: any) => {
+                if (a) anchorMap.set(toAnchorKey(a), a);
+              });
+              targetNewVer.verifiedProvenance.forEach((a: any) => {
+                if (a) anchorMap.set(toAnchorKey(a), a);
+              });
+              mergedV.verifiedProvenance = Array.from(anchorMap.values()).sort(
+                (a, b) => (a.fallbackCharIndex ?? 0) - (b.fallbackCharIndex ?? 0)
+              );
+            }
+            const mergedVerScenes = Array.from(
+              new Set([
+                ...(Array.isArray(existingV.sourceScenes) ? existingV.sourceScenes : []),
+                ...(Array.isArray(targetNewVer.sourceScenes) ? targetNewVer.sourceScenes : []),
+                ...(Array.isArray(mergedV.verifiedProvenance)
+                  ? mergedV.verifiedProvenance.map((a: any) => a?.sceneTitle).filter(Boolean)
+                  : []),
+              ])
+            );
+            if (mergedVerScenes.length > 0) {
+              mergedV.sourceScenes = mergedVerScenes;
+            }
+            mergedVersions[vMatchIdx] = mergedV;
+          } else {
+            mergedVersions.push(newVer);
+          }
         }
+        updates.versions = mergedVersions;
       }
     }
     const updatedItem: Record<string, any> = {
@@ -865,6 +915,13 @@ export function executeProjectAssetMutation(
     delete updatedItem.provenances;
     delete updatedItem.evidenceSnippets;
     delete updatedItem.evidenceTexts;
+    delete updatedItem.mode;
+    delete updatedItem.provenanceMode;
+    delete updatedItem.replace;
+    delete updatedItem.paragraphIndex;
+    delete updatedItem.paragraphIndices;
+    delete updatedItem.sceneTitle;
+    delete updatedItem.verifiedCandidateIds;
     attachDirectProvenancesToItem(
       updatedItem,
       updates,
@@ -878,20 +935,46 @@ export function executeProjectAssetMutation(
       Array.isArray(updatedItem.versions) &&
       updatedItem.versions.length > 0 &&
       updatedItem.versions[0]?.id === updatedItem.id &&
-      Array.isArray(updatedItem.verifiedProvenance)
+      (Array.isArray(updatedItem.verifiedProvenance) || Array.isArray(updatedItem.versions[0]?.verifiedProvenance))
     ) {
+      const unionMap = new Map<string, any>();
+      const pushAnchor = (a: any) => {
+        if (!a) return;
+        const key =
+          typeof a.fallbackCharIndex === 'number' && a.fallbackCharIndex >= 0
+            ? `pos:${a.fallbackCharIndex}`
+            : `${a.lineNumber || ''}:${a.text || a.evidenceText || ''}`;
+        unionMap.set(key, a);
+      };
+      if (Array.isArray(updatedItem.verifiedProvenance)) {
+        updatedItem.verifiedProvenance.forEach(pushAnchor);
+      }
+      if (Array.isArray(updatedItem.versions[0].verifiedProvenance)) {
+        updatedItem.versions[0].verifiedProvenance.forEach(pushAnchor);
+      }
+      const unionProvenance = Array.from(unionMap.values()).sort(
+        (a, b) => (a.fallbackCharIndex ?? 0) - (b.fallbackCharIndex ?? 0)
+      );
+      updatedItem.verifiedProvenance = unionProvenance;
+      updatedItem.provenanceStatus = unionProvenance.length > 0 ? 'verified' : updatedItem.provenanceStatus;
+      updatedItem.verifiedScriptHash = currentScriptHash;
+
       const ver0Scenes = Array.from(
-        new Set(updatedItem.verifiedProvenance.map((a: any) => a?.sceneTitle).filter(Boolean))
+        new Set(unionProvenance.map((a: any) => a?.sceneTitle).filter(Boolean))
       );
       const syncedVer0 = {
         ...updatedItem.versions[0],
-        ...(typeof updatedItem.appearance === 'string' && updatedItem.appearance.trim()
-          ? { appearance: updatedItem.appearance.trim() }
-          : {}),
-        ...(typeof updatedItem.role === 'string' && updatedItem.role.trim()
-          ? { role: updatedItem.role.trim() }
-          : {}),
-        verifiedProvenance: updatedItem.verifiedProvenance,
+        ...(typeof updatedItem.versions[0].appearance === 'string' && updatedItem.versions[0].appearance.trim()
+          ? {}
+          : typeof updatedItem.appearance === 'string' && updatedItem.appearance.trim()
+            ? { appearance: updatedItem.appearance.trim() }
+            : {}),
+        ...(typeof updatedItem.versions[0].role === 'string' && updatedItem.versions[0].role.trim()
+          ? {}
+          : typeof updatedItem.role === 'string' && updatedItem.role.trim()
+            ? { role: updatedItem.role.trim() }
+            : {}),
+        verifiedProvenance: unionProvenance,
         provenanceStatus: updatedItem.provenanceStatus,
         verifiedScriptHash: updatedItem.verifiedScriptHash,
         ...(ver0Scenes.length > 0 ? { sourceScenes: ver0Scenes } : {}),
