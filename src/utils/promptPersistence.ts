@@ -42,7 +42,10 @@ export function isObsoletePromptText(text: string): boolean {
     text.includes('若该资产在当前画面中有明确可见的自身动作') ||
     text.includes('提取出处时须自上而下逐段核对剧本原文') ||
     text.includes('如果资产可能在画面中呈现出来') ||
-    text.includes('出处（provenances）判定规则：')
+    text.includes('出处（provenances）判定规则：') ||
+    text.includes('核对参数依据与场次段落是否完整就绪，确定本轮要调用的工具与具体参数') ||
+    text.includes('参数纯净与多版本规范：') ||
+    text.includes('提取资产前必须先调用 script.read 读取目标场次的完整剧本正文')
   );
 }
 
