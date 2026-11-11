@@ -129,6 +129,7 @@ export const parseScriptEpisodes = (
 export const readScriptDirectory = (
   scriptText: string,
   options: {
+    episode?: string | number | Array<string | number>;
     range?: [number, number];
     query?: string;
     tailOnly?: boolean;
@@ -180,6 +181,25 @@ export const readScriptDirectory = (
         ],
       };
     });
+  }
+
+  const episodeFilters =
+    options.episode !== undefined && options.episode !== null && String(options.episode).trim() !== ''
+      ? (Array.isArray(options.episode) ? options.episode : [options.episode])
+      : [];
+  if (episodeFilters.length > 0) {
+    const matchedIds = new Set<string>();
+    for (const epFilter of episodeFilters) {
+      const matched = findEpisodeByIdentifier(entries, epFilter);
+      if (matched) {
+        matchedIds.add(matched.id);
+      }
+    }
+    if (matchedIds.size > 0) {
+      entries = entries.filter(e => matchedIds.has(e.id));
+    } else {
+      entries = [];
+    }
   }
 
   if (options.query?.trim()) {
@@ -289,20 +309,41 @@ export function matchesSceneIdentifier(scene: ScriptSceneSummary, sceneIndex: nu
   if (normTitle.includes(normalizedDash)) return true;
   if (scene.locationName && scene.locationName.toLowerCase().includes(normalizedDash)) return true;
 
-  // Support concatenated or partially specified scene number + location (e.g. "1-5布莱克伍德庄园" or "1-3 贫民窟门口 日 外")
+  // Support concatenated or partially specified scene number + location or INT/EXT/time attributes (e.g. "1-5布莱克伍德庄园", "1-5内", "1-5 外")
   const dashMatch = normalizedDash.match(/^(\d+\s*-\s*\d+)(.+)$/);
   if (dashMatch) {
     const targetNum = dashMatch[1].replace(/\s+/g, '');
     const targetRest = dashMatch[2].trim();
     const sceneNum = (scene.sceneNumber || '').toLowerCase().replace(/[—–\s]/g, '-');
     if (sceneNum === targetNum && targetRest) {
-      const genericTokens = new Set(['日', '夜', '内', '外', '晨', '昏', '早', '晚', 'int', 'ext']);
+      const genericTokens = new Set(['日', '夜', '内', '外', '晨', '昏', '早', '晚', '内景', '外景', '内外', 'int', 'ext']);
       const specificTokens = targetRest
         .split(/\s+/)
         .map(t => t.replace(/^(?:日|夜|内|外|晨|昏)+/, '').trim())
         .filter(t => t.length > 0 && !genericTokens.has(t));
-      if (specificTokens.length > 0 && specificTokens.every(t => normTitle.includes(t) || (scene.locationName && scene.locationName.toLowerCase().includes(t)))) {
+      if (
+        specificTokens.length > 0 &&
+        specificTokens.every(
+          t => normTitle.includes(t) || (scene.locationName && scene.locationName.toLowerCase().includes(t))
+        )
+      ) {
         return true;
+      }
+      if (specificTokens.length === 0) {
+        const attrTokens = targetRest.match(/内景|外景|内外|内|外|日|夜|晨|昏|早|晚|int|ext/gi) || [];
+        if (
+          attrTokens.length > 0 &&
+          attrTokens.every(rawAttr => {
+            const attr = rawAttr.toLowerCase();
+            if (normTitle.includes(attr)) return true;
+            if ((attr === '内' || attr === '内景' || attr === 'int') && scene.type === 'INT') return true;
+            if ((attr === '外' || attr === '外景' || attr === 'ext') && scene.type === 'EXT') return true;
+            if (scene.timeOfDay && scene.timeOfDay.toLowerCase().includes(attr)) return true;
+            return false;
+          })
+        ) {
+          return true;
+        }
       }
     }
   }
@@ -636,8 +677,8 @@ export function readScriptStructured(
       : (totalParagraphs > 30 && !options.paragraph);
   const notice = hasVolumeWarning
     ? (isMultiSceneMatch && options.scene && !isExplicitSceneBatch
-        ? `我发现当前条件 "${options.scene}" 共匹配到 ${totalScenes} 个场次（${scenesSummary.map(s => `"${s.title}" ${s.paragraphCount}段`).join('、')}，共 ${totalParagraphs} 个段落），内容较多。本次已将全部原文返回在下方，当前处于 Stage 0 阶段，建议拆分为多轮计划处理。`
-        : `我发现当前读取范围包含 ${totalScenes} 个场次共 ${totalParagraphs} 个段落，内容较多。本次已将全部原文返回在下方，当前处于 Stage 0 阶段，建议拆分为多轮计划处理。`)
+        ? `我发现当前条件 "${options.scene}" 共匹配到 ${totalScenes} 个场次（${scenesSummary.map(s => `"${s.title}" ${s.paragraphCount}段`).join('、')}，共 ${totalParagraphs} 个段落），内容较多。本次已将全部原文返回在下方，当前处于 Stage 0 阶段，建议按照场次或者集数拆分为多轮计划处理。`
+        : `我发现当前读取范围包含 ${totalScenes} 个场次共 ${totalParagraphs} 个段落，内容较多。本次已将全部原文返回在下方，当前处于 Stage 0 阶段，建议按照场次或者集数拆分为多轮计划处理。`)
     : undefined;
 
   return {
@@ -904,7 +945,7 @@ export const searchScriptWithScope = (
   const scenesSummary = Array.from(sceneSummaryMap.values());
   const hasVolumeWarning = allMatches.length > 15 || (scenesSummary.length >= 2 && allMatches.length >= 12);
   const notice = hasVolumeWarning
-    ? `我发现检索到 ${allMatches.length} 条匹配，跨越 ${scenesSummary.length} 个场次，内容较多。本次已将全部匹配结果返回在下方，当前处于 Stage 0 阶段，建议拆分为多轮计划处理。`
+    ? `我发现检索到 ${allMatches.length} 条匹配，跨越 ${scenesSummary.length} 个场次，内容较多。本次已将全部匹配结果返回在下方，当前处于 Stage 0 阶段，建议按照场次或者集数拆分为多轮计划处理。`
     : undefined;
 
   return {

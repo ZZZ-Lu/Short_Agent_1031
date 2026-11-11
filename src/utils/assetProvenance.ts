@@ -429,6 +429,16 @@ function matchSectionsBySceneHint(
           return specificTokens.every(t => secMeta.includes(t));
         });
         if (locationFiltered.length > 0) return locationFiltered;
+      } else {
+        const attrTokens = hintMeta.match(/内景|外景|内外|内|外|日|夜|晨|昏|早|晚|int|ext/gi) || [];
+        if (attrTokens.length > 0) {
+          const attrFiltered = sameNumSecs.filter(s => {
+            const secMeta = extractSceneMetaAfterNumber(s.title).toLowerCase();
+            if (!secMeta) return false;
+            return attrTokens.every(t => secMeta.includes(t.toLowerCase()));
+          });
+          if (attrFiltered.length > 0) return attrFiltered;
+        }
       }
 
       if (sameNumSecs.some(s => Boolean(extractSceneMetaAfterNumber(s.title)))) {

@@ -45,7 +45,22 @@ export function isObsoletePromptText(text: string): boolean {
     text.includes('出处（provenances）判定规则：') ||
     text.includes('核对参数依据与场次段落是否完整就绪，确定本轮要调用的工具与具体参数') ||
     text.includes('参数纯净与多版本规范：') ||
-    text.includes('提取资产前必须先调用 script.read 读取目标场次的完整剧本正文')
+    text.includes('提取资产前必须先调用 script.read 读取目标场次的完整剧本正文') ||
+    text.includes('上一轮返回了场次分布概览（scenesSummary）') ||
+    text.includes('遵循“读取一批、核验一批、落盘一批”的增量闭环推进') ||
+    text.includes('scenesSummary 场次分布细化为分步子任务列表') ||
+    text.includes('4. 连续推进与工具流转：') ||
+    text.includes('3. 工具装载与流转：结合“当前计划”所需工具') ||
+    text.includes('更新后的当前进度（合并已完成事项与当前正在推进的事项）') ||
+    text.includes('一字不差完整复制该段原文>」→ 判定：') ||
+    text.includes('原封不动摘录该段中文原文>」→ 判定：') ||
+    text.includes('工具调用：\n{{调用 工具名称, {"参数名": "参数值"}}}') ||
+    text.includes('围绕全局目标、计划制定与工具准备进行逻辑推演，确定本轮要调用的工具与参数') ||
+    text.includes('每个子步骤必须定义为“读取该单元数据并完成对应的创建或增量更新”的完整读写闭环') ||
+    text.includes('当前子步骤处于“已读取待写入”还是“已写入落盘完成”状态？“当前计划”中还有哪些后续步骤待推进？') ||
+    text.includes('首批场次读取并调用创建工具建主卡锚定出处') ||
+    text.includes('分析当前任务进展与本轮返回的数据规模、场次或集数分布') ||
+    text.includes('必须严格按该工具规则在思考中完整输出，不得缩写省略')
   );
 }
 

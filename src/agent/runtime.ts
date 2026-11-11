@@ -243,33 +243,93 @@ export class AgentRuntime {
         const isAuxAssetCheckOnly = Array.isArray(result.toolCalls) &&
           result.toolCalls.length > 0 &&
           result.toolCalls.every(call => !call.validationError && (call.name === 'asset.list' || call.name === 'sys.selectContext'));
+        const isConsecutiveLevel1ScriptRead =
+          (task.context?.level ?? 0) === 1 &&
+          Array.isArray(result.toolCalls) &&
+          result.toolCalls.length > 0 &&
+          result.toolCalls.every(
+            call =>
+              !call.validationError &&
+              (call.name === 'script.read' || call.name === 'asset.list' || call.name === 'sys.selectContext')
+          );
+        const hasAllValidationErrors = Array.isArray(result.toolCalls) &&
+          result.toolCalls.length > 0 &&
+          result.toolCalls.every(call => Boolean(call.validationError));
 
         // The debug transport snapshot is for the developer trace only. It
         // must never become part of the next model request's history.
         // Results are delivered once, except when pausing on user.ask, switching
-        // stages/tools via sys.selectContext, or checking existing assets via asset.list
-        // before consuming previously read script/provenance evidence.
-        const preservedObservations = (hasUserAskTool || isOnlySelectContext)
-          ? task.observations.filter(obs => {
-              const content = obs.content as any;
-              const name = content?.name;
-              if (name === 'sys.nudge' || name === 'user.ask' || name === 'sys.selectContext') {
-                return false;
-              }
-              if (isOnlySelectContext && content?.status !== 'succeeded') {
-                return false;
-              }
-              return true;
-            })
-          : isAuxAssetCheckOnly
-            ? task.observations.filter(obs => {
+        // stages/tools via sys.selectContext, checking existing assets via asset.list,
+        // accumulating unconsumed script.read batches in Level 1,
+        // or retrying after a tool call / JSON format validationError.
+        const isEnteringLevel1WithRead =
+          isOnlySelectContext &&
+          (task.context?.level ?? 0) === 0 &&
+          result.toolCalls.some(
+            call =>
+              call.name === 'sys.selectContext' &&
+              Array.isArray(call.arguments?.tools) &&
+              call.arguments.tools.includes('script.read')
+          );
+        const hadVolumeWarningProbe =
+          (task.context?.level ?? 0) === 0 &&
+          task.observations.some(obs => {
+            const out = (obs.content as any)?.output;
+            return Boolean(out && typeof out === 'object' && (out.hasVolumeWarning || out.autoReturnedToLevel0));
+          });
+
+        const preservedObservations = (hasUserAskTool || isOnlySelectContext || hasAllValidationErrors)
+          ? task.observations
+              .filter(obs => {
                 const content = obs.content as any;
                 const name = content?.name;
-                return (
-                  content?.status === 'succeeded' &&
-                  (name === 'script.read' || name === 'script.search' || name === 'asset.searchProvenanceCandidates')
-                );
+                if (name === 'sys.nudge' || name === 'user.ask' || (!hasAllValidationErrors && name === 'sys.selectContext')) {
+                  return false;
+                }
+                if ((isOnlySelectContext || hasAllValidationErrors) && content?.status !== 'succeeded') {
+                  return false;
+                }
+                // 当 0 级已完成数据量预警重规划并装载 script.read 进入 1 级分步精读时，
+                // 卸载已在 0 级消费完毕的宏观探查结果（script.directory / script.search / asset.list），避免将全剧目录与 0 级预警带入 1 级
+                if (
+                  isEnteringLevel1WithRead &&
+                  hadVolumeWarningProbe &&
+                  (name === 'script.directory' || name === 'script.search' || name === 'asset.list')
+                ) {
+                  return false;
+                }
+                return true;
               })
+              .map(obs => {
+                const content = obs.content as any;
+                const out = content?.output;
+                if (isOnlySelectContext && (task.context?.level ?? 0) === 0 && out && typeof out === 'object' && (out.hasVolumeWarning || out.autoReturnedToLevel0)) {
+                  const cleanedOut = { ...out };
+                  delete cleanedOut.hasVolumeWarning;
+                  delete cleanedOut.autoReturnedToLevel0;
+                  delete cleanedOut.notice;
+                  delete cleanedOut.warning;
+                  return {
+                    ...obs,
+                    content: {
+                      ...content,
+                      output: cleanedOut,
+                    },
+                  };
+                }
+                return obs;
+              })
+          : (isAuxAssetCheckOnly || isConsecutiveLevel1ScriptRead)
+            ? task.observations
+                .filter(obs => {
+                  const content = obs.content as any;
+                  const name = content?.name;
+                  return (
+                    content?.status === 'succeeded' &&
+                    (name === 'script.read' || name === 'script.search' || name === 'asset.searchProvenanceCandidates')
+                  );
+                })
+                .slice(-2)
             : [];
         task.observations = [...preservedObservations];
         result.narration.forEach(text => this.addEvent(task, { turnId, type: 'thought', text }));
@@ -322,8 +382,10 @@ export class AgentRuntime {
           const hasPendingPlan = planList.some(p => p && p.status !== 'completed');
           const isAutonomousMode = task.context?.level === 1 || task.thinkingLevel === 1;
           const hasExecutedTools = task.events.some(e => e.type === 'tool' && e.status === 'succeeded');
+          const narrationText = Array.isArray(result.narration) ? result.narration.join('\n') : '';
+          const hasUncheckedPlanInNarration = /(?:^|\n)\s*(?:[-*+]|\d+\.)?\s*\[\s*\]\s+\S/.test(narrationText);
 
-          const isUnfinishedTask = hasPendingPlan || isAutonomousMode || hasExecutedTools;
+          const isUnfinishedTask = hasPendingPlan || isAutonomousMode || hasExecutedTools || hasUncheckedPlanInNarration;
 
           if (isUnfinishedTask && emptyToolCount < MAX_EMPTY_TOOL_RETRIES) {
             emptyToolCount++;
@@ -414,8 +476,10 @@ export class AgentRuntime {
 
         // Dedicated State Node: Run AFTER tools have executed so the cognitive state
         // reflects the actual completed tool actions (e.g., sys.selectContext already loaded tools).
-        // When user.ask is present, fire non-blocking so waiting_user UI updates with zero latency.
-        if (this.options.updateStateNode && !signal.aborted && (task.status as RuntimeTaskStatus) !== 'cancelled') {
+        // If all tool calls in this turn were intercepted by validationError and a plan already exists,
+        // skip state node update so the failed turn does not prematurely mark steps completed.
+        const shouldRunStateNode = !hasAllValidationErrors || !task.goal || task.plan.length === 0;
+        if (this.options.updateStateNode && shouldRunStateNode && !signal.aborted && (task.status as RuntimeTaskStatus) !== 'cancelled') {
           if (hasUserAskTool) {
             void Promise.resolve(this.options.updateStateNode(task, result, signal))
               .then(() => this.publish(task))

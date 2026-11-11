@@ -4,9 +4,9 @@ import { createServer as createViteServer } from "vite";
 import fs from "fs";
 import dotenv from "dotenv";
 import { AGENT_TOOL_REGISTRY } from './src/agent/toolRegistry';
-import { initialAgentContext, PROMPT_MODULES, TOOL_CATEGORIES, resolveContext, CONTROL_TOOLS, cleanToolOutputForPrompt, mergeTaskNotes, type AgentContextSelection } from './src/agent/contextPolicy';
+import { initialAgentContext, TOOL_CATEGORIES, resolveContext, CONTROL_TOOLS, cleanToolOutputForPrompt, mergeTaskNotes, type AgentContextSelection } from './src/agent/contextPolicy';
 import { mcpRouter } from './src/server/mcpRouter';
-import { autoCloseJsonString, robustParseJson } from './src/utils/jsonParser';
+import { autoCloseJsonString, robustParseJson, tryHealSharedClosingBraceInToolArgs } from './src/utils/jsonParser';
 dotenv.config();
 const defaultPromptFilePath = path.join(process.cwd(), "src/agent/systemPrompt.txt");
 const defaultExecutionPromptFilePath = path.join(process.cwd(), "src/agent/systemPromptExecution.txt");
@@ -59,30 +59,49 @@ function isObsoleteMainPrompt(text: string): boolean {
     text.includes('如果资产可能在画面中呈现出来') ||
     text.includes('出处（provenances）判定规则：') ||
     text.includes('核对参数依据与场次段落是否完整就绪，确定本轮要调用的工具与具体参数') ||
-    text.includes('参数纯净与多版本规范：') ||
-    text.includes('提取资产前必须先调用 script.read 读取目标场次的完整剧本正文')
-  );
-}
+      text.includes('参数纯净与多版本规范：') ||
+      text.includes('提取资产前必须先调用 script.read 读取目标场次的完整剧本正文') ||
+      text.includes('上一轮返回了场次分布概览（scenesSummary）') ||
+      text.includes('遵循“读取一批、核验一批、落盘一批”的增量闭环推进') ||
+      text.includes('scenesSummary 场次分布细化为分步子任务列表') ||
+      text.includes('4. 连续推进与工具流转：') ||
+      text.includes('3. 工具装载与流转：结合“当前计划”所需工具') ||
+      text.includes('更新后的当前进度（合并已完成事项与当前正在推进的事项）') ||
+      text.includes('一字不差完整复制该段原文>」→ 判定：') ||
+      text.includes('原封不动摘录该段中文原文>」→ 判定：') ||
+      text.includes('工具调用：\n{{调用 工具名称, {"参数名": "参数值"}}}') ||
+      text.includes('围绕全局目标、计划制定与工具准备进行逻辑推演，确定本轮要调用的工具与参数') ||
+      text.includes('每个子步骤必须定义为“读取该单元数据并完成对应的创建或增量更新”的完整读写闭环') ||
+      text.includes('当前子步骤处于“已读取待写入”还是“已写入落盘完成”状态？“当前计划”中还有哪些后续步骤待推进？') ||
+      text.includes('首批场次读取并调用创建工具建主卡锚定出处') ||
+      text.includes('分析当前任务进展与本轮返回的数据规模、场次或集数分布') ||
+      text.includes('必须严格按该工具规则在思考中完整输出，不得缩写省略')
+    );
+  }
 
-function readUserSavedPrompts(): Partial<Record<ManagedPromptType, SavedPromptEntry>> {
-  try {
-    // Clean up legacy tracked .data/systemPrompt.txt if present so it never overrides newer prompts
-    if (fs.existsSync(legacyCustomPromptFilePath)) {
-      try { fs.unlinkSync(legacyCustomPromptFilePath); } catch {}
-    }
-    if (!fs.existsSync(userSavedPromptsFilePath)) return {};
-    const raw = fs.readFileSync(userSavedPromptsFilePath, "utf-8");
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object') return {};
-    let mutated = false;
-    if (parsed.main && isObsoleteMainPrompt(parsed.main.prompt)) {
-      delete parsed.main;
-      mutated = true;
-    }
-    if (parsed.mainExecution && isObsoleteMainPrompt(parsed.mainExecution.prompt)) {
-      delete parsed.mainExecution;
-      mutated = true;
-    }
+  function readUserSavedPrompts(): Partial<Record<ManagedPromptType, SavedPromptEntry>> {
+    try {
+      // Clean up legacy tracked .data/systemPrompt.txt if present so it never overrides newer prompts
+      if (fs.existsSync(legacyCustomPromptFilePath)) {
+        try { fs.unlinkSync(legacyCustomPromptFilePath); } catch {}
+      }
+      if (!fs.existsSync(userSavedPromptsFilePath)) return {};
+      const raw = fs.readFileSync(userSavedPromptsFilePath, "utf-8");
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return {};
+      let mutated = false;
+      if (parsed.main && isObsoleteMainPrompt(parsed.main.prompt)) {
+        delete parsed.main;
+        mutated = true;
+      }
+      if (parsed.mainExecution && isObsoleteMainPrompt(parsed.mainExecution.prompt)) {
+        delete parsed.mainExecution;
+        mutated = true;
+      }
+      if (parsed.state && isObsoleteMainPrompt(parsed.state.prompt)) {
+        delete parsed.state;
+        mutated = true;
+      }
     if (mutated) {
       try {
         fs.writeFileSync(userSavedPromptsFilePath, JSON.stringify(parsed, null, 2), "utf-8");
@@ -895,19 +914,31 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
       const turnContext = resolveContext(rawContext, configuredToolIds);
       const enabledToolIds = new Set<string>(turnContext.tools);
       const isLevel1 = turnContext.level === 1;
+      const formatRegistryToolLine = (toolId: string) => {
+        const def = AGENT_TOOL_REGISTRY.find((t) => t.id === toolId);
+        return def ? `- ${def.id}：${def.description}\n  参数：${def.input}` : '';
+      };
       const controlToolLines = isLevel1
         ? [
-            `- sys.selectContext：补充装载工具或退出局部执行返回全局计划阶段（当前计划的后续步骤如需补充装载工具，可传 {"tools": [...]} 增量合并装载，已装载工具会自动保留；当“当前计划”中的所有步骤均已执行完毕后，直接无参调用 {{调用 sys.selectContext}} 返回全局计划与验收阶段）。\n  参数：{ categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[], level?: 0 | 1 }`,
-            `- user.ask：向用户提问并挂起任务等待回复（问题直接写在【用户沟通】中，无需传参）。\n  参数：{ question?: string }`,
-          ]
+            `- sys.selectContext：补充装载工具或退出局部执行返回全局计划阶段（后续步骤如需补充工具可传 {"tools": [...]} 增量合并装载；当前计划步骤全部执行完毕后，直接无参调用 {{调用 sys.selectContext}} 返回全局计划与验收阶段）。\n  参数：{ categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[], level?: 0 | 1 }`,
+            formatRegistryToolLine('user.ask'),
+          ].filter(Boolean)
         : [
-            `- sys.selectContext：按需展开工具分类或装载具体工具进入执行阶段。规则：① 需展开新工具分类时，传 {"categories": [...]} 展开对应分类下的候选工具简表；② 结合“当前计划”中的各个步骤，从已展开的候选简表中一次性挑选执行该计划所需的具体工具 ID 传 {"tools": [...]} 进入局部执行阶段（装配原则：工具须成组配套，若任务涉及资产提取且需分步追加，须同时装配 [asset.create, asset.update]；探查阶段推荐同时装载并并发调用 [directory, search, list]）。\n  参数：{ categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[], level?: 0 | 1 }`,
-            `- user.ask：向用户提问并挂起任务等待回复（问题直接写在【用户沟通】中，无需传参）。\n  参数：{ question?: string }`,
-            `- sys.endTask：结束当前任务（仅限在全局计划与验收阶段调用，最终汇报直接写在【用户沟通】中；若需等待异步任务可设 paused: true）。\n  参数：{ success?: boolean, paused?: boolean }`,
-          ];
+            `- sys.selectContext：按需展开工具分类或装载具体工具进入执行阶段：① 传 {"categories": [...]} 展开对应分类下的候选工具简表；② 结合当前计划从候选简表中成套挑选工具 ID 传 {"tools": [...]} 进入局部执行阶段（涉及分步提取须同时装配 [asset.create, asset.update]；探查期推荐同时装载 [directory, search, list]）。\n  参数：{ categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[], level?: 0 | 1 }`,
+            formatRegistryToolLine('user.ask'),
+            formatRegistryToolLine('sys.endTask'),
+          ].filter(Boolean);
+      const hasAssetCreate = enabledToolIds.has('asset.create');
       const injectedBusinessTools = AGENT_TOOL_REGISTRY
         .filter((tool) => enabledToolIds.has(tool.id) && !CONTROL_TOOLS.includes(tool.id))
-        .map((tool) => `- ${tool.id}：${tool.description}\n  参数：${tool.input}`);
+        .map((tool) => {
+          if (tool.id === 'asset.update' && hasAssetCreate) {
+            const dedupedDesc = '按资产 ID 或版本 ID 修改属性、追加新版本（versions）或补充出处（provenances）。规则：① 按场次判定造型版本并对号入座：逐场次判断该场次中资产属于“已有造型/状态”还是“新视觉造型/状态”（不同年龄阶段、不同服装造型、不同日夜或形态状态）——属于已有主造型/状态的场次出处传在顶层 provenances 中；属于新视觉造型/状态的场次，通过 versions 数组传入新版本对象（含 name、description、appearance、aliases，且该新版本的 provenances 仅绑定属于该新造型的场次；同一轮支持顶层 provenances 与 versions 同时传入，系统会自动将顶层出处归入原主造型并与新版本并列保留）；② provenances（画面出处）：判定标准为“根据段落内容，如果该资产必须出现在画面中才能呈现该段落，则判定该段落为出处”；核实出处时须在思考中从第1段至末段按连续序号逐段输出（包含判定为“是”与“否”的每一个段落），格式为“段[序号]「<一字不差完整复制该段全部原文>」→ 问题： [目标资产名]是否必须出现在画面中？→ 分析：<依据分析> → 判定：[是/否]”，将判定为“是”的序号按各自场次所属造型分别传入顶层 provenances 或对应 versions 项的 provenances 中；③ 合并语义：mode 默认 "append" 增量保留已有版本与出处（全量覆盖传 "overwrite"）；顶层文本字段（如 description、appearance）传入即替换原值，仅追加出处或版本时无需传顶层文本字段。';
+            const dedupedInput = '{ id: string, type?: "characters" | "locations" | "props", mode?: "append" | "overwrite", provenances?: Array<{ sceneTitle: string, paragraphIndices: number[] }>, versions?: Array<同 asset.create.versions>, name?: string, description?: string, role?: string, appearance?: string, atmosphere?: string, visualDetails?: string, materialAndState?: string, owner?: string }';
+            return `- ${tool.id}：${dedupedDesc}\n  参数：${dedupedInput}`;
+          }
+          return `- ${tool.id}：${tool.description}\n  参数：${tool.input}`;
+        });
       const candidateToolLines = (turnContext.candidateTools || [])
         .map((tool) => `- ${tool.id}：${tool.summary}`);
       const remainingCandidateToolLines = (turnContext.candidateTools || [])
@@ -951,7 +982,7 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
       } else if (remainingCandidateToolLines.length > 0) {
         assembledToolSections.push(
           ``,
-          `## 候选工具简表（后续步骤如需使用，可调 sys.selectContext 补充装载）`,
+          `## 候选工具简表`,
           ...remainingCandidateToolLines,
         );
       }
@@ -1062,7 +1093,7 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
         };
 
         const formatWarningHeader = (out: any) => {
-          if (!out || typeof out !== 'object' || !out.hasVolumeWarning) return '';
+          if (isLevel1 || !out || typeof out !== 'object' || !out.hasVolumeWarning) return '';
           const noticeText = out.notice || out.warning;
           if (!noticeText) return '';
           const isAutoReturned = Boolean(out.autoReturnedToLevel0);
@@ -1113,17 +1144,28 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
             } else if (name === 'script.directory' && output && typeof output === 'object') {
               const dirOut = output as any;
               const warningHeader = formatWarningHeader(dirOut);
-              const summaryLine = Array.isArray(dirOut.scenesSummary) && dirOut.scenesSummary.length > 0
-                ? ` | 场次分布: ${dirOut.scenesSummary.join('、')}`
-                : '';
+              const { scenesSummary: _omittedDirSummary, projectId: _dpid, source: _dsrc, ...slimDirOut } = dirOut;
               toolObs.push(
-                `${warningHeader}【工具 script.directory 执行成功】（共 ${dirOut.total ?? 0} 个集数条目 | 场次总计: ${dirOut.totalScenes ?? '未知'} | 段落总计: ${dirOut.totalParagraphs ?? '未知'}${summaryLine}）\n${serializeCleanOutput(output)}`
+                `${warningHeader}【工具 script.directory 执行成功】（共 ${dirOut.total ?? 0} 个集数条目 | 场次总计: ${dirOut.totalScenes ?? '未知'} | 段落总计: ${dirOut.totalParagraphs ?? '未知'}）\n${serializeCleanOutput(slimDirOut)}`
               );
             } else if (name === 'script.read' && output && typeof output === 'object') {
               const readOut = output as any;
               const warningHeader = formatWarningHeader(readOut);
               if (Array.isArray(readOut.episodes)) {
-                const { content: _omittedFlatContent, ...structuredReadOut } = readOut;
+                const {
+                  content: _omittedFlatContent,
+                  projectId: _pid,
+                  source: _src,
+                  total: _tot,
+                  offset: _off,
+                  startLine: _sl,
+                  endLine: _el,
+                  episodeCount: _ec,
+                  sceneCount: _sc,
+                  paragraphCount: _pc,
+                  scenesSummary: _ss,
+                  ...structuredReadOut
+                } = readOut;
                 toolObs.push(
                   `${warningHeader}【工具 script.read 执行成功】（按“集数 -> 场次 -> 段落”三层结构返回 | 集数: ${readOut.episodeCount ?? readOut.episodes.length} | 场次数: ${readOut.sceneCount ?? '未知'} | 段落数: ${readOut.paragraphCount ?? '未知'} | 行范围: 第 ${readOut.startLine ?? 1}～${readOut.endLine ?? 1} 行 | nextOffset: ${readOut.nextOffset ?? 'null'}）\n${serializeCleanOutput(structuredReadOut)}`
                 );
@@ -1257,31 +1299,31 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         `# 工作指南`,
         `默认优先使用后台工具读取项目数据；需要演示或核验界面时使用 UI。基于工具返回的事实推进，严禁把未执行视为成功。`,
         `进入执行阶段前，必须制定步骤化的“当前计划”，驱动执行阶段连续执行：`,
-        `1. 探查期安全原则（数据未知时）：制定宏观探查计划，调用 sys.selectContext 仅装载只读探查工具（建议 script.directory、script.search、asset.list 配套并发调用以建立全局视野），严禁提前装载写入工具；`,
-        `2. 动态重规划原则（获知数据分布后）：当触发数据量预警或上一轮返回了场次分布概览（scenesSummary）时，必须在“当前计划”中将宏观任务细化为按场次/实体的具体子步骤（分步精读推进：首场读取正文并建卡、后续场次分步读取正文并增量追加）；切入执行时一次性成套装载所需的读写工具组（如 [script.read, asset.create, asset.update]），严禁跳过正文读取或单步盲目硬吞；`,
-        `3. 工具装载与流转：结合“当前计划”所需工具，通过 sys.selectContext 展开分类或装载 tools 进入执行阶段；`,
-        `4. 全局核验与结案：从执行阶段返回后，对照“最终目标”与“当前计划”核验所有步骤；确认全部真实达成后，调用 sys.endTask 结束任务并向用户汇报。`,
-        `称用户为“你”，口吻亲和随意；遇需用户决策事项在用户沟通中说明。工具调用统一采用标准 JSON 参数格式：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）。`,
+        `1. 探查期安全原则（数据未知时）：在尚未掌握目标数据分布与现有状态前，先制定宏观探查计划；首次展开分类时一次性展开任务涉及的全部工具箱分类，探查期仅装载只读探查工具建立全局视野，不提前装载写入或修改工具；`,
+        `2. 动态重规划与单步读写闭环原则（获知数据分布后）：当探查结果返回了数据分布概览或触发数据量预警时，必须在“当前计划”中按工具返回的数据分布或预警建议的维度，将宏观任务拆解为分批推进的具体子步骤；每个子步骤必须定义为“读取该批数据并立即完成创建或增量更新落盘”的完整读写闭环（即使操作对象为单个目标实体，也必须按“首批读取并调用创建工具建档落盘 → 后续每批读取并调用更新工具增量追加”拆解，不规划无写入动作的纯读取步骤或留到最后一步才汇总创建）；切入执行时必须在 tools 参数中同时成套装载所需的读取、创建与更新工具 ID，随读随写完成每一批闭环；`,
+        `3. 全局核验与结案：从执行阶段返回后，对照“最终目标”与“当前计划”核验所有步骤；确认全部真实达成后，调用 sys.endTask 结束任务并向用户汇报。称用户为“你”，口吻亲和随意。`,
         ``,
         `# 输出格式`,
         `状态检查：`,
-        `{回顾并检查上面的“认知状态”。`,
+        `{回顾并检查上面的“认知状态”与本轮“工具执行结果 / 页面观察”。`,
         `- 最终目标是什么？（若认知状态中为“暂无”，结合当前聚焦目标与用户输入归纳）`,
-        `- 对照“当前计划”与“工具执行结果”核验推进：`,
-        `  * 初次规划：列出宏观探查计划（如：[ ] 1. 探查数据现状；[ ] 2. 提取/创建资产；[ ] 3. 全局核验）；`,
-        `  * 动态重规划：若触发数据量预警或已知场次分布，在此处将旧宏观步骤直接替换输出为细化后的分步子任务列表（标记 [x] 已完成、[ ] 待推进）；`,
-        `  * 常规推进：列出当前计划各步骤完成状态（[x] / [ ]）。`,
-        `- 最终目标与当前计划是否全部达成？若全部达成，准备调用 sys.endTask 结案；若未完成，下一步推进哪个步骤与小目标？`,
-        `- 为执行当前计划，需要先展开哪些分类（categories），或挑选哪些具体工具（tools）进入执行阶段？`,
-        `- 是否有关键结论需要沉淀到“重点笔记”？}`,
+        `- 本轮执行结果与事实盘点：上一步工具返回了哪些具体结果？是否获知了数据分布概览或触发了数据量预警？`,
+        `- 原计划完成度核对：对照现有“当前计划”，哪些步骤已真实达成（[x]），哪些尚待推进（[ ]）？最终目标是否已全部达成？`,
+        `- 重点笔记盘点：本轮发现了哪些跨轮次仍需引用的关键事实、实体 ID 或新线索需要沉淀到“重点笔记”？}`,
         `思考：`,
-        `{使用内心独白的方式，围绕全局目标、计划制定与工具准备进行逻辑推演。如果需要展开分类、装载工具进入执行或结束任务，请调用对应工具，系统会自动执行你的操作。}`,
+        `{使用内心独白的方式，基于“状态检查”盘点的事实进行逻辑推演与规划决策：`,
+        `- 1. 拆解策略推演：分析当前任务进展与本轮返回的数据规模及分布结构，思考接下来的推进策略（若获知数据分布或触发数据量预警，先分析如何按工具返回的分布或预警提示维度拆分为合理的“首批读取+创建、后续每批读取+增量更新”读写批次）；`,
+        `- 2. 制定或更新“当前计划”（显式列出完整步骤列表，标记 [x] 已完成、[ ] 待推进）：`,
+        `  * 初次规划（数据未知时）：列出宏观阶段计划（如：[ ] 1. 探查项目数据现状；[ ] 2. 按探查分布执行目标操作；[ ] 3. 全局核验）；`,
+        `  * 动态重规划（获知数据分布或触发数据量预警时）：基于上述推演，将旧宏观步骤直接替换为按批次拆解的“首批读取+创建、后续每批读取+增量更新”闭环子步骤列表；`,
+        `  * 常规推进：输出更新状态后的当前计划各步骤列表；`,
+        `- 3. 下一步小目标与工具准备：若所有步骤均已真实达成，决定调用 sys.endTask 结案；若未完成，明确下一步要推进的具体步骤与“当前小目标”，并确定本轮需调用 sys.selectContext 展开哪些分类（categories）或在 tools 参数中成套装载哪些具体读写工具 ID 切入执行阶段。}`,
         `工具调用：`,
-        `{{调用 工具名称, {"参数名": "参数值"}}}`,
+        `{严格按双花括号格式输出本轮要调用的工具指令：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）}`,
         `用户沟通：`,
         `{`,
-        `- 对用户说的话（完整版）：“如果需要，此处插入完整的描述，但也要尽可能简洁，注意，调用了工具不等于完成任务，要等工具返回结果并检查”`,
-        `- 对用户说的话（简版）：“插入对用户说的话，介绍当前任务状态、汇报结果或向用户提问。需要用户回复时直接在此简版提问并调用 user.ask 挂起等待，无需在工具调用中重复回复，口语化，控制在30字以内”`,
+        `- 对用户说的话（完整版）：“简洁说明当前进展或汇总结果；注意调用工具不等于完成任务，需等工具返回结果并检查”`,
+        `- 对用户说的话（简版）：“口语化介绍当前状态、汇报结果或向用户提问，控制在30字以内”`,
         `}`,
         ``,
         `# 可用工具`,
@@ -1299,7 +1341,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       const defaultExecutionTemplate = [
         `# 背景`,
         `你位于一个短剧协作平台中，负责协助用户从剧本到生图到视频的流程，你的名字是“Mira”。`,
-        `当前你处于【局部执行阶段】，你的核心职责是：依据全局规划阶段制定并持续存在的“当前计划”，按步骤连续调用工具推进执行，直到计划中的所有步骤全部完成。`,
+        `当前你处于【局部执行阶段】，你的核心职责是：依据全局规划阶段制定的“当前计划”，按步骤连续调用工具推进执行，直到计划中的所有步骤全部完成。`,
         ``,
         `# 用户指令`,
         `## 当前聚焦目标`,
@@ -1308,35 +1350,31 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         `{{userMessage}}`,
         ``,
         `# 工作指南`,
-        `依据【认知状态 -> 当前计划】连续调用工具推进执行，基于工具返回的真实结果推进，不把未执行视为成功。`,
-        `1. 事实依据原则：`,
-        `   - 所有写入、修改或生成操作必须基于已读取的真实项目数据或已观察到的页面事实，按计划步骤先读取/观察、再执行写入或操作；`,
-        `2. 分步执行与增量落盘：`,
-        `   - 面对多批次或多步骤任务时，遵循“读取一批、核验一批、落盘一批”的增量闭环推进，避免跳过前置读取或单次囤积全量数据后再写入；`,
-        `3. 工具契约与确定性真值：`,
-        `   - 严格遵循当前已装载工具的参数格式与规则要求；写入或修改类工具返回成功即代表状态已落盘生效，无需额外调用查询工具重复回查；`,
-        `4. 连续推进与工具流转：`,
-        `   - 当前步骤完成后紧接着推进“当前计划”中的下一个未完成步骤（[ ]）；`,
-        `   - 所需工具已在【当前可直接调用】列表中，直接连续调用，无需频繁退回全局计划阶段；`,
-        `   - 若需补充工具可从候选简表中调 sys.selectContext({"tools": [...]}) 补充装载；所有计划全部完成后无参调用 sys.selectContext 返回全局计划阶段结案。`,
-        `称用户为“你”，口吻亲和随意；工具调用统一采用标准 JSON 参数格式：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）。`,
+        `基于工具返回的真实结果推进，严禁把未执行视为成功。`,
+        `1. 事实依据与分步读写闭环：`,
+        `   - 所有写入、修改或生成操作必须基于已读取的真实项目数据或已观察到的页面事实；`,
+        `   - 多批次任务中，每个子步骤均按“先调用读取工具获取该单元明细 → 下一轮立即基于【工具执行结果】中的原始明细核验并调用创建或增量更新工具落盘”的两步闭环推进；仅当该单元落盘完成后该子步骤才算完成（[x]）并推进下一未完成步骤（[ ]），不跨多轮连续只读囤积数据后再集中汇总写入；`,
+        `2. 工具契约与确定性真值：`,
+        `   - 严格遵循已装载工具的参数格式与规则要求；写入或修改类工具返回成功即代表状态已落盘生效，无需额外调用查询工具重复回查；`,
+        `3. 连续流转与交互口吻：`,
+        `   - 所需工具已在【当前可直接调用】中，直接连续调用推进；仅在需补充工具或所有计划步骤全部完成时调用 sys.selectContext。称用户为“你”，口吻亲和随意。`,
         ``,
         `# 输出格式`,
         `状态检查：`,
         `{回顾并检查上面的“认知状态”与本轮“工具执行结果 / 页面观察”。`,
         `- 对照“当前计划”，当前正在执行哪一步骤（以及对应的“当前小目标”）？`,
-        `- 本轮工具返回了哪些具体结果？当前步骤是否已经完成？“当前计划”中还有哪些后续步骤待推进？`,
-        `- 本轮在“工具执行结果”中发现了哪些对后续步骤有用的关键事实、ID 或原文线索？（整理列出以便沉淀到“重点笔记”）`,
-        `- 当前计划各步骤状态（[x] / [ ]）与当前进度需要更新为什么？`,
-        `- 下一步行动判断：若计划未完成且工具已装载，下一步调用哪个工具继续推进？若需补充工具或计划全部完成，准备调用 sys.selectContext。}`,
+        `- 本轮工具返回了哪些具体结果？当前子步骤处于“已读取待写入落盘”还是“已写入落盘完成”状态？`,
+        `- 本轮发现了哪些后续步骤仍需引用的关键事实、实体 ID 或未落盘线索？（整理以便更新至“重点笔记”）}`,
         `思考：`,
-        `{使用内心独白的方式，结合当前【工具执行结果】中的原始明细数据、【认知状态 -> 当前计划】与已装载工具的参数说明进行逻辑推演（若本轮拟调用的工具在规则中规定了逐项核验格式，必须严格按该工具规则在思考中完整输出，不得缩写省略），确定本轮要调用的工具与具体参数。}`,
+        `{使用内心独白的方式，结合当前【工具执行结果】中的原始明细数据、【认知状态 -> 当前计划】与已装载工具的参数说明进行逻辑推演：`,
+        `- 1. 逐项核验与参数推演：若当前处于“已读取待写入落盘”状态，必须立即基于刚读出的原始明细调用创建或更新工具完成本批落盘（若本轮拟调用的工具在规则中规定了逐项核验格式，必须严格按该工具规则在思考中从首段至末段逐段完整输出）；`,
+        `- 2. 计划状态更新与下一步行动：更新“当前计划”各步骤状态（[x] / [ ]）与当前进度，确定本轮要调用的具体工具与参数（若当前计划所有步骤均已落盘完成，调用 sys.selectContext 返回全局计划阶段）。}`,
         `工具调用：`,
-        `{{调用 工具名称, {"参数名": "参数值"}}}`,
+        `{严格按双花括号格式输出本轮要调用的工具指令：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）}`,
         `用户沟通：`,
         `{`,
-        `- 对用户说的话（完整版）：“如果需要，此处插入完整的描述，但也要尽可能简洁，注意，调用了工具不等于完成任务，要等工具返回结果并检查”`,
-        `- 对用户说的话（简版）：“插入对用户说的话，介绍当前执行进展或向用户提问。需要用户回复时直接在此简版提问并调用 user.ask 挂起等待，无需在工具调用中重复回复，口语化，控制在30字以内”`,
+        `- 对用户说的话（完整版）：“简洁说明当前进展；注意调用工具不等于完成任务，需等工具返回结果并检查”`,
+        `- 对用户说的话（简版）：“口语化介绍当前进展或向用户提问，控制在30字以内”`,
         `}`,
         ``,
         `# 可用工具`,
@@ -1426,6 +1464,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       const requestPayload: Record<string, unknown> = {
         model: actualModel,
         messages,
+        max_tokens: 8192,
       };
 
       if (stream) {
@@ -1441,6 +1480,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
           thinking: { type: 'enabled' },
         };
       } else {
+        requestPayload.temperature = 0.2;
         requestPayload.thinking = { type: 'disabled' };
         requestPayload.extra_body = {
           thinking: { type: 'disabled' },
@@ -1602,7 +1642,8 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         'script.readDirectory',
         'script.readEpisode',
         'asset.extractElements',
-        'card.batchCreate'
+        'card.batchCreate',
+        'card.annotateElements'
       ]);
 
       const resolveNormalizedToolName = (rawName: string): string => {
@@ -1631,7 +1672,13 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         return trimmed;
       };
 
-      const rawExtractedCalls: Array<{ rawName: string; rawArgs: string; rawSpan: string }> = [];
+      const rawExtractedCalls: Array<{
+        rawName: string;
+        rawArgs: string;
+        rawSpan: string;
+        unclosedBlock?: boolean;
+        formatError?: string;
+      }> = [];
 
       if (typeof message.content === 'string' && message.content.includes('{{')) {
         const text = message.content;
@@ -1699,14 +1746,16 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
 
           let inner = '';
           let rawSpan = '';
+          let isUnclosedBlock = blockEnd === -1;
+          let hasTrailingDoubleBrace = false;
 
           if (blockEnd !== -1) {
             rawSpan = text.slice(startIdx, blockEnd);
             inner = text.slice(startIdx + 2, blockEnd - 2).trim();
             pos = blockEnd;
           } else {
-            // Fallback for non-closed or imperfectly closed {{ block:
-            // Find candidate boundary (before next {{ or next semantic section header)
+            // Non-closed or imperfectly closed {{ block (e.g. unclosed JSON braces/quotes or missing }}):
+            // Extract span up to next section boundary so we can report a deterministic validationError to the model
             const remaining = text.slice(startIdx + 2);
             const nextBoundaryMatch = remaining.search(/\n\s*\{\{|\n\s*(?:用户沟通|状态检查|思考|小目标|全局核验|行动|进展)[:：]/);
             const candidateLen = nextBoundaryMatch !== -1 ? nextBoundaryMatch : remaining.length;
@@ -1714,43 +1763,103 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
 
             const lastDouble = candidateChunk.lastIndexOf('}}');
             if (lastDouble !== -1) {
+              hasTrailingDoubleBrace = true;
               inner = candidateChunk.slice(0, lastDouble).trim();
               rawSpan = text.slice(startIdx, startIdx + 2 + lastDouble + 2);
               pos = startIdx + 2 + lastDouble + 2;
             } else {
-              const lastSingle = candidateChunk.lastIndexOf('}');
-              if (lastSingle !== -1) {
-                inner = candidateChunk.slice(0, lastSingle).trim();
-                rawSpan = text.slice(startIdx, startIdx + 2 + lastSingle + 1);
-                pos = startIdx + 2 + lastSingle + 1;
-              } else {
-                inner = candidateChunk.trim();
-                rawSpan = text.slice(startIdx, startIdx + 2 + candidateLen);
-                pos = startIdx + 2 + candidateLen;
-              }
+              inner = candidateChunk.trim();
+              rawSpan = text.slice(startIdx, startIdx + 2 + candidateLen);
+              pos = startIdx + 2 + candidateLen;
             }
           }
 
           if (inner) {
-            const callMatch = inner.match(/^(?:调用|call)\s*([a-zA-Z0-9_.]+)(?:[\s,，]+([\s\S]*))?$/i);
+            const callMatch = inner.match(/^(?:调用|call)\s*([a-zA-Z0-9_.]+)(?:[\s,，:：]+([\s\S]*))?$/i);
             if (callMatch) {
-              rawExtractedCalls.push({
-                rawName: callMatch[1].trim(),
-                rawArgs: (callMatch[2] || '').trim(),
-                rawSpan,
-              });
-            } else {
-              const directMatch = inner.match(/^([a-zA-Z0-9_.]+)(?:[\s,，]+([\s\S]*))?$/);
-              if (directMatch) {
-                const possibleName = resolveNormalizedToolName(directMatch[1]);
-                if (allKnownToolIds.has(possibleName)) {
-                  rawExtractedCalls.push({
-                    rawName: directMatch[1].trim(),
-                    rawArgs: (directMatch[2] || '').trim(),
-                    rawSpan,
-                  });
+              let rawArgs = (callMatch[2] || '').trim();
+              if (isUnclosedBlock && hasTrailingDoubleBrace && rawArgs) {
+                const healedArgs = tryHealSharedClosingBraceInToolArgs(rawArgs);
+                if (healedArgs !== null) {
+                  rawArgs = healedArgs;
+                  isUnclosedBlock = false;
                 }
               }
+              rawExtractedCalls.push({
+                rawName: callMatch[1].trim(),
+                rawArgs,
+                rawSpan,
+                unclosedBlock: isUnclosedBlock,
+              });
+            } else {
+              const directMatch = inner.match(/^([a-zA-Z0-9_.]+)(?:[\s,，:：]+([\s\S]*))?$/);
+              if (directMatch) {
+                let rawArgs = (directMatch[2] || '').trim();
+                if (isUnclosedBlock && hasTrailingDoubleBrace && rawArgs) {
+                  const healedArgs = tryHealSharedClosingBraceInToolArgs(rawArgs);
+                  if (healedArgs !== null) {
+                    rawArgs = healedArgs;
+                    isUnclosedBlock = false;
+                  }
+                }
+                rawExtractedCalls.push({
+                  rawName: directMatch[1].trim(),
+                  rawArgs,
+                  rawSpan,
+                  unclosedBlock: isUnclosedBlock,
+                });
+              } else {
+                const snippet = rawSpan.length > 160 ? `${rawSpan.slice(0, 90)}...${rawSpan.slice(-70)}` : rawSpan;
+                rawExtractedCalls.push({
+                  rawName: 'format.invalid',
+                  rawArgs: inner,
+                  rawSpan,
+                  unclosedBlock: isUnclosedBlock,
+                  formatError: `【工具调用或 JSON 格式错误】无法解析工具调用指令：${snippet}。请严格按 {{调用 工具名称, {"参数名": "参数值"}}} 格式输出，且参数必须为合法闭合的标准 JSON 对象。`,
+                });
+              }
+            }
+          }
+        }
+      }
+
+      // If no {{...}} block was found, check whether the model wrote a "工具调用：" section with broken wrapper or broken JSON.
+      // Return a validationError to the model so the task never silently ends when the tool call / JSON format is wrong.
+      if (rawExtractedCalls.length === 0 && typeof message.content === 'string') {
+        const toolSectionMatch = message.content.match(/(?:^|\n)\s*工具调用\s*[:：]\s*([\s\S]*?)(?=\n\s*(?:用户沟通|状态检查|思考|小目标|全局核验)[:：]|$)/i);
+        if (toolSectionMatch && toolSectionMatch[1]) {
+          let sectionBody = toolSectionMatch[1].trim();
+          const isExplicitNone = /^(?:无|暂无|不调用|无需调用|none|null|n\/a|-+|\{\s*\})$/i.test(sectionBody);
+          if (sectionBody && !isExplicitNone) {
+            let unwrapped = sectionBody;
+            if (unwrapped.startsWith('{') && unwrapped.endsWith('}') && !unwrapped.startsWith('{"')) {
+              unwrapped = unwrapped.slice(1, -1).trim();
+            }
+            const candidateMatch = unwrapped.match(/^(?:[-*+]\s*)?(?:调用|call)?\s*([a-zA-Z0-9_.]+)(?:[\s,，:：]+([\s\S]*))?$/i);
+            const rawToolName = candidateMatch ? candidateMatch[1].trim() : 'format.invalid';
+            const normalizedTool = resolveNormalizedToolName(rawToolName);
+            const displayTool = allKnownToolIds.has(normalizedTool) ? normalizedTool : rawToolName;
+            const rawCandidateArgs = candidateMatch ? (candidateMatch[2] || '').trim() : unwrapped;
+            let jsonDiagnostic = '';
+            if (rawCandidateArgs) {
+              try {
+                JSON.parse(rawCandidateArgs);
+              } catch (jsonErr: any) {
+                jsonDiagnostic = `；同时检测到 JSON 参数语法错误（${jsonErr instanceof Error ? jsonErr.message : String(jsonErr)}）`;
+              }
+            }
+            const snippet = sectionBody.length > 160 ? `${sectionBody.slice(0, 90)}...${sectionBody.slice(-70)}` : sectionBody;
+            const err = `【工具调用与 JSON 格式错误】检测到“工具调用”段落未按规定的双花括号格式输出${jsonDiagnostic}。当前输出：${snippet}。请严格按 {{调用 ${displayTool === 'format.invalid' ? '工具名称' : displayTool}, {"参数名": "参数值"}}} 格式重新输出，并确保参数为合法闭合的标准 JSON 对象！`;
+            rawExtractedCalls.push({
+              rawName: displayTool,
+              rawArgs: rawCandidateArgs,
+              rawSpan: toolSectionMatch[0],
+              formatError: err,
+            });
+            if (Array.isArray(parsed.narration) && parsed.narration.length > 0) {
+              parsed.narration = parsed.narration
+                .map((n: string) => n.replace(/(?:^|\n)\s*工具调用\s*[:：]\s*[\s\S]*$/i, '').trim())
+                .filter(Boolean);
             }
           }
         }
@@ -1764,6 +1873,13 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         const item = rawExtractedCalls[i];
         const callId = `call_${Date.now()}_${i}`;
         const normalizedName = resolveNormalizedToolName(item.rawName);
+
+        // 0. Explicit Wrapper / Format Error Check
+        if (item.formatError) {
+          validationErrors.push({ name: normalizedName, error: item.formatError, rawArgs: item.rawArgs });
+          toolCalls.push({ id: callId, name: normalizedName, arguments: {}, validationError: item.formatError });
+          continue;
+        }
 
         // 1. Tool Existence Check
         if (!allKnownToolIds.has(normalizedName)) {
@@ -1782,22 +1898,47 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
           continue;
         }
 
-        // 3. Arguments Syntax Parsing
+        // 3. Strict JSON Arguments Syntax Parsing (no silent truncation/auto-close on broken JSON)
+        if (item.unclosedBlock) {
+          const snippet = item.rawSpan.length > 160 ? `${item.rawSpan.slice(0, 90)}...${item.rawSpan.slice(-70)}` : item.rawSpan;
+          const err = `【JSON 与指令闭合错误】工具 "${normalizedName}" 的调用指令未以双花括号 "}}" 完整闭合，或内部 JSON 参数存在未闭合的引号、花括号 {} 或方括号 []。当前输入片段：${snippet}。请检查 JSON 格式并重新输出完整的 {{调用 ${normalizedName}, {...}}} 指令。`;
+          validationErrors.push({ name: normalizedName, error: err, rawArgs: item.rawArgs });
+          toolCalls.push({ id: callId, name: normalizedName, arguments: {}, validationError: err });
+          continue;
+        }
+
         let argsObj: Record<string, any> = {};
         if (item.rawArgs) {
           const cleanedArgs = item.rawArgs.trim();
           if (cleanedArgs && cleanedArgs !== '{}') {
-            const parsed = robustParseJson(cleanedArgs);
-            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-              argsObj = parsed;
-            } else if (parsed && Array.isArray(parsed)) {
-              argsObj = { items: parsed };
-            } else if (normalizedName === 'user.ask') {
-              const qStr = typeof parsed === 'string' ? parsed : cleanedArgs.replace(/^[“"'\s]+|[”"'\s]+$/g, '');
-              argsObj = qStr ? { question: qStr } : {};
+            let jsonCandidate = cleanedArgs;
+            const mdMatch = jsonCandidate.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+            if (mdMatch) {
+              jsonCandidate = mdMatch[1].trim();
+            }
+            let parsedJson: unknown;
+            let jsonSyntaxErr: string | null = null;
+            try {
+              parsedJson = JSON.parse(jsonCandidate);
+            } catch (err: any) {
+              jsonSyntaxErr = err instanceof Error ? err.message : String(err);
+            }
+
+            if (jsonSyntaxErr !== null) {
+              const snippet = cleanedArgs.length > 160 ? `${cleanedArgs.slice(0, 90)}...${cleanedArgs.slice(-70)}` : cleanedArgs;
+              const err = `【JSON 参数语法错误】工具 "${normalizedName}" 调用参数解析失败，不是合法的 JSON 格式（${jsonSyntaxErr}）。当前输入片段：${snippet}。请检查：1. 键名和字符串是否使用标准双引号 "" 并正确转义；2. 字段间逗号、花括号 {} 与方括号 [] 是否完整配对闭合；修正后重新调用 {{调用 ${normalizedName}, {...}}}。`;
+              validationErrors.push({ name: normalizedName, error: err, rawArgs: cleanedArgs });
+              toolCalls.push({ id: callId, name: normalizedName, arguments: {}, validationError: err });
+              continue;
+            }
+
+            if (parsedJson && typeof parsedJson === 'object' && !Array.isArray(parsedJson)) {
+              argsObj = parsedJson as Record<string, any>;
+            } else if (parsedJson && Array.isArray(parsedJson) && normalizedName === 'asset.create') {
+              argsObj = { items: parsedJson };
             } else {
               const snippet = cleanedArgs.length > 160 ? `${cleanedArgs.slice(0, 90)}...${cleanedArgs.slice(-70)}` : cleanedArgs;
-              const err = `【参数语法错误】工具 "${normalizedName}" 调用参数解析失败（无法解析为合法的 JSON 对象）。当前输入片段：${snippet}。建议排查：1. 确认引号、花括号和方括号是否完整闭合；2. 建议扁平化传参（可直接传入顶层字段如 description、appearance、role、versions，无需包裹在 updates 对象中）；3. 若数据量较大，可拆分为精简单条分步提交。`;
+              const err = `【JSON 参数类型错误】工具 "${normalizedName}" 的参数必须为标准 JSON 对象 {...}（例如 {"参数名": "参数值"}）。当前输入片段：${snippet}。请修正为 JSON 对象后重新调用。`;
               validationErrors.push({ name: normalizedName, error: err, rawArgs: cleanedArgs });
               toolCalls.push({ id: callId, name: normalizedName, arguments: {}, validationError: err });
               continue;
@@ -1983,24 +2124,25 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
 【输出格式（严格输出合法 JSON）】
 请按以下字段顺序逐步核对并输出 JSON：
 {
-  "stateCheck": "一句话核对本轮增量：对照【本轮执行的工具动作】与【当前聚焦目标实时状态】，上一步小目标及关联的面板/数据更新是否已解决？本轮主循环在状态检查中提出了哪些进度/计划调整？发现了哪些需要并入重点笔记的新线索？",
+  "stateCheck": "一句话核对本轮增量：对照【本轮执行的工具动作】与【当前聚焦目标实时状态】，上一步小目标及关联的面板/数据更新是否已解决？本轮主循环在状态检查与思考中提出了哪些进度/计划调整？发现了哪些需要并入重点笔记的新线索？",
   "taskTitle": "8字以内的任务简短标题（已有明确标题时保持不变）",
   "goal": "根据主循环在状态检查与思考中总结归纳出的最终目标（若处于多轮对话补充阶段，保留并融合已有最终目标）",
   "subGoal": "下一轮要推进的当前小目标（仅当【阶段状态与下一轮去向】明确显示本轮已实际执行 sys.selectContext 返回【全局计划与验收阶段】时，才更新为‘全局核验上一阶段执行结果并推进下一步或结案’；若下一轮仍处于【局部执行阶段】，必须保持为当前局部执行的具体小目标，严禁因主循环文字中预告‘完成后将返回全局阶段’而提前改为全局核验）",
-  "progress": "更新后的当前进度（合并已完成事项与当前正在推进的事项）",
+  "progress": "一句话简述当前所处步骤与状态（如‘已完成前3步，当前第4步已读取数据待落盘’，严禁逐条罗列已完成步骤的段落序号或剧情明细，避免与当前计划重复）",
   "plan": [
-    {"id": "1", "title": "计划步骤标题：若主循环提出了动态重规划（如根据数据量预警或 scenesSummary 场次分布细化为分步子任务列表），必须完整采纳并替换为该细化计划列表；若【本轮执行的工具动作】已完成某步数据落盘且【当前聚焦目标实时状态】已同步更新，应将对应步骤一并标为 completed", "status": "completed | pending"}
+    {"id": "1", "title": "计划步骤标题：若主循环提出了动态重规划，必须完整采纳并替换为细化后的子步骤列表；对于包含‘读取+创建/更新’的读写闭环步骤，仅当该步骤对应的写入/更新工具已实际调用落盘后才标为 completed，若本轮仅完成了前置读取尚未执行写入/更新则保持为 pending", "status": "completed | pending"}
   ],
-  "notes": "合并整理后的重点笔记：保留已记录的核心事实、资产ID、出处行号与人物结论（即使本轮是阶段切换轮也予以保留），在此基础上并入主循环本轮新发现的关键线索，剔除已过时的过程状态描述与冗余重复文本，保持精炼条理",
+  "notes": "合并整理后的重点笔记（仅保留跨轮次仍需引用的目标实体ID、已有版本/造型名称、核心设定属性及尚未落盘的关键线索，即使本轮是阶段切换轮也予以保留；严禁重复抄写最终目标、已完成步骤的历史段落序号明细、面板数量统计、已装载工具列表或系统执行原则，控制在5条以内）",
   "notesMode": "overwrite"
 }`;
 
-      let statePromptTemplate = (typeof customStatePrompt === 'string' && customStatePrompt.trim().length > 0)
+      let statePromptTemplate = (typeof customStatePrompt === 'string' && customStatePrompt.trim().length > 0 && !isObsoleteMainPrompt(customStatePrompt))
         ? customStatePrompt
         : getPrompt('state');
       if (
         !statePromptTemplate ||
         !statePromptTemplate.trim() ||
+        isObsoleteMainPrompt(statePromptTemplate) ||
         !statePromptTemplate.includes('根据主循环在状态检查与思考中总结归纳出的最终目标') ||
         !statePromptTemplate.includes('即使本轮是阶段切换轮') ||
         !statePromptTemplate.includes('阶段状态与下一轮去向') ||

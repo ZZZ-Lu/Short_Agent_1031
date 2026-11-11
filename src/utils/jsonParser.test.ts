@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { autoCloseJsonString, robustParseJson } from './jsonParser.js';
+import { autoCloseJsonString, robustParseJson, tryHealSharedClosingBraceInToolArgs } from './jsonParser.js';
 
 test('autoCloseJsonString - correctly closes unclosed quotes, brackets, and braces', () => {
   // Simple unclosed object
@@ -99,4 +99,36 @@ test('robustParseJson - heals truncated state node JSON with multiline notes and
   assert.ok(res2);
   assert.equal(res2.notes, 'line1\nline2\nline3');
 });
+
+test('robustParseJson - heals truncated keys, colons, and minimal input', () => {
+  assert.deepEqual(robustParseJson('{'), {});
+  assert.deepEqual(robustParseJson('{\n'), {});
+  assert.deepEqual(robustParseJson('{\n  "stateCheck":'), {});
+  assert.deepEqual(robustParseJson('{\n  "stateCheck": "test",\n  "taskTitle": "title",\n  "notes":'), {
+    stateCheck: 'test',
+    taskTitle: 'title',
+  });
+  assert.deepEqual(robustParseJson('{\n  "stateCheck": "test",\n  "plan": [\n    {"id": "1", "title": "step 1", "status":\n'), {
+    stateCheck: 'test',
+    plan: [{ id: '1', title: 'step 1' }],
+  });
+});
+
+test('tryHealSharedClosingBraceInToolArgs - heals tool call args where outer } was shared with }} wrapper (}]}})', () => {
+  // Exact pattern from Turn 9-18 of trace: after stripping trailing `}}`, rawArgs ends with `}]`
+  const rawArgsMissingSharedBrace =
+    '{"type": "characters", "name": "娜塔莉亚", "versions": [{"name": "十年前", "provenances": [{"sceneTitle": "1-3 日 外 贫民窟门口", "paragraphIndices": [1, 3, 6, 7, 8]}]}]';
+  const healed = tryHealSharedClosingBraceInToolArgs(rawArgsMissingSharedBrace);
+  assert.ok(healed);
+  const parsed = JSON.parse(healed!);
+  assert.equal(parsed.name, '娜塔莉亚');
+  assert.deepEqual(parsed.versions[0].provenances[0].paragraphIndices, [1, 3, 6, 7, 8]);
+
+  // Truly broken/unclosed JSON (missing both ] and }) must NOT be healed by a single shared brace
+  const brokenUnclosedArray =
+    '{"type": "characters", "name": "娜塔莉亚", "versions": [{"name": "十年前"}';
+  assert.equal(tryHealSharedClosingBraceInToolArgs(brokenUnclosedArray), null);
+});
+
+
 

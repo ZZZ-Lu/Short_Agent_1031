@@ -70,10 +70,10 @@ const CATEGORY_ALIASES: Record<string, string> = {
 };
 
 export const PROMPT_MODULES: Record<string, { label: string; content: string }> = {
-  script: { label: '剧本读取与分析', content: '剧本数据按“集数（episodes）-> 场次（scenes）-> 段落（paragraphs）”三层结构组织（段落判定标准：换行即为下一段落，没有换行就是一个段落；场次头与场首人物名单已收敛为场次属性，paragraphs 仅包含实质正文段落及对应的场内 1-based 段落序号 index）。script.read 支持直接传入 episode、scene、paragraph 读取三层结构化正文；目录中的集号可能跳号或重复，总集数按实际条目统计。' },
-  assets: { label: '项目资产', content: '角色、场景和道具属于当前项目资产。依据剧本分析出的角色造型、场景或关键道具应及时沉淀保存到资产清单中；更新时保留已有设定，仅补全或修订差异。\n【资产识别描述（description）与多版本（versions）规范】\n1. 资产条目的浅色文本描述（description）严禁写空泛套话，核心目的是为了资产精准识别，避免混淆、重复、丢失：\n   - 道具（props）：必须写清首次出场位置（集/场）、归属者（谁的），以及能与其它相似道具区分的关键辨识信息；若同一道具存在不同形态/状态（如损毁前/损毁后、开启/闭合等），必须按形态/状态区分版本。\n   - 场景（locations）：必须写清首次出场位置、空间归属与核心视觉辨识特征；若同一场景同时存在日景和夜景（或明显不同的时间光影状态），必须分开为两个版本。\n   - 角色（characters）：必须写清首次出场位置、核心身份与人物关系辨识点（未在画面中呈现、仅在台词或独白中提及的背景信息归入 description）；若同一角色存在视觉上的不同造型（含不同年龄阶段或不同服装造型），必须按视觉上的不同造型直接区分版本（versions），无需向用户提问是否单独新建角色。\n2. 单版本与多版本规则：单一版本直接写在一级属性；若资产存在多个版本（如角色在视觉上的不同造型、场景的日夜景、道具的不同形态），必须在 versions 数组中同时传入初始版本与所有变体版本（确保 versions 数组长度至少为 2，且每个版本分别绑定各自对应造型的 provenances 出处与 aliases 别名），或使用 parentId 为变体版本独立创建衍生卡片。' },
-  image: { label: '图像生成与卡片', content: '禁止覆盖资产卡片或已出图卡片；重新生成应使用现有复刻机制。只有工具返回 generating 才能宣称生成已启动；默认使用 Hy Image3.5 preview，并提供简短卡片名称。' },
-  ui: { label: '页面观察与操作', content: '仅在需要演示或检查页面时使用页面操作。page.inspect 只描述可见界面；ui.actAndObserve 只能操作已观察的目标。' },
+  script: { label: '剧本读取与分析', content: '按集数 -> 场次 -> 段落三层结构读取、检索与分析剧本数据。' },
+  assets: { label: '项目资产', content: '查询、创建、更新角色/场景/道具资产，维护多版本造型与画面出处锚点。' },
+  image: { label: '图像生成与卡片', content: '查看卡片属性、空间标注元素，执行生图或复刻衍生。' },
+  ui: { label: '页面观察与操作', content: '观察当前可见界面结构、查询操作指南或执行鼠标交互。' },
 };
 
 export const CONTROL_TOOLS: AgentToolName[] = ['sys.selectContext', 'sys.endTask', 'user.ask'];
@@ -209,6 +209,15 @@ export function validateSelection(
 
   // 1. 已选定具体业务工具 ID -> 自动切入或保持在局部执行阶段（level: 1，若当前已在 1 级则增量合并已装载工具，同时记忆已展开分类）
   if (resolvedTools.size > 0) {
+    // 若模型在切入 1 级装载 script.read 时同时显式传入了 categories: ["asset"]（意图将资产读写工具组与 script.read 一并注入 1 级），自动配齐 asset.create 与 asset.update
+    const hasExplicitAssetTool = [...resolvedTools].some(t => t.startsWith('asset.'));
+    if (resolvedCategories.has('asset') && resolvedTools.has('script.read') && !hasExplicitAssetTool) {
+      for (const pairTool of ['asset.create', 'asset.update'] as AgentToolName[]) {
+        if (known.has(pairTool) && available.has(pairTool)) {
+          resolvedTools.add(pairTool);
+        }
+      }
+    }
     const validPrevTools = previousLevel1Tools.filter(
       t => known.has(t) && (available.has(t) || t === 'sys.selectContext')
     );
@@ -246,13 +255,14 @@ export function validateSelection(
 }
 
 const OBSOLETE_GREETING_NOTE_RE = /尚未明确具体任务|尚未提供具体创作任务|处于需求引导阶段/;
+const REDUNDANT_META_NOTE_RE = /^(最终目标|已装载工具|执行原则|资产清单面板|当前计划|当前进度)[:：]/;
 
 function extractNoteItems(raw: string | undefined): string[] {
   if (!raw || typeof raw !== 'string') return [];
   return raw
     .split(/\r?\n/)
     .map(line => line.trim().replace(/^[-*•]\s*/, '').trim())
-    .filter(line => Boolean(line) && line !== '暂无笔记');
+    .filter(line => Boolean(line) && line !== '暂无笔记' && !REDUNDANT_META_NOTE_RE.test(line));
 }
 
 function normalizeNoteKey(item: string): string {
@@ -260,7 +270,7 @@ function normalizeNoteKey(item: string): string {
 }
 
 /**
- * 合并并按行归一化去重重点笔记（task.notes），同时在进入实质任务后自动剔除开场寒暄阶段占位笔记。
+ * 合并并按行归一化去重重点笔记（task.notes），同时在进入实质任务后自动剔除开场寒暄阶段占位笔记与重复元信息。
  */
 export function mergeTaskNotes(
   existingNotes: string | undefined,
@@ -319,7 +329,15 @@ export function cleanToolOutputForPrompt(val: unknown, depth = 0): unknown {
   }
   const cleanedObj: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
-    if (k === 'verifiedScriptHash') continue;
+    if (
+      k === 'verifiedScriptHash' ||
+      k === 'hasVolumeWarning' ||
+      k === 'notice' ||
+      k === 'warning' ||
+      k === 'autoReturnedToLevel0'
+    ) {
+      continue;
+    }
     if (k === 'verifiedProvenance' && Array.isArray(v)) {
       const slimProvenances = v
         .map(item => {

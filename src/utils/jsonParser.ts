@@ -88,6 +88,26 @@ export function autoCloseJsonString(input: string): string {
   return repaired;
 }
 
+export function stripIncompleteJsonTail(input: string): string {
+  let s = input.trim();
+  if (!s) return s;
+
+  for (let i = 0; i < 5; i++) {
+    const prev = s;
+    s = s.replace(/,\s*"[^"]*"?\s*:?\s*$/, '');
+    s = s.replace(/([{,\[])\s*"[^"]*"?\s*:?\s*$/, '$1');
+    s = s.replace(/:\s*$/, '');
+    s = s.replace(/,\s*$/, '');
+    if (s.trim() === prev.trim()) break;
+  }
+
+  if (!s.trim()) {
+    if (input.trim().startsWith('{')) return '{';
+    if (input.trim().startsWith('[')) return '[';
+  }
+  return s;
+}
+
 export function robustParseJson<T = any>(str: string): T | null {
   if (!str || typeof str !== 'string') return null;
 
@@ -109,7 +129,14 @@ export function robustParseJson<T = any>(str: string): T | null {
     return JSON.parse(closed);
   } catch {}
 
-  // 3. Repair common LLM JSON formatting defects:
+  // 3. Auto-close with incomplete tail stripped (e.g. truncated after key or colon)
+  try {
+    const stripped = stripIncompleteJsonTail(cleaned);
+    const closedStripped = autoCloseJsonString(stripped);
+    return JSON.parse(closedStripped);
+  } catch {}
+
+  // 4. Repair common LLM JSON formatting defects:
   let repaired = cleaned
     .replace(/(["\d\]}])\s*\n\s*(["\d\[{])/g, '$1,\n$2')
     .replace(/(")\s+(")/g, '$1, $2')
@@ -130,7 +157,13 @@ export function robustParseJson<T = any>(str: string): T | null {
     return JSON.parse(closedRepaired);
   } catch {}
 
-  // 4. Boundary recovery only if string starts with leading garbage before { or [
+  try {
+    const strippedRepaired = stripIncompleteJsonTail(repaired);
+    const closedStrippedRepaired = autoCloseJsonString(strippedRepaired);
+    return JSON.parse(closedStrippedRepaired);
+  } catch {}
+
+  // 5. Boundary recovery only if string starts with leading garbage before { or [
   const firstBrace = cleaned.indexOf('{');
   const firstBracket = cleaned.indexOf('[');
   let startIdx = -1;
@@ -149,9 +182,13 @@ export function robustParseJson<T = any>(str: string): T | null {
     try {
       return JSON.parse(autoCloseJsonString(leadingCleaned));
     } catch {}
+    try {
+      const strippedLeading = stripIncompleteJsonTail(leadingCleaned);
+      return JSON.parse(autoCloseJsonString(strippedLeading));
+    } catch {}
   }
 
-  // 5. Fallback manual repair suffixes
+  // 6. Fallback manual repair suffixes
   const autoRepairSuffixes = ['}', ']', '}]', '}]}', '"}]}', '"]}', '"}', '"'];
   for (const s of autoRepairSuffixes) {
     try {
@@ -164,3 +201,34 @@ export function robustParseJson<T = any>(str: string): T | null {
 
   return null;
 }
+
+/**
+ * When a model outputs `{{调用 toolName, {"a": [{"b": 1}]}}` (writing 2 closing braces `}}` instead of 3 `}}}`
+ * by visually merging the outer JSON `}` with the `{{...}}` command terminator `}}`), stripping the trailing `}}`
+ * leaves `rawArgs` missing only its final outer `}`.
+ * This helper deterministically checks if appending that single shared `}` yields a 100% valid JSON object.
+ */
+export function tryHealSharedClosingBraceInToolArgs(rawArgs: string): string | null {
+  if (!rawArgs || typeof rawArgs !== 'string') return null;
+  const trimmed = rawArgs.trim();
+  if (!trimmed.startsWith('{')) return null;
+
+  try {
+    const alreadyValid = JSON.parse(trimmed);
+    if (alreadyValid && typeof alreadyValid === 'object' && !Array.isArray(alreadyValid)) {
+      return trimmed;
+    }
+  } catch {}
+
+  const candidate = `${trimmed}}`;
+  try {
+    const parsed = JSON.parse(candidate);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return candidate;
+    }
+  } catch {}
+
+  return null;
+}
+
+

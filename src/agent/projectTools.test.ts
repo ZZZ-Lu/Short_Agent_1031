@@ -1326,6 +1326,22 @@ test('跨行场次副标题匹配、同集重名场次(1-5内外景)隔离、跨
   assert.equal(repairedList[0].versions.length, 2);
   assert.equal(repairedList[0].versions[0].name, '常服');
   assert.equal(repairedList[0].versions[1].name, '小娜塔莉亚/8岁');
+
+  // 9. script.read 与 provenances 传入 "1-5内" / "1-5外" / "1-5日内" 等场次号+内外景简写时，能精准区分同名 1-5 的内外景子场次
+  const readIntExt = executeProjectReadTool('script.read', {
+    episode: 1,
+    scene: ['1-5内', '1-5外'],
+  }, proj) as any;
+  assert.equal(readIntExt.sceneCount, 2, '"1-5内" 与 "1-5外" 应分别命中 1-5 内景与 1-5 外景共 2 个场次');
+  assert.equal(readIntExt.episodes[0].scenes[0].locationName, '娜塔莉亚家');
+  assert.equal(readIntExt.episodes[0].scenes[1].locationName, '布莱克伍德庄园');
+
+  // 10. script.directory 传入 episode: 1 时，仅返回第 1 集目录与场次，不带出第 31 集等其它分集
+  const dirEp1 = executeProjectReadTool('script.directory', { episode: 1 }, proj) as any;
+  assert.equal(dirEp1.total, 1);
+  assert.equal(dirEp1.entries.length, 1);
+  assert.equal(dirEp1.entries[0].title, '第一集');
 });
+
 
 

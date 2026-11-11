@@ -108,6 +108,14 @@ test('两步漏斗：0级选categories先展开候选工具简表，再传具体
   );
   assert.equal(supplementInLevel1.level, 1);
   assert.deepEqual(supplementInLevel1.tools, ['asset.create', 'asset.delete', 'script.read']);
+
+  // 切入 1 级时若同时传 categories: ['asset'] 与 tools: ['script.read']（漏列具体 asset 写入工具 ID），自动配齐已启用的 asset.create / asset.update
+  const autoPairAssetSuite = validateSelection(
+    { categories: ['asset'], tools: ['script.read'] },
+    [...enabled, 'asset.update']
+  );
+  assert.equal(autoPairAssetSuite.level, 1);
+  assert.deepEqual(autoPairAssetSuite.tools, ['script.read', 'asset.create', 'asset.update']);
 });
 
 test('mergeTaskNotes 按行去重并在进入具体任务后剔除开场占位笔记', () => {

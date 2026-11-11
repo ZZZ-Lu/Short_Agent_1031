@@ -107,7 +107,9 @@ function findAssetInProject(
 
 export function executeProjectReadTool(name: string, args: Record<string, unknown>, project: ProjectData): Record<string, any> {
   if (name === 'script.directory') {
+    const rawEpisode = args.episode ?? args.episodeId ?? args.episodes;
     const all = readScriptDirectory(project.scriptText, {
+      episode: rawEpisode as any,
       query: typeof args.query === 'string' ? args.query : undefined,
       scenePattern: project.tocConfig?.scenePattern,
       flags: project.tocConfig?.flags,
@@ -142,7 +144,7 @@ export function executeProjectReadTool(name: string, args: Record<string, unknow
 
     const hasVolumeWarning = totalScenes >= 3 || totalParagraphs >= 20;
     const notice = hasVolumeWarning
-      ? `我发现当前剧集目录包含 ${totalScenes} 个场次共 ${totalParagraphs} 个段落，内容较多。本次已将全部目录信息返回在下方，当前处于 Stage 0 阶段，建议拆分为多轮计划处理。`
+      ? `我发现当前剧集目录包含 ${totalScenes} 个场次共 ${totalParagraphs} 个段落，内容较多。本次已将全部目录信息返回在下方，当前处于 Stage 0 阶段，建议按照场次或者集数拆分为多轮计划处理。`
       : undefined;
 
     return {
@@ -334,7 +336,7 @@ export function executeProjectReadTool(name: string, args: Record<string, unknow
     const candidateScenesSummary = Array.from(sceneCandidateMap.values());
     const hasVolumeWarning = candidates.length > 15 || (candidateScenesSummary.length >= 2 && candidates.length >= 12);
     const notice = hasVolumeWarning
-      ? `我发现候选出处共 ${candidates.length} 条，跨越 ${candidateScenesSummary.length} 个场次，内容较多。本次已将全部候选出处返回在下方，当前处于 Stage 0 阶段，建议拆分为多轮计划处理。`
+      ? `我发现候选出处共 ${candidates.length} 条，跨越 ${candidateScenesSummary.length} 个场次，内容较多。本次已将全部候选出处返回在下方，当前处于 Stage 0 阶段，建议按照场次或者集数拆分为多轮计划处理。`
       : undefined;
 
     return {
@@ -930,11 +932,14 @@ export function executeProjectAssetMutation(
       updatedItem.name
     );
 
-    // Sync default version versions[0] if it shares the parent asset ID
+    // Sync default version versions[0] if it shares the parent asset ID or when top-level provenances are explicitly appended
+    const hasTopLevelProvenanceInput = Boolean(
+      updates.provenances || updates.sceneTitle || updates.paragraphIndices || updates.paragraphIndex
+    );
     if (
       Array.isArray(updatedItem.versions) &&
       updatedItem.versions.length > 0 &&
-      updatedItem.versions[0]?.id === updatedItem.id &&
+      (updatedItem.versions[0]?.id === updatedItem.id || hasTopLevelProvenanceInput) &&
       (Array.isArray(updatedItem.verifiedProvenance) || Array.isArray(updatedItem.versions[0]?.verifiedProvenance))
     ) {
       const unionMap = new Map<string, any>();

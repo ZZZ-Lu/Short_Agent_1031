@@ -399,6 +399,69 @@ test('执行阶段持续推进：script.read 读取剧本后若先调用 asset.l
   assert.equal(finished.turn, 6);
 });
 
+test('1级连续两轮分批调用 script.read（尚未调用 asset.create 消费）时，自动保留前一批未消费的 script.read 原文观察避免丢失前序场次', async () => {
+  const runtime = new AgentRuntime({
+    enabledTools: () => ['script.read', 'asset.create', 'sys.endTask'],
+    requestTurn: async task => {
+      if (task.turn === 1) {
+        return {
+          narration: ['装载工具进入1级'],
+          toolCalls: [{ id: 'c1', name: 'sys.selectContext', arguments: { tools: ['script.read', 'asset.create'] } }],
+          complete: false,
+        };
+      }
+      if (task.turn === 2) {
+        return {
+          narration: ['读取第1批场次 1-2、1-4'],
+          toolCalls: [{ id: 'c2', name: 'script.read', arguments: { episode: 1, scene: ['1-2', '1-4'] } }],
+          complete: false,
+        };
+      }
+      if (task.turn === 3) {
+        assert.equal(task.observations.length, 1);
+        return {
+          narration: ['继续读取第2批场次 1-3、1-5内、1-5外'],
+          toolCalls: [{ id: 'c3', name: 'script.read', arguments: { episode: 1, scene: ['1-3', '1-5内', '1-5外'] } }],
+          complete: false,
+        };
+      }
+      if (task.turn === 4) {
+        // 关键验证：第2轮与第3轮连续读取的两批 script.read 原文观察均保留在视野中，直到 asset.create 消费
+        assert.equal(task.observations.length, 2);
+        assert.deepEqual(
+          task.observations.map(o => (o.content as any).output.batch),
+          ['batch_1', 'batch_2']
+        );
+        return {
+          narration: ['基于两批完整原文调用 asset.create 并返回0级'],
+          toolCalls: [
+            { id: 'c4', name: 'asset.create', arguments: { type: 'characters', name: '娜塔莉亚' } },
+            { id: 'c5', name: 'sys.selectContext', arguments: {} },
+          ],
+          complete: false,
+        };
+      }
+      return {
+        narration: ['结案'],
+        toolCalls: [{ id: 'c6', name: 'sys.endTask', arguments: { success: true } }],
+        complete: false,
+      };
+    },
+    executeTool: async call => {
+      if (call.name === 'script.read') {
+        const scenes = call.arguments.scene as string[];
+        return { batch: scenes.includes('1-2') ? 'batch_1' : 'batch_2', scenes };
+      }
+      return { success: true };
+    },
+  });
+
+  const task = runtime.createTask({ id: 'task_consecutive_reads', sessionId: 'proj_1', goal: '提取娜塔莉亚' });
+  const finished = await runtime.wake(task.id);
+  assert.equal(finished.status, 'completed');
+  assert.equal(finished.turn, 5);
+});
+
 test('短剧多项数据自适应分步操作与数据量预警全链路测试：0级宏观探查 -> 1级数据量预警 -> 0级动态重规划 -> 1级分场执行 -> 0级完结', async () => {
   const recordedPlans: string[][] = [];
 
@@ -548,6 +611,92 @@ test('短剧多项数据自适应分步操作与数据量预警全链路测试�
   assert.ok(recordedPlans[3][2].includes('第1-2场'));
 });
 
+test('工具调用或 JSON 格式错误时返回错误给模型自愈（绝不直接结束任务），且保留上一轮已读取的剧本观察数据', async () => {
+  const runtime = new AgentRuntime({
+    enabledTools: () => ['script.read', 'asset.create', 'sys.endTask', 'user.ask'],
+    requestTurn: async task => {
+      if (task.turn === 1) {
+        // 第1轮：模拟模型在工具调用段落漏写双花括号或 JSON 语法错误，被校验器拦截返回 validationError
+        return {
+          narration: ['状态检查：\n- [ ] 1. 探查项目数据现状\n思考：准备展开分类'],
+          toolCalls: [
+            {
+              id: 'call_bad_1',
+              name: 'sys.selectContext',
+              arguments: {},
+              validationError: '【工具调用与 JSON 格式错误】检测到“工具调用”段落未按规定的双花括号格式输出。',
+            },
+          ],
+          complete: false,
+        };
+      }
+      if (task.turn === 2) {
+        // 第2轮：任务绝不能在 Turn 1 直接结束，且必须收到上一轮的 failed 错误反馈
+        assert.equal(task.observations.length, 1);
+        assert.equal((task.observations[0].content as any).name, 'sys.selectContext');
+        assert.equal((task.observations[0].content as any).status, 'failed');
+        assert.ok(String((task.observations[0].content as any).error).includes('工具调用与 JSON 格式错误'));
+        return {
+          narration: ['修正格式，装载 script.read 与 asset.create 进入 1 级'],
+          toolCalls: [{ id: 'call_sel_ok', name: 'sys.selectContext', arguments: { level: 1, tools: ['script.read', 'asset.create'] } }],
+          complete: false,
+        };
+      }
+      if (task.turn === 3) {
+        return {
+          narration: ['读取 1-2 场剧本'],
+          toolCalls: [{ id: 'call_read_1', name: 'script.read', arguments: { episodeNumber: 1, scene: '1-2' } }],
+          complete: false,
+        };
+      }
+      if (task.turn === 4) {
+        // 第4轮：模型已拿到 script.read 原文，但在调用 asset.create 时输出了残缺非法的 JSON
+        assert.equal(task.observations.length, 1);
+        assert.equal((task.observations[0].content as any).name, 'script.read');
+        return {
+          narration: ['尝试创建角色资产（模拟 JSON 语法缺失闭合）'],
+          toolCalls: [
+            {
+              id: 'call_create_bad_json',
+              name: 'asset.create',
+              arguments: {},
+              validationError: '【JSON 参数语法错误】工具 "asset.create" 调用参数解析失败，不是合法的 JSON 格式。',
+            },
+          ],
+          complete: false,
+        };
+      }
+      if (task.turn === 5) {
+        // 第5轮：关键验证！上一轮读取的 script.read 原文必须被完整保留，同时附带 asset.create 的 JSON 语法错误反馈
+        const obsNames = task.observations.map(o => `${(o.content as any).name}:${(o.content as any).status}`);
+        assert.deepEqual(obsNames, ['script.read:succeeded', 'asset.create:failed']);
+        return {
+          narration: ['基于保留的剧本原文修正 JSON 参数，完成创建并返回 0 级'],
+          toolCalls: [
+            { id: 'call_create_ok', name: 'asset.create', arguments: { type: 'characters', name: '娜塔莉亚' } },
+            { id: 'call_back_0', name: 'sys.selectContext', arguments: {} },
+          ],
+          complete: false,
+        };
+      }
+      if (task.turn === 6) {
+        return {
+          narration: ['验收通过，结案'],
+          toolCalls: [{ id: 'call_end', name: 'sys.endTask', arguments: { success: true } }],
+          complete: false,
+        };
+      }
+      throw new Error(`Unexpected turn ${task.turn}`);
+    },
+    executeTool: async call => {
+      if (call.name === 'script.read') return { episodes: [{ episodeNumber: 1, scenes: [{ sceneNumber: '1-2' }] }] };
+      if (call.name === 'asset.create') return { success: true, createdId: 'char_1' };
+      return { ok: true };
+    },
+  });
 
-
-
+  const task = runtime.createTask({ id: 'task_json_error_recovery', sessionId: 'proj_json', goal: '提取角色娜塔莉亚' });
+  const finished = await runtime.wake(task.id);
+  assert.equal(finished.status, 'completed');
+  assert.equal(finished.turn, 6);
+});
