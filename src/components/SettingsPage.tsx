@@ -174,6 +174,8 @@ const MODEL_ROUTE_DEFINITIONS: NodeDefinition[] = [
 const MODEL_OPTIONS: Array<{ value: ExtractionModelType; label: string }> = [
   { value: 'auto', label: '自动' },
   { value: 'deepseek-v4-flash', label: 'V4 Flash' },
+  { value: 'deepseek-v4-flash-low', label: 'V4 Flash (Low 思考)' },
+  { value: 'deepseek-v4-flash-high', label: 'V4 Flash (High 思考)' },
   { value: 'deepseek-v4-pro', label: 'V4 Pro' },
   { value: 'deepseek-v4.1-flash-expires-on-0910', label: 'V4.1 Flash (0910)' },
   { value: 'qwen3.8-flash', label: 'Qwen 3.8 Flash' },
@@ -1023,7 +1025,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
                   <select
                     value={nodeModels[node.modelKey!]}
                     onChange={(event) => changeNodeModel(node.modelKey!, event.target.value as ExtractionModelType)}
-                    className="h-8 w-32 rounded-lg border border-slate-200 bg-transparent px-2 text-xs outline-none dark:border-white/10 dark:bg-transparent dark:text-white dark:[&_option]:bg-neutral-900"
+                    className="h-8 w-44 rounded-lg border border-slate-200 bg-transparent px-2 text-xs outline-none dark:border-white/10 dark:bg-transparent dark:text-white dark:[&_option]:bg-neutral-900"
                     aria-label={`${node.name}模型`}
                   >
                     {MODEL_OPTIONS.map((model) => <option key={model.value} value={model.value}>{model.label}</option>)}

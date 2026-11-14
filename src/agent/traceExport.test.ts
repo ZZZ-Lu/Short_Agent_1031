@@ -172,3 +172,57 @@ test('resolves final goal from trace.task.goal when top-level trace.goal was ini
   assert.ok(md.includes('- **最终目标**：提取第一集布拉姆的角色资产'));
 });
 
+test('renders [SYSTEM]/[USER] role headers and prompt cache usage statistics when recorded', () => {
+  const traceWithCache: AgentRuntimeTrace = {
+    ...mockTrace,
+    turns: [
+      {
+        ...mockTrace.turns[1],
+        turn: 1,
+        transport: {
+          request: {
+            model: 'deepseek-flash',
+            tools: ['script.read'],
+            context: { level: 1, tools: ['script.read'], prompts: ['script'] },
+            messages: [
+              { role: 'system', content: '# 角色与通用准则\n静态前缀' },
+              { role: 'user', content: '# 用户指令\n动态指令' },
+            ],
+          },
+          response: {
+            toolCalls: [],
+            content: 'ok',
+            usage: {
+              promptTokens: 4000,
+              completionTokens: 200,
+              totalTokens: 4200,
+              cacheHitTokens: 3200,
+              cacheMissTokens: 800,
+              hitRate: 0.8,
+            },
+          },
+        },
+        stateNodeTrace: {
+          prompt: '=== [SYSTEM] ===\nschema\n\n=== [USER] ===\ndata',
+          response: { taskTitle: '布拉姆' },
+          usage: {
+            promptTokens: 1000,
+            cacheHitTokens: 640,
+            cacheMissTokens: 360,
+            hitRate: 0.64,
+          },
+        },
+      },
+    ],
+  };
+
+  const md = formatRuntimeTraceExport(traceWithCache, getPresetExportOptions('full', 'markdown'));
+  assert.ok(md.includes('=== [SYSTEM] ==='));
+  assert.ok(md.includes('=== [USER] ==='));
+  assert.ok(md.includes('缓存命中汇总'));
+  assert.ok(md.includes('主循环命中 3200 / 4000 tokens (80.0%)'));
+  assert.ok(md.includes('状态节点命中 640 / 1000 tokens (64.0%)'));
+  assert.ok(md.includes('Prompt 4000 tokens · 缓存命中 3200 (80.0%)'));
+});
+
+

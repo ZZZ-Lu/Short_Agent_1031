@@ -60,7 +60,22 @@ export function isObsoletePromptText(text: string): boolean {
     text.includes('当前子步骤处于“已读取待写入”还是“已写入落盘完成”状态？“当前计划”中还有哪些后续步骤待推进？') ||
     text.includes('首批场次读取并调用创建工具建主卡锚定出处') ||
     text.includes('分析当前任务进展与本轮返回的数据规模、场次或集数分布') ||
-    text.includes('必须严格按该工具规则在思考中完整输出，不得缩写省略')
+    text.includes('必须严格按该工具规则在思考中完整输出，不得缩写省略') ||
+    text.includes('本轮发现了哪些跨轮次仍需引用的关键事实、实体 ID 或新线索需要沉淀到“重点笔记”？') ||
+    text.includes('本轮发现了哪些后续步骤仍需引用的关键事实、实体 ID 或未落盘线索？（整理以便更新至“重点笔记”）') ||
+    text.includes('仅保留跨轮次仍需引用的目标实体ID、已有版本/造型名称、核心设定属性及尚未落盘的关键线索') ||
+    text.includes('如‘已完成前3步，当前第4步已读取数据待落盘’') ||
+    text.includes('- 重点笔记盘点：本轮有哪些跨轮次仍需引用的关键事实') ||
+    text.includes('对照“当前计划”与“工具执行结果”核验推进（显式列出完整步骤列表') ||
+    text.includes('围绕全局目标、计划拆解与工具准备进行逻辑推演，确定本轮要调用的工具与参数') ||
+    text.includes('跨轮次持久保留的客观锚点（目标实体ID、已落盘版本/状态名称') ||
+    text.includes('# 背景\n你位于一个短剧协作平台中') ||
+    text.includes('## 当前聚焦目标\n{{cardContext}}\n## 用户输入原文') ||
+    text.includes('当前小目标：{{taskSubGoal}}\n当前进度：{{taskProgress}}\n当前计划：{{taskPlan}}') ||
+    text.includes('合并整理为最新的认知状态 JSON。\n\n【当前认知状态（上一轮旧状态）】') ||
+    text.includes('负责协助用户从剧本到生图到视频的流程') ||
+    text.includes('"notesMode": "overwrite"\n}\n\n【当前认知状态（上一轮旧状态）】') ||
+    text.includes('将宏观任务拆解为分批推进的具体子步骤；每个子步骤必须定义为')
   );
 }
 

@@ -230,9 +230,18 @@ export function isSameInitialVersionLook(
   parentItem?: Record<string, any>
 ): boolean {
   const incName = (incomingVer.name || '').trim();
-  const parentAge = typeof parentItem?.age === 'string' ? parentItem.age.trim() : '';
+  const incDesc = (incomingVer.description || '').trim();
+  const parentDesc = (autoPromotedVer.description || parentItem?.description || '').trim();
+  const parentAge = typeof parentItem?.age === 'string' && parentItem.age.trim()
+    ? parentItem.age.trim()
+    : (parentDesc.match(/(\d+\s*岁)/)?.[1] || '');
   const ageMatch = parentAge.match(/^(\d+\s*岁)/);
   if (ageMatch && incName.includes(ageMatch[1].replace(/\s+/g, ''))) {
+    return true;
+  }
+
+  // If the incoming version description explicitly states it is identical to the initial look
+  if (incDesc && /(与.{0,8}初始(形象|造型|状态)一致|回归(初始|默认)(形象|造型|常服))/.test(incDesc)) {
     return true;
   }
 
@@ -324,12 +333,21 @@ function ensureInitialVersionWhenSingleVariant<T extends Record<string, any>>(
   if (!Array.isArray(items) || items.length === 0) return items;
   let mutated = false;
   const normalized = items.map(item => {
-    if (!item || !Array.isArray(item.versions) || item.versions.length !== 1) return item;
-    const onlyVer = item.versions[0];
-    if (!onlyVer || onlyVer.id === item.id || onlyVer.name === item.name) return item;
+    if (!item || !Array.isArray(item.versions) || item.versions.length === 0) return item;
+    const defaultName = getDefaultAssetVersionName(type, item);
+    const alreadyHasDefault = item.versions.some(
+      (v: any) =>
+        v &&
+        (v.id === item.id ||
+          (typeof v.name === 'string' && (v.name === item.name || v.name === defaultName)))
+    );
+    if (alreadyHasDefault) return item;
+
     const parentProvs: any[] = Array.isArray(item.verifiedProvenance) ? item.verifiedProvenance : [];
     if (parentProvs.length === 0) return item;
-    const verProvs: any[] = Array.isArray(onlyVer.verifiedProvenance) ? onlyVer.verifiedProvenance : [];
+    const verProvs: any[] = item.versions.flatMap((v: any) =>
+      Array.isArray(v?.verifiedProvenance) ? v.verifiedProvenance : []
+    );
     const verPosSet = new Set(
       verProvs.map(
         a =>
@@ -348,7 +366,6 @@ function ensureInitialVersionWhenSingleVariant<T extends Record<string, any>>(
     if (!hasDistinctParentProvs) return item;
 
     mutated = true;
-    const defaultName = getDefaultAssetVersionName(type, item);
     const parentVer = itemToVersion(type, item, defaultName);
     const parentOnlyScenes = Array.from(
       new Set(parentProvs.map(a => a?.sceneTitle).filter(Boolean))
@@ -358,7 +375,7 @@ function ensureInitialVersionWhenSingleVariant<T extends Record<string, any>>(
     }
     return {
       ...item,
-      versions: [parentVer, onlyVer],
+      versions: [parentVer, ...item.versions],
     } as T;
   });
   return mutated ? normalized : items;

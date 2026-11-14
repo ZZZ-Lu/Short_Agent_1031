@@ -1,5 +1,6 @@
 import type { AgentHistoryItem, AgentToolCall, AgentTurnResult } from './protocol';
 import { initialAgentContext, mergeTaskNotes, validateSelection, type AgentContextSelection } from './contextPolicy';
+import { searchExperiences } from './experienceRegistry';
 
 export type RuntimeTaskStatus = 'planning' | 'waiting_tools' | 'waiting_user' | 'completed' | 'failed' | 'cancelled' | 'paused';
 export type RuntimeToolStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
@@ -239,7 +240,9 @@ export class AgentRuntime {
         );
         const isOnlySelectContext = Array.isArray(result.toolCalls) &&
           result.toolCalls.length > 0 &&
-          result.toolCalls.every(call => !call.validationError && call.name === 'sys.selectContext');
+          result.toolCalls.every(
+            call => !call.validationError && (call.name === 'sys.selectContext' || call.name === 'experience.search')
+          );
         const isAuxAssetCheckOnly = Array.isArray(result.toolCalls) &&
           result.toolCalls.length > 0 &&
           result.toolCalls.every(call => !call.validationError && (call.name === 'asset.list' || call.name === 'sys.selectContext'));
@@ -250,7 +253,12 @@ export class AgentRuntime {
           result.toolCalls.every(
             call =>
               !call.validationError &&
-              (call.name === 'script.read' || call.name === 'asset.list' || call.name === 'sys.selectContext')
+              (call.name === 'script.read' ||
+                call.name === 'script.search' ||
+                call.name === 'script.directory' ||
+                call.name === 'asset.list' ||
+                call.name === 'asset.searchProvenanceCandidates' ||
+                call.name === 'sys.selectContext')
           );
         const hasAllValidationErrors = Array.isArray(result.toolCalls) &&
           result.toolCalls.length > 0 &&
@@ -290,11 +298,14 @@ export class AgentRuntime {
                   return false;
                 }
                 // 当 0 级已完成数据量预警重规划并装载 script.read 进入 1 级分步精读时，
-                // 卸载已在 0 级消费完毕的宏观探查结果（script.directory / script.search / asset.list），避免将全剧目录与 0 级预警带入 1 级
+                // 卸载已在 0 级消费完毕的宏观探查结果（script.directory / script.search / asset.list / experience.search），避免将全剧目录与 0 级预警带入 1 级
                 if (
                   isEnteringLevel1WithRead &&
                   hadVolumeWarningProbe &&
-                  (name === 'script.directory' || name === 'script.search' || name === 'asset.list')
+                  (name === 'script.directory' ||
+                    name === 'script.search' ||
+                    name === 'asset.list' ||
+                    name === 'experience.search')
                 ) {
                   return false;
                 }
@@ -326,10 +337,15 @@ export class AgentRuntime {
                   const name = content?.name;
                   return (
                     content?.status === 'succeeded' &&
-                    (name === 'script.read' || name === 'script.search' || name === 'asset.searchProvenanceCandidates')
+                    (name === 'experience.search' ||
+                      name === 'script.read' ||
+                      name === 'script.search' ||
+                      name === 'script.directory' ||
+                      name === 'asset.list' ||
+                      name === 'asset.searchProvenanceCandidates')
                   );
                 })
-                .slice(-2)
+                .slice(-4)
             : [];
         task.observations = [...preservedObservations];
         result.narration.forEach(text => this.addEvent(task, { turnId, type: 'thought', text }));
@@ -606,6 +622,17 @@ export class AgentRuntime {
       return;
     }
 
+    if (call.name === 'experience.search') {
+      const query = typeof call.arguments?.query === 'string' ? call.arguments.query : String(call.arguments?.query ?? '');
+      const expResult = searchExperiences(query);
+      const titles = expResult.experiences.map(e => e.title).join('、');
+      const statusSummary = `已检索到同类任务经验：${titles || '通用四步走经验'}`;
+      this.updateLastTool(task, call.id, 'succeeded', statusSummary, { output: expResult });
+      task.history.push({ role: 'tool', content: { callId: call.id, name: call.name, status: 'succeeded', output: expResult } });
+      task.observations.push({ role: 'tool', content: { callId: call.id, name: call.name, status: 'succeeded', output: expResult } });
+      return;
+    }
+
     if (call.name === 'sys.updateState') {
       if (typeof call.arguments.progress === 'string') task.progress = call.arguments.progress;
       if (typeof call.arguments.subGoal === 'string') task.subGoal = call.arguments.subGoal;
@@ -779,10 +806,26 @@ export class AgentRuntime {
           (e.toolName === 'asset.create' || e.toolName === 'asset.update' || e.toolName === 'asset.commitProvenance' || e.toolName === 'asset.delete')
       );
       const hasCompletedPlanStep = Array.isArray(task.plan) && task.plan.some(p => p && p.status === 'completed');
-      const suppressRepeatReadReturn =
-        call.name === 'script.read' && (hasPriorVolumeWarning || hasExecutedAssetMutation || hasCompletedPlanStep);
+      const loadedTools = Array.isArray(task.context?.tools) ? task.context.tools : [];
+      const hasLoadedSearchTool =
+        loadedTools.includes('script.search') || loadedTools.includes('asset.searchProvenanceCandidates');
+      const hasExecutedOrQueuedSearchTool = task.events.some(
+        e =>
+          e.type === 'tool' &&
+          (e.toolName === 'script.search' || e.toolName === 'asset.searchProvenanceCandidates')
+      );
+      const deferDirectoryReturnForPendingSearch =
+        call.name === 'script.directory' && hasLoadedSearchTool && !hasExecutedOrQueuedSearchTool;
 
-      if (hasWarning && isLevel1 && !suppressRepeatReadReturn) {
+      const suppressRepeatVolumeReturn =
+        deferDirectoryReturnForPendingSearch ||
+        ((call.name === 'script.read' ||
+          call.name === 'script.search' ||
+          call.name === 'script.directory' ||
+          call.name === 'asset.searchProvenanceCandidates') &&
+          (hasPriorVolumeWarning || hasExecutedAssetMutation || hasCompletedPlanStep));
+
+      if (hasWarning && isLevel1 && !suppressRepeatVolumeReturn) {
         // 工具已预警：Runtime 直接执行切回 0 级全局规划，无需通过 Agent Prompt 触发
         const prevCategories = task.requestedCategories?.length
           ? task.requestedCategories
@@ -802,7 +845,7 @@ export class AgentRuntime {
           type: 'system',
           text: `【数据量预警自动触发】检测到工具 ${call.name} 返回数据量较大，系统已直接切回 0 级全局规划阶段，请在当前 0 级直接根据数据分布细化分步执行计划。`,
         });
-      } else if (hasWarning && suppressRepeatReadReturn && output && typeof output === 'object') {
+      } else if (hasWarning && suppressRepeatVolumeReturn && output && typeof output === 'object') {
         delete (output as any).hasVolumeWarning;
         delete (output as any).notice;
         delete (output as any).warning;

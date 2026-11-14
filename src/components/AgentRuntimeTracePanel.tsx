@@ -443,7 +443,14 @@ export function AgentRuntimeTracePanel({ traces }: AgentRuntimeTracePanelProps) 
               <JsonBlock 
                 className="flex min-h-0 flex-1 flex-col"
                 title={`模型：${turn.transport.request.model}`} 
-                value={turn.transport.request.messages?.[0]?.content || turn.transport.request} 
+                value={
+                  Array.isArray(turn.transport.request.messages) && turn.transport.request.messages.length > 1
+                    ? turn.transport.request.messages
+                        .map(m => (typeof m?.content === 'string' ? m.content : JSON.stringify(m?.content ?? '')))
+                        .filter(Boolean)
+                        .join('\n\n')
+                    : (turn.transport.request.messages?.[0]?.content || turn.transport.request)
+                } 
               />
             ) : <PendingBlock />}
           </div>}

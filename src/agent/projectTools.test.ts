@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import { executeProjectReadTool, executeProjectAssetMutation, type ProjectData } from './projectTools';
+import { readScriptStructured, RECOMMENDED_BATCH_MAX_CHARS } from './scriptTools';
 import { resolveVerifiedProvenance } from '../utils/assetProvenance';
 import { getAssetIdentificationText, getVersionIdentificationText, mergeMultiVersionAssetList } from '../utils/assetVersions';
 import { refreshTaskCardContext } from './cardContextBuilder';
@@ -21,8 +22,9 @@ test('后台剧本工具读取目录、分页正文和搜索结果', () => {
   const pageFromLine2 = executeProjectReadTool('script.read', { offset: 2, limit: 2 }, project);
   assert.equal(pageFromLine2.content, '你好\n第2集 继续');
   assert.equal(pageFromLine2.nextOffset, 4);
-  assert.deepEqual(executeProjectReadTool('script.search', { query: '再见' }, project).matches?.map(m => m.index), [1]);
-  assert.throws(() => executeProjectReadTool('script.search', { query: '' }, project));
+  assert.deepEqual(executeProjectReadTool('script.search', { query: '再见', episode: 'all' }, project).matches?.map(m => m.index), [1]);
+  assert.throws(() => executeProjectReadTool('script.search', { query: '', episode: 1 }, project));
+  assert.throws(() => executeProjectReadTool('script.search', { query: '再见' }, project), /episode/);
 
   const multiEpProject: ProjectData = {
     id: 'p_scope',
@@ -41,7 +43,7 @@ test('后台剧本工具读取目录、分页正文和搜索结果', () => {
     props: [],
   };
 
-  const allMatches = executeProjectReadTool('script.search', { query: '布拉姆' }, multiEpProject);
+  const allMatches = executeProjectReadTool('script.search', { query: '布拉姆', episode: 'all' }, multiEpProject);
   assert.deepEqual(allMatches.matches?.map(m => m.index), [1, 2, 3]);
 
   // 按 episode="第一集" 或 episode=1 限定搜索，并且连续序号从 1..N 编号
@@ -936,8 +938,8 @@ test('短剧多项数据自适应分步操作与数据量预警机制测试：sc
     props: [],
   };
 
-  // 1. 全局搜索“娜塔莉亚”：共命中 19 次，跨 3 个场次，应当触发 hasVolumeWarning: true 并返回 scenesSummary
-  const searchResult = executeProjectReadTool('script.search', { query: '娜塔莉亚' }, testProj) as any;
+  // 1. 搜索第一集“娜塔莉亚”：共命中 19 次，跨 3 个场次，应当触发 hasVolumeWarning: true 并返回 scenesSummary
+  const searchResult = executeProjectReadTool('script.search', { query: '娜塔莉亚', episode: '第一集' }, testProj) as any;
   assert.equal(searchResult.total, 19);
   assert.equal(searchResult.hasVolumeWarning, true);
   assert.ok(typeof (searchResult.notice || searchResult.warning) === 'string' && (searchResult.notice || searchResult.warning).includes('3 个场次'));
@@ -949,8 +951,8 @@ test('短剧多项数据自适应分步操作与数据量预警机制测试：sc
   assert.equal(searchResult.scenesSummary[2].sceneNumber, '1-3');
   assert.equal(searchResult.scenesSummary[2].matchCount, 7);
 
-  // 2. 局部单场搜索“娜塔莉亚”（指定 scene: "1-1"）：仅 5 处命中，不应触发预警
-  const scopedSearchResult = executeProjectReadTool('script.search', { query: '娜塔莉亚', scene: '1-1' }, testProj) as any;
+  // 2. 局部单场搜索“娜塔莉亚”（指定 episode: "第一集", scene: "1-1"）：仅 5 处命中，不应触发预警
+  const scopedSearchResult = executeProjectReadTool('script.search', { query: '娜塔莉亚', episode: '第一集', scene: '1-1' }, testProj) as any;
   assert.equal(scopedSearchResult.total, 5);
   assert.equal(scopedSearchResult.hasVolumeWarning, false);
   assert.equal(scopedSearchResult.scenesSummary.length, 1);
@@ -1343,5 +1345,346 @@ test('跨行场次副标题匹配、同集重名场次(1-5内外景)隔离、跨
   assert.equal(dirEp1.entries[0].title, '第一集');
 });
 
+test('script.read 与 script.search 支持剥离前缀的场次 ID（如 "52-2776"）、括号标题，且未命中时抛错并列出可选场次', () => {
+  const precomputedProj: ProjectData = {
+    id: 'p_id_suffix',
+    scriptText: [
+      '第一集',
+      '1-4 日 内 医院办公室',
+      '医生查看病历。',
+      '1-5 日 内 娜塔莉亚家',
+      '娜塔莉亚在房间整理资料。',
+      '1-5 日 外 布莱克伍德庄园',
+      '布拉姆把玩着手枪，目光冰冷。',
+    ].join('\n'),
+    scenes: [
+      { id: 'scene-28-1373', title: '1-4 日 内 医院办公室', sceneNumber: '1-4', episodeTitle: '第一集', locationName: '医院办公室', startLine: 2, endLine: 3, paragraphs: [{ index: 1, lineNumber: 3, text: '医生查看病历。' }] },
+      { id: 'scene-39-1953', title: '1-5 日 内 娜塔莉亚家', sceneNumber: '1-5', episodeTitle: '第一集', locationName: '娜塔莉亚家', startLine: 4, endLine: 5, paragraphs: [{ index: 1, lineNumber: 5, text: '娜塔莉亚在房间整理资料。' }] },
+      { id: 'scene-52-2776', title: '1-5 日 外 布莱克伍德庄园', sceneNumber: '1-5', episodeTitle: '第一集', locationName: '布莱克伍德庄园', startLine: 6, endLine: 7, paragraphs: [{ index: 1, lineNumber: 7, text: '布拉姆把玩着手枪，目光冰冷。' }] },
+    ],
+    characters: [],
+    locations: [],
+    props: [],
+  };
 
+  // 1. 传入剥离了 "scene-" 前缀的 ID "52-2776" 应精准命中 scene-52-2776（区分两个 1-5）
+  const readBySuffix = executeProjectReadTool('script.read', {
+    episode: '第一集',
+    scene: '52-2776',
+  }, precomputedProj) as any;
+  assert.equal(readBySuffix.sceneCount, 1);
+  assert.equal(readBySuffix.episodes[0].scenes[0].id, 'scene-52-2776');
+  assert.equal(readBySuffix.episodes[0].scenes[0].locationName, '布莱克伍德庄园');
 
+  // 2. script.search 传入 scene: "52-2776" 同样精准限定在 scene-52-2776
+  const searchBySuffix = executeProjectReadTool('script.search', {
+    query: '手枪',
+    episode: '第一集',
+    scene: '52-2776',
+  }, precomputedProj) as any;
+  assert.equal(searchBySuffix.total, 1);
+  assert.equal(searchBySuffix.matches[0].sceneTitle, '1-5 日 外 布莱克伍德庄园');
+
+  // 3. 传入带括号后缀的 "1-5（布莱克伍德庄园）" 也能容错命中
+  const readWithParens = executeProjectReadTool('script.read', {
+    episode: '第一集',
+    scene: '1-5（布莱克伍德庄园）',
+  }, precomputedProj) as any;
+  assert.equal(readWithParens.sceneCount, 1);
+  assert.equal(readWithParens.episodes[0].scenes[0].id, 'scene-52-2776');
+
+  // 4. 传入不存在的场次编号（如 "1-6"）时，readScriptStructured 返回 notFound 与可选场次，executeProjectReadTool 明确抛错（绝不静默返回 {}）
+  const missStructured = readScriptStructured(precomputedProj.scriptText, {
+    episode: '第一集',
+    scene: '1-6',
+    precomputedScenes: precomputedProj.scenes,
+  }) as any;
+  assert.equal(missStructured.notFound, true);
+  assert.equal(missStructured.availableScenes.length, 3);
+  assert.throws(
+    () => executeProjectReadTool('script.read', { episode: '第一集', scene: '1-6' }, precomputedProj),
+    /未匹配到符合条件.*scene-52-2776/
+  );
+
+  // 5. 传入不存在的集数（如 "第99集"）时同样明确抛错并提示可选范围
+  assert.throws(
+    () => executeProjectReadTool('script.read', { episode: '第99集' }, precomputedProj),
+    /未匹配到符合条件.*第99集/
+  );
+});
+
+test('只读工具返回各集/场次字数 charCount 及每轮建议上限 recommendedBatchMaxChars (2500字)，并在超限合批时触发预警', () => {
+  const mkLine = (tag: string, len: number) => `${tag}${'甲'.repeat(Math.max(1, len - tag.length))}`;
+  // 构造第一集：2 个场次（总段落仅 12 段 < 20，但正文字数 1-1 约 900 字 + 1-2 约 2100 字 = 3000 字 > 2500 字）
+  const s1Lines = [
+    mkLine('▲娜塔莉亚站在客厅里查看文件。', 225),
+    mkLine('娜塔莉亚：第一段对白。', 225),
+    mkLine('▲她把文件放进皮包。', 225),
+    mkLine('焦恩：注意安全。', 225),
+  ];
+  const s2Lines = [
+    mkLine('▲庄园大门缓缓打开，娜塔莉亚走入广场。', 260),
+    mkLine('娜塔莉亚OS：这里守卫森严。', 260),
+    mkLine('▲布拉姆站在主位审视众人。', 260),
+    mkLine('布拉姆：谁敢接下这份工作？', 260),
+    mkLine('▲众人后退一步。', 260),
+    mkLine('娜塔莉亚：我愿意一试。', 260),
+    mkLine('▲布拉姆收起手枪打量娜塔莉亚。', 260),
+    mkLine('布拉姆：有点意思。', 280),
+  ];
+  const s1Chars = s1Lines.reduce((acc, s) => acc + s.length, 0); // 900
+  const s2Chars = s2Lines.reduce((acc, s) => acc + s.length, 0); // 2100
+  const totalEp1Chars = s1Chars + s2Chars; // 3000
+
+  const charProj: ProjectData = {
+    id: 'p_char_budget',
+    scriptText: [
+      '第一集',
+      '1-1 日 内 娜塔莉亚家',
+      ...s1Lines,
+      '1-2 日 外 布莱克伍德庄园',
+      ...s2Lines,
+    ].join('\n'),
+    characters: [{ id: 'char_n', name: '娜塔莉亚', role: '主角' }],
+    locations: [],
+    props: [],
+  };
+
+  // 1. script.directory 返回每集与每场的 charCount、totalChars 与 recommendedBatchMaxChars=2500，且超过 2500 字时触发预警
+  const dirRes = executeProjectReadTool('script.directory', { episode: '第一集' }, charProj) as any;
+  assert.equal(RECOMMENDED_BATCH_MAX_CHARS, 2500);
+  assert.equal(dirRes.recommendedBatchMaxChars, 2500);
+  assert.equal(dirRes.totalChars, totalEp1Chars);
+  assert.equal(dirRes.entries[0].charCount, totalEp1Chars);
+  assert.equal(dirRes.entries[0].scenes[0].charCount, s1Chars);
+  assert.equal(dirRes.entries[0].scenes[1].charCount, s2Chars);
+  assert.equal(dirRes.hasVolumeWarning, true, '虽然只有 2 场 12 段，但正文字数 3000 > 2500 应触发预警');
+  assert.ok(String(dirRes.notice).includes('2500 字') && String(dirRes.notice).includes(String(totalEp1Chars)));
+
+  // 2. script.read 单场读取 1-2（2100 字 <= 2500 且 8 段 <= 30）：不触发预警，且返回准确 charCount
+  const readSingle = executeProjectReadTool('script.read', { episode: '第一集', scene: '1-2' }, charProj) as any;
+  assert.equal(readSingle.charCount, s2Chars);
+  assert.equal(readSingle.recommendedBatchMaxChars, 2500);
+  assert.equal(readSingle.episodes[0].charCount, s2Chars);
+  assert.equal(readSingle.episodes[0].scenes[0].charCount, s2Chars);
+  assert.equal(readSingle.hasVolumeWarning, false, '单场 2100 字 / 8 段属于舒适区间，不应触发预警');
+
+  // 3. script.read 显式合批读取 ['1-1', '1-2']（共 12 段 <= 30，但 3000 字 > 2500）：应触发字数超限预警
+  const readOverBatch = executeProjectReadTool('script.read', { episode: '第一集', scene: ['1-1', '1-2'] }, charProj) as any;
+  assert.equal(readOverBatch.charCount, totalEp1Chars);
+  assert.equal(readOverBatch.recommendedBatchMaxChars, 2500);
+  assert.equal(readOverBatch.hasVolumeWarning, true, '合批总字数 3000 > 2500 即使只有 12 段也应触发超限预警');
+  assert.ok(String(readOverBatch.notice).includes('2500 字'));
+
+  // 4. script.search 返回命中场次各自总字数 charCount、totalChars 与 recommendedBatchMaxChars=2500
+  const searchRes = executeProjectReadTool('script.search', { query: '娜塔莉亚', episode: '第一集' }, charProj) as any;
+  assert.equal(searchRes.recommendedBatchMaxChars, 2500);
+  assert.equal(searchRes.totalChars, totalEp1Chars);
+  assert.equal(searchRes.scenesSummary[0].charCount, s1Chars);
+  assert.equal(searchRes.scenesSummary[0].paragraphCount, 4);
+  assert.equal(searchRes.scenesSummary[1].charCount, s2Chars);
+  assert.equal(searchRes.scenesSummary[1].paragraphCount, 8);
+  assert.equal(searchRes.hasVolumeWarning, true, '涉及场次正文 3000 字 > 2500 即使仅 5 条命中也应给出分批字数建议');
+  assert.ok(String(searchRes.warning).includes('2500 字'));
+
+  // 5. asset.searchProvenanceCandidates 同样附带各场次 charCount、totalChars 与 recommendedBatchMaxChars=2500
+  const candRes = executeProjectReadTool('asset.searchProvenanceCandidates', { id: 'char_n' }, charProj) as any;
+  assert.equal(candRes.recommendedBatchMaxChars, 2500);
+  assert.equal(candRes.totalChars, totalEp1Chars);
+  assert.equal(candRes.scenesSummary[0].charCount, s1Chars);
+  assert.equal(candRes.scenesSummary[1].charCount, s2Chars);
+  assert.equal(candRes.hasVolumeWarning, true);
+  assert.ok(String(candRes.notice).includes('2500 字'));
+});
+
+test('多版本默认造型升格：asset.create / asset.update 一次传入 >= 2 个变体版本时同样自动将主卡初始造型升格为 versions[0]，不丢失也不重复', () => {
+  const script = [
+    '第一集',
+    '1-2 日 内 医院办公室',
+    '▲娜塔莉亚坐在办公室椅子上看照片。',
+    '1-3 日 外 贫民窟门口',
+    '▲小娜塔莉亚穿着破烂站在街道上。',
+    '1-4 日 内 医院办公室',
+    '▲娜塔莉亚继续翻照片。',
+    '1-5 日 内 娜塔莉亚家',
+    '▲娜塔莉亚收拾皮包。',
+    '1-5 日 外 布莱克伍德庄园',
+    '▲娜塔莉亚穿着职业装、戴黑框眼镜站在庄园广场。',
+  ].join('\n');
+
+  const emptyProj: ProjectData = {
+    id: 'p_multi_ver_promo',
+    scriptText: script,
+    characters: [],
+    locations: [],
+    props: [],
+  };
+
+  // 1. asset.create 顶层传 provenances（成年便装）+ versions 一次传 2 个新造型（8岁 + 职业装）
+  const createRes = executeProjectAssetMutation(
+    'asset.create',
+    {
+      type: 'characters',
+      name: '娜塔莉亚',
+      role: '心理医生',
+      appearance: '22岁女性，黑长发，常服为便装',
+      provenances: [
+        { sceneTitle: '1-2 日 内 医院办公室', paragraphIndices: [1] },
+        { sceneTitle: '1-4 日 内 医院办公室', paragraphIndices: [1] },
+        { sceneTitle: '1-5 日 内 娜塔莉亚家', paragraphIndices: [1] },
+      ],
+      versions: [
+        {
+          name: '8岁小娜塔莉亚',
+          appearance: '8岁小女孩，穿着破烂衣衫',
+          provenances: [{ sceneTitle: '1-3 日 外 贫民窟门口', paragraphIndices: [1] }],
+        },
+        {
+          name: '职业装应聘造型',
+          appearance: '22岁女性，职业装、黑框眼镜',
+          provenances: [{ sceneTitle: '1-5 日 外 布莱克伍德庄园', paragraphIndices: [1] }],
+        },
+      ],
+    },
+    emptyProj
+  );
+
+  const createdProj: ProjectData = { ...emptyProj, ...createRes.updatedProject };
+  const charItem = createdProj.characters[0];
+  assert.equal(charItem.versions.length, 3, '应自动将主卡初始造型升格为 versions[0]，共保留 3 个并列版本');
+  assert.equal(charItem.versions[0].id, charItem.id);
+  assert.equal(charItem.versions[0].name, '常服');
+  assert.equal(charItem.versions[0].verifiedProvenance.length, 3);
+  assert.equal(charItem.versions[0].sourceScenes.length, 3, '默认版本 sourceScenes 只应包含便装对应的 3 个场次');
+  assert.equal(charItem.versions[1].name, '8岁小娜塔莉亚');
+  assert.equal(charItem.versions[1].verifiedProvenance.length, 1);
+  assert.equal(charItem.versions[2].name, '职业装应聘造型');
+  assert.equal(charItem.versions[2].verifiedProvenance.length, 1);
+  assert.equal(charItem.sourceScenes.length, 5, '父级 sourceScenes 应汇总全部 5 个场次');
+
+  // 2. 若调用方已在 versions 中显式传入 "常服"，不应重复生成第二个 "常服"
+  const explicitDefaultRes = executeProjectAssetMutation(
+    'asset.create',
+    {
+      type: 'characters',
+      name: '娜塔莉亚',
+      provenances: [{ sceneTitle: '1-2 日 内 医院办公室', paragraphIndices: [1] }],
+      versions: [
+        {
+          name: '常服',
+          provenances: [{ sceneTitle: '1-2 日 内 医院办公室', paragraphIndices: [1] }],
+        },
+        {
+          name: '8岁小娜塔莉亚',
+          provenances: [{ sceneTitle: '1-3 日 外 贫民窟门口', paragraphIndices: [1] }],
+        },
+      ],
+    },
+    emptyProj
+  );
+  assert.equal(explicitDefaultRes.updatedProject.characters![0].versions.length, 2);
+
+  // 3. 单版本主卡先建立，随后通过 asset.update 一次传入 2 个新版本时，也应自动升格原主卡为 "常服" -> 共 3 个版本
+  const singleFirst = executeProjectAssetMutation(
+    'asset.create',
+    {
+      type: 'characters',
+      name: '娜塔莉亚',
+      appearance: '22岁便装',
+      provenances: [{ sceneTitle: '1-2 日 内 医院办公室', paragraphIndices: [1] }],
+    },
+    emptyProj
+  );
+  let projStep: ProjectData = { ...emptyProj, ...singleFirst.updatedProject };
+  const parentId = projStep.characters[0].id;
+
+  const updateTwoAtOnce = executeProjectAssetMutation(
+    'asset.update',
+    {
+      id: parentId,
+      mode: 'append',
+      versions: [
+        {
+          name: '8岁小娜塔莉亚',
+          provenances: [{ sceneTitle: '1-3 日 外 贫民窟门口', paragraphIndices: [1] }],
+        },
+        {
+          name: '职业装应聘造型',
+          provenances: [{ sceneTitle: '1-5 日 外 布莱克伍德庄园', paragraphIndices: [1] }],
+        },
+      ],
+    },
+    projStep
+  );
+  projStep = { ...projStep, ...updateTwoAtOnce.updatedProject };
+  assert.equal(projStep.characters[0].versions.length, 3);
+  assert.equal(projStep.characters[0].versions[0].name, '常服');
+  assert.equal(projStep.characters[0].versions[0].verifiedProvenance.length, 1);
+  assert.equal(projStep.characters[0].versions[1].name, '8岁小娜塔莉亚');
+  assert.equal(projStep.characters[0].versions[2].name, '职业装应聘造型');
+  assert.equal((updateTwoAtOnce.output as any).verifiedCount, 3);
+
+  // 4. 旧数据兼容：仅有 2 个变体版本但父级含独立 verifiedProvenance 时，mergeMultiVersionAssetList 自动补全第 3 个初始版本
+  const unpromotedLegacy = {
+    ...charItem,
+    versions: charItem.versions.slice(1), // 仅留 8岁 + 职业装
+  };
+  const repaired = mergeMultiVersionAssetList('characters', [unpromotedLegacy]);
+  assert.equal(repaired[0].versions.length, 3);
+  assert.equal(repaired[0].versions[0].name, '常服');
+  assert.equal(repaired[0].versions[0].verifiedProvenance.length, 3);
+});
+
+test('同名场次（如两个 1-5）在 script.directory 中自动标出唯一 id，且 script.read 因重名误拉超限（>2500字）时拦截并提示改用 id', () => {
+  const padLine = (prefix: string, len: number) => `${prefix}${'文'.repeat(Math.max(1, len - prefix.length))}`;
+  const script = [
+    '第一集',
+    '1-2 日 内 医院办公室',
+    padLine('▲娜塔莉亚翻看照片。', 490),
+    '1-5 日 内 娜塔莉亚家',
+    padLine('▲娜塔莉亚在家收拾行李准备出门。', 780),
+    '1-5 日 外 布莱克伍德庄园',
+    padLine('▲娜塔莉亚穿职业装站在庄园广场。', 1200),
+    padLine('▲布拉姆坐在主位打量着众人。', 1150),
+  ].join('\n');
+
+  const proj: ProjectData = {
+    id: 'p_dup_1_5',
+    scriptText: script,
+    characters: [],
+    locations: [],
+    props: [],
+  };
+
+  // 1. script.directory 识别 duplicateSceneNumbers=['1-5'] 并在 scenesSummary 中展示各自唯一 id
+  const dirRes = executeProjectReadTool('script.directory', { episode: 1 }, proj) as any;
+  assert.deepEqual(dirRes.duplicateSceneNumbers, ['1-5']);
+  const dupSummaries = (dirRes.scenesSummary as string[]).filter(s => s.includes('1-5'));
+  assert.equal(dupSummaries.length, 2);
+  assert.ok(dupSummaries.every(s => /\[id: scene-/.test(s)), '重名场次摘要必须附带 [id: scene-...]');
+  assert.ok(String(dirRes.notice).includes('重名场次编号'));
+
+  const houseSceneId = dirRes.entries[0].scenes.find((s: any) => s.locationName === '娜塔莉亚家').id as string;
+  const manorSceneId = dirRes.entries[0].scenes.find((s: any) => s.locationName === '布莱克伍德庄园').id as string;
+
+  // 2. script.read 若传模糊的 "1-5" 与 "1-2" 导致同时拉出两个 1-5 且总字数 > 2500，应抛错阻断并给出唯一 id 提示
+  assert.throws(
+    () => executeProjectReadTool('script.read', { episode: 1, scene: ['1-2', '1-5'] }, proj),
+    err =>
+      err instanceof Error &&
+      err.message.includes('读取超限') &&
+      err.message.includes(houseSceneId) &&
+      err.message.includes(manorSceneId)
+  );
+
+  // 3. 改传唯一场次 ID 读取两批，各自 <= 2500 字且精准命中对应单个场次
+  const batch1 = executeProjectReadTool('script.read', { episode: 1, scene: ['1-2', houseSceneId] }, proj) as any;
+  assert.equal(batch1.sceneCount, 2);
+  assert.equal(batch1.episodes[0].scenes[1].id, houseSceneId);
+  assert.ok(batch1.charCount <= 2500);
+
+  const batch2 = executeProjectReadTool('script.read', { episode: 1, scene: manorSceneId }, proj) as any;
+  assert.equal(batch2.sceneCount, 1);
+  assert.equal(batch2.episodes[0].scenes[0].id, manorSceneId);
+  assert.ok(batch2.charCount <= 2500);
+});

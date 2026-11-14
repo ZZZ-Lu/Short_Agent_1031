@@ -140,6 +140,8 @@ export type ExtractionModelType =
   | 'auto' 
   | 'deepseek-flash'
   | 'deepseek-v4-flash' 
+  | 'deepseek-v4-flash-low'
+  | 'deepseek-v4-flash-high'
   | 'deepseek-v4-pro' 
   | 'deepseek-v4.1-flash-expires-on-0910'
   | 'qwen3.8-flash'

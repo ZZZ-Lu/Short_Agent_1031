@@ -4,6 +4,21 @@ import { SceneChunk, ScriptParagraph } from '../types/script';
 export type { ScriptParagraph };
 export type ScriptView = 'script' | 'directory' | 'assets' | 'universe' | 'cards';
 
+export const RECOMMENDED_BATCH_MAX_CHARS = 2500;
+
+export function sumParagraphChars(paragraphs: ReadonlyArray<{ text?: string }> | undefined): number {
+  if (!Array.isArray(paragraphs) || paragraphs.length === 0) return 0;
+  let total = 0;
+  for (const p of paragraphs) {
+    if (typeof p?.text === 'string') total += p.text.length;
+  }
+  return total;
+}
+
+export function buildBatchCharLimitAdvice(maxChars: number = RECOMMENDED_BATCH_MAX_CHARS): string {
+  return `建议按场次或集数分批拆分为多轮计划处理，每轮合批读取处理的总字数建议不超过 ${maxChars} 字（若单场本身超过 ${maxChars} 字可单独作为一轮或按段落区间分段）。`;
+}
+
 export interface ScriptSceneSummary {
   id: string;
   sceneNumber?: string;
@@ -15,6 +30,7 @@ export interface ScriptSceneSummary {
   startLine: number;
   endLine: number;
   paragraphCount?: number;
+  charCount?: number;
   paragraphs?: ScriptParagraph[];
 }
 
@@ -28,6 +44,7 @@ export interface ScriptEpisode {
   endChar: number;
   sceneCount?: number;
   paragraphCount?: number;
+  charCount?: number;
   scenes?: ScriptSceneSummary[];
 }
 
@@ -105,11 +122,15 @@ export const parseScriptEpisodes = (
           startLine: sStart,
           endLine: sEnd,
           paragraphCount: paragraphs.length,
+          charCount: sumParagraphChars(paragraphs),
           ...(options?.includeParagraphs ? { paragraphs } : {}),
         };
       });
 
     const totalParagraphs = epScenes.reduce((acc, s) => acc + (s.paragraphCount ?? 0), 0);
+    const totalChars = epScenes.length > 0
+      ? epScenes.reduce((acc, s) => acc + (s.charCount ?? 0), 0)
+      : lines.slice(epStartLine, endLine).join('\n').length;
 
     return {
       id: `episode-${epStartLine}`,
@@ -121,6 +142,7 @@ export const parseScriptEpisodes = (
       endChar: endChar,
       sceneCount: epScenes.length,
       ...(epScenes.length > 0 ? { paragraphCount: totalParagraphs } : {}),
+      charCount: totalChars,
       scenes: epScenes.length > 0 ? epScenes : undefined,
     };
   });
@@ -152,9 +174,11 @@ export const readScriptDirectory = (
     entries = scenes.map(sc => {
       const sStart = sc.startLine ?? 1;
       const sEnd = sc.endLine ?? 1;
-      const pCount = Array.isArray(sc.paragraphs)
-        ? sc.paragraphs.length
-        : extractSceneParagraphs(lines, sStart, sEnd).length;
+      const sceneParas = Array.isArray(sc.paragraphs)
+        ? sc.paragraphs
+        : extractSceneParagraphs(lines, sStart, sEnd);
+      const pCount = sceneParas.length;
+      const cCount = sumParagraphChars(sceneParas);
       return {
         id: sc.id || `scene-${sc.index}`,
         number: sc.sceneNumber || String(sc.index),
@@ -165,6 +189,7 @@ export const readScriptDirectory = (
         endChar: sc.endCharIndex ?? scriptText.length,
         sceneCount: 1,
         paragraphCount: pCount,
+        charCount: cCount,
         scenes: [
           {
             id: sc.id || `scene-${sc.index}`,
@@ -177,6 +202,7 @@ export const readScriptDirectory = (
             startLine: sStart,
             endLine: sEnd,
             paragraphCount: pCount,
+            charCount: cCount,
           },
         ],
       };
@@ -222,12 +248,13 @@ export const readScriptDirectory = (
   }
   if (options.tailOnly) entries = entries.slice(-1);
   if (options.range) entries = entries.slice(Math.max(0, options.range[0] - 1), Math.max(0, options.range[1]));
-  return entries.map(({ id, number, title, sceneCount, paragraphCount, scenes }) => ({
+  return entries.map(({ id, number, title, sceneCount, paragraphCount, charCount, scenes }) => ({
     id,
     number,
     title,
     ...(typeof sceneCount === 'number' ? { sceneCount } : {}),
     ...(typeof paragraphCount === 'number' ? { paragraphCount } : {}),
+    ...(typeof charCount === 'number' ? { charCount } : {}),
     ...(scenes && scenes.length > 0
       ? {
           scenes: scenes.map(s => ({
@@ -239,6 +266,7 @@ export const readScriptDirectory = (
             locationName: s.locationName,
             characterNames: s.characterNames,
             paragraphCount: s.paragraphCount,
+            charCount: s.charCount,
           })),
         }
       : {}),
@@ -303,7 +331,14 @@ export function matchesSceneIdentifier(scene: ScriptSceneSummary, sceneIndex: nu
     .replace(/^(?:【?\s*第?\s*[0-9一二三四五六七八九十百千]+\s*[集话回]\s*】?\s*)/i, '')
     .trim();
 
-  if (scene.id.toLowerCase() === targetLower) return true;
+  const idLower = scene.id.toLowerCase();
+  if (
+    idLower === targetLower ||
+    (normalizedDash && (idLower === normalizedDash || idLower === `scene-${normalizedDash}` || idLower === `sc-${normalizedDash}`))
+  ) {
+    return true;
+  }
+  if (!normalizedDash) return false;
   if (scene.sceneNumber && scene.sceneNumber.toLowerCase().replace(/[—–]/g, '-') === normalizedDash) return true;
   const normTitle = scene.title.toLowerCase().replace(/[—–]/g, '-').replace(/\s+/g, ' ');
   if (normTitle.includes(normalizedDash)) return true;
@@ -319,7 +354,7 @@ export function matchesSceneIdentifier(scene: ScriptSceneSummary, sceneIndex: nu
       const genericTokens = new Set(['日', '夜', '内', '外', '晨', '昏', '早', '晚', '内景', '外景', '内外', 'int', 'ext']);
       const specificTokens = targetRest
         .split(/\s+/)
-        .map(t => t.replace(/^(?:日|夜|内|外|晨|昏)+/, '').trim())
+        .map(t => t.replace(/[()（）【】[\]]/g, '').replace(/^(?:日|夜|内|外|晨|昏)+/, '').trim())
         .filter(t => t.length > 0 && !genericTokens.has(t));
       if (
         specificTokens.length > 0 &&
@@ -388,6 +423,8 @@ export function readScriptStructured(
       episodeCount: 0,
       sceneCount: 0,
       paragraphCount: 0,
+      charCount: 0,
+      recommendedBatchMaxChars: RECOMMENDED_BATCH_MAX_CHARS,
       hasVolumeWarning: false,
       episodes: [],
       content: '',
@@ -423,6 +460,7 @@ export function readScriptStructured(
           startLine: sStart,
           endLine: sEnd,
           paragraphCount: paragraphs.length,
+          charCount: sumParagraphChars(paragraphs),
           paragraphs,
         };
       });
@@ -437,11 +475,13 @@ export function readScriptStructured(
           endChar: scriptText.length,
           sceneCount: mappedScenes.length,
           paragraphCount: mappedScenes.reduce((acc, s) => acc + (s.paragraphCount ?? 0), 0),
+          charCount: mappedScenes.reduce((acc, s) => acc + (s.charCount ?? 0), 0),
           scenes: mappedScenes,
         },
       ];
     } else {
       const paragraphs = extractSceneParagraphs(lines, 1, lines.length, { skipHeaderCheck: true });
+      const totalFallbackChars = sumParagraphChars(paragraphs);
       allEpisodes = [
         {
           id: 'episode-1',
@@ -453,6 +493,7 @@ export function readScriptStructured(
           endChar: scriptText.length,
           sceneCount: 1,
           paragraphCount: paragraphs.length,
+          charCount: totalFallbackChars,
           scenes: [
             {
               id: 'scene-1',
@@ -461,6 +502,7 @@ export function readScriptStructured(
               startLine: 1,
               endLine: lines.length,
               paragraphCount: paragraphs.length,
+              charCount: totalFallbackChars,
               paragraphs,
             },
           ],
@@ -474,6 +516,7 @@ export function readScriptStructured(
         return ep;
       }
       const paragraphs = extractSceneParagraphs(lines, ep.startLine, ep.endLine);
+      const epChars = sumParagraphChars(paragraphs);
       const defaultScene: ScriptSceneSummary = {
         id: `${ep.id}-scene-1`,
         sceneNumber: `${ep.number}-1`,
@@ -481,12 +524,14 @@ export function readScriptStructured(
         startLine: ep.startLine,
         endLine: ep.endLine,
         paragraphCount: paragraphs.length,
+        charCount: epChars,
         paragraphs,
       };
       return {
         ...ep,
         sceneCount: 1,
         paragraphCount: paragraphs.length,
+        charCount: epChars,
         scenes: [defaultScene],
       };
     });
@@ -558,21 +603,25 @@ export function readScriptStructured(
     }
   }
 
-  // 如果用户在 episode 参数中传了类似 "1-5" 的场次号，自动识别并并入 sceneFilters
+  // 如果用户在 episode 参数中传了类似 "1-5" 的场次号，自动识别并并入 sceneFilters；明确的集数编号（如 "第99集" / 99）未命中则不兜底匹配场次
   const resolvedEpisodeIds = new Set<string>();
   const implicitSceneFilters: Array<string | number> = [...sceneFilters];
+  const pureEpisodeSpecifierRe = /^(?:【?\s*(?:第\s*(?:[0-9]+|[一二三四五六七八九十百千]+)\s*[集话回]|(?:[0-9]+|[一二三四五六七八九十百千]+)\s*集|(?:episode|ep)\s*#?\s*\d+|[0-9]+)\s*】?)$/i;
 
   for (const epFilter of episodeFilters) {
     const matchedEp = findEpisodeByIdentifier(allEpisodes, epFilter);
     if (matchedEp) {
       resolvedEpisodeIds.add(matchedEp.id);
-    } else {
+    } else if (typeof epFilter === 'string' && !pureEpisodeSpecifierRe.test(epFilter.trim())) {
       implicitSceneFilters.push(epFilter);
     }
   }
 
   const filteredEpisodes = allEpisodes
     .filter(ep => {
+      if (episodeFilters.length > 0 && resolvedEpisodeIds.size === 0 && implicitSceneFilters.length === 0) {
+        return false;
+      }
       if (resolvedEpisodeIds.size > 0 && !resolvedEpisodeIds.has(ep.id)) {
         return false;
       }
@@ -619,12 +668,14 @@ export function readScriptStructured(
             ...(sc.locationName ? { locationName: sc.locationName } : {}),
             ...(sc.characterNames && sc.characterNames.length > 0 ? { characterNames: sc.characterNames } : {}),
             paragraphCount: filteredParas.length,
+            charCount: sumParagraphChars(filteredParas),
             paragraphs: filteredParas,
           };
         })
         .filter(sc => implicitSceneFilters.length === 0 || sc.paragraphCount >= 0);
 
       const epParaCount = filteredScenes.reduce((acc, s) => acc + s.paragraphCount, 0);
+      const epCharCount = filteredScenes.reduce((acc, s) => acc + s.charCount, 0);
       return {
         index: epIdx + 1,
         id: ep.id,
@@ -632,6 +683,7 @@ export function readScriptStructured(
         title: ep.title,
         sceneCount: filteredScenes.length,
         paragraphCount: epParaCount,
+        charCount: epCharCount,
         scenes: filteredScenes,
       };
     })
@@ -656,6 +708,7 @@ export function readScriptStructured(
 
   const totalScenes = filteredEpisodes.reduce((acc, ep) => acc + ep.sceneCount, 0);
   const totalParagraphs = filteredEpisodes.reduce((acc, ep) => acc + ep.paragraphCount, 0);
+  const totalChars = filteredEpisodes.reduce((acc, ep) => acc + ep.charCount, 0);
   const contentSlice = effectiveEndLine >= effectiveStartLine
     ? lines.slice(Math.max(0, effectiveStartLine - 1), effectiveEndLine).join('\n')
     : '';
@@ -665,21 +718,101 @@ export function readScriptStructured(
       sceneNumber: sc.sceneNumber || String(sc.index),
       title: sc.title,
       paragraphCount: sc.paragraphCount,
+      charCount: sc.charCount,
     }))
   );
 
   const isExplicitSceneBatch = Array.isArray(options.scene) && options.scene.length > 1;
   const isMultiSceneMatch = totalScenes > 1;
   const hasVolumeWarning = isExplicitSceneBatch
-    ? totalParagraphs > 30
+    ? (totalParagraphs > 30 || totalChars > RECOMMENDED_BATCH_MAX_CHARS)
     : isMultiSceneMatch
-      ? (totalParagraphs >= 15 || totalScenes >= 2)
-      : (totalParagraphs > 30 && !options.paragraph);
+      ? (totalParagraphs >= 15 || totalScenes >= 2 || totalChars > RECOMMENDED_BATCH_MAX_CHARS)
+      : ((totalParagraphs > 30 || totalChars > RECOMMENDED_BATCH_MAX_CHARS) && !options.paragraph);
+  const batchAdvice = buildBatchCharLimitAdvice(RECOMMENDED_BATCH_MAX_CHARS);
   const notice = hasVolumeWarning
     ? (isMultiSceneMatch && options.scene && !isExplicitSceneBatch
-        ? `我发现当前条件 "${options.scene}" 共匹配到 ${totalScenes} 个场次（${scenesSummary.map(s => `"${s.title}" ${s.paragraphCount}段`).join('、')}，共 ${totalParagraphs} 个段落），内容较多。本次已将全部原文返回在下方，当前处于 Stage 0 阶段，建议按照场次或者集数拆分为多轮计划处理。`
-        : `我发现当前读取范围包含 ${totalScenes} 个场次共 ${totalParagraphs} 个段落，内容较多。本次已将全部原文返回在下方，当前处于 Stage 0 阶段，建议按照场次或者集数拆分为多轮计划处理。`)
+        ? `我发现当前条件 "${options.scene}" 共匹配到 ${totalScenes} 个场次（${scenesSummary.map(s => `"${s.title}" ${s.paragraphCount}段/${s.charCount}字`).join('、')}，共 ${totalParagraphs} 个段落/${totalChars} 字），内容较多。本次已将全部原文返回在下方，当前处于 Stage 0 阶段，${batchAdvice}`
+        : `我发现当前读取范围包含 ${totalScenes} 个场次共 ${totalParagraphs} 个段落（正文约 ${totalChars} 字），内容较多。本次已将全部原文返回在下方，当前处于 Stage 0 阶段，${batchAdvice}`)
     : undefined;
+
+  const hasRequestedFilter = episodeFilters.length > 0 || sceneFilters.length > 0;
+  let notFound = false;
+  let missMessage: string | undefined;
+  let availableEpisodes: Array<{ id: string; number?: string; title: string; sceneCount: number }> | undefined;
+  let availableScenes: Array<{ episode: string; id: string; sceneNumber?: string; title: string; paragraphCount: number }> | undefined;
+
+  if (hasRequestedFilter && filteredEpisodes.length === 0) {
+    notFound = true;
+    const scopeEpisodes = resolvedEpisodeIds.size > 0
+      ? allEpisodes.filter(ep => resolvedEpisodeIds.has(ep.id))
+      : allEpisodes;
+    availableEpisodes = allEpisodes.map(ep => ({
+      id: ep.id,
+      ...(ep.number ? { number: ep.number } : {}),
+      title: ep.title,
+      sceneCount: ep.scenes?.length || 0,
+    }));
+    availableScenes = scopeEpisodes.flatMap(ep =>
+      (ep.scenes || []).map(sc => ({
+        episode: ep.number || ep.title,
+        id: sc.id,
+        ...(sc.sceneNumber ? { sceneNumber: sc.sceneNumber } : {}),
+        title: sc.title,
+        paragraphCount: sc.paragraphs?.length ?? 0,
+      }))
+    );
+    const requestedParts: string[] = [];
+    if (episodeFilters.length > 0) requestedParts.push(`episode=${JSON.stringify(options.episode)}`);
+    if (sceneFilters.length > 0) requestedParts.push(`scene=${JSON.stringify(options.scene)}`);
+    const sceneHints = availableScenes
+      .slice(0, 20)
+      .map(s => `${s.sceneNumber ? `${s.sceneNumber} (` : ''}${s.id}${s.sceneNumber ? ')' : ''} "${s.title}"(${s.paragraphCount}段)`)
+      .join('、');
+    const epHints = availableEpisodes
+      .slice(0, 15)
+      .map(e => `${e.number || e.id} "${e.title}"(${e.sceneCount}场)`)
+      .join('、');
+    const detailHint = availableScenes.length > 0
+      ? `可选场次：${sceneHints}${availableScenes.length > 20 ? ` 等共${availableScenes.length}场` : ''}`
+      : `可选集数：${epHints || '当前剧本暂无结构化场次'}`;
+    missMessage = `未匹配到符合条件（${requestedParts.join(', ')}）的剧本内容。${detailHint}`;
+  }
+
+  const ambiguousSceneFilters: Array<{
+    filter: string;
+    matchedScenes: Array<{ id: string; sceneNumber?: string; title: string; paragraphCount: number; charCount: number }>;
+  }> = [];
+  if (implicitSceneFilters.length > 0 && filteredEpisodes.length > 0) {
+    const candidateEpisodes = allEpisodes.filter(ep => {
+      if (resolvedEpisodeIds.size > 0 && !resolvedEpisodeIds.has(ep.id)) return false;
+      if (ep.endLine < effectiveStartLine || ep.startLine > effectiveEndLine) return false;
+      return true;
+    });
+    for (const sf of implicitSceneFilters) {
+      const sfStr = String(sf).trim();
+      if (!sfStr) continue;
+      const matchedList: Array<{ id: string; sceneNumber?: string; title: string; paragraphCount: number; charCount: number }> = [];
+      for (const ep of candidateEpisodes) {
+        const rawScenes = ep.scenes || [];
+        rawScenes.forEach((sc, scIdx) => {
+          if (sc.endLine < effectiveStartLine || sc.startLine > effectiveEndLine) return;
+          if (matchesSceneIdentifier(sc, scIdx + 1, sf)) {
+            matchedList.push({
+              id: sc.id,
+              ...(sc.sceneNumber ? { sceneNumber: sc.sceneNumber } : {}),
+              title: sc.title,
+              paragraphCount: sc.paragraphCount ?? (sc.paragraphs?.length || 0),
+              charCount: sc.charCount ?? sumParagraphChars(sc.paragraphs),
+            });
+          }
+        });
+      }
+      if (matchedList.length >= 2) {
+        ambiguousSceneFilters.push({ filter: sfStr, matchedScenes: matchedList });
+      }
+    }
+  }
 
   return {
     total: lines.length,
@@ -690,7 +823,11 @@ export function readScriptStructured(
     episodeCount: filteredEpisodes.length,
     sceneCount: totalScenes,
     paragraphCount: totalParagraphs,
+    charCount: totalChars,
+    recommendedBatchMaxChars: RECOMMENDED_BATCH_MAX_CHARS,
     hasVolumeWarning,
+    ...(ambiguousSceneFilters.length > 0 ? { ambiguousSceneFilters } : {}),
+    ...(notFound ? { notFound: true, message: missMessage, availableEpisodes, availableScenes } : {}),
     ...(notice ? { notice, warning: notice } : {}),
     ...(hasVolumeWarning ? { scenesSummary } : {}),
     episodes: filteredEpisodes,
@@ -710,6 +847,8 @@ export const readScriptEpisode = (scriptText: string, episodeId: string, options
   return {
     ...episode,
     lineRange: [start, end] as [number, number],
+    charCount: content.length,
+    recommendedBatchMaxChars: RECOMMENDED_BATCH_MAX_CHARS,
     content: content.slice(0, maxChars),
     truncated: content.length > maxChars,
   };
@@ -735,6 +874,8 @@ export interface ScriptSearchSceneSummary {
   sceneId?: string;
   sceneNumber: string;
   sceneTitle: string;
+  paragraphCount?: number;
+  charCount?: number;
   matchCount: number;
   matchIndices: number[];
 }
@@ -742,6 +883,8 @@ export interface ScriptSearchSceneSummary {
 export interface ScriptSearchResult {
   matches: Array<{ index: number; paragraphIndex?: number; sceneTitle?: string; snippet: string }>;
   totalMatches: number;
+  totalChars?: number;
+  recommendedBatchMaxChars?: number;
   scope?: ScriptSearchScope;
   hasVolumeWarning?: boolean;
   warning?: string;
@@ -770,29 +913,29 @@ export const searchScriptWithScope = (
     precomputedScenes: options.precomputedScenes,
   });
 
+  let matchedEpObj: ScriptEpisode | undefined;
   if (options.episode !== undefined && options.episode !== null && String(options.episode).trim() !== '') {
-    hasExplicitScope = true;
     const epRaw = String(options.episode).trim();
-    const ep = findEpisodeByIdentifier(episodes, epRaw);
-    if (ep) {
-      rangeStart = Math.max(rangeStart, ep.startLine);
-      rangeEnd = Math.min(rangeEnd, ep.endLine);
-      matchedEpisodeTitle = ep.title;
-    } else {
-      // Also check if the user/Agent passed a scene identifier like "1-5" in episode
-      for (const candidateEp of episodes) {
-        const sc = candidateEp.scenes?.find(
-          s =>
-            s.sceneNumber === epRaw ||
-            s.id.toLowerCase() === epRaw.toLowerCase() ||
-            s.title.toLowerCase().includes(epRaw.toLowerCase())
-        );
-        if (sc) {
-          rangeStart = Math.max(rangeStart, sc.startLine);
-          rangeEnd = Math.min(rangeEnd, sc.endLine);
-          matchedEpisodeTitle = candidateEp.title;
-          matchedSceneTitle = sc.title;
-          break;
+    const isAllEpisodes = /^(all|\*|全部|全剧|全文)$/i.test(epRaw);
+    if (!isAllEpisodes) {
+      hasExplicitScope = true;
+      const ep = findEpisodeByIdentifier(episodes, epRaw);
+      if (ep) {
+        matchedEpObj = ep;
+        rangeStart = Math.max(rangeStart, ep.startLine);
+        rangeEnd = Math.min(rangeEnd, ep.endLine);
+        matchedEpisodeTitle = ep.title;
+      } else {
+        // Also check if the user/Agent passed a scene identifier like "1-5" or "52-2776" in episode
+        for (const candidateEp of episodes) {
+          const sc = candidateEp.scenes?.find((s, idx) => matchesSceneIdentifier(s, idx + 1, epRaw));
+          if (sc) {
+            rangeStart = Math.max(rangeStart, sc.startLine);
+            rangeEnd = Math.min(rangeEnd, sc.endLine);
+            matchedEpisodeTitle = candidateEp.title;
+            matchedSceneTitle = sc.title;
+            break;
+          }
         }
       }
     }
@@ -801,13 +944,9 @@ export const searchScriptWithScope = (
   if (typeof options.scene === 'string' && options.scene.trim()) {
     hasExplicitScope = true;
     const scRaw = options.scene.trim();
-    for (const candidateEp of episodes) {
-      const sc = candidateEp.scenes?.find(
-        s =>
-          s.sceneNumber === scRaw ||
-          s.id.toLowerCase() === scRaw.toLowerCase() ||
-          s.title.toLowerCase().includes(scRaw.toLowerCase())
-      );
+    const candidateEps = matchedEpObj ? [matchedEpObj] : episodes;
+    for (const candidateEp of candidateEps) {
+      const sc = candidateEp.scenes?.find((s, idx) => matchesSceneIdentifier(s, idx + 1, scRaw));
       if (sc) {
         rangeStart = Math.max(rangeStart, sc.startLine);
         rangeEnd = Math.min(rangeEnd, sc.endLine);
@@ -883,10 +1022,14 @@ export const searchScriptWithScope = (
     const sceneTitle = matchedScene?.scene.title || matchedScene?.epTitle || '未归类场次';
 
     let paragraphIndex: number | undefined;
+    let sceneParagraphCount: number | undefined;
+    let sceneCharCount: number | undefined;
     if (matchedScene) {
       const sceneParas = Array.isArray(matchedScene.scene.paragraphs)
         ? matchedScene.scene.paragraphs
         : extractSceneParagraphs(allLines, matchedScene.scene.startLine, matchedScene.scene.endLine);
+      sceneParagraphCount = sceneParas.length;
+      sceneCharCount = sumParagraphChars(sceneParas);
       const foundP = sceneParas.find(p => p.lineNumber === m.lineNumber);
       if (foundP) {
         paragraphIndex = foundP.index;
@@ -902,6 +1045,8 @@ export const searchScriptWithScope = (
       sceneTitle,
       hasMatchedScene: Boolean(matchedScene),
       paragraphIndex,
+      sceneParagraphCount,
+      sceneCharCount,
     };
   });
 
@@ -933,6 +1078,8 @@ export const searchScriptWithScope = (
         sceneId: m.sceneId,
         sceneNumber: m.sceneNum,
         sceneTitle: m.sceneTitle,
+        ...(typeof m.sceneParagraphCount === 'number' ? { paragraphCount: m.sceneParagraphCount } : {}),
+        ...(typeof m.sceneCharCount === 'number' ? { charCount: m.sceneCharCount } : {}),
         matchCount: 1,
         matchIndices: [matchIndex],
       });
@@ -943,14 +1090,23 @@ export const searchScriptWithScope = (
   }
 
   const scenesSummary = Array.from(sceneSummaryMap.values());
-  const hasVolumeWarning = allMatches.length > 15 || (scenesSummary.length >= 2 && allMatches.length >= 12);
+  const totalMatchedSceneChars = scenesSummary.reduce((acc, s) => acc + (s.charCount ?? 0), 0);
+  const totalChars = totalMatchedSceneChars > 0
+    ? totalMatchedSceneChars
+    : allMatches.reduce((acc, m) => acc + m.snippet.length, 0);
+  const hasVolumeWarning =
+    allMatches.length > 15 ||
+    (scenesSummary.length >= 2 && allMatches.length >= 12) ||
+    totalChars > RECOMMENDED_BATCH_MAX_CHARS;
   const notice = hasVolumeWarning
-    ? `我发现检索到 ${allMatches.length} 条匹配，跨越 ${scenesSummary.length} 个场次，内容较多。本次已将全部匹配结果返回在下方，当前处于 Stage 0 阶段，建议按照场次或者集数拆分为多轮计划处理。`
+    ? `我发现检索到 ${allMatches.length} 条匹配，跨越 ${scenesSummary.length} 个场次（涉及场次正文约 ${totalChars} 字），内容较多。本次已将全部匹配结果返回在下方，当前处于 Stage 0 阶段，${buildBatchCharLimitAdvice(RECOMMENDED_BATCH_MAX_CHARS)}`
     : undefined;
 
   return {
     matches: allMatches.slice(0, maxLimit),
     totalMatches: allMatches.length,
+    totalChars,
+    recommendedBatchMaxChars: RECOMMENDED_BATCH_MAX_CHARS,
     hasVolumeWarning,
     ...(notice ? { notice, warning: notice } : {}),
     ...(scenesSummary.length > 0 ? { scenesSummary } : {}),

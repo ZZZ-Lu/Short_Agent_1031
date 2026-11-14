@@ -1,4 +1,5 @@
 import type { AgentTurnDebugSnapshot, AgentTurnResult } from './protocol';
+import type { PromptCacheUsageStats } from './promptCache';
 import type { RuntimeTask } from './runtime';
 
 export interface AgentTurnTrace {
@@ -16,6 +17,7 @@ export interface AgentTurnTrace {
   stateNodeTrace?: {
     prompt?: string;
     response?: any;
+    usage?: PromptCacheUsageStats;
   };
   error?: string;
 }

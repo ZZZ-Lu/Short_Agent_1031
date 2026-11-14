@@ -1,5 +1,8 @@
+import type { PromptCacheUsageStats } from './promptCache';
+
 export type AgentToolName =
   | 'sys.selectContext'
+  | 'experience.search'
   | 'script.directory'
   | 'script.read'
   | 'script.search'
@@ -61,8 +64,8 @@ export const TOOL_CATEGORIES: Record<string, ToolCategoryMeta> = {
   system: {
     id: 'system',
     name: '系统与任务调度',
-    description: '应用指南查询(guide.lookup)、认知状态更新(sys.updateState)、思考层级切换(sys.setThinkingLevel)与任务收尾(sys.endTask)',
-    toolIds: ['guide.lookup', 'sys.updateState', 'sys.setThinkingLevel', 'sys.endTask', 'user.ask'],
+    description: '应用指南查询(guide.lookup)、任务经验检索(experience.search)、认知状态更新(sys.updateState)、思考层级切换(sys.setThinkingLevel)与任务收尾(sys.endTask)',
+    toolIds: ['guide.lookup', 'experience.search', 'sys.updateState', 'sys.setThinkingLevel', 'sys.endTask', 'user.ask'],
   },
 };
 
@@ -110,6 +113,7 @@ export interface AgentTurnDebugSnapshot {
   response: {
     content: unknown;
     toolCalls: unknown[];
+    usage?: PromptCacheUsageStats;
   };
 }
 

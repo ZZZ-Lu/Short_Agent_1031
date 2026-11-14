@@ -1,4 +1,5 @@
 import type { AgentRuntimeTrace, AgentTurnTrace } from './debugTrace';
+import type { PromptCacheUsageStats } from './promptCache';
 import type { RuntimeEvent } from './runtime';
 
 export type TraceExportPreset = 'diagnostic' | 'io_only' | 'full' | 'custom';
@@ -161,6 +162,60 @@ function formatJsonPretty(value: unknown): string {
   }
 }
 
+function formatPromptMessagesForTrace(msgs: unknown, fallbackRequest: unknown): unknown {
+  if (Array.isArray(msgs) && msgs.length > 1) {
+    return msgs
+      .map((m: any) => {
+        const role = String(m?.role || 'unknown').toUpperCase();
+        const body = typeof m?.content === 'string' ? m.content : JSON.stringify(m?.content ?? '');
+        return body ? `=== [${role}] ===\n${body}` : '';
+      })
+      .filter(Boolean)
+      .join('\n\n');
+  }
+  if (Array.isArray(msgs) && msgs.length === 1) {
+    return msgs[0]?.content ?? fallbackRequest ?? null;
+  }
+  return fallbackRequest ?? null;
+}
+
+function formatCacheUsageLine(usage?: PromptCacheUsageStats): string | null {
+  if (!usage || typeof usage.promptTokens !== 'number') return null;
+  const hit = typeof usage.cacheHitTokens === 'number' ? usage.cacheHitTokens : undefined;
+  const pct = hit !== undefined && usage.promptTokens > 0
+    ? ((hit / usage.promptTokens) * 100).toFixed(1)
+    : undefined;
+  const hitText = hit !== undefined ? `缓存命中 ${hit} (${pct}%)` : '未返回命中明细';
+  const outText = typeof usage.completionTokens === 'number' ? ` · 输出 ${usage.completionTokens}` : '';
+  return `Prompt ${usage.promptTokens} tokens · ${hitText}${outText}`;
+}
+
+function aggregateTraceCacheStats(turns: AgentTurnTrace[]): {
+  mainPromptTokens: number;
+  mainCacheHitTokens: number;
+  statePromptTokens: number;
+  stateCacheHitTokens: number;
+} {
+  let mainPromptTokens = 0;
+  let mainCacheHitTokens = 0;
+  let statePromptTokens = 0;
+  let stateCacheHitTokens = 0;
+
+  for (const turn of turns) {
+    const u = turn.transport?.response?.usage;
+    if (u && typeof u.promptTokens === 'number') {
+      mainPromptTokens += u.promptTokens;
+      mainCacheHitTokens += u.cacheHitTokens ?? 0;
+    }
+    const su = turn.stateNodeTrace?.usage;
+    if (su && typeof su.promptTokens === 'number') {
+      statePromptTokens += su.promptTokens;
+      stateCacheHitTokens += su.cacheHitTokens ?? 0;
+    }
+  }
+  return { mainPromptTokens, mainCacheHitTokens, statePromptTokens, stateCacheHitTokens };
+}
+
 export function buildStructuredTraceExportObject(
   trace: AgentRuntimeTrace,
   options: TraceExportOptions,
@@ -177,6 +232,9 @@ export function buildStructuredTraceExportObject(
   const resolvedTitle = (trace.task?.title && trace.task.title !== '尚未命名')
     ? trace.task.title
     : (trace.task?.initialGoal || trace.goal || resolvedGoal);
+  const cacheAgg = aggregateTraceCacheStats(turns);
+  const hasCacheStats = cacheAgg.mainPromptTokens > 0 || cacheAgg.statePromptTokens > 0;
+
   return {
     taskId: trace.taskId,
     traceId: trace.id,
@@ -185,6 +243,7 @@ export function buildStructuredTraceExportObject(
     status: trace.task?.status || 'unknown',
     totalTurns: turns.length,
     totalDurationMs: lastEnd && firstStart && lastEnd >= firstStart ? lastEnd - firstStart : undefined,
+    ...(hasCacheStats ? { cacheSummary: cacheAgg } : {}),
     exportedAt: new Date().toISOString(),
     exportPreset: options.preset,
     turns: turns.map((turn, idx) => {
@@ -204,16 +263,17 @@ export function buildStructuredTraceExportObject(
         if (turn.transport?.request?.model) {
           turnObj.model = turn.transport.request.model;
         }
+        if (turn.transport?.response?.usage) {
+          turnObj.usage = turn.transport.response.usage;
+        }
       }
 
       const shouldIncludePrompt =
         options.promptMode === 'all_turns' ||
         (options.promptMode === 'first_turn' && idx === 0);
       if (shouldIncludePrompt) {
-        turnObj.prompt =
-          turn.transport?.request?.messages?.[0]?.content ??
-          turn.transport?.request ??
-          null;
+        const msgs = turn.transport?.request?.messages;
+        turnObj.prompt = formatPromptMessagesForTrace(msgs, turn.transport?.request ?? null);
       }
 
       if (options.includeModelOutput) {
@@ -286,6 +346,19 @@ export function formatRuntimeTraceExport(
   if (trace.task?.subGoal || trace.task?.progress) {
     lines.push(`- **最新进展**：${trace.task.progress || '无'}（小目标：${trace.task.subGoal || '无'}）`);
   }
+  const mdCacheAgg = aggregateTraceCacheStats(turns);
+  if (mdCacheAgg.mainPromptTokens > 0 || mdCacheAgg.statePromptTokens > 0) {
+    const parts: string[] = [];
+    if (mdCacheAgg.mainPromptTokens > 0) {
+      const pct = ((mdCacheAgg.mainCacheHitTokens / mdCacheAgg.mainPromptTokens) * 100).toFixed(1);
+      parts.push(`主循环命中 ${mdCacheAgg.mainCacheHitTokens} / ${mdCacheAgg.mainPromptTokens} tokens (${pct}%)`);
+    }
+    if (mdCacheAgg.statePromptTokens > 0) {
+      const pct = ((mdCacheAgg.stateCacheHitTokens / mdCacheAgg.statePromptTokens) * 100).toFixed(1);
+      parts.push(`状态节点命中 ${mdCacheAgg.stateCacheHitTokens} / ${mdCacheAgg.statePromptTokens} tokens (${pct}%)`);
+    }
+    lines.push(`- **缓存命中汇总**：${parts.join(' · ')}`);
+  }
   lines.push('');
 
   turns.forEach((turn, idx) => {
@@ -304,6 +377,10 @@ export function formatRuntimeTraceExport(
           `- **运行上下文**：模型 \`${modelName}\` · 思考层级 \`${turn.thinkingLevel ?? 0} 级\` · ${turn.requireTool ? '强制要求调用工具' : '正常唤醒'}`
         );
       }
+      const turnUsageLine = formatCacheUsageLine(turn.transport?.response?.usage);
+      if (turnUsageLine) {
+        lines.push(`- **Token 与缓存**：${turnUsageLine}`);
+      }
     }
 
     const shouldIncludePrompt =
@@ -311,9 +388,8 @@ export function formatRuntimeTraceExport(
       (options.promptMode === 'first_turn' && idx === 0);
 
     if (shouldIncludePrompt) {
-      const rawPrompt =
-        turn.transport?.request?.messages?.[0]?.content ??
-        turn.transport?.request;
+      const msgs = turn.transport?.request?.messages;
+      const rawPrompt = formatPromptMessagesForTrace(msgs, turn.transport?.request);
       lines.push('');
       lines.push(`### [第 ${turn.turn} 轮] 实际发送 Prompt`);
       lines.push('```text');
@@ -384,6 +460,10 @@ export function formatRuntimeTraceExport(
       if (turn.stateNodeTrace?.prompt || turn.stateNodeTrace?.response) {
         lines.push('');
         lines.push(`### [第 ${turn.turn} 轮] 认知状态提取节点`);
+        const stateUsageLine = formatCacheUsageLine(turn.stateNodeTrace.usage);
+        if (stateUsageLine) {
+          lines.push(`- **状态节点 Token 与缓存**：${stateUsageLine}`);
+        }
         if (turn.stateNodeTrace.prompt) {
           lines.push('**状态节点输入 Prompt**：');
           lines.push('```text');

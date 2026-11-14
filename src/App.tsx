@@ -38,7 +38,7 @@ import { assetExtractionService } from './services/assetExtractionService';
 import { getActiveMcpKey, getActiveMcpTokenSync, getMcpConfig } from './utils/mcpStorage';
 import { CanvasLineageOverlay } from './components/CanvasLineageOverlay';
 import { AGENT_TOOL_REGISTRY, getAgentToolConfig } from './agent/toolRegistry';
-import { initialAgentContext, mergeTaskNotes } from './agent/contextPolicy';
+import { initialAgentContext, mergeTaskNotes, summarizeToolOutputForStateNode } from './agent/contextPolicy';
 import { getPageComponentDefinition, type MouseActionName } from './agent/pageComponentRegistry';
 import { buildAutoInjectedCardContext, buildMultiCardInjectedContext, refreshTaskCardContext } from './agent/cardContextBuilder';
 import { agentFocusManager, type AgentFocusSnapshot } from './agent/agentFocusManager';
@@ -5516,7 +5516,7 @@ export default function App() {
 
   const executeAgentTool = useCallback(async (call: AgentToolCall, task: RuntimeTask, signal?: AbortSignal) => {
     if (signal?.aborted) return { aborted: true };
-    if (call.name === 'script.directory' || call.name === 'script.read' || call.name === 'script.search' || call.name === 'asset.list' || call.name === 'asset.searchProvenanceCandidates') {
+    if (call.name === 'experience.search' || call.name === 'script.directory' || call.name === 'script.read' || call.name === 'script.search' || call.name === 'asset.list' || call.name === 'asset.searchProvenanceCandidates') {
       return executeProjectReadTool(call.name, call.arguments, currentProjectRef.current);
     }
     if (call.name === 'asset.create' || call.name === 'asset.update' || call.name === 'asset.delete' || call.name === 'asset.commitProvenance') {
@@ -6802,14 +6802,14 @@ export default function App() {
             let responseData: any = null;
 
             try {
-              const agentModel = assetExtractionService.getNodeModels().agentModel;
-              const isArkModel = agentModel.includes('doubao') || agentModel.includes('seed-2-1') || agentModel.includes('seed-2.1') || agentModel.includes('ark') || agentModel.includes('volces');
-              const isDashscopeModel = agentModel.startsWith('qwen') || agentModel.includes('glm') || agentModel.includes('ZHIPU') || agentModel.includes('zhipu');
-              const savedKey = isArkModel
-                ? (localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || localStorage.getItem('deepseek_api_key') || localStorage.getItem('qwen_api_key') || '')
-                : isDashscopeModel
-                ? (localStorage.getItem('qwen_api_key') || localStorage.getItem('glm_api_key') || localStorage.getItem('deepseek_api_key') || '')
-                : (localStorage.getItem('deepseek_api_key') || '');
+              const stateNodeModel = 'deepseek-v4-flash';
+              const savedKey =
+                localStorage.getItem('deepseek_api_key') ||
+                localStorage.getItem('qwen_api_key') ||
+                localStorage.getItem('glm_api_key') ||
+                localStorage.getItem('ark_api_key') ||
+                localStorage.getItem('volcengine_api_key') ||
+                '';
 
               const userLogs = (task.negotiationLog || []).filter(l => l.role === 'user' && l.content?.trim());
               const firstUserMsg = task.initialGoal || userLogs[0]?.content || task.goal;
@@ -6827,6 +6827,8 @@ export default function App() {
                   status: e.status,
                   input: e.input,
                   summary: e.text,
+                  outputSummary: summarizeToolOutputForStateNode(e.toolName || '', e.status || 'succeeded', e.output, e.error),
+                  ...(e.error ? { error: e.error } : {}),
                 }));
               const res = await fetch('/api/agent/update-state-node', {
                 method: 'POST',
@@ -6850,7 +6852,7 @@ export default function App() {
                     executedTools,
                   },
                   apiKey: savedKey,
-                  model: agentModel,
+                  model: stateNodeModel,
                   statePrompt: localStorage.getItem('mira_saved_prompt_state') || localStorage.getItem('mira_custom_state_prompt') || undefined,
                 }),
                 signal,
@@ -6891,7 +6893,7 @@ export default function App() {
               console.warn('Dedicated state node update execution error:', e);
               responseData = { error: '请求发起异常', details: String(e) };
             } finally {
-              const { debugPrompt: _p, ...cleanOutput } = responseData || {};
+              const { debugPrompt: _p, usage: stateUsage, ...cleanOutput } = responseData || {};
               updateAgentRuntimeTrace(task, (trace) => {
                 const turns = trace.turns.map(turn => {
                   if (turn.id === targetTurnId || turn.turn === task.turn) {
@@ -6900,6 +6902,7 @@ export default function App() {
                       stateNodeTrace: {
                         prompt: debugPromptText || '状态提取节点已触发运行',
                         response: cleanOutput,
+                        ...(stateUsage ? { usage: stateUsage } : {}),
                       },
                     };
                   }

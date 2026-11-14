@@ -76,7 +76,7 @@ export const PROMPT_MODULES: Record<string, { label: string; content: string }> 
   ui: { label: '页面观察与操作', content: '观察当前可见界面结构、查询操作指南或执行鼠标交互。' },
 };
 
-export const CONTROL_TOOLS: AgentToolName[] = ['sys.selectContext', 'sys.endTask', 'user.ask'];
+export const CONTROL_TOOLS: AgentToolName[] = ['sys.selectContext', 'experience.search', 'sys.endTask', 'user.ask'];
 export const LEVEL_1_CONTROL_TOOLS: AgentToolName[] = ['sys.selectContext', 'user.ask'];
 export const initialAgentContext = (): AgentContextSelection => ({ level: 0, tools: [], prompts: [], categories: [] });
 
@@ -98,13 +98,13 @@ export function resolveContext(selection: AgentContextSelection | undefined, ena
   const activeControlTools = isLevel1 ? LEVEL_1_CONTROL_TOOLS : CONTROL_TOOLS;
   const expandedTools = new Set<AgentToolName>([
     ...activeControlTools,
-    ...(isLevel1 ? (context.tools || []) : []),
+    ...(isLevel1 ? (context.tools || []).filter(toolId => toolId !== 'sys.endTask' && toolId !== 'experience.search') : []),
   ]);
 
   const injected = AGENT_TOOL_REGISTRY.filter(
     tool =>
       expandedTools.has(tool.id) &&
-      (tool.id === 'sys.selectContext' || available.has(tool.id))
+      (tool.id === 'sys.selectContext' || tool.id === 'experience.search' || available.has(tool.id))
   );
   const injectedIds = injected.map(tool => tool.id);
 
@@ -163,11 +163,15 @@ export function validateSelection(
   const resolvedTools = new Set<AgentToolName>();
   const resolvedCategories = new Set<string>();
 
+  let requestedEndTaskOnlyGuard = false;
+
   for (const rawCat of (args.categories as string[] | undefined) ?? []) {
     const trimmed = rawCat.trim();
     const catKey = CATEGORY_ALIASES[trimmed.toLowerCase()];
     if (catKey && TOOL_CATEGORIES[catKey]) {
       resolvedCategories.add(catKey);
+    } else if (trimmed === 'sys.endTask') {
+      requestedEndTaskOnlyGuard = true;
     } else if (known.has(trimmed as AgentToolName)) {
       if (!available.has(trimmed) && trimmed !== 'sys.selectContext') {
         throw new Error(`工具不存在或未启用：${trimmed}`);
@@ -181,7 +185,9 @@ export function validateSelection(
   for (const rawId of (args.tools as string[] | undefined) ?? []) {
     const id = rawId.trim();
     const catKey = CATEGORY_ALIASES[id.toLowerCase()];
-    if (known.has(id as AgentToolName)) {
+    if (id === 'sys.endTask') {
+      requestedEndTaskOnlyGuard = true;
+    } else if (known.has(id as AgentToolName)) {
       if (!available.has(id) && id !== 'sys.selectContext') {
         throw new Error(`工具不存在或未启用：${id}`);
       }
@@ -191,6 +197,10 @@ export function validateSelection(
     } else {
       throw new Error(`工具不存在或未启用：${id}`);
     }
+  }
+
+  if (requestedEndTaskOnlyGuard && args.level === 1 && resolvedTools.size === 0) {
+    throw new Error('sys.endTask 仅限全局计划与验收阶段（0 级）调用，不可装载到局部执行阶段（1 级）；请无参调用 sys.selectContext 返回全局阶段后再结束任务。');
   }
 
   const explicitPrompts: string[] = [];
@@ -218,8 +228,17 @@ export function validateSelection(
         }
       }
     }
+    // 若模型在切入 1 级装载 [asset.create, asset.update] 分步提取写入套件时漏传了 script.read，自动配齐 script.read 形成完整读写闭环
+    if (
+      resolvedTools.has('asset.create') &&
+      resolvedTools.has('asset.update') &&
+      known.has('script.read') &&
+      available.has('script.read')
+    ) {
+      resolvedTools.add('script.read');
+    }
     const validPrevTools = previousLevel1Tools.filter(
-      t => known.has(t) && (available.has(t) || t === 'sys.selectContext')
+      t => t !== 'sys.endTask' && t !== 'experience.search' && known.has(t) && (available.has(t) || t === 'sys.selectContext')
     );
     const finalTools = [...new Set([...validPrevTools, ...resolvedTools])];
     const finalPrompts = [...new Set([...explicitPrompts, ...derivePromptsFromTools(finalTools)])];
@@ -303,13 +322,75 @@ export function mergeTaskNotes(
 }
 
 /**
+ * 将冗长的 verifiedProvenance 数组按场次聚合为轻量摘要：
+ * 保留 { sceneId, sceneTitle, count, lines } 以便区分同号不同场次（如两个 1-5）并确认落盘行号，
+ * 剔除冗余的整段中英双语 evidenceText / anchorText / fallbackCharIndex 等大体积字段。
+ */
+function summarizeProvenanceListForPrompt(provenances: unknown[]): Array<Record<string, unknown>> {
+  const grouped = new Map<string, { sceneId?: string; sceneTitle: string; count: number; lineNumbers: number[] }>();
+  for (const raw of provenances) {
+    if (!raw || typeof raw !== 'object') continue;
+    const p = raw as Record<string, unknown>;
+    const sceneId = typeof p.sceneId === 'string' && p.sceneId.trim() ? p.sceneId.trim() : undefined;
+    const sceneTitle = typeof p.sceneTitle === 'string' && p.sceneTitle.trim() ? p.sceneTitle.trim() : '未知场次';
+    const key = sceneId || sceneTitle;
+    let entry = grouped.get(key);
+    if (!entry) {
+      entry = {
+        ...(sceneId ? { sceneId } : {}),
+        sceneTitle,
+        count: 0,
+        lineNumbers: [],
+      };
+      grouped.set(key, entry);
+    }
+    entry.count += 1;
+    if (typeof p.lineNumber === 'number' && Number.isFinite(p.lineNumber) && !entry.lineNumbers.includes(p.lineNumber)) {
+      entry.lineNumbers.push(p.lineNumber);
+    }
+  }
+  return Array.from(grouped.values()).map(g => ({
+    ...(g.sceneId ? { sceneId: g.sceneId } : {}),
+    sceneTitle: g.sceneTitle,
+    count: g.count,
+    ...(g.lineNumbers.length > 0 ? { lines: g.lineNumbers.sort((a, b) => a - b) } : {}),
+  }));
+}
+
+/**
  * 面向 LLM Prompt 的工具返回值净化与裁剪：
  * 1. 剥离 Base64 大体积图像数据；
- * 2. 剔除前端高亮专用的内部锚点字段（verifiedScriptHash 及 verifiedProvenance 中的 id/sceneId/matchedTerm/anchorText/offsetInAnchor/fallbackCharIndex），
- *    仅保留 { sceneTitle, lineNumber, evidenceText } 等业务语义字段。
+ * 2. 将 verifiedProvenance 按场次聚合为 { sceneId, sceneTitle, count, lines } 轻量摘要，
+ *    并在存在 versions 自带出处时省略主卡顶层重复 verifiedProvenance（保留 verifiedProvenanceCount），
+ *    避免 asset.update / asset.list 返回数十段双语原文撑爆后期 Prompt。
  */
+function countDistinctVerifiedProvenanceForPrompt(rawObj: Record<string, unknown>): number {
+  const parentAnchors = Array.isArray(rawObj.verifiedProvenance) ? rawObj.verifiedProvenance : [];
+  const versionAnchors = Array.isArray(rawObj.versions)
+    ? rawObj.versions.flatMap(ver =>
+        ver && typeof ver === 'object' && Array.isArray((ver as Record<string, unknown>).verifiedProvenance)
+          ? ((ver as Record<string, unknown>).verifiedProvenance as unknown[])
+          : []
+      )
+    : [];
+  const all = [...parentAnchors, ...versionAnchors];
+  if (all.length === 0) return 0;
+  const keys = new Set<string>();
+  all.forEach((item, idx) => {
+    if (!item || typeof item !== 'object') return;
+    const a = item as Record<string, unknown>;
+    const textPart = a.anchorText || a.evidenceText || a.text || (a.lineNumber !== undefined ? '' : idx);
+    const key =
+      typeof a.fallbackCharIndex === 'number' && a.fallbackCharIndex >= 0
+        ? `pos:${a.fallbackCharIndex}`
+        : `${a.sceneId || a.sceneTitle || ''}:${a.lineNumber ?? ''}:${textPart}`;
+    keys.add(key);
+  });
+  return keys.size;
+}
+
 export function cleanToolOutputForPrompt(val: unknown, depth = 0): unknown {
-  if (depth > 6) return val;
+  if (depth > 8) return val;
   if (val === null || val === undefined) return undefined;
   if (typeof val === 'string') {
     const trimmed = val.trim();
@@ -327,8 +408,15 @@ export function cleanToolOutputForPrompt(val: unknown, depth = 0): unknown {
       .map(item => cleanToolOutputForPrompt(item, depth + 1))
       .filter(item => item !== undefined);
   }
+  const rawObj = val as Record<string, unknown>;
+  const hasVersionsWithProvenance =
+    Array.isArray(rawObj.versions) &&
+    rawObj.versions.some(
+      ver => ver && typeof ver === 'object' && Array.isArray((ver as Record<string, unknown>).verifiedProvenance) && ((ver as Record<string, unknown>).verifiedProvenance as unknown[]).length > 0
+    );
+
   const cleanedObj: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+  for (const [k, v] of Object.entries(rawObj)) {
     if (
       k === 'verifiedScriptHash' ||
       k === 'hasVolumeWarning' ||
@@ -339,21 +427,14 @@ export function cleanToolOutputForPrompt(val: unknown, depth = 0): unknown {
       continue;
     }
     if (k === 'verifiedProvenance' && Array.isArray(v)) {
-      const slimProvenances = v
-        .map(item => {
-          if (!item || typeof item !== 'object') return undefined;
-          const p = item as Record<string, unknown>;
-          const slim: Record<string, unknown> = {};
-          if (typeof p.sceneTitle === 'string' && p.sceneTitle.trim()) slim.sceneTitle = p.sceneTitle.trim();
-          const evText = typeof p.evidenceText === 'string' && p.evidenceText.trim()
-            ? p.evidenceText.trim()
-            : (typeof p.matchedTerm === 'string' && p.matchedTerm.trim() ? p.matchedTerm.trim() : undefined);
-          if (evText) slim.evidenceText = evText;
-          if (typeof p.versionId === 'string' && p.versionId.trim()) slim.versionId = p.versionId.trim();
-          if (typeof p.versionName === 'string' && p.versionName.trim()) slim.versionName = p.versionName.trim();
-          return Object.keys(slim).length > 0 ? slim : undefined;
-        })
-        .filter(item => item !== undefined);
+      if (hasVersionsWithProvenance) {
+        const totalCount = countDistinctVerifiedProvenanceForPrompt(rawObj);
+        if (totalCount > 0) {
+          cleanedObj.verifiedProvenanceCount = totalCount;
+        }
+        continue;
+      }
+      const slimProvenances = summarizeProvenanceListForPrompt(v);
       if (slimProvenances.length > 0) {
         cleanedObj[k] = slimProvenances;
       }
@@ -364,7 +445,198 @@ export function cleanToolOutputForPrompt(val: unknown, depth = 0): unknown {
       cleanedObj[k] = cleanedVal;
     }
   }
+  if (hasVersionsWithProvenance && cleanedObj.verifiedProvenanceCount === undefined) {
+    const totalCount = countDistinctVerifiedProvenanceForPrompt(rawObj);
+    if (totalCount > 0) {
+      cleanedObj.verifiedProvenanceCount = totalCount;
+    }
+  }
   return cleanedObj;
 }
+
+/**
+ * 为认知状态更新节点（updateStateNode）提取精简、确定性的工具真实返回值摘要，
+ * 防止状态节点盲信主循环叙事或把未命中/错读场次误判为已完成。
+ */
+export function summarizeToolOutputForStateNode(
+  toolName: string,
+  status: string,
+  output: unknown,
+  error?: string
+): string {
+  if (status === 'failed') {
+    return `失败: ${String(error || '未知错误').slice(0, 240)}`;
+  }
+  if (!output || typeof output !== 'object') {
+    return typeof output === 'string' && output.trim() ? output.trim().slice(0, 200) : '执行成功';
+  }
+  const out = output as Record<string, any>;
+
+  if (toolName === 'script.read') {
+    if (out.notFound) {
+      return `未命中: ${String(out.message || '未匹配到指定剧本集数或场次').slice(0, 260)}`;
+    }
+    if (Array.isArray(out.episodes)) {
+      const sceneItems: string[] = [];
+      for (const ep of out.episodes) {
+        for (const sc of Array.isArray(ep?.scenes) ? ep.scenes : []) {
+          const idPart = sc.id ? `${sc.id} ` : '';
+          sceneItems.push(`${idPart}"${sc.title || sc.sceneNumber || sc.index || '未知场次'}"(${sc.paragraphCount ?? 0}段)`);
+        }
+      }
+      const scCount = typeof out.sceneCount === 'number' ? out.sceneCount : sceneItems.length;
+      const paraCount = typeof out.paragraphCount === 'number' ? out.paragraphCount : 0;
+      if (scCount === 0 || paraCount === 0) {
+        return `未读取到有效正文 (sceneCount=${scCount}, paragraphCount=${paraCount})`;
+      }
+      const shown = sceneItems.slice(0, 6).join('；');
+      const more = sceneItems.length > 6 ? ` 等共${sceneItems.length}场` : '';
+      return `实际读取 ${scCount} 场共 ${paraCount} 段: [${shown}${more}]${out.hasVolumeWarning ? '（触发数据量预警）' : ''}`;
+    }
+    if (typeof out.content === 'string') {
+      const lineCount = out.content ? String(out.content).split('\n').length : 0;
+      return `实际读取第 ${out.startLine ?? out.offset ?? 1}～${out.endLine ?? '?'} 行 (共 ${lineCount} 行)`;
+    }
+  }
+
+  if (toolName === 'script.directory') {
+    const epCount = out.total ?? (Array.isArray(out.entries) ? out.entries.length : 0);
+    const totalScenes = out.totalScenes ?? '未知';
+    const totalParas = out.totalParagraphs ?? '未知';
+    const epParts = Array.isArray(out.entries)
+      ? out.entries.slice(0, 3).map((ep: any) => {
+          const scIds = Array.isArray(ep?.scenes)
+            ? ep.scenes.slice(0, 8).map((s: any) => `${s.id || s.sceneNumber || s.title}(${s.paragraphCount ?? 0}段)`).join(',')
+            : `${ep?.sceneCount ?? 0}场`;
+          return `${ep?.number || ep?.title || ep?.id}:[${scIds}]`;
+        })
+      : [];
+    return `返回 ${epCount} 集共 ${totalScenes} 场/${totalParas} 段${epParts.length > 0 ? ` (${epParts.join('；')})` : ''}`;
+  }
+
+  if (toolName === 'script.search') {
+    const total = typeof out.total === 'number' ? out.total : (Array.isArray(out.matches) ? out.matches.length : 0);
+    const scList = Array.isArray(out.scenesSummary)
+      ? out.scenesSummary
+          .slice(0, 8)
+          .map((s: any) => `${s.sceneId || s.sceneNumber || s.sceneTitle}(${s.matchCount ?? 0}处)`)
+          .join('、')
+      : '';
+    return `搜索命中 ${total} 处${scList ? `: [${scList}]` : ''}`;
+  }
+
+  if (toolName === 'asset.list') {
+    const total = typeof out.total === 'number' ? out.total : (Array.isArray(out.items) ? out.items.length : 0);
+    const names = Array.isArray(out.items)
+      ? out.items
+          .slice(0, 6)
+          .map((it: any) => {
+            const raw = it?.item || it;
+            const distinctProv = raw && typeof raw === 'object' ? countDistinctVerifiedProvenanceForPrompt(raw) : 0;
+            const provCount =
+              typeof raw?.verifiedProvenanceCount === 'number'
+                ? raw.verifiedProvenanceCount
+                : typeof raw?.verifiedCount === 'number'
+                  ? raw.verifiedCount
+                  : distinctProv > 0
+                    ? distinctProv
+                    : Array.isArray(raw?.verifiedProvenance)
+                      ? raw.verifiedProvenance.length
+                      : undefined;
+            const provStr = provCount !== undefined && provCount > 0 ? `, 出处:${provCount}条` : '';
+            const verStr =
+              Array.isArray(raw?.versions) && raw.versions.length > 0
+                ? `, versions:[${raw.versions.map((v: any) => `${v.name}:${v.id}`).join(',')}]`
+                : '';
+            return `${raw?.name || '未命名'}(id:${raw?.id || '?'}${provStr}${verStr})`;
+          })
+          .join('、')
+      : '';
+    return `查询返回 ${total} 条${names ? `: [${names}]` : ''}`;
+  }
+
+  if (toolName === 'asset.create') {
+    const items = Array.isArray(out.items) ? out.items : (out.id ? [out] : []);
+    const createdCount = out.createdCount ?? items.length;
+    const desc = items
+      .slice(0, 5)
+      .map((it: any) => {
+        const distinctProv = it && typeof it === 'object' ? countDistinctVerifiedProvenanceForPrompt(it) : 0;
+        const provCount =
+          typeof it?.verifiedProvenanceCount === 'number'
+            ? it.verifiedProvenanceCount
+            : typeof it?.verifiedCount === 'number'
+              ? it.verifiedCount
+              : distinctProv > 0
+                ? distinctProv
+                : undefined;
+        const provStr = provCount !== undefined && provCount > 0 ? `, 出处:${provCount}条` : '';
+        const verStr = Array.isArray(it?.versions) && it.versions.length > 0
+          ? `, versions:[${it.versions.map((v: any) => `${v.name}:${v.id}`).join(',')}]`
+          : '';
+        return `${it?.name || '未命名'}(id:${it?.id || '?'}${provStr}${verStr})`;
+      })
+      .join('、');
+    return `已落盘创建 ${createdCount} 项${desc ? `: [${desc}]` : ''}`;
+  }
+
+  if (toolName === 'asset.update') {
+    const item = out.item || out;
+    const verCount = Array.isArray(item?.versions) ? item.versions.length : 0;
+    const distinctProv = item && typeof item === 'object' ? countDistinctVerifiedProvenanceForPrompt(item) : 0;
+    const provCount =
+      out.provenanceBoundCount ??
+      out.verifiedCount ??
+      out.verifiedProvenanceCount ??
+      (distinctProv > 0
+        ? distinctProv
+        : Array.isArray(item?.verifiedProvenance)
+          ? item.verifiedProvenance.length
+          : undefined);
+    const extras: string[] = [];
+    if (provCount !== undefined) extras.push(`出处:${provCount}条`);
+    if (verCount > 0) {
+      const verNames = item.versions.map((v: any) => `${v.name}:${v.id}`).join(',');
+      extras.push(`版本:${verCount}个(${verNames})`);
+    }
+    return `已落盘更新 ${item?.name || '资产'}(id:${item?.id || out.id || '?'})${extras.length > 0 ? ` [${extras.join(', ')}]` : ''}`;
+  }
+
+  if (toolName === 'asset.delete') {
+    const deletedIds = Array.isArray(out.deletedIds) ? out.deletedIds.join(', ') : '';
+    return `已删除 ${out.deletedCount ?? 0} 项${deletedIds ? ` (${deletedIds})` : ''}`;
+  }
+
+  if (toolName === 'asset.commitProvenance') {
+    const scenes = Array.isArray(out.sourceScenes) ? out.sourceScenes.join('、') : '';
+    return `已提交核验出处 ${out.verifiedCount ?? 0} 条${scenes ? ` (${scenes})` : ''}`;
+  }
+
+  if (toolName === 'asset.searchProvenanceCandidates') {
+    return `检索到 ${out.totalCandidates ?? 0} 条出处候选`;
+  }
+
+  if (toolName === 'sys.selectContext') {
+    const parts = [`level=${out.level ?? ''}`];
+    if (out.transition) parts.push(`transition=${out.transition}`);
+    if (Array.isArray(out.tools) && out.tools.length > 0) parts.push(`tools=[${out.tools.join(',')}]`);
+    if (Array.isArray(out.categories) && out.categories.length > 0) parts.push(`categories=[${out.categories.join(',')}]`);
+    return parts.join(', ');
+  }
+
+  if (toolName === 'experience.search') {
+    const titles = Array.isArray(out.experiences)
+      ? out.experiences.map((e: any) => e?.title || e?.id).filter(Boolean).join('、')
+      : '';
+    return `匹配经验 ${out.matchedCount ?? 0} 条${titles ? `: [${titles}]` : ''}`;
+  }
+
+  try {
+    return JSON.stringify(cleanToolOutputForPrompt(out)).slice(0, 240);
+  } catch {
+    return '执行成功';
+  }
+}
+
 
 

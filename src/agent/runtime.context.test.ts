@@ -490,7 +490,7 @@ test('短剧多项数据自适应分步操作与数据量预警全链路测试�
         assert.equal(task.plan[0].title, '探查剧本数据');
         return {
           narration: ['搜索剧本中娜塔莉亚的相关段落'],
-          toolCalls: [{ id: 'c2', name: 'script.search', arguments: { query: '娜塔莉亚' } }],
+          toolCalls: [{ id: 'c2', name: 'script.search', arguments: { query: '娜塔莉亚', episode: '第一集' } }],
           complete: false,
         };
       }
@@ -700,3 +700,224 @@ test('工具调用或 JSON 格式错误时返回错误给模型自愈（绝不�
   assert.equal(finished.status, 'completed');
   assert.equal(finished.turn, 6);
 });
+
+test('模型在 1 级调用 sys.selectContext({ tools: ["sys.endTask"] }) 时自动切回 0 级，绝不在 1 级暴露 sys.endTask', async () => {
+  const seenLevels: number[] = [];
+  const runtime = new AgentRuntime({
+    enabledTools: () => ['script.read', 'asset.create', 'sys.endTask', 'user.ask'],
+    requestTurn: async task => {
+      seenLevels.push(task.context.level);
+      if (task.turn === 1) {
+        return {
+          narration: ['进入 1 级加载读剧本和建卡工具'],
+          toolCalls: [{ id: 'c1', name: 'sys.selectContext', arguments: { tools: ['script.read', 'asset.create'] } }],
+          complete: false,
+        };
+      }
+      if (task.turn === 2) {
+        assert.equal(task.context.level, 1);
+        return {
+          narration: ['读取剧本'],
+          toolCalls: [{ id: 'c2', name: 'script.read', arguments: { scene: '1-2' } }],
+          complete: false,
+        };
+      }
+      if (task.turn === 3) {
+        assert.equal(task.context.level, 1);
+        // 复现 19 轮 trace 第 16 轮行为：在 1 级传 tools: ['sys.endTask'] 试图调用结束工具
+        return {
+          narration: ['尝试切换出 sys.endTask 准备收尾'],
+          toolCalls: [{ id: 'c3', name: 'sys.selectContext', arguments: { tools: ['sys.endTask'] } }],
+          complete: false,
+        };
+      }
+      if (task.turn === 4) {
+        // 修复后应直接回到 0 级（全局计划与验收阶段），且 1 级 tools 已清空，第 4 轮可直接合法调用 sys.endTask
+        assert.equal(task.context.level, 0);
+        assert.deepEqual(task.context.tools, []);
+        return {
+          narration: ['已在 0 级，直接验收结案'],
+          toolCalls: [{ id: 'c4', name: 'sys.endTask', arguments: { success: true } }],
+          complete: false,
+        };
+      }
+      throw new Error(`Unexpected turn ${task.turn}`);
+    },
+    executeTool: async () => ({ episodes: [{ episodeNumber: 1, scenes: [{ sceneNumber: '1-2' }] }] }),
+  });
+
+  const task = runtime.createTask({ id: 'task_endtask_guard', sessionId: 'proj_guard', goal: '测试1级endTask防护' });
+  const finished = await runtime.wake(task.id);
+  assert.equal(finished.status, 'completed');
+  assert.equal(finished.turn, 4);
+  assert.deepEqual(seenLevels, [0, 1, 1, 0]);
+});
+
+test('1级探查同时装载 script.directory 与 script.search 但分两轮串行调用时，directory 不提前踢回 0 级，待 search 完成后合并观察一次性回 0 级重规划', async () => {
+  const seenLevels: number[] = [];
+  const runtime = new AgentRuntime({
+    enabledTools: () => ['script.directory', 'script.search', 'asset.list', 'sys.endTask'],
+    requestTurn: async task => {
+      seenLevels.push(task.context.level);
+      if (task.turn === 1) {
+        return {
+          narration: ['装载探查工具组进入 1 级'],
+          toolCalls: [
+            {
+              id: 'c1',
+              name: 'sys.selectContext',
+              arguments: { tools: ['script.directory', 'script.search', 'asset.list'] },
+            },
+          ],
+          complete: false,
+        };
+      }
+      if (task.turn === 2) {
+        assert.equal(task.context.level, 1);
+        // 先单独调用 script.directory（尽管返回 hasVolumeWarning: true，但因已装载 script.search 尚未执行，应留在 1 级）
+        return {
+          narration: ['先读取第一集目录'],
+          toolCalls: [{ id: 'c2', name: 'script.directory', arguments: { episode: 1 } }],
+          complete: false,
+        };
+      }
+      if (task.turn === 3) {
+        assert.equal(task.context.level, 1, 'script.search 尚未执行前，script.directory 不应提前踢回 0 级');
+        return {
+          narration: ['继续调用 script.search 检索目标出场分布'],
+          toolCalls: [{ id: 'c3', name: 'script.search', arguments: { query: '目标角色', episode: 1 } }],
+          complete: false,
+        };
+      }
+      if (task.turn === 4) {
+        assert.equal(task.context.level, 0, 'script.search 触发预警后应自动切回 0 级重规划');
+        const obsNames = task.observations.map(o => (o.content as any).name);
+        assert.deepEqual(obsNames, ['script.directory', 'script.search']);
+        return {
+          narration: ['已在 0 级同时拿到目录与搜索分布，直接结案'],
+          toolCalls: [{ id: 'c4', name: 'sys.endTask', arguments: { success: true } }],
+          complete: false,
+        };
+      }
+      throw new Error(`Unexpected turn ${task.turn}`);
+    },
+    executeTool: async call => {
+      if (call.name === 'script.directory') {
+        return { total: 1, totalScenes: 6, totalParagraphs: 111, hasVolumeWarning: true, entries: [] };
+      }
+      if (call.name === 'script.search') {
+        return { total: 43, hasVolumeWarning: true, scenesSummary: [{ sceneId: 'scene-5-261', matchCount: 5 }] };
+      }
+      return { ok: true };
+    },
+  });
+
+  const task = runtime.createTask({ id: 'task_serial_probe', sessionId: 'proj_probe', goal: '串行探查防双跳测试' });
+  const finished = await runtime.wake(task.id);
+  assert.equal(finished.status, 'completed');
+  assert.equal(finished.turn, 4);
+  assert.deepEqual(seenLevels, [0, 1, 1, 0]);
+});
+
+test('0级调用 experience.search 检索四步走经验：跨探查轮保留至0级动态重规划，切入1级分批精读时自动卸载', async () => {
+  const seenLevels: number[] = [];
+  const runtime = new AgentRuntime({
+    enabledTools: () => ['script.directory', 'script.search', 'script.read', 'asset.list', 'asset.create', 'asset.update', 'sys.endTask', 'experience.search'],
+    requestTurn: async task => {
+      seenLevels.push(task.context.level);
+      if (task.turn === 1) {
+        assert.equal(task.context.level, 0);
+        return {
+          narration: ['首轮检索提取角色经验并展开工具分类'],
+          toolCalls: [
+            { id: 'e1', name: 'experience.search', arguments: { query: '提取角色' } },
+            { id: 'c1', name: 'sys.selectContext', arguments: { categories: ['script', 'asset'] } },
+          ],
+          complete: false,
+        };
+      }
+      if (task.turn === 2) {
+        assert.equal(task.context.level, 0);
+        const obsNames = task.observations.map(o => (o.content as any).name);
+        assert(obsNames.includes('experience.search'), 'Turn 2 应看到 experience.search 返回的经验指南');
+        const expObs = task.observations.find(o => (o.content as any).name === 'experience.search');
+        assert.equal((expObs?.content as any)?.output?.experiences?.[0]?.id, 'script_asset_extraction');
+        return {
+          narration: ['按经验第一步装载探查三件套'],
+          toolCalls: [
+            { id: 'c2', name: 'sys.selectContext', arguments: { tools: ['script.directory', 'script.search', 'asset.list'] } },
+          ],
+          complete: false,
+        };
+      }
+      if (task.turn === 3) {
+        assert.equal(task.context.level, 1);
+        return {
+          narration: ['执行探查三件套'],
+          toolCalls: [
+            { id: 'p1', name: 'script.directory', arguments: { episode: 1 } },
+            { id: 'p2', name: 'script.search', arguments: { query: '目标角色', episode: 1 } },
+            { id: 'p3', name: 'asset.list', arguments: { type: 'characters' } },
+          ],
+          complete: false,
+        };
+      }
+      if (task.turn === 4) {
+        assert.equal(task.context.level, 0, '探查返回预警后自动回到 0 级动态重规划');
+        const obsNames = task.observations.map(o => (o.content as any).name);
+        assert.deepEqual(
+          obsNames,
+          ['experience.search', 'script.directory', 'script.search', 'asset.list'],
+          'Turn 4 动态重规划时必须同时保有 experience.search 经验与探查三件套结果'
+        );
+        return {
+          narration: ['按经验第二步完成多版本预判与大场次独立分批计划，装载读写套件进入 1 级'],
+          toolCalls: [
+            { id: 'c4', name: 'sys.selectContext', arguments: { tools: ['script.read', 'asset.create', 'asset.update'] } },
+          ],
+          complete: false,
+        };
+      }
+      if (task.turn === 5) {
+        assert.equal(task.context.level, 1);
+        const obsNames = task.observations.map(o => (o.content as any).name);
+        assert(!obsNames.includes('experience.search'), '进入 1 级分批精读后应卸载已消费完毕的 experience.search 与探查结果');
+        assert(!obsNames.includes('script.directory'));
+        return {
+          narration: ['分批精读执行完毕，返回 0 级'],
+          toolCalls: [{ id: 'c5', name: 'sys.selectContext', arguments: {} }],
+          complete: false,
+        };
+      }
+      if (task.turn === 6) {
+        assert.equal(task.context.level, 0);
+        return {
+          narration: ['验收结案'],
+          toolCalls: [{ id: 'c6', name: 'sys.endTask', arguments: { success: true } }],
+          complete: false,
+        };
+      }
+      throw new Error(`Unexpected turn ${task.turn}`);
+    },
+    executeTool: async call => {
+      if (call.name === 'script.directory') {
+        return { total: 1, totalScenes: 6, totalParagraphs: 111, hasVolumeWarning: true, entries: [] };
+      }
+      if (call.name === 'script.search') {
+        return { total: 43, hasVolumeWarning: true, scenesSummary: [{ sceneId: 'scene-5-261', matchCount: 5 }] };
+      }
+      if (call.name === 'asset.list') {
+        return { total: 0, items: [] };
+      }
+      return { ok: true };
+    },
+  });
+
+  const task = runtime.createTask({ id: 'task_exp_search', sessionId: 'proj_exp', goal: '提取目标角色' });
+  const finished = await runtime.wake(task.id);
+  assert.equal(finished.status, 'completed');
+  assert.equal(finished.turn, 6);
+  assert.deepEqual(seenLevels, [0, 0, 1, 0, 1, 0]);
+});
+
+

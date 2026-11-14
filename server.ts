@@ -5,6 +5,10 @@ import fs from "fs";
 import dotenv from "dotenv";
 import { AGENT_TOOL_REGISTRY } from './src/agent/toolRegistry';
 import { initialAgentContext, TOOL_CATEGORIES, resolveContext, CONTROL_TOOLS, cleanToolOutputForPrompt, mergeTaskNotes, type AgentContextSelection } from './src/agent/contextPolicy';
+import { applyThinkingPayload, resolveAgentTurnMaxTokens, resolveModelConfig, type ModelConfig } from './src/agent/modelConfig';
+import { splitPromptForPrefixCache, splitStateNodePromptForPrefixCache, normalizeTokenUsage, type PromptCacheUsageStats } from './src/agent/promptCache';
+import { RECOMMENDED_BATCH_MAX_CHARS } from './src/agent/scriptTools';
+import { formatExperiencePlaybookForPrompt, type ExperienceSearchResult } from './src/agent/experienceRegistry';
 import { mcpRouter } from './src/server/mcpRouter';
 import { autoCloseJsonString, robustParseJson, tryHealSharedClosingBraceInToolArgs } from './src/utils/jsonParser';
 dotenv.config();
@@ -75,7 +79,24 @@ function isObsoleteMainPrompt(text: string): boolean {
       text.includes('当前子步骤处于“已读取待写入”还是“已写入落盘完成”状态？“当前计划”中还有哪些后续步骤待推进？') ||
       text.includes('首批场次读取并调用创建工具建主卡锚定出处') ||
       text.includes('分析当前任务进展与本轮返回的数据规模、场次或集数分布') ||
-      text.includes('必须严格按该工具规则在思考中完整输出，不得缩写省略')
+      text.includes('必须严格按该工具规则在思考中完整输出，不得缩写省略') ||
+      text.includes('本轮发现了哪些跨轮次仍需引用的关键事实、实体 ID 或新线索需要沉淀到“重点笔记”？') ||
+      text.includes('本轮发现了哪些后续步骤仍需引用的关键事实、实体 ID 或未落盘线索？（整理以便更新至“重点笔记”）') ||
+      text.includes('仅保留跨轮次仍需引用的目标实体ID、已有版本/造型名称、核心设定属性及尚未落盘的关键线索') ||
+      text.includes('如‘已完成前3步，当前第4步已读取数据待落盘’') ||
+      text.includes('- 重点笔记盘点：本轮有哪些跨轮次仍需引用的关键事实') ||
+      text.includes('对照“当前计划”与“工具执行结果”核验推进（显式列出完整步骤列表') ||
+      text.includes('围绕全局目标、计划拆解与工具准备进行逻辑推演，确定本轮要调用的工具与参数') ||
+      text.includes('跨轮次持久保留的客观锚点（目标实体ID、已落盘版本/状态名称') ||
+      text.includes('# 背景\n你位于一个短剧协作平台中') ||
+      text.includes('## 当前聚焦目标\n{{cardContext}}\n## 用户输入原文') ||
+      text.includes('当前小目标：{{taskSubGoal}}\n当前进度：{{taskProgress}}\n当前计划：{{taskPlan}}') ||
+      text.includes('合并整理为最新的认知状态 JSON。\n\n【当前认知状态（上一轮旧状态）】') ||
+      text.includes('负责协助用户从剧本到生图到视频的流程') ||
+      text.includes('"notesMode": "overwrite"\n}\n\n【当前认知状态（上一轮旧状态）】') ||
+      text.includes('将宏观任务拆解为分批推进的具体子步骤；每个子步骤必须定义为') ||
+      text.includes('进入执行阶段前，必须制定步骤化的“当前计划”，驱动执行阶段连续执行：') ||
+      text.includes('执行任务通用规范——严格遵循“四步走”闭环推进（搜集足够的信息 → 制定足够清晰的计划 → 实施 → 验收）：\n1. 搜集足够的信息')
     );
   }
 
@@ -193,12 +214,12 @@ const parametersForTool = (toolId: string) => {
     'script.search': {
       properties: {
         query: { type: 'string', description: '搜索关键词（必填）' },
-        episode: { type: 'string', description: '可选，限定搜索的分集或场次（如 "第一集"、"1"、"episode-1" 或 "1-5"）' },
+        episode: { type: 'string', description: '限定搜索的分集（必填，如 "第一集"、"1"；若需跨全剧搜索请传 "all" 或 "全部"）' },
         startLine: { type: 'integer', minimum: 1, description: '可选，限定搜索的 1-based 起始行号（含）' },
         endLine: { type: 'integer', minimum: 1, description: '可选，限定搜索的 1-based 结束行号（含）' },
         limit: { type: 'integer', minimum: 1, maximum: 200, description: '可选，最多返回匹配条数（默认 50）' },
       },
-      required: ['query'],
+      required: ['query', 'episode'],
     },
     'asset.list': {
       properties: {
@@ -381,6 +402,7 @@ const parametersForTool = (toolId: string) => {
     'sys.updateState': { properties: { taskTitle: { type: 'string' }, goal: { type: 'string' }, subGoal: { type: 'string' }, progress: { type: 'string' }, notes: { type: 'string' }, notesMode: { type: 'string', enum: ['append', 'overwrite'], description: '重点笔记模式：append（追加，默认）或 overwrite（重写替换现有笔记）' }, plan: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, title: { type: 'string' }, status: { type: 'string' } } } } } },
     'sys.endTask': { properties: { success: { type: 'boolean' }, waitForUser: { type: 'string' }, paused: { type: 'boolean', description: '若任务属于等待后台异步生图/排队渲染，设置为 true 挂起任务等待出图事件唤醒' } } },
     'user.ask': { properties: { question: { type: 'string' } }, required: ['question'] },
+    'experience.search': { properties: { query: { type: 'string', description: '任务类型或关键词（如“提取角色”、“核验出处”、“生图复刻”等）' } }, required: ['query'] },
   };
   const schema = schemas[toolId] || { properties: {} };
   return { type: 'object', properties: schema.properties, ...(schema.required ? { required: schema.required } : {}) };
@@ -394,109 +416,11 @@ function trySanitizeAndParseJson(str: string): Record<string, any> | null {
   return null;
 }
 
-interface ModelConfig {
-  endpoint: string;
-  actualModel: string;
-  apiKey: string;
-  stream?: boolean;
-  enableThinking?: boolean;
-  reasoningEffort?: 'low' | 'high' | 'max';
-}
-
 function getModelConfig(modelType: string, userKey?: string): ModelConfig {
-  let endpoint = 'https://api.deepseek.com/chat/completions';
-  let actualModel = 'deepseek-flash';
-  let apiKey = userKey || process.env.GEMINI_API_KEY || process.env.DEEPSEEK_API_KEY || process.env.DASHSCOPE_API_KEY || process.env.ARK_API_KEY || process.env.VOLCENGINE_API_KEY || process.env.ZHIPU_API_KEY || process.env.SILICONFLOW_API_KEY;
-  let stream = true;
-  let enableThinking = false;
-  let reasoningEffort: 'low' | 'high' | 'max' = 'max';
-
-  if (modelType.toLowerCase().includes('gemini') || modelType === 'gemini-2.5-flash' || modelType === 'gemini-2.5-pro') {
-    endpoint = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
-    actualModel = modelType.toLowerCase().includes('pro') ? 'gemini-2.5-pro' : 'gemini-2.5-flash';
-    apiKey = userKey || process.env.GEMINI_API_KEY || process.env.DEEPSEEK_API_KEY;
-    stream = true;
-  } else if (modelType === 'deepseek-v4-pro') {
-    actualModel = 'deepseek-v4-pro';
-    enableThinking = true;
-    stream = true;
-  } else if (
-    modelType === 'deepseek-v4-flash' ||
-    modelType === 'deepseek-v4.1-flash-expires-on-0910' ||
-    modelType === 'deepseek-flash' ||
-    modelType === 'deepseek' ||
-    modelType === 'auto'
-  ) {
-    if (
-      (modelType === 'auto' || modelType === 'deepseek-v4-flash') &&
-      process.env.GEMINI_API_KEY &&
-      !process.env.DEEPSEEK_API_KEY &&
-      !userKey
-    ) {
-      endpoint = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
-      actualModel = 'gemini-2.5-flash';
-      apiKey = process.env.GEMINI_API_KEY;
-      enableThinking = false;
-      stream = true;
-    } else {
-      actualModel = 'deepseek-flash';
-      enableThinking = false;
-      stream = true;
-    }
-  } else if (modelType === 'qwen3.8-flash') {
-    endpoint = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';
-    actualModel = 'qwen3.8-flash';
-    apiKey = userKey || process.env.DASHSCOPE_API_KEY || process.env.GEMINI_API_KEY || process.env.DEEPSEEK_API_KEY;
-    stream = true;
-  } else if (
-    modelType === 'qwen3-vl-plus' ||
-    modelType === 'qwen-vl-plus' ||
-    modelType.toLowerCase().includes('qwen3-vl') ||
-    modelType.toLowerCase().includes('vl-plus')
-  ) {
-    endpoint = 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';
-    actualModel = 'qwen3-vl-plus';
-    apiKey = userKey || process.env.DASHSCOPE_API_KEY || process.env.GEMINI_API_KEY || process.env.DEEPSEEK_API_KEY;
-    stream = true;
-  } else if (
-    modelType === 'doubao-seed-2-1-pro-260915' ||
-    modelType === 'doubao-seed-2.1-pro' ||
-    modelType === 'doubao-seed-2-1-pro' ||
-    modelType.toLowerCase().includes('doubao') ||
-    modelType.toLowerCase().includes('seed-2-1') ||
-    modelType.toLowerCase().includes('seed-2.1') ||
-    modelType.toLowerCase().includes('volces') ||
-    modelType.toLowerCase().includes('ark')
-  ) {
-    endpoint = process.env.ARK_API_ENDPOINT || 'https://ark.cn-beijing.volces.com/api/v3/chat/completions';
-    actualModel = process.env.ARK_MODEL_NAME || 'doubao-seed-2-1-pro-260915';
-    apiKey = userKey || process.env.ARK_API_KEY || process.env.VOLCENGINE_API_KEY || process.env.GEMINI_API_KEY || process.env.DASHSCOPE_API_KEY || process.env.DEEPSEEK_API_KEY;
-    stream = true;
-    enableThinking = false;
-  } else if (
-    modelType.toLowerCase().includes('5.3-flash') ||
-    modelType.toLowerCase().includes('glm-5.3')
-  ) {
-    endpoint = process.env.GLM_API_ENDPOINT || 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions';
-    actualModel = process.env.GLM_MODEL_NAME || process.env.ZHIPU_MODEL_NAME || 'ZHIPU/GLM-5.3-Flash';
-    apiKey = userKey || process.env.DASHSCOPE_API_KEY || process.env.ZHIPU_API_KEY || process.env.GEMINI_API_KEY || process.env.DEEPSEEK_API_KEY;
-    stream = true;
-    enableThinking = true;
-
-    if (modelType.toLowerCase().endsWith('-low') || modelType.toLowerCase().includes('low')) {
-      reasoningEffort = 'low';
-    } else if (modelType.toLowerCase().endsWith('-high') || modelType.toLowerCase().includes('high')) {
-      reasoningEffort = 'high';
-    } else {
-      reasoningEffort = 'max';
-    }
-  }
-
-  if (!apiKey) throw new Error('未配置 API Key。请在 Settings > Secrets 面板中配置 GEMINI_API_KEY 或相关 API 密钥。');
-  return { endpoint, actualModel, apiKey, stream, enableThinking, reasoningEffort };
+  return resolveModelConfig(modelType, userKey, process.env);
 }
 
-async function parseChatCompletionResponse(response: Response, isStream: boolean): Promise<{ content: string; reasoning_content?: string }> {
+async function parseChatCompletionResponse(response: Response, isStream: boolean): Promise<{ content: string; reasoning_content?: string; usage?: PromptCacheUsageStats }> {
   const contentType = response.headers.get('content-type') || '';
   if (!contentType.includes('text/event-stream') && !isStream) {
     const data = await response.json();
@@ -504,6 +428,7 @@ async function parseChatCompletionResponse(response: Response, isStream: boolean
     return {
       content: message.content || '',
       reasoning_content: message.reasoning_content || message.reasoning || '',
+      usage: normalizeTokenUsage(data.usage),
     };
   }
 
@@ -513,7 +438,11 @@ async function parseChatCompletionResponse(response: Response, isStream: boolean
     try {
       const data = JSON.parse(text);
       const message = data.choices?.[0]?.message || {};
-      return { content: message.content || '', reasoning_content: message.reasoning_content || '' };
+      return {
+        content: message.content || '',
+        reasoning_content: message.reasoning_content || '',
+        usage: normalizeTokenUsage(data.usage),
+      };
     } catch {
       throw new Error('无法读取响应流内容');
     }
@@ -523,6 +452,7 @@ async function parseChatCompletionResponse(response: Response, isStream: boolean
   let buffer = '';
   let fullContent = '';
   let fullReasoning = '';
+  let latestUsage: PromptCacheUsageStats | undefined;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -539,6 +469,10 @@ async function parseChatCompletionResponse(response: Response, isStream: boolean
         const jsonStr = trimmed.slice(6);
         try {
           const chunk = JSON.parse(jsonStr);
+          if (chunk.usage) {
+            const parsedUsage = normalizeTokenUsage(chunk.usage);
+            if (parsedUsage) latestUsage = parsedUsage;
+          }
           const delta = chunk.choices?.[0]?.delta;
           if (delta) {
             if (delta.content) {
@@ -560,6 +494,10 @@ async function parseChatCompletionResponse(response: Response, isStream: boolean
   if (buffer.trim().startsWith('data: ') && buffer.trim() !== 'data: [DONE]') {
     try {
       const chunk = JSON.parse(buffer.trim().slice(6));
+      if (chunk.usage) {
+        const parsedUsage = normalizeTokenUsage(chunk.usage);
+        if (parsedUsage) latestUsage = parsedUsage;
+      }
       const delta = chunk.choices?.[0]?.delta;
       if (delta?.content) fullContent += delta.content;
       if (delta?.reasoning_content) fullReasoning += delta.reasoning_content;
@@ -567,7 +505,7 @@ async function parseChatCompletionResponse(response: Response, isStream: boolean
     } catch {}
   }
 
-  return { content: fullContent, reasoning_content: fullReasoning };
+  return { content: fullContent, reasoning_content: fullReasoning, usage: latestUsage };
 }
 
 // Heuristic fallback for script TOC pattern recognition
@@ -797,20 +735,11 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
       if (stream) {
         requestPayload.stream = true;
       }
-      if (enableThinking) {
-        requestPayload.enable_thinking = true;
-        requestPayload.reasoning_effort = reasoningEffort;
-        requestPayload.extra_body = {
-          enable_thinking: true,
-          reasoning_effort: reasoningEffort,
-          thinking: { type: 'enabled' },
-        };
-      } else {
-        requestPayload.thinking = { type: 'disabled' };
-        requestPayload.extra_body = {
-          thinking: { type: 'disabled' },
-        };
-      }
+      applyThinkingPayload(requestPayload, {
+        endpoint,
+        enableThinking,
+        reasoningEffort,
+      });
 
       const response = await fetch(endpoint, {
         method: "POST",
@@ -920,12 +849,13 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
       };
       const controlToolLines = isLevel1
         ? [
-            `- sys.selectContext：补充装载工具或退出局部执行返回全局计划阶段（后续步骤如需补充工具可传 {"tools": [...]} 增量合并装载；当前计划步骤全部执行完毕后，直接无参调用 {{调用 sys.selectContext}} 返回全局计划与验收阶段）。\n  参数：{ categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[], level?: 0 | 1 }`,
             formatRegistryToolLine('user.ask'),
+            `- sys.selectContext：补充装载工具或退出局部执行返回全局计划阶段（后续步骤如需补充工具可传 {"tools": [...]} 增量合并装载；当前计划步骤全部执行完毕后，直接无参调用 {{调用 sys.selectContext}} 返回全局计划与验收阶段）。\n  参数：{ categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[], level?: 0 | 1 }`,
           ].filter(Boolean)
         : [
-            `- sys.selectContext：按需展开工具分类或装载具体工具进入执行阶段：① 传 {"categories": [...]} 展开对应分类下的候选工具简表；② 结合当前计划从候选简表中成套挑选工具 ID 传 {"tools": [...]} 进入局部执行阶段（涉及分步提取须同时装配 [asset.create, asset.update]；探查期推荐同时装载 [directory, search, list]）。\n  参数：{ categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[], level?: 0 | 1 }`,
             formatRegistryToolLine('user.ask'),
+            formatRegistryToolLine('experience.search'),
+            `- sys.selectContext：按需展开工具分类或装载具体工具进入执行阶段：① 传 {"categories": [...]} 展开对应分类下的候选工具简表；② 结合当前计划从候选简表中成套挑选工具 ID 传 {"tools": [...]} 进入局部执行阶段（涉及分步提取须同时装配 [script.read, asset.create, asset.update] 读写套件；探查期推荐同时装载 [directory, search, list]）。\n  参数：{ categories?: Array<"script" | "asset" | "card" | "ui">, tools?: string[], level?: 0 | 1 }`,
             formatRegistryToolLine('sys.endTask'),
           ].filter(Boolean);
       const hasAssetCreate = enabledToolIds.has('asset.create');
@@ -933,7 +863,7 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
         .filter((tool) => enabledToolIds.has(tool.id) && !CONTROL_TOOLS.includes(tool.id))
         .map((tool) => {
           if (tool.id === 'asset.update' && hasAssetCreate) {
-            const dedupedDesc = '按资产 ID 或版本 ID 修改属性、追加新版本（versions）或补充出处（provenances）。规则：① 按场次判定造型版本并对号入座：逐场次判断该场次中资产属于“已有造型/状态”还是“新视觉造型/状态”（不同年龄阶段、不同服装造型、不同日夜或形态状态）——属于已有主造型/状态的场次出处传在顶层 provenances 中；属于新视觉造型/状态的场次，通过 versions 数组传入新版本对象（含 name、description、appearance、aliases，且该新版本的 provenances 仅绑定属于该新造型的场次；同一轮支持顶层 provenances 与 versions 同时传入，系统会自动将顶层出处归入原主造型并与新版本并列保留）；② provenances（画面出处）：判定标准为“根据段落内容，如果该资产必须出现在画面中才能呈现该段落，则判定该段落为出处”；核实出处时须在思考中从第1段至末段按连续序号逐段输出（包含判定为“是”与“否”的每一个段落），格式为“段[序号]「<一字不差完整复制该段全部原文>」→ 问题： [目标资产名]是否必须出现在画面中？→ 分析：<依据分析> → 判定：[是/否]”，将判定为“是”的序号按各自场次所属造型分别传入顶层 provenances 或对应 versions 项的 provenances 中；③ 合并语义：mode 默认 "append" 增量保留已有版本与出处（全量覆盖传 "overwrite"）；顶层文本字段（如 description、appearance）传入即替换原值，仅追加出处或版本时无需传顶层文本字段。';
+            const dedupedDesc = '按资产 ID 或版本 ID 修改属性、追加新版本（versions）或补充出处（provenances）。规则：① 按场次判定造型版本并对号入座：主卡顶层 provenances 对应资产首次建卡时的初始默认造型/状态（如默认常服、默认日夜或初始形态），当所读场次中资产仍为或回归该初始默认造型/状态时，直接向主卡 ID 顶层传 provenances 增量追加出处（或向已有对应版本的 ID 传 provenances 追加）；当所读场次中资产呈现出尚未建立的新视觉造型或状态（如新的年龄阶段、新的具体服装造型、新的日夜或形态状态）时，通过 versions 数组传入以该具体视觉特征命名的新版本对象（含 name、description、appearance、aliases，且该新版本的 provenances 仅绑定属于该新造型的场次；同一轮支持顶层 provenances 与 versions 同时传入，系统会自动将顶层出处归入原主造型并与各新版本并列保留）；② provenances（画面出处）：判定标准为“根据段落内容，如果该资产必须出现在画面中才能呈现该段落，则判定该段落为出处”；核实出处时须在思考中从第1段至末段按连续序号逐段输出（包含判定为“是”与“否”的每一个段落），格式为“段[序号]「<一字不差完整复制该段全部原文>」→ 问题： [目标资产名]是否必须出现在画面中？→ 分析：<依据分析> → 判定：[是/否]”，将判定为“是”的序号按各自场次所属造型分别传入顶层 provenances 或对应 versions 项的 provenances 中；③ 合并语义：mode 默认 "append" 增量保留已有版本与出处（全量覆盖传 "overwrite"）；顶层文本字段（如 description、appearance）传入即替换原值，仅追加出处或版本时无需传顶层文本字段。';
             const dedupedInput = '{ id: string, type?: "characters" | "locations" | "props", mode?: "append" | "overwrite", provenances?: Array<{ sceneTitle: string, paragraphIndices: number[] }>, versions?: Array<同 asset.create.versions>, name?: string, description?: string, role?: string, appearance?: string, atmosphere?: string, visualDetails?: string, materialAndState?: string, owner?: string }';
             return `- ${tool.id}：${dedupedDesc}\n  参数：${dedupedInput}`;
           }
@@ -1008,22 +938,24 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
       const userEntries = negotiationLog.filter((item: any) => item && item.role === 'user' && typeof item.content === 'string' && item.content.trim());
       const firstUserGoal = userEntries.length > 0 ? cleanUserGoalText(userEntries[0].content) : '';
       const hasMultiTurnDialogue = negotiationLog.length > 1 && userEntries.length > 1;
-      let displayUserMessage = cleanUserGoalText(userMessage) || '（无新指令）';
-      if (hasMultiTurnDialogue) {
-        const dialogueLines = negotiationLog
-          .map((entry: any, idx: number) => {
-            const cleaned = cleanUserGoalText(String(entry?.content || ''));
-            if (!cleaned) return '';
-            if (entry.role === 'agent') {
-              return `- Mira（提问）：${cleaned}`;
-            }
-            const isLatest = idx === negotiationLog.length - 1;
-            return isLatest ? `- 用户（本轮最新回复）：${cleaned}` : `- 用户：${cleaned}`;
-          })
-          .filter(Boolean)
-          .join('\n');
-        displayUserMessage = `【初始任务指令】：${firstUserGoal || displayUserMessage}\n【多轮对话与最新回复】：\n${dialogueLines}\n（请结合初始任务指令与用户的最新回复，直接继续推进任务）`;
-      }
+      const singleUserMessage = cleanUserGoalText(userMessage) || '（无新指令）';
+      const dialogueLines = hasMultiTurnDialogue
+        ? negotiationLog
+            .map((entry: any, idx: number) => {
+              const cleaned = cleanUserGoalText(String(entry?.content || ''));
+              if (!cleaned) return '';
+              if (entry.role === 'agent') {
+                return `- Mira（提问）：${cleaned}`;
+              }
+              const isLatest = idx === negotiationLog.length - 1;
+              return isLatest ? `- 用户（本轮最新回复）：${cleaned}` : `- 用户：${cleaned}`;
+            })
+            .filter(Boolean)
+            .join('\n')
+        : '';
+      const displayUserMessage = hasMultiTurnDialogue
+        ? `【初始任务指令】：${firstUserGoal || singleUserMessage}\n【多轮对话与最新回复】：\n${dialogueLines}\n（请结合初始任务指令与用户的最新回复，直接继续推进任务）`
+        : singleUserMessage;
 
       const hasNudgeObservation = Array.isArray(observations) && observations.some((obs: any) => obs?.content?.name === 'sys.nudge');
       const effectiveRequireTool = Boolean(requireTool || hasNudgeObservation);
@@ -1141,17 +1073,24 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
               pageObs.push(`【UI交互成功】动作 ${output.action} 作用于 ${output.targetId}。\n${pageText}`);
             } else if (name === 'guide.lookup') {
               toolObs.push(`【操作指南查询结果】\n查询词：${output.query || '未提供'}\n指南内容：${output.guidance}`);
+            } else if (name === 'experience.search' && output && typeof output === 'object') {
+              if (isLevel1) {
+                return;
+              }
+              toolObs.push(`【工具 experience.search 执行成功】\n${formatExperiencePlaybookForPrompt(output as ExperienceSearchResult)}`);
             } else if (name === 'script.directory' && output && typeof output === 'object') {
               const dirOut = output as any;
               const warningHeader = formatWarningHeader(dirOut);
               const { scenesSummary: _omittedDirSummary, projectId: _dpid, source: _dsrc, ...slimDirOut } = dirOut;
               toolObs.push(
-                `${warningHeader}【工具 script.directory 执行成功】（共 ${dirOut.total ?? 0} 个集数条目 | 场次总计: ${dirOut.totalScenes ?? '未知'} | 段落总计: ${dirOut.totalParagraphs ?? '未知'}）\n${serializeCleanOutput(slimDirOut)}`
+                `${warningHeader}【工具 script.directory 执行成功】（共 ${dirOut.total ?? 0} 个集数条目 | 场次总计: ${dirOut.totalScenes ?? '未知'} | 段落总计: ${dirOut.totalParagraphs ?? '未知'} | 正文字数: ${dirOut.totalChars ?? '未知'} 字 | 每轮建议上限: ${dirOut.recommendedBatchMaxChars ?? RECOMMENDED_BATCH_MAX_CHARS} 字）\n${serializeCleanOutput(slimDirOut)}`
               );
             } else if (name === 'script.read' && output && typeof output === 'object') {
               const readOut = output as any;
               const warningHeader = formatWarningHeader(readOut);
-              if (Array.isArray(readOut.episodes)) {
+              if (readOut.notFound) {
+                toolObs.push(`【执行工具 script.read 失败】\n原因：${readOut.message || '未匹配到指定剧本集数或场次'}`);
+              } else if (Array.isArray(readOut.episodes)) {
                 const {
                   content: _omittedFlatContent,
                   projectId: _pid,
@@ -1163,11 +1102,13 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
                   episodeCount: _ec,
                   sceneCount: _sc,
                   paragraphCount: _pc,
+                  charCount: _cc,
+                  recommendedBatchMaxChars: _rbc,
                   scenesSummary: _ss,
                   ...structuredReadOut
                 } = readOut;
                 toolObs.push(
-                  `${warningHeader}【工具 script.read 执行成功】（按“集数 -> 场次 -> 段落”三层结构返回 | 集数: ${readOut.episodeCount ?? readOut.episodes.length} | 场次数: ${readOut.sceneCount ?? '未知'} | 段落数: ${readOut.paragraphCount ?? '未知'} | 行范围: 第 ${readOut.startLine ?? 1}～${readOut.endLine ?? 1} 行 | nextOffset: ${readOut.nextOffset ?? 'null'}）\n${serializeCleanOutput(structuredReadOut)}`
+                  `${warningHeader}【工具 script.read 执行成功】（按“集数 -> 场次 -> 段落”三层结构返回 | 集数: ${readOut.episodeCount ?? readOut.episodes.length} | 场次数: ${readOut.sceneCount ?? '未知'} | 段落数: ${readOut.paragraphCount ?? '未知'} | 字数: ${readOut.charCount ?? '未知'} 字 | 每轮建议上限: ${readOut.recommendedBatchMaxChars ?? RECOMMENDED_BATCH_MAX_CHARS} 字 | 行范围: 第 ${readOut.startLine ?? 1}～${readOut.endLine ?? 1} 行 | nextOffset: ${readOut.nextOffset ?? 'null'}）\n${serializeCleanOutput(structuredReadOut)}`
                 );
               } else if (typeof readOut.content === 'string') {
                 const startLineNum = typeof readOut.startLine === 'number' && readOut.startLine >= 1
@@ -1176,18 +1117,24 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
                 const rawLines = String(readOut.content).split('\n');
                 const numberedText = rawLines.map((line: string, idx: number) => `[第${startLineNum + idx}行] ${line}`).join('\n');
                 const endLineNum = startLineNum + rawLines.length - 1;
-                toolObs.push(`${warningHeader}【工具 script.read 执行成功】（总行数: ${readOut.total ?? '未知'} | 当前显示: 第 ${startLineNum}～${endLineNum} 行 | nextOffset: ${readOut.nextOffset ?? 'null'}）\n${numberedText}`);
+                toolObs.push(`${warningHeader}【工具 script.read 执行成功】（总行数: ${readOut.total ?? '未知'} | 当前显示: 第 ${startLineNum}～${endLineNum} 行 | 字数: ${readOut.content.length} 字 | 每轮建议上限: ${RECOMMENDED_BATCH_MAX_CHARS} 字 | nextOffset: ${readOut.nextOffset ?? 'null'}）\n${numberedText}`);
               } else {
                 toolObs.push(`${warningHeader}【工具 script.read 执行成功】\n${serializeCleanOutput(output)}`);
               }
             } else if (name === 'script.search' && output && typeof output === 'object') {
               const searchOut = output as any;
               const warningHeader = formatWarningHeader(searchOut);
-              toolObs.push(`${warningHeader}【工具 script.search 执行成功】（匹配结果数: ${searchOut.total ?? (Array.isArray(searchOut.results) ? searchOut.results.length : 0)}）\n${serializeCleanOutput(output)}`);
+              const charMeta = typeof searchOut.totalChars === 'number'
+                ? ` | 涉及场次正文字数: ${searchOut.totalChars} 字 | 每轮建议上限: ${searchOut.recommendedBatchMaxChars ?? RECOMMENDED_BATCH_MAX_CHARS} 字`
+                : '';
+              toolObs.push(`${warningHeader}【工具 script.search 执行成功】（匹配结果数: ${searchOut.total ?? (Array.isArray(searchOut.results) ? searchOut.results.length : 0)}${charMeta}）\n${serializeCleanOutput(output)}`);
             } else if (name === 'asset.searchProvenanceCandidates' && output && typeof output === 'object') {
               const candOut = output as any;
               const warningHeader = formatWarningHeader(candOut);
-              toolObs.push(`${warningHeader}【工具 asset.searchProvenanceCandidates 执行成功】\n${serializeCleanOutput(output)}`);
+              const charMeta = typeof candOut.totalChars === 'number'
+                ? `（候选数: ${candOut.totalCandidates ?? 0} | 涉及场次正文字数: ${candOut.totalChars} 字 | 每轮建议上限: ${candOut.recommendedBatchMaxChars ?? RECOMMENDED_BATCH_MAX_CHARS} 字）`
+                : '';
+              toolObs.push(`${warningHeader}【工具 asset.searchProvenanceCandidates 执行成功】${charMeta}\n${serializeCleanOutput(output)}`);
             } else if (name === 'user.ask') {
               // 当 # 用户指令 已通过 negotiationLog 完整呈现多轮对话与最新回复时，不在 # 工具执行结果 中重复输出 user.ask
               if (hasMultiTurnDialogue) {
@@ -1285,39 +1232,45 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       const hasPageObs = Boolean(formattedObs.pageObservations && formattedObs.pageObservations.trim() && formattedObs.pageObservations.trim() !== '无');
 
       const dedupedNotes = task?.notes ? mergeTaskNotes(undefined, task.notes, 'overwrite') : '';
+      const sharedHeaderLines = [
+        `# 角色与通用准则`,
+        `你位于一个短剧协作平台中，负责协助用户完成从剧本拆解、资产建档到分镜生图与视频生成的全流程创作任务，你的名字是“Mira”。称用户为“你”，沟通口吻亲和、自然、清晰。`,
+        `1. 事实依据与后台优先底线：处理项目数据时优先使用后台工具直接读取与持久化，需要演示或核验界面时再使用 UI 工具。所有判断、写入、状态更新与结案结论，都必须严格以【工具执行结果 / 页面观察】返回与当前聚焦目标中的真实事实为依据，将工具成功返回作为生效准绳，不把预期动作提前当作已完成事实。`,
+        `2. 清晰协同与边界确认原则：当用户的任务边界、资产归属、版本划分或关键取舍存在客观歧义且无法仅凭项目数据自证时，主动通过 user.ask 简明征询用户意见后再推进；在目标与事实明确时保持连贯自主执行，避免无谓打断。`,
+        `3. 通用四段式输出协议：无论处于哪一阶段，每次回复都必须严格依次输出以下 4 个完整区块（区块名须保持原样，不得省略或改名）：`,
+        `   - 状态检查：{客观盘点当前认知状态、本轮工具返回事实与下一步准备}`,
+        `   - 思考：{使用内心独白进行严密逻辑推演与参数核对，形成确定性的行动依据}`,
+        `   - 工具调用：{严格按双花括号格式输出本轮要调用的工具指令：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）}`,
+        `   - 用户沟通：{- 对用户说的话（完整版）：“简洁说明当前进展或阶段结论；注意调用工具不等于完成任务，需等工具返回结果并核验” / - 对用户说的话（简版）：“口语化介绍当前进展或向用户提问，控制在30字以内”}`,
+      ];
+
       const defaultPlanningTemplate = [
-        `# 背景`,
-        `你位于一个短剧协作平台中，负责协助用户从剧本到生图到视频的流程，你的名字是“Mira”。`,
-        `当前你处于【全局计划与验收阶段】，你的核心职责是：理解并锚定最终目标、制定传入执行阶段的“当前计划”、按需装载工具切入执行，并在计划全部达成后核验结案。`,
+        ...sharedHeaderLines,
         ``,
-        `# 用户指令`,
-        `## 当前聚焦目标`,
-        `{{cardContext}}`,
-        `## 用户输入原文`,
-        `{{userMessage}}`,
-        ``,
-        `# 工作指南`,
-        `默认优先使用后台工具读取项目数据；需要演示或核验界面时使用 UI。基于工具返回的事实推进，严禁把未执行视为成功。`,
-        `进入执行阶段前，必须制定步骤化的“当前计划”，驱动执行阶段连续执行：`,
-        `1. 探查期安全原则（数据未知时）：在尚未掌握目标数据分布与现有状态前，先制定宏观探查计划；首次展开分类时一次性展开任务涉及的全部工具箱分类，探查期仅装载只读探查工具建立全局视野，不提前装载写入或修改工具；`,
-        `2. 动态重规划与单步读写闭环原则（获知数据分布后）：当探查结果返回了数据分布概览或触发数据量预警时，必须在“当前计划”中按工具返回的数据分布或预警建议的维度，将宏观任务拆解为分批推进的具体子步骤；每个子步骤必须定义为“读取该批数据并立即完成创建或增量更新落盘”的完整读写闭环（即使操作对象为单个目标实体，也必须按“首批读取并调用创建工具建档落盘 → 后续每批读取并调用更新工具增量追加”拆解，不规划无写入动作的纯读取步骤或留到最后一步才汇总创建）；切入执行时必须在 tools 参数中同时成套装载所需的读取、创建与更新工具 ID，随读随写完成每一批闭环；`,
-        `3. 全局核验与结案：从执行阶段返回后，对照“最终目标”与“当前计划”核验所有步骤；确认全部真实达成后，调用 sys.endTask 结束任务并向用户汇报。称用户为“你”，口吻亲和随意。`,
+        `# 当前阶段职责与工作指南`,
+        `当前你处于【全局计划与验收阶段】，你的核心职责是：理解并锚定最终目标、检索同类任务经验、制定传入执行阶段的“当前计划”、按需装载工具切入执行，并在计划全部达成后核验结案。`,
+        `执行任务通用规范——严格遵循“检索经验 + 四步走”闭环推进（搜集足够的信息 → 制定足够清晰的计划 → 实施 → 验收）：`,
+        `0. 检索同类任务经验（初次规划必做）：收到新任务尚未检索经验时，优先调用 experience.search（传入任务类型关键词，如“提取角色”、“核验出处”等；可与首次展开工具分类的 sys.selectContext({"categories": [...]}) 同轮并发调用），获取该类任务的四步走最佳实践指南；`,
+        `1. 搜集足够的信息（探查期，数据未知时）：在尚未掌握目标数据分布与现有状态前，先制定宏观探查计划；首次展开分类时一次性展开任务涉及的全部工具箱分类，探查期结合所获经验装载只读探查工具建立全局视野、搜集足够的信息，不提前装载写入或修改工具；`,
+        `2. 制定足够清晰的计划（获知数据分布后动态重规划）：当探查结果返回了数据分布概览或触发数据量预警时，必须对照 experience.search 返回的计划制定标准与探查结果，在“当前计划”中将宏观任务拆解为边界明确、分批推进的具体子步骤（结合各场次/集数字数 charCount 规划合批，每轮合批总字数控制在工具建议上限 recommendedBatchMaxChars 内，重头戏大场次独立成批；若涉及多版本/造型演进，先从目录人物表与检索命中切片中梳理完整造型版本清单，并将每一批需创建或追加的具体版本动作显式写进计划步骤标题）；每个子步骤必须定义为“读取该批数据并立即完成创建或增量更新落盘”的完整读写闭环（即使操作对象为单个目标实体，也必须按“首批读取并调用创建工具建档落盘 → 后续每批读取并调用更新工具增量追加”拆解，不规划无写入动作的纯读取步骤或留到最后一步才汇总创建）；`,
+        `3. 实施（成套装载工具切入执行）：计划明确后，在 tools 参数中同时成套装载所需的读取、创建与更新工具 ID 切入执行阶段，按计划步骤随读随写完成每一批闭环；`,
+        `4. 验收（全局核验与结案）：从执行阶段返回后，对照“最终目标”与“当前计划”逐项验收所有步骤；确认全部真实达成后，调用 sys.endTask 结束任务并向用户汇报。`,
         ``,
         `# 输出格式`,
         `状态检查：`,
-        `{回顾并检查上面的“认知状态”与本轮“工具执行结果 / 页面观察”。`,
+        `{回顾并检查下面的“认知状态”与本轮“工具执行结果 / 页面观察”。`,
         `- 最终目标是什么？（若认知状态中为“暂无”，结合当前聚焦目标与用户输入归纳）`,
-        `- 本轮执行结果与事实盘点：上一步工具返回了哪些具体结果？是否获知了数据分布概览或触发了数据量预警？`,
+        `- 本轮执行结果与事实盘点：上一步工具返回了哪些具体结果？是否已获取同类任务经验（experience.search）？是否获知了数据分布概览或触发了数据量预警？`,
         `- 原计划完成度核对：对照现有“当前计划”，哪些步骤已真实达成（[x]），哪些尚待推进（[ ]）？最终目标是否已全部达成？`,
-        `- 重点笔记盘点：本轮发现了哪些跨轮次仍需引用的关键事实、实体 ID 或新线索需要沉淀到“重点笔记”？}`,
+        `- 工具箱分类与工具准备：若尚未检索经验，本轮需调用 experience.search；为执行接下来的计划，需要先展开哪些工具箱分类（categories，首次展开时可与 experience.search 同轮并发调用，一次性展开任务涉及的全部工具箱分类），或成套装载哪些具体读写工具（tools）进入执行阶段？}`,
         `思考：`,
-        `{使用内心独白的方式，基于“状态检查”盘点的事实进行逻辑推演与规划决策：`,
-        `- 1. 拆解策略推演：分析当前任务进展与本轮返回的数据规模及分布结构，思考接下来的推进策略（若获知数据分布或触发数据量预警，先分析如何按工具返回的分布或预警提示维度拆分为合理的“首批读取+创建、后续每批读取+增量更新”读写批次）；`,
+        `{使用内心独白的方式，围绕全局目标、计划拆解与工具准备进行逻辑推演：`,
+        `- 1. 拆解策略推演：分析当前任务进展、已获取的同类任务经验（experience.search）与本轮返回的数据规模及分布结构，思考接下来的推进策略（若处于初次规划尚未检索经验，决定同轮并发调用 experience.search 与 sys.selectContext 展开分类；若已获知探查数据分布或触发数据量预警，严格对照同类任务经验中的“制定足够清晰的计划”标准，先从探查数据中梳理关键状态/版本清单，再拆分为合理的“首批读取+创建、后续每批读取+增量更新”读写批次）；`,
         `- 2. 制定或更新“当前计划”（显式列出完整步骤列表，标记 [x] 已完成、[ ] 待推进）：`,
-        `  * 初次规划（数据未知时）：列出宏观阶段计划（如：[ ] 1. 探查项目数据现状；[ ] 2. 按探查分布执行目标操作；[ ] 3. 全局核验）；`,
-        `  * 动态重规划（获知数据分布或触发数据量预警时）：基于上述推演，将旧宏观步骤直接替换为按批次拆解的“首批读取+创建、后续每批读取+增量更新”闭环子步骤列表；`,
-        `  * 常规推进：输出更新状态后的当前计划各步骤列表；`,
-        `- 3. 下一步小目标与工具准备：若所有步骤均已真实达成，决定调用 sys.endTask 结案；若未完成，明确下一步要推进的具体步骤与“当前小目标”，并确定本轮需调用 sys.selectContext 展开哪些分类（categories）或在 tools 参数中成套装载哪些具体读写工具 ID 切入执行阶段。}`,
+        `  * 初次规划（数据未知时）：按“四步走”列出宏观阶段计划（如：[ ] 1. 搜集足够的信息（探查项目数据现状）；[ ] 2. 制定足够清晰的计划并分批实施目标操作；[ ] 3. 全局验收结案）；`,
+        `  * 动态重规划（获知数据分布或触发数据量预警时）：直接将旧宏观步骤替换为按经验标准与数据分布拆解的“首批读取+创建、后续每批读取+增量更新”闭环子步骤列表（在步骤标题中写明唯一场次 ID 与本批需创建/追加的具体版本动作）；`,
+        `  * 常规推进：列出当前计划各步骤完成状态（[x] / [ ]）；`,
+        `- 3. 下一步小目标与重点笔记盘点：若所有步骤均已真实达成，决定调用 sys.endTask 结案；若未完成，明确下一步要推进的具体步骤与“当前小目标”，确定本轮调用的工具与参数，并盘点本轮有哪些跨轮次仍需引用的关键事实、实体 ID、预判的造型版本清单或待办线索，以及你对任务的新理解、总结了什么经验，或对接下来的推进有什么直观感受与自我提醒。}`,
         `工具调用：`,
         `{严格按双花括号格式输出本轮要调用的工具指令：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）}`,
         `用户沟通：`,
@@ -1329,42 +1282,40 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         `# 可用工具`,
         `{{toolPrompt}}`,
         ``,
+        `# 用户指令`,
+        `## 初始任务指令`,
+        `{{userMessage}}`,
+        `## 当前聚焦目标`,
+        `{{cardContext}}`,
+        ``,
         `# 认知状态`,
         `任务标题：{{taskTitle}}`,
         `最终目标：{{taskGoal}}`,
-        `当前小目标：{{taskSubGoal}}`,
-        `当前进度：{{taskProgress}}`,
         `当前计划：{{taskPlan}}`,
         `重点笔记：{{taskNotes}}`,
+        `当前小目标：{{taskSubGoal}}`,
+        `当前进度：{{taskProgress}}`,
       ].join('\n');
 
       const defaultExecutionTemplate = [
-        `# 背景`,
-        `你位于一个短剧协作平台中，负责协助用户从剧本到生图到视频的流程，你的名字是“Mira”。`,
+        ...sharedHeaderLines,
+        ``,
+        `# 当前阶段职责与工作指南`,
         `当前你处于【局部执行阶段】，你的核心职责是：依据全局规划阶段制定的“当前计划”，按步骤连续调用工具推进执行，直到计划中的所有步骤全部完成。`,
-        ``,
-        `# 用户指令`,
-        `## 当前聚焦目标`,
-        `{{cardContext}}`,
-        `## 用户输入原文`,
-        `{{userMessage}}`,
-        ``,
-        `# 工作指南`,
-        `基于工具返回的真实结果推进，严禁把未执行视为成功。`,
         `1. 事实依据与分步读写闭环：`,
         `   - 所有写入、修改或生成操作必须基于已读取的真实项目数据或已观察到的页面事实；`,
         `   - 多批次任务中，每个子步骤均按“先调用读取工具获取该单元明细 → 下一轮立即基于【工具执行结果】中的原始明细核验并调用创建或增量更新工具落盘”的两步闭环推进；仅当该单元落盘完成后该子步骤才算完成（[x]）并推进下一未完成步骤（[ ]），不跨多轮连续只读囤积数据后再集中汇总写入；`,
         `2. 工具契约与确定性真值：`,
         `   - 严格遵循已装载工具的参数格式与规则要求；写入或修改类工具返回成功即代表状态已落盘生效，无需额外调用查询工具重复回查；`,
-        `3. 连续流转与交互口吻：`,
-        `   - 所需工具已在【当前可直接调用】中，直接连续调用推进；仅在需补充工具或所有计划步骤全部完成时调用 sys.selectContext。称用户为“你”，口吻亲和随意。`,
+        `3. 连续流转与退出时机：`,
+        `   - 所需工具已在【当前可直接调用】中，直接连续调用推进；仅在需补充工具或所有计划步骤全部完成时调用 sys.selectContext。`,
         ``,
         `# 输出格式`,
         `状态检查：`,
         `{回顾并检查上面的“认知状态”与本轮“工具执行结果 / 页面观察”。`,
         `- 对照“当前计划”，当前正在执行哪一步骤（以及对应的“当前小目标”）？`,
         `- 本轮工具返回了哪些具体结果？当前子步骤处于“已读取待写入落盘”还是“已写入落盘完成”状态？`,
-        `- 本轮发现了哪些后续步骤仍需引用的关键事实、实体 ID 或未落盘线索？（整理以便更新至“重点笔记”）}`,
+        `- 重点笔记盘点：本轮有哪些后续步骤仍需引用的关键事实、实体 ID 或未落盘线索？结合本轮执行，你对任务有哪些新的理解、总结了什么当轮经验，或对后续步骤有什么主观感受与自我提醒？}`,
         `思考：`,
         `{使用内心独白的方式，结合当前【工具执行结果】中的原始明细数据、【认知状态 -> 当前计划】与已装载工具的参数说明进行逻辑推演：`,
         `- 1. 逐项核验与参数推演：若当前处于“已读取待写入落盘”状态，必须立即基于刚读出的原始明细调用创建或更新工具完成本批落盘（若本轮拟调用的工具在规则中规定了逐项核验格式，必须严格按该工具规则在思考中从首段至末段逐段完整输出）；`,
@@ -1380,13 +1331,19 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         `# 可用工具`,
         `{{toolPrompt}}`,
         ``,
+        `# 用户指令`,
+        `## 初始任务指令`,
+        `{{userMessage}}`,
+        `## 当前聚焦目标`,
+        `{{cardContext}}`,
+        ``,
         `# 认知状态`,
         `任务标题：{{taskTitle}}`,
         `最终目标：{{taskGoal}}`,
-        `当前小目标：{{taskSubGoal}}`,
-        `当前进度：{{taskProgress}}`,
         `当前计划：{{taskPlan}}`,
         `重点笔记：{{taskNotes}}`,
+        `当前小目标：{{taskSubGoal}}`,
+        `当前进度：{{taskProgress}}`,
       ].join('\n');
 
       const rawCandidateTemplate = isLevel1
@@ -1402,12 +1359,19 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         : (isLevel1 ? defaultExecutionTemplate : defaultPlanningTemplate);
 
       const hasCardContextPlaceholder = activeTemplate.includes('{{cardContext}}');
+      const userMsgIndex = activeTemplate.indexOf('{{userMessage}}');
+      const cardCtxIndex = activeTemplate.indexOf('{{cardContext}}');
+      const userMsgBeforeCardCtx = hasCardContextPlaceholder && userMsgIndex !== -1 && cardCtxIndex !== -1 && userMsgIndex < cardCtxIndex;
+      const effectiveCardBlock = cardContextInjection || '无';
+      const cardContextReplacement = (hasMultiTurnDialogue && userMsgBeforeCardCtx && dialogueLines)
+        ? `${effectiveCardBlock}\n## 多轮对话与最新回复\n${dialogueLines}\n（请结合初始任务指令与用户的最新回复，直接继续推进任务）`
+        : effectiveCardBlock;
       const userMessageReplacement = hasCardContextPlaceholder
-        ? displayUserMessage
-        : `## 当前聚焦目标\n${cardContextInjection || '无'}\n## 用户输入原文\n${displayUserMessage}`;
+        ? ((hasMultiTurnDialogue && userMsgBeforeCardCtx) ? (firstUserGoal || singleUserMessage) : displayUserMessage)
+        : `## 初始任务指令\n${(hasMultiTurnDialogue ? (firstUserGoal || singleUserMessage) : displayUserMessage)}\n## 当前聚焦目标\n${cardContextReplacement}`;
 
       let finalPrompt = activeTemplate
-        .replaceAll('{{cardContext}}', () => cardContextInjection || '无')
+        .replaceAll('{{cardContext}}', () => cardContextReplacement)
         .replaceAll('{{userMessage}}', () => userMessageReplacement)
         .replaceAll('{{toolPrompt}}', () => assembledToolPrompt)
         .replaceAll('{{taskTitle}}', () => task?.title || '尚未命名')
@@ -1444,10 +1408,13 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         ...(effectiveCardContext?.imageUrl ? [effectiveCardContext.imageUrl] : []),
       ].filter((img, idx, arr) => typeof img === 'string' && img.length > 0 && arr.indexOf(img) === idx);
 
-      let userContent: any = finalPrompt;
+      const { systemPrompt: cachedSystemPrefix, userPrompt: dynamicUserPrompt } = splitPromptForPrefixCache(finalPrompt);
+      const effectiveUserText = cachedSystemPrefix ? dynamicUserPrompt : finalPrompt;
+
+      let userContent: any = effectiveUserText;
       if (allImages.length > 0) {
         userContent = [
-          { type: 'text', text: finalPrompt },
+          { type: 'text', text: effectiveUserText },
           ...allImages.map((img: string) => ({
             type: 'image_url',
             image_url: {
@@ -1458,34 +1425,31 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         ];
       }
 
-      const messages = [
-        { role: 'user', content: userContent },
-      ];
+      const messages: Array<{ role: string; content: any }> = cachedSystemPrefix
+        ? [
+            { role: 'system', content: cachedSystemPrefix },
+            { role: 'user', content: userContent },
+          ]
+        : [
+            { role: 'user', content: userContent },
+          ];
+
       const requestPayload: Record<string, unknown> = {
         model: actualModel,
         messages,
-        max_tokens: 8192,
+        max_tokens: resolveAgentTurnMaxTokens({ endpoint, enableThinking, reasoningEffort }),
       };
 
       if (stream) {
         requestPayload.stream = true;
+        requestPayload.stream_options = { include_usage: true };
       }
-      if (enableThinking) {
-        requestPayload.thinking = { type: 'enabled' };
-        requestPayload.enable_thinking = true;
-        requestPayload.reasoning_effort = reasoningEffort;
-        requestPayload.extra_body = {
-          enable_thinking: true,
-          reasoning_effort: reasoningEffort,
-          thinking: { type: 'enabled' },
-        };
-      } else {
-        requestPayload.temperature = 0.2;
-        requestPayload.thinking = { type: 'disabled' };
-        requestPayload.extra_body = {
-          thinking: { type: 'disabled' },
-        };
-      }
+      applyThinkingPayload(requestPayload, {
+        endpoint,
+        enableThinking,
+        reasoningEffort,
+        includeTemperatureWhenDisabled: 0.2,
+      });
 
       let response = await fetch(endpoint, {
         method: 'POST',
@@ -1493,10 +1457,28 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         body: JSON.stringify(requestPayload),
       });
 
+      // Fallback if an upstream OpenAI-compatible provider rejects stream_options
+      if (!response.ok && response.status === 400 && requestPayload.stream_options) {
+        const errBody = await response.clone().text().catch(() => '');
+        if (/stream_options|include_usage/i.test(errBody)) {
+          delete requestPayload.stream_options;
+          response = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${keyToUse}` },
+            body: JSON.stringify(requestPayload),
+          });
+        }
+      }
+
       // If multimodal payload was rejected (e.g. text-only model or provider error), transparently retry with text-only payload
       if (!response.ok && Array.isArray(userContent)) {
         console.warn(`Vision payload rejected (${response.status}), retrying with text-only payload`);
-        requestPayload.messages = [{ role: 'user', content: finalPrompt }];
+        requestPayload.messages = cachedSystemPrefix
+          ? [
+              { role: 'system', content: cachedSystemPrefix },
+              { role: 'user', content: effectiveUserText },
+            ]
+          : [{ role: 'user', content: finalPrompt }];
         response = await fetch(endpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${keyToUse}` },
@@ -1664,6 +1646,9 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         }
         if (norm === 'userask' || norm === 'ask') {
           return 'user.ask';
+        }
+        if (norm === 'experiencesearch' || norm === 'searchexperience') {
+          return 'experience.search';
         }
         for (const toolId of allKnownToolIds) {
           const toolNorm = toolId.toLowerCase().replaceAll('_', '').replaceAll('.', '');
@@ -1984,6 +1969,12 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
           if (argsObj.success === undefined) {
             argsObj.success = true;
           }
+        } else if (normalizedName === 'experience.search') {
+          if (isLevel1) {
+            schemaError = '【阶段权限拦截】experience.search 仅限在全局计划与验收阶段（0 级）调用。';
+          } else if (typeof argsObj.query !== 'string') {
+            argsObj.query = String(argsObj.query ?? '');
+          }
         } else if (normalizedName === 'asset.create') {
           if (Array.isArray(argsObj.items)) {
             if (argsObj.items.length === 0) {
@@ -2006,8 +1997,11 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
             schemaError = '【参数校验错误】asset.delete 缺少必需参数：请传入目标资产 "id"（单个）或 "ids"（批量删除数组）。';
           }
         } else if (normalizedName === 'script.search') {
+          const rawEpisode = argsObj.episode ?? argsObj.episodeId;
           if (!argsObj.query || typeof argsObj.query !== 'string' || !argsObj.query.trim()) {
             schemaError = '【参数校验错误】script.search 缺少必需参数 "query"（检索关键词）。';
+          } else if (rawEpisode === undefined || rawEpisode === null || String(rawEpisode).trim() === '') {
+            schemaError = '【参数校验错误】script.search 缺少必需参数 "episode"（目标集数，如 "第一集" 或 1；若需搜索全剧请显式传 "all" 或 "全部"）。';
           }
         } else if (normalizedName === 'card.inspect') {
           if (!argsObj.cardId || typeof argsObj.cardId !== 'string' || !argsObj.cardId.trim()) {
@@ -2087,6 +2081,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
           response: {
             content: message.content ?? null,
             toolCalls: toolCalls,
+            ...(message.usage ? { usage: message.usage } : {}),
           },
         },
       });
@@ -2100,41 +2095,47 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
   app.post('/api/agent/update-state-node', async (req, res) => {
     try {
       const { currentTask, cardContext: topLevelCardContext, userMessage, lastTurnOutput, apiKey, model, statePrompt: customStatePrompt } = req.body || {};
-      const { endpoint, actualModel, apiKey: keyToUse } = getModelConfig(model || 'deepseek-v4-flash', apiKey);
+      const requestedStateModel = typeof model === 'string' && model.trim() ? model.trim() : 'deepseek-v4-flash';
+      const fastStateModel = requestedStateModel.toLowerCase().includes('deepseek-v4-pro')
+        ? 'deepseek-v4-flash'
+        : requestedStateModel;
+      const { endpoint, actualModel, apiKey: keyToUse } = getModelConfig(fastStateModel, apiKey);
 
       const defaultDeltaMergeStatePrompt = `你是一个认知状态增量合并与整理节点。
-你的职责是：对照【当前认知状态（上一轮旧状态）】，读取【本轮最新输入与主循环输出】，将主循环在“状态检查”和“思考”中产出的本轮增量变化，合并整理为最新的认知状态 JSON。
-
-【当前认知状态（上一轮旧状态）】
-- 任务标题: {{taskTitle}}
-- 最终目标: {{taskGoal}}
-- 当前小目标: {{taskSubGoal}}
-- 当前进度: {{taskProgress}}
-- 当前计划: {{taskPlan}}
-- 重点笔记: {{taskNotes}}
-
-【本轮最新输入与主循环输出】
-- 阶段状态与下一轮去向: {{currentStage}}
-- 当前聚焦目标实时状态:
-{{cardContext}}
-- 用户指令/回复: {{userMessage}}
-- Agent 主循环输出:
-{{lastTurnOutput}}
+你的职责是：对照【任务背景与聚焦目标】与【当前认知状态（上一轮旧状态）】，读取【本轮最新流向与主循环输出】，将主循环在“状态检查”和“思考”中产出的本轮增量变化，合并整理为最新的认知状态 JSON。
 
 【输出格式（严格输出合法 JSON）】
 请按以下字段顺序逐步核对并输出 JSON：
 {
-  "stateCheck": "一句话核对本轮增量：对照【本轮执行的工具动作】与【当前聚焦目标实时状态】，上一步小目标及关联的面板/数据更新是否已解决？本轮主循环在状态检查与思考中提出了哪些进度/计划调整？发现了哪些需要并入重点笔记的新线索？",
+  "stateCheck": "一句话核对本轮增量：严格以【本轮执行的工具动作】返回的真实数据及【当前聚焦目标实时状态】为准（不盲信主循环叙事或未执行的预期）：核对工具实际命中的场次ID/标题/段落数或创建更新结果是否与上一步小目标及预期目标一致？若工具失败、未命中正文或读取了非目标场次，必须如实指明；同时汇总主循环提出的计划调整、新线索、任务新理解、当轮经验或主观感受",
   "taskTitle": "8字以内的任务简短标题（已有明确标题时保持不变）",
   "goal": "根据主循环在状态检查与思考中总结归纳出的最终目标（若处于多轮对话补充阶段，保留并融合已有最终目标）",
-  "subGoal": "下一轮要推进的当前小目标（仅当【阶段状态与下一轮去向】明确显示本轮已实际执行 sys.selectContext 返回【全局计划与验收阶段】时，才更新为‘全局核验上一阶段执行结果并推进下一步或结案’；若下一轮仍处于【局部执行阶段】，必须保持为当前局部执行的具体小目标，严禁因主循环文字中预告‘完成后将返回全局阶段’而提前改为全局核验）",
-  "progress": "一句话简述当前所处步骤与状态（如‘已完成前3步，当前第4步已读取数据待落盘’，严禁逐条罗列已完成步骤的段落序号或剧情明细，避免与当前计划重复）",
+  "subGoal": "下一轮要推进的当前小目标（依据【阶段状态与下一轮去向】判定：当下一轮处于【局部执行阶段】时，填写当前待推进的具体子步骤小目标；当本轮已实际执行 sys.selectContext 且下一轮去向为【全局计划与验收阶段】时，填写‘全局核验上一阶段执行结果并推进下一步或结案’）",
+  "progress": "严格以【本轮执行的工具动作】的真实返回事实为准，用一句话概括整体步骤完成进度与当前所处步骤的真实状态（若工具未命中目标数据、报错或读取错场次，必须明确记录未完成/偏差事实）",
   "plan": [
-    {"id": "1", "title": "计划步骤标题：若主循环提出了动态重规划，必须完整采纳并替换为细化后的子步骤列表；对于包含‘读取+创建/更新’的读写闭环步骤，仅当该步骤对应的写入/更新工具已实际调用落盘后才标为 completed，若本轮仅完成了前置读取尚未执行写入/更新则保持为 pending", "status": "completed | pending"}
+    {"id": "1", "title": "计划步骤标题：若主循环提出了动态重规划，必须完整采纳并替换为细化后的子步骤列表；对于包含‘读取+创建/更新’的读写闭环步骤，仅当该步骤对应的写入/更新工具已实际调用落盘（或目标场次经实际读取正文核验确无新增内容）后才标为 completed，若仅完成前置读取、读取失败或读错场次则保持为 pending", "status": "completed | pending"}
   ],
-  "notes": "合并整理后的重点笔记（仅保留跨轮次仍需引用的目标实体ID、已有版本/造型名称、核心设定属性及尚未落盘的关键线索，即使本轮是阶段切换轮也予以保留；严禁重复抄写最终目标、已完成步骤的历史段落序号明细、面板数量统计、已装载工具列表或系统执行原则，控制在5条以内）",
+  "notes": "合并整理后的重点笔记（控制在6条以内，即使本轮是阶段切换轮也予以保留），包含两类核心内容：① 跨轮次持久保留的客观锚点（以工具实际返回为准：完整保留目标资产与各版本的原始ID字符串、已读取确认的真实场次ID与标题、已落盘版本/状态名称、核心设定属性及尚未落盘的待办线索）；② 随轮次动态迭代的认知与体感（对任务脉络的新理解、本轮总结的数据规律或操作经验、Agent对当前进展的主观感受与下一步直觉提醒）",
   "notesMode": "overwrite"
-}`;
+}
+
+【任务背景与聚焦目标】
+- 用户指令/回复: {{userMessage}}
+- 当前聚焦目标实时状态:
+{{cardContext}}
+
+【当前认知状态（上一轮旧状态）】
+- 任务标题: {{taskTitle}}
+- 最终目标: {{taskGoal}}
+- 当前计划: {{taskPlan}}
+- 重点笔记: {{taskNotes}}
+- 当前小目标: {{taskSubGoal}}
+- 当前进度: {{taskProgress}}
+
+【本轮最新流向与主循环输出】
+- 阶段状态与下一轮去向: {{currentStage}}
+- Agent 主循环输出:
+{{lastTurnOutput}}`;
 
       let statePromptTemplate = (typeof customStatePrompt === 'string' && customStatePrompt.trim().length > 0 && !isObsoleteMainPrompt(customStatePrompt))
         ? customStatePrompt
@@ -2144,8 +2145,11 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         !statePromptTemplate.trim() ||
         isObsoleteMainPrompt(statePromptTemplate) ||
         !statePromptTemplate.includes('根据主循环在状态检查与思考中总结归纳出的最终目标') ||
-        !statePromptTemplate.includes('即使本轮是阶段切换轮') ||
+        !statePromptTemplate.includes('随轮次动态迭代的认知与体感') ||
+        !statePromptTemplate.includes('完整保留目标资产与各版本的原始ID字符串') ||
+        !statePromptTemplate.includes('严格以【本轮执行的工具动作】的真实返回事实为准') ||
         !statePromptTemplate.includes('阶段状态与下一轮去向') ||
+        !statePromptTemplate.includes('【任务背景与聚焦目标】') ||
         !statePromptTemplate.includes('{{cardContext}}') ||
         statePromptTemplate.includes('必须在 notes 中原样保留')
       ) {
@@ -2180,10 +2184,13 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         const toolsSummary = executedToolList.length > 0
           ? executedToolList
               .map((t: any) => {
-                const summarySnippet = typeof t.summary === 'string' && t.summary.trim()
-                  ? ` [${t.summary.trim().slice(0, 120)}]`
+                const rawSummary = (typeof t.outputSummary === 'string' && t.outputSummary.trim())
+                  ? t.outputSummary.trim()
+                  : (typeof t.summary === 'string' && t.summary.trim() ? t.summary.trim() : '');
+                const summarySnippet = rawSummary
+                  ? ` [${rawSummary.slice(0, 400)}]`
                   : '';
-                return `${t.name}(${JSON.stringify(t.input || {})}) -> ${t.status}${summarySnippet}${t.error ? `: ${t.error}` : ''}`;
+                return `${t.name}(${JSON.stringify(t.input || {})}) -> ${t.status}${summarySnippet}${t.error ? `: ${String(t.error).slice(0, 300)}` : ''}`;
               })
               .join('；')
           : '无';
@@ -2222,15 +2229,24 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         .replace('{{userMessage}}', userMessage || '（无新指令）')
         .replace('{{lastTurnOutput}}', formattedLastTurnOutput);
 
-      const requestPayload = {
+      const { systemPrompt: stateSystemPrompt, userPrompt: stateUserPrompt } = splitStateNodePromptForPrefixCache(prompt);
+      const formattedStateDebugPrompt = `=== [SYSTEM] ===\n${stateSystemPrompt}\n\n=== [USER] ===\n${stateUserPrompt}`;
+
+      const isDeepSeekStateEndpoint = endpoint.includes('deepseek.com');
+      const requestPayload: Record<string, unknown> = {
         model: actualModel,
         response_format: { type: 'json_object' },
-        max_tokens: 4096,
+        temperature: 0.1,
+        max_tokens: 2048,
         thinking: { type: 'disabled' },
-        extra_body: { thinking: { type: 'disabled' } },
+        ...(isDeepSeekStateEndpoint ? { reasoning_effort: 'none' } : {}),
+        extra_body: {
+          thinking: { type: 'disabled' },
+          ...(isDeepSeekStateEndpoint ? { reasoning_effort: 'none' } : {}),
+        },
         messages: [
-          { role: 'system', content: '你是一个严格输出 JSON 的认知状态增量合并与整理节点。' },
-          { role: 'user', content: prompt }
+          { role: 'system', content: stateSystemPrompt },
+          { role: 'user', content: stateUserPrompt }
         ]
       };
 
@@ -2255,7 +2271,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
           progress: speakText ? '已完成本轮回答与分析' : (currentTask?.progress || '步骤运行中'),
           notes: speakText ? mergeTaskNotes(currentTask?.notes, speakText.slice(0, 100), 'append') : undefined,
           notesMode: 'overwrite',
-          debugPrompt: prompt,
+          debugPrompt: formattedStateDebugPrompt,
           fallbackNotice: `接口响应异常 (${response.status})，已启用启发式保底提炼机制`,
           apiError: errText,
         });
@@ -2289,7 +2305,8 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         plan: Array.isArray(parsed.plan) ? parsed.plan : undefined,
         notes: consolidatedNotes,
         notesMode: 'overwrite',
-        debugPrompt: prompt,
+        debugPrompt: formattedStateDebugPrompt,
+        ...(data.usage ? { usage: data.usage } : {}),
       });
     } catch (err: any) {
       console.error('Update state node error:', err);

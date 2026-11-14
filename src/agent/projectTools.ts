@@ -1,4 +1,11 @@
-import { readScriptDirectory, readScriptStructured, searchScript, searchScriptWithScope } from './scriptTools';
+import {
+  readScriptDirectory,
+  readScriptStructured,
+  searchScript,
+  searchScriptWithScope,
+  RECOMMENDED_BATCH_MAX_CHARS,
+  buildBatchCharLimitAdvice,
+} from './scriptTools';
 import {
   searchProvenanceCandidates,
   computeScriptSignature,
@@ -14,6 +21,7 @@ import {
   getDefaultAssetVersionName,
   isSameInitialVersionLook,
 } from '../utils/assetVersions';
+import { searchExperiences } from './experienceRegistry';
 
 export type ProjectData = {
   id: string;
@@ -102,10 +110,47 @@ function findAssetInProject(
       }
     }
   }
+
+  // Fallback for abbreviated version IDs (e.g. "charv_2", "locv_1", "propv_1") or version names passed in `id`
+  if (targetId) {
+    for (const cat of categories) {
+      const list = Array.isArray(project[cat]) ? project[cat] : [];
+      for (let idx = list.length - 1; idx >= 0; idx--) {
+        const item = list[idx];
+        if (!item || !Array.isArray(item.versions)) continue;
+        for (let vIdx = 0; vIdx < item.versions.length; vIdx++) {
+          const ver = item.versions[vIdx];
+          if (!ver) continue;
+          const verIdStr = typeof ver.id === 'string' ? ver.id.trim() : '';
+          const verNameStr = typeof ver.name === 'string' ? ver.name.trim() : '';
+          if (
+            (verIdStr && verIdStr.endsWith(`_${targetId}`)) ||
+            (verNameStr && verNameStr === targetId)
+          ) {
+            return {
+              type: cat,
+              index: idx,
+              item: ver,
+              versionIndex: vIdx,
+              parentItem: item,
+            };
+          }
+        }
+      }
+    }
+  }
+
   return null;
 }
 
-export function executeProjectReadTool(name: string, args: Record<string, unknown>, project: ProjectData): Record<string, any> {
+export function executeProjectReadTool(name: string, args: Record<string, unknown>, project?: ProjectData): Record<string, any> {
+  if (name === 'experience.search') {
+    const query = typeof args.query === 'string' ? args.query : String(args.query ?? '');
+    return searchExperiences(query);
+  }
+  if (!project) {
+    throw new Error('当前没有打开的项目。');
+  }
   if (name === 'script.directory') {
     const rawEpisode = args.episode ?? args.episodeId ?? args.episodes;
     const all = readScriptDirectory(project.scriptText, {
@@ -137,15 +182,46 @@ export function executeProjectReadTool(name: string, args: Record<string, unknow
           (ep.scenes ? ep.scenes.reduce((pAcc, sc) => pAcc + (sc.paragraphCount ?? 0), 0) : 0)),
       0
     );
-    const allScenesList = all.flatMap(ep => (Array.isArray(ep.scenes) ? ep.scenes : []));
-    const scenesSummary = allScenesList.map(
-      s => `${s.title || s.sceneNumber || s.id} (${s.paragraphCount ?? 0}段)`
+    const totalChars = all.reduce(
+      (acc, ep) =>
+        acc +
+        (ep.charCount ??
+          (ep.scenes ? ep.scenes.reduce((cAcc, sc) => cAcc + (sc.charCount ?? 0), 0) : 0)),
+      0
     );
+    const allScenesList = all.flatMap(ep => (Array.isArray(ep.scenes) ? ep.scenes : []));
+    const sceneNumberCounts = new Map<string, number>();
+    for (const sc of allScenesList) {
+      const sn = typeof sc.sceneNumber === 'string' ? sc.sceneNumber.trim() : '';
+      if (sn) sceneNumberCounts.set(sn, (sceneNumberCounts.get(sn) || 0) + 1);
+    }
+    const duplicateSceneNumbers = Array.from(sceneNumberCounts.entries())
+      .filter(([, count]) => count >= 2)
+      .map(([sn]) => sn);
+    const duplicateSet = new Set(duplicateSceneNumbers);
 
-    const hasVolumeWarning = totalScenes >= 3 || totalParagraphs >= 20;
-    const notice = hasVolumeWarning
-      ? `我发现当前剧集目录包含 ${totalScenes} 个场次共 ${totalParagraphs} 个段落，内容较多。本次已将全部目录信息返回在下方，当前处于 Stage 0 阶段，建议按照场次或者集数拆分为多轮计划处理。`
-      : undefined;
+    const scenesSummary = allScenesList.map(s => {
+      const sn = typeof s.sceneNumber === 'string' ? s.sceneNumber.trim() : '';
+      const idTag = sn && duplicateSet.has(sn) ? ` [id: ${s.id}]` : '';
+      return `${s.title || s.sceneNumber || s.id}${idTag} (${s.paragraphCount ?? 0}段/${s.charCount ?? 0}字)`;
+    });
+
+    const duplicateNotice = (() => {
+      if (duplicateSceneNumbers.length === 0) return '';
+      const sampleSn = duplicateSceneNumbers[0];
+      const sampleScenes = allScenesList.filter(s => (s.sceneNumber || '').trim() === sampleSn);
+      const idExamples = sampleScenes.slice(0, 2).map(s => `"${s.id}"（${s.title}）`).join(' / ');
+      return `注：目录存在重名场次编号（${duplicateSceneNumbers.join('、')}），调用 script.read 精准读取单个子场次时请传唯一 id（如 ${idExamples}）或带地点/内外景的标识（如 "${sampleSn}内" / "${sampleSn}外"），勿只传未区分的 "${sampleSn}"。`;
+    })();
+
+    const hasVolumeWarning =
+      totalScenes >= 3 ||
+      totalParagraphs >= 20 ||
+      totalChars > RECOMMENDED_BATCH_MAX_CHARS;
+    const baseNotice = hasVolumeWarning
+      ? `我发现当前剧集目录包含 ${totalScenes} 个场次共 ${totalParagraphs} 个段落（正文约 ${totalChars} 字），内容较多。本次已将全部目录信息返回在下方，当前处于 Stage 0 阶段，${buildBatchCharLimitAdvice(RECOMMENDED_BATCH_MAX_CHARS)}`
+      : '';
+    const notice = [baseNotice, duplicateNotice].filter(Boolean).join(' ') || undefined;
 
     return {
       projectId: project.id,
@@ -156,7 +232,10 @@ export function executeProjectReadTool(name: string, args: Record<string, unknow
       nextOffset: offset + limit < all.length ? offset + limit : null,
       totalScenes,
       totalParagraphs,
+      totalChars,
+      recommendedBatchMaxChars: RECOMMENDED_BATCH_MAX_CHARS,
       scenesSummary,
+      ...(duplicateSceneNumbers.length > 0 ? { duplicateSceneNumbers } : {}),
       hasVolumeWarning,
       ...(notice ? { notice, warning: notice } : {}),
     };
@@ -189,6 +268,39 @@ export function executeProjectReadTool(name: string, args: Record<string, unknow
       precomputedScenes: Array.isArray(project.scenes) ? project.scenes : undefined,
     });
 
+    if ((structured as any).notFound) {
+      throw new Error((structured as any).message || '未找到匹配的剧本集数或场次。');
+    }
+
+    const ambiguousFilters = (structured as any).ambiguousSceneFilters as
+      | Array<{
+          filter: string;
+          matchedScenes: Array<{ id: string; sceneNumber?: string; title: string; paragraphCount: number; charCount: number }>;
+        }>
+      | undefined;
+    const hasParagraphOrLineSlice =
+      rawParagraph !== undefined || startParagraph !== undefined || endParagraph !== undefined || startLine !== undefined || endLine !== undefined;
+    if (
+      Array.isArray(ambiguousFilters) &&
+      ambiguousFilters.length > 0 &&
+      !hasParagraphOrLineSlice &&
+      structured.charCount > RECOMMENDED_BATCH_MAX_CHARS
+    ) {
+      const detailText = ambiguousFilters
+        .map(af => {
+          const choices = af.matchedScenes
+            .map(s => `"${s.title}" [id: "${s.id}", ${s.paragraphCount}段/${s.charCount}字]`)
+            .join('、');
+          return `场次条件 "${af.filter}" 同时命中了 ${af.matchedScenes.length} 个同名子场次（${choices}）`;
+        })
+        .join('；');
+      const sampleFilter = ambiguousFilters[0]?.filter || '该场次号';
+      const suggestedId = ambiguousFilters[0]?.matchedScenes[0]?.id || 'scene-...';
+      throw new Error(
+        `读取超限：${detailText}，导致本次合批正文达 ${structured.charCount} 字，已超过每轮建议上限 ${RECOMMENDED_BATCH_MAX_CHARS} 字。请改用唯一场次 id（如 "${suggestedId}"）或带地点/内外景区分的标识（如 "${sampleFilter}内" / "${sampleFilter}外"）拆批读取。`
+      );
+    }
+
     return {
       projectId: project.id,
       source: 'project',
@@ -198,10 +310,13 @@ export function executeProjectReadTool(name: string, args: Record<string, unknow
   if (name === 'script.search') {
     if (typeof args.query !== 'string' || !args.query.trim()) throw new Error('搜索关键词不能为空。');
     const rawEpisode = args.episode ?? args.episodeId;
+    if (rawEpisode === undefined || rawEpisode === null || String(rawEpisode).trim() === '') {
+      throw new Error('缺少必填参数 episode（请传入目标集数如 "第一集" 或 1；若需跨全剧搜索请传 "all" 或 "全部"）。');
+    }
     const episode =
       typeof rawEpisode === 'string' || typeof rawEpisode === 'number'
         ? rawEpisode
-        : undefined;
+        : String(rawEpisode);
     const scene = typeof args.scene === 'string' ? args.scene : undefined;
     const rawStartLine = args.startLine ?? (Array.isArray(args.lineRange) ? args.lineRange[0] : undefined);
     const rawEndLine = args.endLine ?? (Array.isArray(args.lineRange) ? args.lineRange[1] : undefined);
@@ -224,6 +339,8 @@ export function executeProjectReadTool(name: string, args: Record<string, unknow
       source: 'project',
       ...(searchRes.scope ? { scope: searchRes.scope } : {}),
       total: searchRes.totalMatches,
+      ...(typeof searchRes.totalChars === 'number' ? { totalChars: searchRes.totalChars } : {}),
+      recommendedBatchMaxChars: searchRes.recommendedBatchMaxChars ?? RECOMMENDED_BATCH_MAX_CHARS,
       hasVolumeWarning: Boolean(searchRes.hasVolumeWarning),
       ...(searchRes.warning ? { warning: searchRes.warning } : {}),
       ...(searchRes.scenesSummary ? { scenesSummary: searchRes.scenesSummary } : {}),
@@ -322,21 +439,63 @@ export function executeProjectReadTool(name: string, args: Record<string, unknow
       });
     }
 
-    const sceneCandidateMap = new Map<string, { sceneTitle: string; candidateCount: number; candidateIndices: number[] }>();
+    const dirEntries = readScriptDirectory(project.scriptText || '', {
+      scenePattern: project.tocConfig?.scenePattern,
+      flags: project.tocConfig?.flags,
+      precomputedScenes: Array.isArray(project.scenes) ? project.scenes : undefined,
+    });
+    const sceneCharLookup = new Map<string, number>();
+    const normTitleKey = (s: string) => s.replace(/\s+/g, ' ').trim();
+    for (const ep of dirEntries) {
+      if (typeof ep.charCount === 'number' && ep.title) {
+        const epKey = normTitleKey(ep.title);
+        if (!sceneCharLookup.has(epKey)) sceneCharLookup.set(epKey, ep.charCount);
+      }
+      if (Array.isArray(ep.scenes)) {
+        for (const sc of ep.scenes) {
+          if (typeof sc.charCount !== 'number') continue;
+          if (ep.title && sc.title) {
+            sceneCharLookup.set(normTitleKey(`${ep.title} ${sc.title}`), sc.charCount);
+          }
+          if (sc.title) {
+            const scKey = normTitleKey(sc.title);
+            if (!sceneCharLookup.has(scKey)) sceneCharLookup.set(scKey, sc.charCount);
+          }
+        }
+      }
+    }
+
+    const sceneCandidateMap = new Map<string, { sceneTitle: string; charCount: number; candidateCount: number; candidateIndices: number[]; matchedEvidenceChars: number }>();
     candidates.forEach((c, idx) => {
       const sTitle = c.sceneTitle || '未知场次';
       const existing = sceneCandidateMap.get(sTitle);
+      const evidenceLen = typeof c.evidenceText === 'string' ? c.evidenceText.length : 0;
       if (!existing) {
-        sceneCandidateMap.set(sTitle, { sceneTitle: sTitle, candidateCount: 1, candidateIndices: [idx + 1] });
+        const resolvedChars = sceneCharLookup.get(normTitleKey(sTitle));
+        sceneCandidateMap.set(sTitle, {
+          sceneTitle: sTitle,
+          charCount: typeof resolvedChars === 'number' ? resolvedChars : evidenceLen,
+          candidateCount: 1,
+          candidateIndices: [idx + 1],
+          matchedEvidenceChars: evidenceLen,
+        });
       } else {
         existing.candidateCount += 1;
         existing.candidateIndices.push(idx + 1);
+        existing.matchedEvidenceChars += evidenceLen;
+        if (sceneCharLookup.get(normTitleKey(sTitle)) === undefined) {
+          existing.charCount = existing.matchedEvidenceChars;
+        }
       }
     });
-    const candidateScenesSummary = Array.from(sceneCandidateMap.values());
-    const hasVolumeWarning = candidates.length > 15 || (candidateScenesSummary.length >= 2 && candidates.length >= 12);
+    const candidateScenesSummary = Array.from(sceneCandidateMap.values()).map(({ matchedEvidenceChars: _m, ...rest }) => rest);
+    const totalChars = candidateScenesSummary.reduce((acc, s) => acc + s.charCount, 0);
+    const hasVolumeWarning =
+      candidates.length > 15 ||
+      (candidateScenesSummary.length >= 2 && candidates.length >= 12) ||
+      totalChars > RECOMMENDED_BATCH_MAX_CHARS;
     const notice = hasVolumeWarning
-      ? `我发现候选出处共 ${candidates.length} 条，跨越 ${candidateScenesSummary.length} 个场次，内容较多。本次已将全部候选出处返回在下方，当前处于 Stage 0 阶段，建议按照场次或者集数拆分为多轮计划处理。`
+      ? `我发现候选出处共 ${candidates.length} 条，跨越 ${candidateScenesSummary.length} 个场次（涉及场次正文约 ${totalChars} 字），内容较多。本次已将全部候选出处返回在下方，当前处于 Stage 0 阶段，${buildBatchCharLimitAdvice(RECOMMENDED_BATCH_MAX_CHARS)}`
       : undefined;
 
     return {
@@ -361,9 +520,11 @@ export function executeProjectReadTool(name: string, args: Record<string, unknow
       } : undefined,
       searchedTerms,
       totalCandidates: candidates.length,
+      totalChars,
+      recommendedBatchMaxChars: RECOMMENDED_BATCH_MAX_CHARS,
       hasVolumeWarning,
       ...(notice ? { notice, warning: notice } : {}),
-      ...(hasVolumeWarning ? { scenesSummary: candidateScenesSummary } : {}),
+      ...(candidateScenesSummary.length > 0 ? { scenesSummary: candidateScenesSummary } : {}),
       candidates: candidates.map((c, idx) => ({
         index: idx + 1,
         candidateId: c.candidateId,
@@ -676,18 +837,39 @@ export function executeProjectAssetMutation(
       // Attach direct provenances if provided on the top-level item
       attachDirectProvenancesToItem(builtObj, item, currentScriptText, currentScriptHash, itemName);
 
-      // If only 1 variant version was provided while top-level item has its own distinct provenances, prepend the default version
+      // If variant version(s) were provided while top-level item has its own distinct provenances, prepend the default version
       if (
         normalizedVersions &&
-        normalizedVersions.length === 1 &&
-        normalizedVersions[0].id !== builtObj.id &&
-        normalizedVersions[0].name !== builtObj.name &&
+        normalizedVersions.length >= 1 &&
         Array.isArray(builtObj.verifiedProvenance) &&
         builtObj.verifiedProvenance.length > 0
       ) {
         const defaultVerName = getDefaultAssetVersionName(type, builtObj);
-        const defaultVer = itemToVersion(type, builtObj, defaultVerName);
-        builtObj.versions = [defaultVer, ...normalizedVersions];
+        const alreadyHasDefault = normalizedVersions.some(
+          v => v.id === builtObj.id || v.name === builtObj.name || v.name === defaultVerName
+        );
+        if (!alreadyHasDefault) {
+          const verPosSet = new Set(
+            normalizedVersions
+              .flatMap((v: any) => (Array.isArray(v?.verifiedProvenance) ? v.verifiedProvenance : []))
+              .map(a =>
+                typeof a?.fallbackCharIndex === 'number' && a.fallbackCharIndex >= 0
+                  ? `pos:${a.fallbackCharIndex}`
+                  : `${a?.sceneTitle || ''}:${a?.lineNumber || ''}:${a?.evidenceText || ''}`
+              )
+          );
+          const hasDistinctParentProvs = builtObj.verifiedProvenance.some((a: any) => {
+            const key =
+              typeof a?.fallbackCharIndex === 'number' && a.fallbackCharIndex >= 0
+                ? `pos:${a.fallbackCharIndex}`
+                : `${a?.sceneTitle || ''}:${a?.lineNumber || ''}:${a?.evidenceText || ''}`;
+            return !verPosSet.has(key);
+          });
+          if (hasDistinctParentProvs) {
+            const defaultVer = itemToVersion(type, builtObj, defaultVerName);
+            builtObj.versions = [defaultVer, ...normalizedVersions];
+          }
+        }
       }
 
       // If child versions have verified provenance, sync sourceScenes onto parent
@@ -741,14 +923,15 @@ export function executeProjectAssetMutation(
     const foundType = found.type;
     const currentList = [...(project[foundType] || [])];
 
-    // Updating a second-level version item directly
-    if (found.parentItem && typeof found.versionIndex === 'number') {
+    // Updating a second-level version item directly (when not appending sibling `versions` onto the parent)
+    if (found.parentItem && typeof found.versionIndex === 'number' && !Array.isArray(updates.versions)) {
       const parentItem = currentList[found.index];
       const versions = Array.isArray(parentItem.versions) ? [...parentItem.versions] : [];
+      const canonicalVersionId = String(versions[found.versionIndex]?.id || id);
       const updatedVersion: Record<string, any> = {
         ...versions[found.versionIndex],
         ...updates,
-        id,
+        id: canonicalVersionId,
       };
       delete updatedVersion.provenances;
       delete updatedVersion.evidenceSnippets;
@@ -772,11 +955,16 @@ export function executeProjectAssetMutation(
       const mergedParentScenes = Array.from(
         new Set([...(Array.isArray(parentItem.sourceScenes) ? parentItem.sourceScenes : []), ...verScenes])
       );
-      const updatedParent = {
+      const updatedParent: Record<string, any> = {
         ...parentItem,
         ...(mergedParentScenes.length > 0 ? { sourceScenes: mergedParentScenes } : {}),
         versions,
       };
+      if (found.versionIndex === 0 && updatedParent.id === canonicalVersionId && Array.isArray(updatedVersion.verifiedProvenance)) {
+        updatedParent.verifiedProvenance = updatedVersion.verifiedProvenance;
+        updatedParent.provenanceStatus = 'verified';
+        updatedParent.verifiedScriptHash = currentScriptHash;
+      }
       currentList[found.index] = updatedParent;
       const verifiedCount = countTotalVerifiedProvenance(updatedParent);
 
@@ -787,16 +975,17 @@ export function executeProjectAssetMutation(
         output: {
           success: true,
           type: foundType,
-          id,
+          id: canonicalVersionId,
           parentId: parentItem.id,
           verifiedCount,
           item: updatedVersion,
-          message: `成功更新资产【${parentItem.name}】的版本 [${updatedVersion.name || id}]（当前累计确认 ${verifiedCount} 处真实出场）。`,
+          message: `成功更新资产【${parentItem.name}】的版本 [${updatedVersion.name || canonicalVersionId}]（当前累计确认 ${verifiedCount} 处真实出场）。`,
         },
       };
     }
 
     const originalItem = currentList[found.index];
+    const canonicalParentId = String(originalItem?.id || id);
     if (Array.isArray(updates.versions)) {
       const rawVers = updates.versions as unknown[];
       let existingVersions = Array.isArray(originalItem.versions) ? [...originalItem.versions] : [];
@@ -804,19 +993,29 @@ export function executeProjectAssetMutation(
       if (
         args.mode !== 'overwrite' &&
         existingVersions.length === 0 &&
-        rawVers.length === 1
+        rawVers.length >= 1
       ) {
-        const firstRaw = rawVers[0] as Record<string, any> | undefined;
-        const firstRawId = typeof firstRaw?.id === 'string' ? firstRaw.id.trim() : '';
-        const firstRawName = String(firstRaw?.name || firstRaw?.versionName || firstRaw?.timeOfDay || '').trim();
-        if (firstRawName && firstRawId !== originalItem.id && firstRawName !== originalItem.name) {
+        const hasExplicitDefault = rawVers.some(rv => {
+          const r = rv as Record<string, any> | undefined;
+          const rId = typeof r?.id === 'string' ? r.id.trim() : '';
+          const rName = String(r?.name || r?.versionName || r?.timeOfDay || '').trim();
+          return Boolean(
+            (rId && rId === originalItem.id) ||
+            (rName && (rName === originalItem.name || rName === defaultVersionName))
+          );
+        });
+        const hasAnyNamedVariant = rawVers.some(rv => {
+          const r = rv as Record<string, any> | undefined;
+          return Boolean(String(r?.name || r?.versionName || r?.timeOfDay || '').trim());
+        });
+        if (hasAnyNamedVariant && !hasExplicitDefault) {
           existingVersions = [itemToVersion(foundType, originalItem, defaultVersionName)];
         }
       }
 
       const normVers = normalizeAssetVersions(
         foundType,
-        id,
+        canonicalParentId,
         rawVers,
         args.mode === 'overwrite' ? undefined : existingVersions
       );
@@ -842,6 +1041,7 @@ export function executeProjectAssetMutation(
           let vMatchIdx = mergedVersions.findIndex(
             ev => (newVer.id && ev.id === newVer.id) || (newVer.name && ev.name === newVer.name)
           );
+          let matchedByInitialLook = false;
           if (
             vMatchIdx < 0 &&
             mergedVersions.length > 0 &&
@@ -850,6 +1050,7 @@ export function executeProjectAssetMutation(
             isSameInitialVersionLook(mergedVersions[0], newVer, originalItem)
           ) {
             vMatchIdx = 0;
+            matchedByInitialLook = true;
           }
           if (vMatchIdx >= 0) {
             const existingV = mergedVersions[vMatchIdx] as any;
@@ -858,6 +1059,7 @@ export function executeProjectAssetMutation(
               ...existingV,
               ...targetNewVer,
               id: existingV.id,
+              ...(matchedByInitialLook ? { name: existingV.name } : {}),
             };
             if (Array.isArray(existingV.provenances) && !Array.isArray(targetNewVer.provenances)) {
               mergedV.provenances = existingV.provenances;
@@ -912,7 +1114,7 @@ export function executeProjectAssetMutation(
     const updatedItem: Record<string, any> = {
       ...originalItem,
       ...updates,
-      id,
+      id: canonicalParentId,
     };
     delete updatedItem.provenances;
     delete updatedItem.evidenceSnippets;
