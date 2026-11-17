@@ -35,7 +35,7 @@ export const AGENT_EXPERIENCE_PLAYBOOKS: AgentExperiencePlaybook[] = [
         '  1. 首批建主卡克制原则：调用 asset.create 时，顶层 appearance 仅客观记录当前已精读场次中明确写出的初始体貌与状态（未写具体服饰时保持基础特征描述，不提前透支未读场次的服装）；若首批已读场次包含另一年龄/造型，同步在 versions 数组中传入；\n' +
         '  2. 后续批次严格兑现新版本建档：每批调用 script.read 精读全文后，严格按工具规则逐段摘录中文原文核验出处；若该场次原文出现了前序批次未建立的新服装穿搭、标志性配饰、年龄阶段、场景日夜或道具形态变化，调用 asset.update 时必须通过 versions 数组传入新版本对象并将该场 provenances 绑定在新版本下。',
       verify:
-        'asset.create 与 asset.update 落盘返回即为最终真值；所有批次均完成落盘后调用 sys.selectContext 返回全局计划阶段，核对累计出处条数、覆盖场次及各造型版本均已落盘后，直接调用 sys.endTask 结案汇报（无需额外装载 asset.list 重复回查）。',
+        '所有批次均完成落盘后，通过 asset.list 回查核对已创建的资产数量、各造型版本（versions）及累计出处条数是否完整无误，确认全部真实达成后调用 sys.endTask 结案汇报。',
     },
   },
   {
@@ -54,7 +54,7 @@ export const AGENT_EXPERIENCE_PLAYBOOKS: AgentExperiencePlaybook[] = [
       execute:
         '成套装载 ["script.read", "asset.commitProvenance", "asset.update"]，按批次精读场次全文，在思考区严格按工具规定的逐段中文原文核验模板判定是否必须入画，随读随写完成每一批出处落盘。',
       verify:
-        '全部批次落盘后返回全局计划阶段，核对各场次有效出处段落与造型版本归属均已准确同步，直接调用 sys.endTask 结案。',
+        '全部批次落盘后，通过 asset.list 回查核对各场次有效出处段落与造型版本归属均已准确同步，确认无误后调用 sys.endTask 结案。',
     },
   },
   {
@@ -89,11 +89,30 @@ export const AGENT_EXPERIENCE_PLAYBOOKS: AgentExperiencePlaybook[] = [
       gatherInfo:
         '确认当前聚焦卡片已包含有效图片；若需操作其他卡片，先通过 card.query 获取目标卡片 ID。',
       makePlan:
-        '规划标注步骤（[ ] 1. 装载并调用 card.annotateLandmarks 传入待定位的目标语义标签列表完成视觉定位落盘；[ ] 2. 核验返回的归一化坐标点位并结案）。',
+        '规划标注执行步骤（[ ] 1. 装载并调用 card.detectLandmarks 传入待定位的目标语义标签列表完成视觉定位落盘；注意：仅列业务执行步骤，不把“验收结案”列为计划步骤）。',
       execute:
-        '展开 ["card"] 并装载 card.annotateLandmarks，传入清晰的 labels 数组执行视觉定位，工具返回即自动持久化至卡片。',
+        '展开 ["card"] 并装载 card.detectLandmarks，传入清晰的 requirement / updates 参数执行视觉空间定位，工具返回即自动持久化至卡片。',
       verify:
-        '核对返回的 landmarks 坐标与标签完整无误后，返回全局计划阶段调用 sys.endTask 结案。',
+        '核对返回的 elements 坐标与标签完整无误后，返回全局计划阶段调用 sys.endTask 结案。',
+    },
+  },
+  {
+    id: 'asset_image_visual_verification',
+    title: '资产绑定图像与外貌设定描述相符性核验经验',
+    taskTypes: ['核验图片', '图片与描述是否一致', '检查资产图', '视觉核验', '图像描述相符核验'],
+    keywords: [
+      '图片', '图像', '相符', '一致', '符合', '描述', '外貌', '设定', '服饰', '装束', '检查图片', '看图',
+    ],
+    summary: '适用于查看资产（或二级造型版本）已绑定的图片卡片，逐项比对画面呈现的年龄、面部、发型、服装、配饰与文字设定是否相符。',
+    steps: {
+      gatherInfo:
+        '确认当前聚焦目标（资产主卡或版本）中已包含绑定图像对应的卡片 ID（如 card:xxx）与设定描述；若尚未展开卡片工具，展开 ["card"] 分类。',
+      makePlan:
+        '制定纯核验执行计划（如：[ ] 1. 调用 card.inspect 查看目标卡片图像并逐项比对画面特征与资产文字描述是否一致；注意：计划中仅列需在执行阶段完成的查看与比对步骤，不将“结案汇报”写进计划步骤）。',
+      execute:
+        '装载 ["card.inspect"] 切入执行阶段，调用 card.inspect({"cardId": "...", "includeImage": true}) 获取多模态画面；在下一轮思考中逐项核对画面细节与设定描述并将结论记入重点笔记，将该核验步骤标为 [x] 后立即无参调用 sys.selectContext 返回全局计划阶段。',
+      verify:
+        '返回全局计划与验收阶段后，基于已核实的视觉比对结论调用 sys.endTask，在【用户沟通】中向用户输出清晰完整的相符性核验报告。',
     },
   },
 ];
@@ -133,10 +152,7 @@ export function searchExperiences(query?: string): ExperienceSearchResult {
     .filter(item => item.score > 0)
     .sort((a, b) => b.score - a.score);
 
-  const matched =
-    scored.length > 0
-      ? scored.map(item => item.playbook)
-      : [AGENT_EXPERIENCE_PLAYBOOKS[0]];
+  const matched = scored.map(item => item.playbook);
 
   return {
     query: String(query || '').trim(),

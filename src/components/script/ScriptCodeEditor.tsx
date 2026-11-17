@@ -3,6 +3,10 @@ import { EditorState, StateEffect, StateField, Range, Compartment } from '@codem
 import { EditorView, Decoration, DecorationSet, WidgetType, placeholder as cmPlaceholder, keymap } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 import { ScriptAnnotation } from '../../types/script';
+import {
+  resolveCodeMirrorTargetTopFromBlock,
+  type ScriptScrollAnchor,
+} from '../../utils/scrollMemory';
 
 export interface ScriptSelectionChange {
   text: string;
@@ -24,6 +28,8 @@ export interface ScriptCodeEditorRef {
   ) => void;
   scrollToTop: (top: number) => void;
   getScrollTop: () => number;
+  getScrollAnchor: () => ScriptScrollAnchor | null;
+  resolveScrollTopForAnchor: (anchor: ScriptScrollAnchor) => number;
   focus: () => void;
   getSelection: () => { start: number; end: number };
   setSelection: (start: number, end: number) => void;
@@ -40,6 +46,7 @@ export interface ScriptCodeEditorProps {
   onSelectionChange?: (selection: ScriptSelectionChange | null) => void;
   onCursorMove?: (offset: number) => void;
   onScroll?: (scrollTop: number) => void;
+  onEditorReady?: (view: EditorView) => void;
   onEscape?: () => void;
   onAnnotationClick?: (annotation: ScriptAnnotation) => void;
   className?: string;
@@ -181,6 +188,7 @@ export const ScriptCodeEditor = forwardRef<ScriptCodeEditorRef, ScriptCodeEditor
       onSelectionChange,
       onCursorMove,
       onScroll,
+      onEditorReady,
       onEscape,
       onAnnotationClick,
       className = '',
@@ -201,6 +209,8 @@ export const ScriptCodeEditor = forwardRef<ScriptCodeEditorRef, ScriptCodeEditor
     onCursorMoveRef.current = onCursorMove;
     const onScrollRef = useRef(onScroll);
     onScrollRef.current = onScroll;
+    const onEditorReadyRef = useRef(onEditorReady);
+    onEditorReadyRef.current = onEditorReady;
     const onEscapeRef = useRef(onEscape);
     onEscapeRef.current = onEscape;
     const onAnnotationClickRef = useRef(onAnnotationClick);
@@ -242,6 +252,40 @@ export const ScriptCodeEditor = forwardRef<ScriptCodeEditorRef, ScriptCodeEditor
         },
         getScrollTop: () => {
           return viewRef.current ? viewRef.current.scrollDOM.scrollTop : 0;
+        },
+        getScrollAnchor: () => {
+          const view = viewRef.current;
+          if (!view) return null;
+          const scrollTop = Math.max(0, view.scrollDOM.scrollTop);
+          if (scrollTop <= 0) {
+            return { top: 0, anchorPos: 0, offsetFromBlockTop: 0, lineHeight: 0 };
+          }
+          const topPadding = view.documentPadding?.top || 16;
+          const queryY = Math.max(0, scrollTop + 12 - topPadding);
+          const block = view.lineBlockAtHeight(queryY);
+          return {
+            top: scrollTop,
+            anchorPos: Math.max(0, Math.min(block.from, view.state.doc.length)),
+            offsetFromBlockTop: scrollTop - block.top,
+            lineHeight: block.height,
+          };
+        },
+        resolveScrollTopForAnchor: (anchor) => {
+          const view = viewRef.current;
+          if (!view || typeof anchor.anchorPos !== 'number' || !Number.isFinite(anchor.anchorPos)) {
+            return Math.max(0, anchor.top || 0);
+          }
+          const clampedPos = Math.max(0, Math.min(Math.floor(anchor.anchorPos), view.state.doc.length));
+          const block = view.lineBlockAt(clampedPos);
+          const topPadding = view.documentPadding?.top || 16;
+          return resolveCodeMirrorTargetTopFromBlock({
+            blockTop: block.top,
+            blockHeight: block.height,
+            offsetFromBlockTop: anchor.offsetFromBlockTop,
+            savedLineHeight: anchor.lineHeight,
+            fallbackTop: anchor.top,
+            topPadding,
+          });
         },
         focus: () => {
           viewRef.current?.focus();
@@ -287,6 +331,7 @@ export const ScriptCodeEditor = forwardRef<ScriptCodeEditorRef, ScriptCodeEditor
           padding: '16px 17px 16px 22px',
           overflowY: 'auto',
           overflowX: 'hidden',
+          overflowAnchor: 'none',
           lineHeight: '1.625',
         },
         '.cm-content': {
@@ -510,6 +555,7 @@ export const ScriptCodeEditor = forwardRef<ScriptCodeEditorRef, ScriptCodeEditor
       view.scrollDOM.addEventListener('scroll', handleScroll, { passive: true });
 
       viewRef.current = view;
+      onEditorReadyRef.current?.(view);
 
       return () => {
         view.scrollDOM.removeEventListener('scroll', handleScroll);

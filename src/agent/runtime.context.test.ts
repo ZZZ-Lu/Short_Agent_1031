@@ -920,4 +920,86 @@ test('0级调用 experience.search 检索四步走经验：跨探查轮保留至
   assert.deepEqual(seenLevels, [0, 0, 1, 0, 1, 0]);
 });
 
+test('answer 事件同时保留 speak（简版）与 text（完整版），避免鼠标气泡被完整版覆盖', async () => {
+  const runtime = new AgentRuntime({
+    enabledTools: () => ['sys.endTask'],
+    requestTurn: async () => ({
+      narration: ['结案汇报'],
+      speak: '已完成第一集娜塔莉亚角色与3个造型版本的提取！',
+      response: '已完成第一集角色‘娜塔莉亚’的提取与建档：主卡 char_123（初始默认造型）及 8岁时期、职业装黑框眼镜造型共3个版本。',
+      toolCalls: [{ id: 'end1', name: 'sys.endTask', arguments: { success: true } }],
+      complete: false,
+    }),
+    executeTool: async () => ({ ok: true }),
+  });
 
+  const task = runtime.createTask({ id: 'task_speak_preserve', sessionId: 'proj_1', goal: '提取角色' });
+  const finished = await runtime.wake(task.id);
+  const answerEvent = finished.events.find(e => e.type === 'answer');
+  assert(answerEvent, '应生成 answer 事件');
+  assert.equal(answerEvent.speak, '已完成第一集娜塔莉亚角色与3个造型版本的提取！');
+  assert(answerEvent.text.includes('char_123'), 'text 应保留完整版汇总详情');
+  assert.equal(finished.summary, '已完成第一集娜塔莉亚角色与3个造型版本的提取！');
+});
+
+test('路径 B user.ask 澄清后若用户回复取消/仅寒暄，无工具直答收尾时不误触发 sys.nudge', async () => {
+  const runtime = new AgentRuntime({
+    enabledTools: () => ['user.ask', 'experience.search', 'sys.endTask'],
+    requestTurn: async task => {
+      if (task.turn === 1) {
+        return {
+          narration: ['状态检查：用户要求整理当前面板但边界不明确\n思考：路径B，先调用 user.ask 澄清'],
+          speak: '想确认你要怎么整理资产清单？',
+          response: '想确认一下，你需要我提取角色、场景还是道具呢？',
+          toolCalls: [{ id: 'ask_b', name: 'user.ask', arguments: { question: '需要提取哪类资产？' } }],
+          complete: false,
+        };
+      }
+      return {
+        narration: ['状态检查：用户表示先不用整理\n思考：转为路径A友好收尾'],
+        speak: '好的，有需要随时告诉我～',
+        response: '好的，先不操作数据了，后续有需要随时告诉我！',
+        toolCalls: [],
+        complete: false,
+      };
+    },
+    executeTool: async call => {
+      if (call.name === 'user.ask') {
+        return { question: call.arguments.question, status: 'waiting_user' };
+      }
+      return { ok: true };
+    },
+  });
+
+  const task = runtime.createTask({ id: 'task_path_b_cancel', sessionId: 'proj_1', goal: '帮我整理一下' });
+  const waiting = await runtime.wake(task.id);
+  assert.equal(waiting.status, 'waiting_user');
+
+  runtime.addUserInput(task.id, '先不用了，随便问问');
+  const finished = await runtime.wake(task.id);
+  assert.equal(finished.status, 'completed');
+  assert.equal(finished.turn, 2);
+  assert.equal(finished.events.some(e => e.text.includes('系统干预')), false);
+});
+
+test('experience.search 仅匹配相关任务经验，非任务关键词不再强行兜底返回剧本提取指南，且经验步骤不向 1 级泄露 sys.endTask', async () => {
+  const { AGENT_EXPERIENCE_PLAYBOOKS, searchExperiences, formatExperiencePlaybookForPrompt } = await import('./experienceRegistry');
+  const casual = searchExperiences('你好');
+  assert.equal(casual.matchedCount, 0);
+  assert.deepEqual(casual.experiences, []);
+  assert.ok(formatExperiencePlaybookForPrompt(casual).includes('未匹配到特定任务经验'));
+
+  const extract = searchExperiences('提取角色');
+  assert.ok(extract.matchedCount >= 1);
+  assert.equal(extract.experiences[0].id, 'script_asset_extraction');
+
+  const verifyImg = searchExperiences('查看已绑定图片，核验与描述是否相符');
+  assert.ok(verifyImg.matchedCount >= 1);
+  assert.equal(verifyImg.experiences[0].id, 'asset_image_visual_verification');
+
+  // 所有经验指南的 makePlan 与 execute 阶段均不得暴露 0 级专属 sys.endTask
+  for (const pb of AGENT_EXPERIENCE_PLAYBOOKS) {
+    assert.equal(pb.steps.makePlan.includes('sys.endTask'), false, `${pb.id}.makePlan must not leak sys.endTask`);
+    assert.equal(pb.steps.execute.includes('sys.endTask'), false, `${pb.id}.execute must not leak sys.endTask`);
+  }
+});

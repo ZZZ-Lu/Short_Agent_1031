@@ -23,7 +23,8 @@ import {
   AlertCircle,
   Download,
   Eye,
-  Copy
+  Copy,
+  Link2
 } from 'lucide-react';
 import { isCardIntersectingRectangle } from '../utils/viewportCulling';
 import { getBottomPanelHeight, getPromptAreaHeight, getPromptSurfaceLayout, getReferencePreviewLayout } from '../utils/cardLayout';
@@ -45,6 +46,7 @@ import { useMcpKey } from '../hooks/useMcpKey';
 import { useWorkrallyModels } from '../hooks/useWorkrallyModels';
 import { WORKRALLY_IMAGE_MODELS, WORKRALLY_IMAGE_RATIOS, WORKRALLY_IMAGE_TOOL, WorkRallyImageModel } from '../config/workrallyImageModels';
 import { WORKRALLY_VIDEO_MODELS, WORKRALLY_VIDEO_RATIOS, WORKRALLY_VIDEO_TOOL, WorkRallyVideoModel } from '../config/workrallyVideoModels';
+import { resolveMediaResolutionTag, stripMediaFileExtension } from '../utils/assetImages';
 
 export type CardState = 'draft' | 'generating' | 'completed' | 'idle' | 'error';
 export type AspectRatio = string;
@@ -2395,6 +2397,7 @@ export interface GenerationCardProps {
   isPickerTarget?: boolean;
   isPickerSelectable?: boolean;
   pickerSelectionIndex?: number;
+  isPickerAlreadyBound?: boolean;
   isAgentThinking?: boolean;
   onStartCanvasPicker?: (cardId: string) => void;
   onSelect?: (e: React.PointerEvent, id: string, selectOnlyOnPointerUp?: boolean) => void;
@@ -2403,6 +2406,7 @@ export interface GenerationCardProps {
   onDelete?: (id: string) => void;
   onUpdate: (id: string, updates: Partial<CardData>, isSignificant?: boolean) => void;
   onForkCard?: (cardId: string, customConfigOrPrompt?: string | Partial<CardData>, autoStart?: boolean) => void;
+  onBindToScriptAsset?: (cardId: string) => void;
   onHover?: (cardId: string | null) => void;
 }
 
@@ -2422,6 +2426,7 @@ export const GenerationCard = React.memo(function GenerationCard({
   isPickerTarget,
   isPickerSelectable,
   pickerSelectionIndex,
+  isPickerAlreadyBound,
   onStartCanvasPicker,
   onSelect, 
   onDrag, 
@@ -2429,6 +2434,7 @@ export const GenerationCard = React.memo(function GenerationCard({
   onDelete,
   onUpdate,
   onForkCard,
+  onBindToScriptAsset,
   onHover
 }: GenerationCardProps) {
   const { id, x, y, state, ratio, res, prompt, imageUrl, isVideo, currentTime } = data;
@@ -3406,6 +3412,7 @@ export const GenerationCard = React.memo(function GenerationCard({
   const onPointerDown = (e: React.PointerEvent) => {
     if (e.button !== 0) return; // Only left click
     e.stopPropagation();
+    if (isPickerSelectable) return; // Picker mode selects cleanly without dragging the card
     
     isDragging.current = true;
     (window as any).isDraggingCard = true;
@@ -4617,22 +4624,12 @@ export const GenerationCard = React.memo(function GenerationCard({
   const effHeight = actualDimensions?.height || data.nativeHeight;
   const hasLoadedMedia = Boolean(imageUrl || data.originalImageUrl || data.fileData || data.thumbnailUrl);
 
-  let resolutionTag = '';
-  if (hasLoadedMedia && effWidth && effHeight) {
-    const maxDim = Math.max(effWidth, effHeight);
-    const minDim = Math.min(effWidth, effHeight);
-    if (data.isVideo) {
-      if (minDim >= 2160 || maxDim >= 3840) resolutionTag = '4K';
-      else if (minDim >= 1080 || maxDim >= 1920) resolutionTag = '1080p';
-      else if (minDim >= 720 || maxDim >= 1280) resolutionTag = '720p';
-      else resolutionTag = '480p';
-    } else {
-      if (maxDim >= 4000) resolutionTag = '4K+';
-      else if (maxDim >= 3840 || minDim >= 2160) resolutionTag = '4K';
-      else if (maxDim >= 2048 || minDim >= 1440) resolutionTag = '2K';
-      else resolutionTag = '1K';
-    }
-  }
+  const resolutionTag = resolveMediaResolutionTag({
+    width: effWidth,
+    height: effHeight,
+    isVideo: Boolean(data.isVideo),
+    hasMedia: hasLoadedMedia,
+  });
 
   const mcpModels = dynamicMcpModels && dynamicMcpModels.length > 0
     ? dynamicMcpModels
@@ -4908,7 +4905,9 @@ export const GenerationCard = React.memo(function GenerationCard({
                   transform: 'scale(calc(1 / var(--current-scale, 1)))',
                   transformOrigin: 'bottom center',
                 }}
-                onPointerDown={(e) => e.stopPropagation()}
+                onPointerDown={(e) => {
+                  if (e.button === 0) e.stopPropagation();
+                }}
               >
                 {/* Landmarks HUD Toggle Action Button */}
                 {data.landmarks && (
@@ -4916,10 +4915,10 @@ export const GenerationCard = React.memo(function GenerationCard({
                     type="button"
                     title={showLandmarksHUD ? "隐藏元素标注" : "显示元素标注"}
                     onPointerDown={(e) => {
-                      e.stopPropagation();
+                      if (e.button === 0) e.stopPropagation();
                     }}
                     onPointerUp={(e) => {
-                      e.stopPropagation();
+                      if (e.button === 0) e.stopPropagation();
                     }}
                     onClick={(e) => {
                       e.stopPropagation();
@@ -4942,10 +4941,10 @@ export const GenerationCard = React.memo(function GenerationCard({
                   type="button"
                   title="复制卡片参数并创建副本"
                   onPointerDown={(e) => {
-                    e.stopPropagation();
+                    if (e.button === 0) e.stopPropagation();
                   }}
                   onPointerUp={(e) => {
-                    e.stopPropagation();
+                    if (e.button === 0) e.stopPropagation();
                   }}
                   onClick={(e) => {
                     e.stopPropagation();
@@ -4964,10 +4963,10 @@ export const GenerationCard = React.memo(function GenerationCard({
                     type="button"
                     title="下载媒体文件"
                     onPointerDown={(e) => {
-                      e.stopPropagation();
+                      if (e.button === 0) e.stopPropagation();
                     }}
                     onPointerUp={(e) => {
-                      e.stopPropagation();
+                      if (e.button === 0) e.stopPropagation();
                     }}
                     onClick={(e) => {
                       e.stopPropagation();
@@ -4981,6 +4980,30 @@ export const GenerationCard = React.memo(function GenerationCard({
                   </button>
                 )}
 
+                {/* Bind to Script Asset Action Button */}
+                {!data.isVideo && onBindToScriptAsset && (imageUrl || data.fileData) && (state === 'completed' || !state || state === 'draft' || state === 'idle') && (
+                  <button
+                    type="button"
+                    title="将该图像绑定为资产图"
+                    aria-label="绑定到剧本资产"
+                    onPointerDown={(e) => {
+                      if (e.button === 0) e.stopPropagation();
+                    }}
+                    onPointerUp={(e) => {
+                      if (e.button === 0) e.stopPropagation();
+                    }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      e.preventDefault();
+                      onBindToScriptAsset(id);
+                    }}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-[10px] corner-squircle bg-gray-100/80 dark:bg-neutral-800/80 hover:bg-blue-50 dark:hover:bg-blue-950/70 text-gray-700 dark:text-gray-200 hover:text-blue-600 dark:hover:text-blue-300 text-xs font-medium transition-all duration-150 active:scale-95 cursor-pointer select-none"
+                  >
+                    <Link2 className="w-3.5 h-3.5 text-blue-500 dark:text-blue-400" />
+                    <span>绑定资产</span>
+                  </button>
+                )}
+
                 {/* Reserved extensibility slot for future tools/actions */}
               </motion.div>
             )}
@@ -4989,7 +5012,11 @@ export const GenerationCard = React.memo(function GenerationCard({
 
         {/* Top Layer: Image Placeholder & Drag Handle */}
         <div 
-          className={`generation-card-body pointer-events-auto relative shrink-0 overflow-hidden cursor-grab active:cursor-grabbing bg-gray-100 dark:bg-neutral-800 squircle self-start ease-out [&.drag-degraded]:!shadow-none [&.drag-degraded]:!backdrop-filter-none ${
+          className={`generation-card-body pointer-events-auto relative shrink-0 overflow-hidden cursor-grab active:cursor-grabbing ${
+            (imageUrl || data.fileData || data.thumbnailUrl)
+              ? 'bg-transparent'
+              : 'bg-gray-100 dark:bg-neutral-800'
+          } squircle self-start ease-out [&.drag-degraded]:!shadow-none [&.drag-degraded]:!backdrop-filter-none ${
             pickerSelectionIndex && pickerSelectionIndex > 0
               ? 'outline outline-[4px] outline-[#2563eb] shadow-[0_0_25px_rgba(37,99,235,0.7)] scale-[1.015]'
               : isAgentTarget && isSelected
@@ -5062,7 +5089,7 @@ export const GenerationCard = React.memo(function GenerationCard({
           >
             <div className="bg-white/80 dark:bg-black/60 h-[26px] px-2.5 rounded-xl corner-squircle border border-black/10 dark:border-white/10 shadow-sm flex items-center justify-center max-w-full min-w-0">
               <span className="text-gray-900 dark:text-white/95 text-[11px] font-medium truncate leading-normal tracking-wide">
-                {(data.name || data.fileName || '').replace(/\.[^/.]+$/, "")}
+                {stripMediaFileExtension(data.name || data.fileName || '')}
               </span>
             </div>
           </div>
@@ -5112,11 +5139,13 @@ export const GenerationCard = React.memo(function GenerationCard({
         )}
 
         {/* Empty State Placeholder (SVG matching user request) */}
-        <div className={`absolute inset-0 flex items-center justify-center bg-gray-100 dark:bg-neutral-800 transition-opacity duration-500 ${!imageUrl ? 'opacity-100' : 'opacity-0'} group-data-[scale-micro=true]/canvas:!opacity-0`}>
-          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-gray-300 dark:text-neutral-600">
-            {EMPTY_CARD_PATHS.map(path => <path key={path} d={path} fill="currentColor" />)}
-          </svg>
-        </div>
+        {!imageUrl && !data.fileData && (
+          <div className="absolute inset-0 flex items-center justify-center bg-gray-100 dark:bg-neutral-800 group-data-[scale-micro=true]/canvas:!opacity-0 pointer-events-none">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-gray-300 dark:text-neutral-600">
+              {EMPTY_CARD_PATHS.map(path => <path key={path} d={path} fill="currentColor" />)}
+            </svg>
+          </div>
+        )}
 
         {/* Generated Image or Video */}
         {imageUrl && (
@@ -5297,7 +5326,9 @@ export const GenerationCard = React.memo(function GenerationCard({
                       </p>
                     )}
                     <button
-                      onPointerDown={(e) => e.stopPropagation()}
+                      onPointerDown={(e) => {
+                        if (e.button === 0) e.stopPropagation();
+                      }}
                       onClick={(e) => {
                         e.stopPropagation();
                         setVideoHasError(false);
@@ -5499,7 +5530,7 @@ export const GenerationCard = React.memo(function GenerationCard({
             <motion.div 
               initial={isStagedMediaEntry(id) ? { opacity: 0 } : false}
               animate={{ opacity: 1 }}
-              transition={{ duration: MEDIA_REVEAL_MS / 1000 }}
+              transition={{ duration: isStagedMediaEntry(id) ? MEDIA_REVEAL_MS / 1000 : 0 }}
               className="absolute inset-0 overflow-hidden squircle pointer-events-auto"
               style={{
                 width: w,
@@ -5820,6 +5851,12 @@ export const GenerationCard = React.memo(function GenerationCard({
                 : 'bg-neutral-800/85 hover:bg-blue-500 text-white hover:scale-105 border border-white/40'
             }`}>
               {pickerSelectionIndex && pickerSelectionIndex > 0 ? pickerSelectionIndex : '+'}
+            </div>
+          )}
+
+          {isPickerSelectable && isPickerAlreadyBound && !(pickerSelectionIndex && pickerSelectionIndex > 0) && (
+            <div className="absolute -top-3 -left-3 z-30 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-600 text-white shadow-md pointer-events-none">
+              已绑定
             </div>
           )}
 

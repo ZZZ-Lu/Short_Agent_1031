@@ -2,6 +2,18 @@ import React, { useState, useRef, useEffect, useLayoutEffect, useMemo } from 're
 import { motion, MotionValue, useTransform, useMotionValue, animate, AnimatePresence } from 'motion/react';
 import { ArrowUp } from 'lucide-react';
 import { CardData } from './GenerationCard';
+import { AgentCoordinateSpace } from '../agent/agentCursorPosition';
+import {
+  QIQI_TRI,
+  QIQI_PIVOT,
+  QIQI_VIEWBOX,
+  QIQI_STATES,
+  QiqiStateSpec,
+  buildQiqiInnerMarkup,
+  mkQiqiSvg,
+} from './qiqiCursorSvg';
+export { QIQI_STATES, mkQiqiSvg };
+export type { QiqiStateSpec };
 
 export function buildDynamicSelectionPrompt(cards: CardData[]): string {
   if (!cards || cards.length === 0) {
@@ -84,6 +96,7 @@ interface AgentCursorProps {
   agentState: {
     x: number;
     y: number;
+    coordinateSpace?: AgentCoordinateSpace;
     visible: boolean;
     isActive: boolean;
     isMoving: boolean;
@@ -91,6 +104,8 @@ interface AgentCursorProps {
     lastPrompt?: string;
     lastPromptTargetId?: string | null;
     cursorMode?: 'default' | 'inspect' | 'working' | 'interact';
+    isSleeping?: boolean;
+    isAsking?: boolean;
   };
   transform: {
     tx: MotionValue<number>;
@@ -101,11 +116,12 @@ interface AgentCursorProps {
   isZooming?: boolean;
   isAgentRunning?: boolean;
   isAgentThinking?: boolean;
+  isAgentAsking?: boolean;
   badgeNumber?: number;
   selectedCards?: CardData[];
   quickInput?: QuickInputConfig | null;
   onClickPointer?: () => void;
-  onDragAgent?: (newCanvasX: number, newCanvasY: number) => void;
+  onDragAgent?: (newX: number, newY: number, coordinateSpace: AgentCoordinateSpace) => void;
   onDragAgentEnd?: (finalCanvasX: number, finalCanvasY: number, screenX: number, screenY: number) => void;
   onDismissSpeak?: () => void;
   isDarkMode?: boolean;
@@ -114,24 +130,86 @@ interface AgentCursorProps {
   onEndAgentBoxSelect?: () => void;
 }
 
-const CURSOR_FLOAT_VARIANTS = {
-  floating: {
-    y: [0, -6],
-    transition: {
-      duration: 1.5,
-      repeat: Infinity,
-      repeatType: 'reverse' as const,
-      ease: 'easeInOut',
-    },
-  },
-  still: {
-    y: 0,
-    transition: {
-      duration: 0.2,
-      ease: 'easeOut',
-    },
-  },
-};
+export function mountQiqiSvg(
+  el: HTMLElement,
+  st: string = 'idle',
+  size: number = 88,
+  vb?: string,
+  noTilt?: boolean,
+  isDarkMode: boolean = false
+) {
+  if (!el) return;
+  el.innerHTML = mkQiqiSvg(st, size, vb, noTilt, undefined, isDarkMode);
+  const sv = el.querySelector("svg") as SVGSVGElement | null;
+  if (sv && typeof sv.setCurrentTime === 'function') {
+    try {
+      sv.setCurrentTime(0);
+    } catch {}
+  }
+}
+
+if (typeof window !== 'undefined') {
+  (window as any).QIQI = {
+    mk: mkQiqiSvg,
+    mount: mountQiqiSvg,
+    states: QIQI_STATES,
+    tri: QIQI_TRI,
+    pivot: QIQI_PIVOT,
+  };
+}
+
+function QiqiCursorIcon({
+  state,
+  size = 57.6,
+  isDarkMode = false,
+}: {
+  state: 'idle' | 'think' | 'sleep' | 'ask';
+  size?: number;
+  isDarkMode?: boolean;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const svgInnerMarkup = useMemo(() => {
+    return buildQiqiInnerMarkup(state, false, 'currentColor', isDarkMode);
+  }, [state, isDarkMode]);
+
+  useEffect(() => {
+    const sv = containerRef.current?.querySelector('svg') as SVGSVGElement | null;
+    if (sv && typeof sv.setCurrentTime === 'function') {
+      try {
+        sv.setCurrentTime(0);
+      } catch {}
+    }
+  }, [state]);
+
+  // Anchor pointer tip V1 (27.95, 20.00 in 92x92 viewBox) to (0, 0) of cursor coordinate
+  const tipOffsetX = -(size * (27.95 / 92));
+  const tipOffsetY = -(size * (20.0 / 92));
+  const colorClass = 'text-[#a45cf8]';
+
+  return (
+    <div
+      ref={containerRef}
+      className={`relative z-10 transition-transform group-hover:scale-105 active:scale-95 pointer-events-none select-none ${colorClass}`}
+      style={{
+        width: `${size}px`,
+        height: `${size}px`,
+        marginLeft: `${tipOffsetX}px`,
+        marginTop: `${tipOffsetY}px`,
+      }}
+    >
+      <svg
+        key={state}
+        width={size}
+        height={size}
+        viewBox={QIQI_VIEWBOX}
+        xmlns="http://www.w3.org/2000/svg"
+        className="pointer-events-none select-none block"
+        dangerouslySetInnerHTML={{ __html: svgInnerMarkup }}
+      />
+    </div>
+  );
+}
 
 function isThinkingPhrase(text?: string): boolean {
   if (!text) return false;
@@ -287,6 +365,7 @@ export function AgentCursor({
   isZooming = false, 
   isAgentRunning,
   isAgentThinking,
+  isAgentAsking,
   badgeNumber,
   selectedCards = [],
   quickInput, 
@@ -302,7 +381,16 @@ export function AgentCursor({
   const [isAgentBoxSelecting, setIsAgentBoxSelecting] = useState(false);
   const isAgentBoxSelectingRef = useRef(false);
   const longPressTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const dragStartRef = useRef<{ pointerX: number; pointerY: number; startCanvasX: number; startCanvasY: number; hasMoved: boolean } | null>(null);
+  const dragStartRef = useRef<{
+    pointerX: number;
+    pointerY: number;
+    startPosX: number;
+    startPosY: number;
+    startCoordSpace: AgentCoordinateSpace;
+    startCanvasX: number;
+    startCanvasY: number;
+    hasMoved: boolean;
+  } | null>(null);
 
   const quickInputRef = useRef<HTMLInputElement>(null);
 
@@ -370,7 +458,7 @@ export function AgentCursor({
     }
 
     // 2. Active task or user.ask execution
-    const isExecutionActive = isAgentRunning || Boolean(quickInput?.onAskResolve);
+    const isExecutionActive = isAgentRunning || Boolean(quickInput?.onAskResolve) || Boolean(isAgentAsking) || Boolean(agentState.isAsking);
     if (isExecutionActive && agentState.lastPrompt && agentState.lastPrompt.trim()) {
       const scopeMatches = !agentState.lastPromptTargetId || agentState.lastPromptTargetId === (quickInput?.targetId || 'global');
       if (scopeMatches) {
@@ -387,7 +475,7 @@ export function AgentCursor({
     }
 
     // 4. Legacy fallback for lastReply (if contextHistory not explicitly provided)
-    if (quickInput?.isOpen && quickInput.lastReply && quickInput.lastReply.trim() && !quickInput.onAskResolve) {
+    if (quickInput?.isOpen && quickInput.lastReply && quickInput.lastReply.trim() && !quickInput.onAskResolve && !isAgentAsking && !agentState.isAsking) {
       return {
         text: quickInput.lastReply.trim(),
         speaker: 'agent',
@@ -395,7 +483,7 @@ export function AgentCursor({
     }
 
     return null;
-  }, [submittedUserPrompt, isAgentRunning, quickInput?.isOpen, quickInput?.onAskResolve, quickInput?.targetId, quickInput?.contextHistory, quickInput?.lastReply, agentState.lastPrompt, agentState.lastPromptTargetId]);
+  }, [submittedUserPrompt, isAgentRunning, isAgentAsking, agentState.isAsking, quickInput?.isOpen, quickInput?.onAskResolve, quickInput?.targetId, quickInput?.contextHistory, quickInput?.lastReply, agentState.lastPrompt, agentState.lastPromptTargetId]);
 
   const hasSelectedCanvasCards = Boolean(selectedCards && selectedCards.length > 0);
   const isDefaultOrSelectionSpeak = !agentState.speak ||
@@ -466,7 +554,16 @@ export function AgentCursor({
     }, 320);
   };
 
-  const row2Content = isSubmitting
+  const isAsking =
+    (Boolean(isAgentAsking) || Boolean(agentState.isAsking) || Boolean(quickInput?.onAskResolve)) &&
+    !(effectiveIsThinking || isActuallyThinking || isSubmitting || Boolean(isAgentRunning));
+
+  const isSleeping =
+    Boolean(agentState.isSleeping) &&
+    !isAsking &&
+    !(effectiveIsThinking || isActuallyThinking || isSubmitting || Boolean(isAgentRunning));
+
+  const row2Content = (isSubmitting || isSleeping)
     ? null
     : (effectiveAgentSpeak ? { type: 'agent' as const, text: effectiveAgentSpeak, isThinking: effectiveIsThinking } : null);
 
@@ -553,65 +650,95 @@ export function AgentCursor({
     };
   }, [isOpen]);
 
-  // Animate the agent's canvas position smoothly when moved programmatically
-  const agentCanvasX = useMotionValue(agentState.x);
-  const agentCanvasY = useMotionValue(agentState.y);
+  const currentCoordSpace: AgentCoordinateSpace = agentState.coordinateSpace === 'screen' ? 'screen' : 'canvas';
+  const prevCoordSpaceRef = useRef<AgentCoordinateSpace>(currentCoordSpace);
+  const isScreenSpaceMV = useMotionValue(currentCoordSpace === 'screen' ? 1 : 0);
+
+  // Animate the agent's position smoothly in either canvas world space or fixed screen space
+  const agentPosX = useMotionValue(agentState.x);
+  const agentPosY = useMotionValue(agentState.y);
 
   useEffect(() => {
+    if (prevCoordSpaceRef.current !== currentCoordSpace) {
+      const scaleVal = transform.tScale.get() || 1;
+      const txVal = transform.tx.get();
+      const tyVal = transform.ty.get();
+      if (currentCoordSpace === 'screen') {
+        agentPosX.set(agentPosX.get() * scaleVal + txVal);
+        agentPosY.set(agentPosY.get() * scaleVal + tyVal);
+      } else {
+        agentPosX.set((agentPosX.get() - txVal) / scaleVal);
+        agentPosY.set((agentPosY.get() - tyVal) / scaleVal);
+      }
+      prevCoordSpaceRef.current = currentCoordSpace;
+      isScreenSpaceMV.set(currentCoordSpace === 'screen' ? 1 : 0);
+    }
+
     if (isDragging) {
-      agentCanvasX.set(agentState.x);
-      agentCanvasY.set(agentState.y);
+      agentPosX.set(agentState.x);
+      agentPosY.set(agentState.y);
     } else {
-      const transition = isZooming 
+      const transition = isZooming && currentCoordSpace === 'canvas'
         ? { type: 'tween', duration: 0.15, ease: 'easeOut' }
         : agentState.isMoving 
           ? { type: 'spring', damping: 28, stiffness: 450, mass: 0.35 }
           : { duration: 0 };
           
-      animate(agentCanvasX, agentState.x, transition as any);
-      animate(agentCanvasY, agentState.y, transition as any);
+      animate(agentPosX, agentState.x, transition as any);
+      animate(agentPosY, agentState.y, transition as any);
     }
-  }, [agentState.x, agentState.y, isDragging, isZooming, agentState.isMoving, agentCanvasX, agentCanvasY]);
+  }, [agentState.x, agentState.y, currentCoordSpace, isDragging, isZooming, agentState.isMoving, agentPosX, agentPosY, isScreenSpaceMV, transform.tScale, transform.tx, transform.ty]);
 
-  // Derive screen position instantly from canvas position and viewport transform
+  // Derive screen position instantly: invariant when anchored to dock card ('screen'), transformed with camera when on canvas ('canvas')
   const targetScreenX = useTransform(
-    [agentCanvasX, transform.tx, transform.tScale],
-    ([ax, tx, s]: any[]) => ax * s + tx
+    [agentPosX, transform.tx, transform.tScale, isScreenSpaceMV],
+    ([ax, tx, s, isScreen]: any[]) => (isScreen ? ax : ax * s + tx)
   );
   
   const targetScreenY = useTransform(
-    [agentCanvasY, transform.ty, transform.tScale],
-    ([ay, ty, s]: any[]) => ay * s + ty
+    [agentPosY, transform.ty, transform.tScale, isScreenSpaceMV],
+    ([ay, ty, s, isScreen]: any[]) => (isScreen ? ay : ay * s + ty)
   );
 
-  const handlePointerDown = (e: React.PointerEvent) => {
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (isAgentRunning) return;
     e.stopPropagation();
     e.preventDefault();
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {}
 
     isAgentBoxSelectingRef.current = false;
     setIsAgentBoxSelecting(false);
 
+    const scaleVal = transform.tScale.get() || 1;
+    const startCanvasX = currentCoordSpace === 'screen' ? (agentState.x - transform.tx.get()) / scaleVal : agentState.x;
+    const startCanvasY = currentCoordSpace === 'screen' ? (agentState.y - transform.ty.get()) / scaleVal : agentState.y;
+
     dragStartRef.current = {
       pointerX: e.clientX,
       pointerY: e.clientY,
-      startCanvasX: agentState.x,
-      startCanvasY: agentState.y,
+      startPosX: agentState.x,
+      startPosY: agentState.y,
+      startCoordSpace: currentCoordSpace,
+      startCanvasX,
+      startCanvasY,
       hasMoved: false
     };
 
-    // Start a 350ms long-press timer for Agent box-selection mode!
-    longPressTimerRef.current = setTimeout(() => {
-      if (dragStartRef.current && !dragStartRef.current.hasMoved) {
-        isAgentBoxSelectingRef.current = true;
-        setIsAgentBoxSelecting(true);
-        onStartAgentBoxSelect?.(agentState.x, agentState.y);
-      }
-    }, 350);
+    // Start a 350ms long-press timer for Agent box-selection mode (only when awake)
+    if (!isSleeping) {
+      longPressTimerRef.current = setTimeout(() => {
+        if (dragStartRef.current && !dragStartRef.current.hasMoved) {
+          isAgentBoxSelectingRef.current = true;
+          setIsAgentBoxSelecting(true);
+          onStartAgentBoxSelect?.(startCanvasX, startCanvasY);
+        }
+      }, 350);
+    }
   };
 
-  const handlePointerMove = (e: React.PointerEvent) => {
+  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!dragStartRef.current) return;
     e.stopPropagation();
     e.preventDefault();
@@ -629,21 +756,34 @@ export function AgentCursor({
     }
 
     if (isAgentBoxSelectingRef.current) {
-      const currentCanvasX = dragStartRef.current.startCanvasX + (e.clientX - dragStartRef.current.pointerX) / transform.tScale.get();
-      const currentCanvasY = dragStartRef.current.startCanvasY + (e.clientY - dragStartRef.current.pointerY) / transform.tScale.get();
+      const currentCanvasX = dragStartRef.current.startCanvasX + (e.clientX - dragStartRef.current.pointerX) / (transform.tScale.get() || 1);
+      const currentCanvasY = dragStartRef.current.startCanvasY + (e.clientY - dragStartRef.current.pointerY) / (transform.tScale.get() || 1);
       onUpdateAgentBoxSelect?.(currentCanvasX, currentCanvasY);
     } else if (dragStartRef.current.hasMoved) {
-      const dx = (e.clientX - dragStartRef.current.pointerX) / transform.tScale.get();
-      const dy = (e.clientY - dragStartRef.current.pointerY) / transform.tScale.get();
+      if (dragStartRef.current.startCoordSpace === 'screen') {
+        const dx = e.clientX - dragStartRef.current.pointerX;
+        const dy = e.clientY - dragStartRef.current.pointerY;
+        const newX = dragStartRef.current.startPosX + dx;
+        const newY = dragStartRef.current.startPosY + dy;
 
-      const newX = dragStartRef.current.startCanvasX + dx;
-      const newY = dragStartRef.current.startCanvasY + dy;
+        agentPosX.set(newX);
+        agentPosY.set(newY);
+        onDragAgent?.(newX, newY, 'screen');
+      } else {
+        const scaleVal = transform.tScale.get() || 1;
+        const dx = (e.clientX - dragStartRef.current.pointerX) / scaleVal;
+        const dy = (e.clientY - dragStartRef.current.pointerY) / scaleVal;
+        const newX = dragStartRef.current.startPosX + dx;
+        const newY = dragStartRef.current.startPosY + dy;
 
-      onDragAgent?.(newX, newY);
+        agentPosX.set(newX);
+        agentPosY.set(newY);
+        onDragAgent?.(newX, newY, 'canvas');
+      }
     }
   };
 
-  const handlePointerUp = (e: React.PointerEvent) => {
+  const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
     if (longPressTimerRef.current) {
       clearTimeout(longPressTimerRef.current);
       longPressTimerRef.current = null;
@@ -652,15 +792,32 @@ export function AgentCursor({
     if (!dragStartRef.current) return;
     e.stopPropagation();
     try {
-      (e.target as HTMLElement).releasePointerCapture(e.pointerId);
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
     } catch {}
 
     const wasBoxSelecting = isAgentBoxSelectingRef.current;
     const wasMoved = dragStartRef.current.hasMoved;
-    const dx = (e.clientX - dragStartRef.current.pointerX) / transform.tScale.get();
-    const dy = (e.clientY - dragStartRef.current.pointerY) / transform.tScale.get();
-    const finalX = dragStartRef.current.startCanvasX + dx;
-    const finalY = dragStartRef.current.startCanvasY + dy;
+    const scaleVal = transform.tScale.get() || 1;
+    const txVal = transform.tx.get();
+    const tyVal = transform.ty.get();
+    const rawDx = e.clientX - dragStartRef.current.pointerX;
+    const rawDy = e.clientY - dragStartRef.current.pointerY;
+
+    const finalPosX = dragStartRef.current.startCoordSpace === 'screen'
+      ? dragStartRef.current.startPosX + rawDx
+      : dragStartRef.current.startPosX + rawDx / scaleVal;
+    const finalPosY = dragStartRef.current.startCoordSpace === 'screen'
+      ? dragStartRef.current.startPosY + rawDy
+      : dragStartRef.current.startPosY + rawDy / scaleVal;
+
+    const finalCanvasX = dragStartRef.current.startCoordSpace === 'screen'
+      ? (finalPosX - txVal) / scaleVal
+      : finalPosX;
+    const finalCanvasY = dragStartRef.current.startCoordSpace === 'screen'
+      ? (finalPosY - tyVal) / scaleVal
+      : finalPosY;
 
     setIsDragging(false);
     setIsAgentBoxSelecting(false);
@@ -672,7 +829,9 @@ export function AgentCursor({
     } else if (!wasMoved) {
       onClickPointer?.();
     } else {
-      onDragAgentEnd?.(finalX, finalY, e.clientX, e.clientY);
+      agentPosX.set(finalPosX);
+      agentPosY.set(finalPosY);
+      onDragAgentEnd?.(finalCanvasX, finalCanvasY, e.clientX, e.clientY);
       // 🚀 Bulletproof delayed focus on drag release to bypass browser mouseup focus-clearing cycles
       setTimeout(() => {
         if (quickInputRef.current) {
@@ -687,6 +846,9 @@ export function AgentCursor({
   return (
     <motion.div
       data-agent-cursor-root="true"
+      data-agent-coord-space={currentCoordSpace}
+      data-agent-sleeping={isSleeping ? 'true' : 'false'}
+      data-agent-asking={isAsking ? 'true' : 'false'}
       className="fixed top-0 left-0 z-[9999] flex items-center select-none pointer-events-none"
       style={{ x: targetScreenX, y: targetScreenY }}
       initial={false}
@@ -701,81 +863,113 @@ export function AgentCursor({
     >
       {/* Floating Wrapper that animates both the Cursor and Speech Bubble together on GPU Compositor */}
       <div
-        className={`relative flex items-center ${!isDragging && isIdle ? 'animate-agent-float' : ''}`}
+        className="relative flex items-center"
         style={{
           willChange: 'transform',
           transform: 'translate3d(0,0,0)',
           backfaceVisibility: 'hidden',
         }}
       >
-        {/* Agent Pointer Cursor */}
+        {/* Agent Pointer Cursor (Qiqi SVG + SMIL: idle / think / ask / sleep) */}
         <div
           className="relative group cursor-grab active:cursor-grabbing p-2 -m-2 touch-none pointer-events-auto shrink-0"
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerUp}
+          onLostPointerCapture={handlePointerUp}
         >
-          {agentState.cursorMode === 'working' && isAgentRunning !== false && !effectiveIsThinking ? (
-            <svg
-              width="36"
-              height="36"
-              viewBox="0 0 24 24"
-              fill="none"
-              xmlns="http://www.w3.org/2000/svg"
-              className="drop-shadow-lg relative z-10 transition-transform group-hover:scale-110 active:scale-95 cursor-pointer animate-pulse"
-              style={{ marginLeft: '-4.5px', marginTop: '-3.5px' }}
-            >
-              <path
-                d="M12 2L14.5 9.5L22 12L14.5 14.5L12 22L9.5 14.5L2 12L9.5 9.5L12 2Z"
-                fill={pointerFill}
-                stroke={pointerStroke}
-                strokeWidth="1.8"
-                strokeLinejoin="round"
-              />
-              <circle cx="12" cy="12" r="2" fill="#ffffff" />
-            </svg>
-          ) : agentState.cursorMode === 'interact' ? (
-            <svg
-              width="36"
-              height="36"
-              viewBox="0 0 24 24"
-              fill="none"
-              xmlns="http://www.w3.org/2000/svg"
-              className="drop-shadow-lg relative z-10 transition-transform group-hover:scale-110 active:scale-95 cursor-pointer"
-              style={{ marginLeft: '-4.5px', marginTop: '-3.5px' }}
-            >
-              <path
-                d="M8 13V4.5C8 3.67 8.67 3 9.5 3C10.33 3 11 3.67 11 4.5V11.5M11 11.5V6C11 5.17 11.67 4.5 12.5 4.5C13.33 4.5 14 5.17 14 6V11.5M14 11.5V7.5C14 6.67 14.67 6 15.5 6C16.33 6 17 6.67 17 7.5V13.5C17 17.5 14 21 10 21C6.5 21 4 18 4 14.5C4 13.5 4.5 12.5 5.5 11.5L8 13Z"
-                fill={pointerFill}
-                stroke={pointerStroke}
-                strokeWidth="1.5"
-                strokeLinejoin="round"
-              />
-            </svg>
-          ) : (
-            <svg
-              width="36"
-              height="36"
-              viewBox="0 0 24 24"
-              fill="none"
-              xmlns="http://www.w3.org/2000/svg"
-              className="drop-shadow-lg relative z-10 transition-transform group-hover:scale-110 active:scale-95 cursor-pointer"
-              style={{ marginLeft: '-4.5px', marginTop: '-3.5px' }}
-            >
-              <path
-                d="M4.5 3.5L19.5 11.5L12 13L10.5 20.5L4.5 3.5Z"
-                fill={pointerFill} 
-                stroke={pointerStroke}
-                strokeWidth="1.5"
-                strokeLinejoin="round"
-              />
-            </svg>
-          )}
+          <QiqiCursorIcon
+            state={
+              effectiveIsThinking || isActuallyThinking || isSubmitting || Boolean(isAgentRunning)
+                ? 'think'
+                : isAsking
+                  ? 'ask'
+                  : isSleeping
+                    ? 'sleep'
+                    : 'idle'
+            }
+            size={57.6}
+            isDarkMode={isDarkMode}
+          />
+          <AnimatePresence>
+            {isAsking && (
+              <motion.div
+                key="ask-indicator"
+                data-testid="agent-ask-indicator"
+                initial={{ opacity: 0, scale: 0.75, y: 4 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.75, y: 2 }}
+                transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+                className="absolute -top-3 left-5.5 z-20 pointer-events-none select-none flex items-end"
+              >
+                <motion.span
+                  className={`inline-block font-black font-mono text-[15px] leading-none tracking-tight ${
+                    isDarkMode
+                      ? 'text-[#c084fc] drop-shadow-[0_1px_4px_rgba(0,0,0,0.8)]'
+                      : 'text-purple-600 drop-shadow-[0_1px_3px_rgba(255,255,255,0.95)]'
+                  }`}
+                  animate={{
+                    y: [0, -3.5, 0],
+                    rotate: [-8, 8, -8],
+                    scale: [0.96, 1.08, 0.96],
+                  }}
+                  transition={{
+                    duration: 1.8,
+                    repeat: Infinity,
+                    ease: 'easeInOut',
+                  }}
+                >
+                  ?
+                </motion.span>
+              </motion.div>
+            )}
+            {isSleeping && (
+              <motion.div
+                key="sleep-zzz"
+                data-testid="agent-sleep-zzz"
+                initial={{ opacity: 0, scale: 0.85 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.85 }}
+                transition={{ duration: 0.18 }}
+                className="absolute -top-2.5 left-6 z-20 pointer-events-none select-none flex items-end"
+              >
+                {[
+                  { delay: 0, x: 0, y: 0, size: 'text-[10px]' },
+                  { delay: 0.55, x: 6, y: -5, size: 'text-[12px]' },
+                  { delay: 1.1, x: 13, y: -11, size: 'text-[14px]' },
+                ].map((item, idx) => (
+                  <motion.span
+                    key={idx}
+                    className={`absolute font-extrabold font-mono leading-none tracking-tight ${item.size} ${
+                      isDarkMode
+                        ? 'text-[#c084fc] drop-shadow-[0_1px_4px_rgba(0,0,0,0.75)]'
+                        : 'text-purple-600 drop-shadow-[0_1px_3px_rgba(255,255,255,0.95)]'
+                    }`}
+                    style={{ left: item.x, top: item.y }}
+                    animate={{
+                      y: [2, -7],
+                      x: [0, 3],
+                      opacity: [0, 0.95, 0],
+                      scale: [0.78, 1.05, 0.92],
+                    }}
+                    transition={{
+                      duration: 2.1,
+                      repeat: Infinity,
+                       delay: item.delay,
+                      ease: 'easeInOut',
+                    }}
+                  >
+                    z
+                  </motion.span>
+                ))}
+              </motion.div>
+            )}
+          </AnimatePresence>
           {badgeNumber !== undefined && badgeNumber > 0 && (
             <div
               data-testid={`agent-cursor-badge-${badgeNumber}`}
-              className="absolute -top-1.5 -right-1.5 z-20 min-w-[16px] h-[16px] px-1 rounded-full bg-[#a45cf8] text-white text-[10px] font-bold font-mono leading-none flex items-center justify-center shadow-md border border-white/90 dark:border-zinc-900 select-none pointer-events-none"
+              className={`absolute -top-1 -right-1 z-20 min-w-[16px] h-[16px] px-1 rounded-full ${isDarkMode ? 'bg-[#a45cf8]' : 'bg-purple-600'} text-white text-[10px] font-bold font-mono leading-none flex items-center justify-center shadow-md border border-white/90 dark:border-zinc-900 select-none pointer-events-none`}
             >
               {badgeNumber}
             </div>
@@ -783,12 +977,12 @@ export function AgentCursor({
         </div>
         
         {/* Stacked Agent HUD beside Cursor */}
-        <div className="absolute left-7.5 top-0.5 flex flex-col gap-1.5 items-start pointer-events-none">
+        <div className="absolute left-8.5 top-1 flex flex-col gap-1.5 items-start pointer-events-none">
           {/* Primary Speech Row Anchor (Level with Agent Mouse Cursor Pointer) */}
           <div className="relative pointer-events-none min-h-[30px] flex items-center">
             {/* Row 1: Memory shelf - Anchored stably ABOVE Row 2 */}
             <AnimatePresence>
-              {row1Message && (
+              {!isSleeping && row1Message && (
                 <motion.div
                   key={row1Message.text}
                   initial={isSubmitting ? { opacity: 1, y: 64, scale: 1 } : { opacity: 0, scale: 0.82, y: 0 }}

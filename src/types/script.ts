@@ -27,6 +27,20 @@ export interface VerifiedProvenanceAnchor {
   lineNumber?: number;        // 核验时刻的行号
 }
 
+export type AssetImageSource = 'canvas' | 'agent' | 'upload';
+
+export interface AssetImageBinding {
+  id: string;
+  cardId?: string;
+  imageUrl?: string;
+  thumbnailUrl?: string;
+  label?: string;
+  prompt?: string;
+  source: AssetImageSource;
+  isPrimary?: boolean;
+  createdAt: number;
+}
+
 export interface ScriptAssetVersion {
   id: string;
   name: string; // 版本名称（如 "日景"、"夜景"、"常服版"、"晚礼服版"）
@@ -48,6 +62,7 @@ export interface ScriptAssetVersion {
   verifiedProvenance?: VerifiedProvenanceAnchor[];
   verifiedScriptHash?: string;
   referenceImage?: string;
+  images?: AssetImageBinding[];
 }
 
 export interface ScriptCharacter {
@@ -67,6 +82,7 @@ export interface ScriptCharacter {
   verifiedProvenance?: VerifiedProvenanceAnchor[];
   verifiedScriptHash?: string;
   referenceImage?: string; // 已生成的参考图
+  images?: AssetImageBinding[];
   versions?: ScriptAssetVersion[]; // 多服装/造型版本二级列表
 }
 
@@ -84,6 +100,7 @@ export interface ScriptLocation {
   verifiedProvenance?: VerifiedProvenanceAnchor[];
   verifiedScriptHash?: string;
   referenceImage?: string;
+  images?: AssetImageBinding[];
   versions?: ScriptAssetVersion[]; // 日景/夜景等多光影状态版本二级列表
 }
 
@@ -100,6 +117,7 @@ export interface ScriptProp {
   verifiedProvenance?: VerifiedProvenanceAnchor[];
   verifiedScriptHash?: string;
   referenceImage?: string;
+  images?: AssetImageBinding[];
   versions?: ScriptAssetVersion[]; // 多状态版本二级列表
 }
 

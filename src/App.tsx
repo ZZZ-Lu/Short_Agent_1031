@@ -3,6 +3,13 @@ import { executeProjectReadTool, executeProjectAssetMutation } from './agent/pro
 import { registerCardEntries, requestCardEntries, stageCardEntry, startCardEntry, startMediaReveal, mediaRevealProgress, MEDIA_REVEAL_MS, CARD_ENTRY_MS, isNewCardAwaitingLod } from './utils/cardEntrance';
 import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
 import { AgentCursor, buildDynamicSelectionPrompt, HudContextMessage } from './components/AgentCursor';
+import {
+  AgentCoordinateSpace,
+  toScreenPoint,
+  toCanvasPoint,
+  resolveAgentCursorStoragePoint,
+  isPointInDockCardRects,
+} from './agent/agentCursorPosition';
 import { AgentContextMenu } from './components/AgentContextMenu';
 import { GenerationCard, CardData, CARD_DIMENSIONS, getCardSize, safeParseJsonResponse, compressImageBlob, resolveReferenceToPayload, SubjectLandmarks, VisualElementAnnotation, pauseVideosForNanoLod } from './components/GenerationCard';
 import { WORKRALLY_IMAGE_MODELS, WORKRALLY_IMAGE_TOOL } from './config/workrallyImageModels';
@@ -16,6 +23,7 @@ import { yieldToMain } from './utils/yieldToMain';
 import { getOrLoadCanvasImage } from './utils/imageTextureCache';
 import { getCardWorldBounds, isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold, CARD_DENSITY_HIGH_THRESHOLD, HIGH_RENDER_WEIGHT_THRESHOLD, calculateTotalRenderWeight, FRAME_BUDGET_MS } from './utils/viewportCulling';
 import { getHybridPointer, setHybridProximityProvider, isHybridCardNear, CANVAS_IDLE_MS, scheduleCanvasSurface, canLoadDuringCameraGesture, subscribeCanvasLoadingMode, getCanvasLoadingMode } from './utils/canvasPerformance';
+import { isCanvasOverlayControlTarget, shouldPassThroughCanvasCardMiddleButton } from './utils/canvasPointerPassThrough';
 import { readyPromptPanels } from './utils/promptSurfaceCache';
 import { createCardMountStore, ProgressiveGenerationCard } from './components/ProgressiveGenerationCard';
 import { canRetireDomForNano, type LodFrame } from './utils/lodHandoff';
@@ -23,13 +31,19 @@ import { buildCardQuadTree, QuadTree, BoundingBox } from './utils/quadTree';
 import { getBottomPanelHeight } from './utils/cardLayout';
 import { createSquareLetterboxImage, createVerticalWidescreenSlices, unpadLandmarks } from './utils/squareImageLetterbox';
 import { cropBoundingBoxFromImage } from './utils/imageCropper';
-import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X, MousePointerClick, Video, ArrowUp, ChevronDown, ChevronUp, RotateCcw } from 'lucide-react';
+import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X, MousePointerClick, Video, ArrowUp, ChevronDown, ChevronUp, RotateCcw, Star, ImagePlus } from 'lucide-react';
 import { loadCards, saveCards, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces, hasPendingCardSaves, subscribeCardSync, synchronizeCards } from './db';
 import { SettingsPage } from './components/SettingsPage';
 import { getDrafts, saveDraft, deleteDraft } from './utils/draftDb';
 import { McpKeyButton } from './components/McpKeyButton';
 import { ProjectScriptBible } from './components/ProjectScriptBible';
+import { computeUncoveredCanvasFocusTransform } from './utils/scriptBibleDockLayout';
+import { CanvasCardBindAssetModal, type CanvasCardAssetOption } from './components/AssetBindImageModal';
 import { ScriptProject, DEFAULT_PROJECT } from './types/script';
+import { buildAssetImagePrompt, resolveAssetImageEntries, buildCardSnapshotMap, toggleCanvasBindPickedCardId, isCanvasCardEligibleForAssetBind, type AssetCategory, type AssetBindPickerTarget } from './utils/assetImages';
+import { mergeMultiVersionAssetList } from './utils/assetVersions';
+import { buildAssetAgentTargetId, resolveAssetItemFromProject, parseAssetAgentTargetId, resolveAllAssetTargetIds } from './utils/assetAgentTarget';
+import { escapeAttrSelectorValue, safeQuerySelector } from './utils/domSelector';
 import { ScriptView, readScriptMetadata, readScriptDirectory, readScriptEpisode, searchScript } from './agent/scriptTools';
 import type { AgentToolCall, AgentTurnResult } from './agent/protocol';
 import { AgentRuntime, type RuntimeTask } from './agent/runtime';
@@ -634,10 +648,10 @@ export default function App() {
             return filtered.map((p: Partial<ScriptProject>) => ({
               ...DEFAULT_PROJECT,
               ...p,
-              characters: Array.isArray(p.characters) ? p.characters : [],
-              locations: Array.isArray(p.locations) ? p.locations : [],
-              props: Array.isArray(p.props) ? p.props : [],
-              scenes: Array.isArray(p.scenes) ? p.scenes : [],
+              characters: Array.isArray(p.characters) ? p.characters.filter(Boolean) : [],
+              locations: Array.isArray(p.locations) ? p.locations.filter(Boolean) : [],
+              props: Array.isArray(p.props) ? p.props.filter(Boolean) : [],
+              scenes: Array.isArray(p.scenes) ? p.scenes.filter(Boolean) : [],
               scriptText: typeof p.scriptText === 'string' ? p.scriptText : '',
               universe: { ...DEFAULT_PROJECT.universe, ...(p.universe || {}) },
             }));
@@ -657,16 +671,16 @@ export default function App() {
     }
     return DEFAULT_PROJECT.id;
   });
-  const rawProject = projects.find(p => p.id === currentProjectId) || projects[0] || DEFAULT_PROJECT;
+  const rawProject = projects.find(p => p?.id === currentProjectId) || projects[0] || DEFAULT_PROJECT;
   const currentProject = useMemo<ScriptProject>(() => ({
     ...DEFAULT_PROJECT,
     ...rawProject,
-    characters: Array.isArray(rawProject.characters) ? rawProject.characters : [],
-    locations: Array.isArray(rawProject.locations) ? rawProject.locations : [],
-    props: Array.isArray(rawProject.props) ? rawProject.props : [],
-    scenes: Array.isArray(rawProject.scenes) ? rawProject.scenes : [],
-    scriptText: typeof rawProject.scriptText === 'string' ? rawProject.scriptText : '',
-    universe: { ...DEFAULT_PROJECT.universe, ...(rawProject.universe || {}) },
+    characters: Array.isArray(rawProject?.characters) ? rawProject.characters.filter(Boolean) : [],
+    locations: Array.isArray(rawProject?.locations) ? rawProject.locations.filter(Boolean) : [],
+    props: Array.isArray(rawProject?.props) ? rawProject.props.filter(Boolean) : [],
+    scenes: Array.isArray(rawProject?.scenes) ? rawProject.scenes.filter(Boolean) : [],
+    scriptText: typeof rawProject?.scriptText === 'string' ? rawProject.scriptText : '',
+    universe: { ...DEFAULT_PROJECT.universe, ...(rawProject?.universe || {}) },
   }), [rawProject]);
   const currentProjectRef = useRef(currentProject);
   currentProjectRef.current = currentProject;
@@ -876,6 +890,9 @@ export default function App() {
   const doubleClickTimeoutRef = useRef<NodeJS.Timeout>();
   const lastPointer = useRef({ x: 0, y: 0 });
   const [selectedCardIds, setSelectedCardIds] = useState<string[]>([]);
+  const [selectedAssetIds, setSelectedAssetIds] = useState<Set<string>>(new Set());
+  const selectedAssetIdsRef = useRef(selectedAssetIds);
+  selectedAssetIdsRef.current = selectedAssetIds;
   const [selectionBox, setSelectionBox] = useState<{
     startX: number;
     startY: number;
@@ -895,6 +912,7 @@ export default function App() {
   const [agentState, setAgentState] = useState<{
     x: number;
     y: number;
+    coordinateSpace?: AgentCoordinateSpace;
     visible: boolean;
     isActive: boolean;
     isMoving: boolean;
@@ -902,14 +920,48 @@ export default function App() {
     lastPrompt?: string;
     lastPromptTargetId?: string | null;
     cursorMode?: 'default' | 'inspect' | 'working' | 'interact';
+    isSleeping?: boolean;
   }>(() => ({ 
     x: typeof window !== 'undefined' ? window.innerWidth - 80 : 0, 
     y: typeof window !== 'undefined' ? window.innerHeight - 150 : 0, 
+    coordinateSpace: 'canvas',
     visible: true, 
     isActive: false, 
     isMoving: false, 
     cursorMode: 'default',
+    isSleeping: false,
   }));
+  const [sleepWakeHint, setSleepWakeHint] = useState<{
+    x: number;
+    y: number;
+    key: number;
+  } | null>(null);
+  const sleepWakeHintTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const rightClickWakePressRef = useRef<{
+    startX: number;
+    startY: number;
+    timer: NodeJS.Timeout | null;
+    wokeByLongPress: boolean;
+  }>({ startX: 0, startY: 0, timer: null, wokeByLongPress: false });
+
+  const clearSleepWakeHint = useCallback(() => {
+    if (sleepWakeHintTimerRef.current) {
+      clearTimeout(sleepWakeHintTimerRef.current);
+      sleepWakeHintTimerRef.current = null;
+    }
+    setSleepWakeHint(null);
+  }, []);
+
+  const showSleepWakeHint = useCallback((clientX: number, clientY: number) => {
+    if (sleepWakeHintTimerRef.current) {
+      clearTimeout(sleepWakeHintTimerRef.current);
+    }
+    setSleepWakeHint({ x: clientX, y: clientY, key: Date.now() });
+    sleepWakeHintTimerRef.current = setTimeout(() => {
+      setSleepWakeHint(null);
+      sleepWakeHintTimerRef.current = null;
+    }, 1100);
+  }, []);
   const [agentFocus, setAgentFocus] = useState<AgentFocusSnapshot>(() => agentFocusManager.getSnapshot());
   useEffect(() => {
     return agentFocusManager.subscribe((snapshot) => {
@@ -924,6 +976,8 @@ export default function App() {
   agentStateRef.current = agentState;
 
   const [verifyingAssetIds, setVerifyingAssetIds] = useState<string[]>([]);
+  const [generatingAssetIds, setGeneratingAssetIds] = useState<string[]>([]);
+  const [bindingCanvasCardId, setBindingCanvasCardId] = useState<string | null>(null);
   const [activeTaskBadgeNumber, setActiveTaskBadgeNumber] = useState<number | undefined>(undefined);
   const activeTaskBadgeNumberRef = useRef<number | undefined>(undefined);
   activeTaskBadgeNumberRef.current = activeTaskBadgeNumber;
@@ -934,11 +988,13 @@ export default function App() {
     badgeNumber: number;
     x: number;
     y: number;
+    coordinateSpace?: AgentCoordinateSpace;
     visible: boolean;
     isActive: boolean;
     isMoving: boolean;
     isRunning: boolean;
     isThinking: boolean;
+    isAsking?: boolean;
     speak?: string;
     cursorMode?: 'default' | 'inspect' | 'working' | 'interact';
     targetId?: string | null;
@@ -946,6 +1002,43 @@ export default function App() {
   const [concurrentTaskCursors, setConcurrentTaskCursors] = useState<Record<string, ConcurrentTaskCursorState>>({});
   const concurrentTaskCursorsRef = useRef<Record<string, ConcurrentTaskCursorState>>(concurrentTaskCursors);
   concurrentTaskCursorsRef.current = concurrentTaskCursors;
+
+  const lastDockCheckMsRef = useRef(0);
+  const releaseScreenCursorsIfOutsideDock = useCallback((forceConvertAll: boolean = false) => {
+    const cur = agentStateRef.current;
+    const scale = tScale.get() || 1;
+    const txVal = tx.get();
+    const tyVal = ty.get();
+
+    if (cur.coordinateSpace === 'screen') {
+      if (forceConvertAll || !isPointInDockCardRects(cur.x, cur.y)) {
+        const canvasPt = toCanvasPoint(cur, { tx: txVal, ty: tyVal, scale });
+        setAgentState(prev =>
+          prev.coordinateSpace === 'screen'
+            ? { ...prev, x: canvasPt.x, y: canvasPt.y, coordinateSpace: 'canvas', isMoving: false }
+            : prev
+        );
+      }
+    }
+
+    const detachedEntries = Object.values(concurrentTaskCursorsRef.current) as ConcurrentTaskCursorState[];
+    if (detachedEntries.some(c => c.coordinateSpace === 'screen')) {
+      setConcurrentTaskCursors(prev => {
+        let changed = false;
+        const next: Record<string, ConcurrentTaskCursorState> = { ...prev };
+        for (const [id, cursor] of Object.entries(prev) as Array<[string, ConcurrentTaskCursorState]>) {
+          if (cursor.coordinateSpace === 'screen' && (forceConvertAll || !isPointInDockCardRects(cursor.x, cursor.y))) {
+            const canvasPt = toCanvasPoint(cursor, { tx: txVal, ty: tyVal, scale });
+            next[id] = { ...cursor, x: canvasPt.x, y: canvasPt.y, coordinateSpace: 'canvas', isMoving: false };
+            changed = true;
+          }
+        }
+        if (!changed) return prev;
+        concurrentTaskCursorsRef.current = next;
+        return next;
+      });
+    }
+  }, [tScale, tx, ty]);
 
   const detachActiveTaskToConcurrentCursor = useCallback(() => {
     const runningTaskId = activeTaskIdRef.current;
@@ -970,6 +1063,7 @@ export default function App() {
           badgeNumber: badge,
           x: currentCursor.x,
           y: currentCursor.y,
+          coordinateSpace: currentCursor.coordinateSpace || 'canvas',
           visible: true,
           isActive: currentCursor.isActive,
           isMoving: false,
@@ -988,6 +1082,7 @@ export default function App() {
     isAgentRunningRef.current = false;
     setIsAgentRunning(false);
     setIsAgentThinking(false);
+    setIsAgentAsking(false);
     setActiveTaskBadgeNumber(undefined);
   }, []);
 
@@ -1032,26 +1127,29 @@ export default function App() {
   }, []);
 
   const [isAgentThinking, setIsAgentThinking] = useState(false);
+  const [isAgentAsking, setIsAgentAsking] = useState(false);
 
   // 🛡️ Bulletproof Reset Function & Safety Net Effect for Agent State & Cursor Mode
   const resetAgentStateToDefault = useCallback(() => {
     const currentTask = activeTaskIdRef.current ? runtimeRef.current?.getTask(activeTaskIdRef.current) : undefined;
     const isWaitingForUser = Boolean(currentTask && (currentTask.status === 'waiting_user' || currentTask.pendingAskCallId));
+    setIsAgentAsking(isWaitingForUser);
     agentFocusManager.setCursorMode('default');
     if (!isWaitingForUser) {
       agentFocusManager.clearAll(0);
     }
     setAgentState(prev => {
       const needsSpeakReset = isThinkingOrLoadingPhrase(prev.speak);
-      if (needsSpeakReset || prev.cursorMode !== 'default' || prev.isActive || prev.isMoving || prev.lastPrompt || prev.lastPromptTargetId) {
+      const shouldClearPrompt = !isWaitingForUser && Boolean(prev.lastPrompt || prev.lastPromptTargetId);
+      if (needsSpeakReset || prev.cursorMode !== 'default' || prev.isActive || prev.isMoving || shouldClearPrompt) {
         return {
           ...prev,
           cursorMode: 'default',
           isActive: false,
           isMoving: false,
           speak: needsSpeakReset ? undefined : prev.speak,
-          lastPrompt: undefined,
-          lastPromptTargetId: undefined,
+          lastPrompt: isWaitingForUser ? prev.lastPrompt : undefined,
+          lastPromptTargetId: isWaitingForUser ? prev.lastPromptTargetId : undefined,
         };
       }
       return prev;
@@ -1082,22 +1180,10 @@ export default function App() {
     targetId: null,
     placeholder: "输入你的想法...",
   }));
-  // Keep Agent input box ALWAYS visible by default and sync targetId with card selections
-  useEffect(() => {
-    setAgentQuickInput(prev => ({
-      isOpen: true,
-      x: prev?.x,
-      y: prev?.y,
-      canvasX: prev?.canvasX,
-      canvasY: prev?.canvasY,
-      lastReply: prev?.lastReply,
-      placeholder: prev?.placeholder || "输入你的想法...",
-      focusTrigger: prev?.focusTrigger,
-      onAskResolve: prev?.onAskResolve,
-      targetId: selectedCardIds.length > 0 ? selectedCardIds[0] : null,
-      targetIds: selectedCardIds.length > 0 ? selectedCardIds : undefined,
-    }));
-  }, [selectedCardIds]);
+  // 🛡️ Decoupling Principle: Keep user's manual selection (selectedCardIds) strictly decoupled
+  // from Agent's target (agentQuickInput.targetId / targetIds & agentFocus).
+  // Left-clicking a card only updates selectedCardIds (User Blue border);
+  // agentQuickInput targets are only updated by explicit Agent interactions (drag agent cursor, right-click, agent box-select, or agent tools).
 
   const [cardDrafts, setCardDrafts] = useState<Record<string, string>>({});
   const [globalChatHistory, setGlobalChatHistory] = useState<Array<{
@@ -1248,6 +1334,13 @@ export default function App() {
       fullText = rawText;
     }
 
+    if (/^(?:[（(]?\s*(?:无需输出|无|略|不需要|暂无|无需完整版)[^）)]*[）)]?|-+)$/i.test(fullText.trim())) {
+      fullText = shortText || '';
+    }
+    if (!fullText && shortText) {
+      fullText = shortText;
+    }
+
     // 2. Smart Short Fallback: If no explicit shortText was parsed, generate a concise summary
     // (first sentence or first 48 chars) instead of dumping the entire fullText into the floating HUD.
     if (!shortText) {
@@ -1346,6 +1439,7 @@ export default function App() {
   }, [cards, agentQuickInput, agentFocus]);
 
   const handleStartAgentBoxSelect = useCallback((startX: number, startY: number) => {
+    if (agentStateRef.current.isSleeping) return;
     setAgentSelectionBox({
       startX,
       startY,
@@ -1355,6 +1449,7 @@ export default function App() {
   }, []);
 
   const handleUpdateAgentBoxSelect = useCallback((currentX: number, currentY: number) => {
+    if (agentStateRef.current.isSleeping) return;
     setAgentSelectionBox(prev => {
       if (!prev) return null;
       const next = { ...prev, currentX, currentY };
@@ -1445,104 +1540,94 @@ export default function App() {
       targetId = 'script.text';
     }
 
-    if (targetId.startsWith('assets.item.character.')) {
-      const charId = targetId.slice('assets.item.character.'.length);
-      let char: any = proj.characters?.find(c => c.id === charId);
-      let parentChar: any = null;
-      if (!char && Array.isArray(proj.characters)) {
-        for (const c of proj.characters) {
-          const ver = Array.isArray(c.versions) ? c.versions.find((v: any) => v.id === charId) : null;
-          if (ver) {
-            char = ver;
-            parentChar = c;
-            break;
-          }
-        }
-      }
-      const name = parentChar ? `${parentChar.name}（${char?.name || charId}）` : (char?.name || charId);
-      const summaryLines = [
-        `【当前聚焦的剧本角色资产】`,
-        parentChar ? `- 版本ID: ${charId}` : `- 资产ID: ${charId}`,
-        parentChar ? `- 所属主资产ID: ${parentChar.id} (${parentChar.name})` : '',
-        `- 角色名: ${name}`,
-        char?.description ? `- 资产识别描述: ${char.description}` : '',
-        char?.role || parentChar?.role ? `- 身份/定位: ${char?.role || parentChar?.role}` : '',
-        char?.appearance ? `- 外貌与服装特征: ${char.appearance}` : '',
-        char?.personality ? `- 性格特征: ${char.personality}` : '',
-        char?.sourceScenes?.length ? `- 出场场次: ${char.sourceScenes.join('、')}` : '',
-      ].filter(Boolean);
-      return {
-        targetId,
-        speak: `选了角色【${name}】，需要我做什么？`,
-        title: `角色资产：${name}`,
-        contextSummary: summaryLines.join('\n'),
-      };
-    }
+    if (targetId.startsWith('assets.item.')) {
+      const resolved = resolveAssetItemFromProject(proj, targetId);
+      const item = resolved?.item;
+      const parentItem = resolved?.parentItem;
+      const isVersion = Boolean(resolved?.isVersion);
+      const itemId = String(item?.id || targetId.split('.').pop() || targetId);
+      const name = parentItem ? `${parentItem.name}（${item?.name || itemId}）` : (item?.name || itemId);
+      const scenesText = Array.isArray(item?.sourceScenes) && item.sourceScenes.length ? item.sourceScenes.join('、') : '';
 
-    if (targetId.startsWith('assets.item.location.')) {
-      const locId = targetId.slice('assets.item.location.'.length);
-      let loc: any = proj.locations?.find(l => l.id === locId);
-      let parentLoc: any = null;
-      if (!loc && Array.isArray(proj.locations)) {
-        for (const l of proj.locations) {
-          const ver = Array.isArray(l.versions) ? l.versions.find((v: any) => v.id === locId) : null;
-          if (ver) {
-            loc = ver;
-            parentLoc = l;
-            break;
-          }
-        }
-      }
-      const name = parentLoc ? `${parentLoc.name}（${loc?.name || locId}）` : (loc?.name || locId);
-      const summaryLines = [
-        `【当前聚焦的剧本场景资产】`,
-        parentLoc ? `- 版本ID: ${locId}` : `- 资产ID: ${locId}`,
-        parentLoc ? `- 所属主资产ID: ${parentLoc.id} (${parentLoc.name})` : '',
-        `- 场景名: ${name}`,
-        loc?.description ? `- 资产识别描述: ${loc.description}` : '',
-        loc?.type || parentLoc?.type ? `- 内外景: ${loc?.type || parentLoc?.type}` : '',
-        loc?.timeOfDay ? `- 时间段: ${loc.timeOfDay}` : '',
-        loc?.atmosphere ? `- 环境氛围: ${loc.atmosphere}` : '',
-        loc?.visualDetails ? `- 视觉细节: ${loc.visualDetails}` : '',
-        loc?.sourceScenes?.length ? `- 出场场次: ${loc.sourceScenes.join('、')}` : '',
-      ].filter(Boolean);
-      return {
-        targetId,
-        speak: `选了场景【${name}】，需要我做什么？`,
-        title: `场景资产：${name}`,
-        contextSummary: summaryLines.join('\n'),
-      };
-    }
+      const parsed = parseAssetAgentTargetId(targetId);
+      const isMultiSelected = Boolean(
+        parsed && selectedAssetIdsRef.current.has(parsed.itemId) && selectedAssetIdsRef.current.size > 1
+      );
+      const focusSnap = agentFocusManager.getSnapshot();
+      const focusAssetCount = [
+        focusSnap.primaryCardId,
+        ...focusSnap.referenceCardIds
+      ].filter((id): id is string => Boolean(id && id.startsWith('assets.item.'))).length;
+      const assetCount = isMultiSelected
+        ? selectedAssetIdsRef.current.size
+        : Math.max(1, focusAssetCount);
 
-    if (targetId.startsWith('assets.item.prop.')) {
-      const propId = targetId.slice('assets.item.prop.'.length);
-      let prop: any = proj.props?.find(p => p.id === propId);
-      let parentProp: any = null;
-      if (!prop && Array.isArray(proj.props)) {
-        for (const p of proj.props) {
-          const ver = Array.isArray(p.versions) ? p.versions.find((v: any) => v.id === propId) : null;
-          if (ver) {
-            prop = ver;
-            parentProp = p;
-            break;
-          }
-        }
+      let speakText = '';
+      if (assetCount > 1) {
+        speakText = `选了 ${assetCount} 项资产，需要我做什么？`;
+      } else if (resolved?.category === 'character' || targetId.startsWith('assets.item.character.')) {
+        speakText = `选了角色【${name}】，需要我做什么？`;
+      } else if (resolved?.category === 'location' || targetId.startsWith('assets.item.location.')) {
+        speakText = `选了场景【${name}】，需要我做什么？`;
+      } else {
+        speakText = `选了道具【${name}】，需要我做什么？`;
       }
-      const name = parentProp ? `${parentProp.name}（${prop?.name || propId}）` : (prop?.name || propId);
+
+      if (resolved?.category === 'character' || targetId.startsWith('assets.item.character.')) {
+        const summaryLines = [
+          `【当前聚焦的剧本角色资产】`,
+          isVersion ? `- 版本ID: ${itemId}` : `- 资产ID: ${itemId}`,
+          parentItem ? `- 所属主资产ID: ${parentItem.id} (${parentItem.name})` : '',
+          `- 角色名: ${name}`,
+          item?.description ? `- 资产识别描述: ${item.description}` : '',
+          item?.role || parentItem?.role ? `- 身份/定位: ${item?.role || parentItem?.role}` : '',
+          item?.appearance ? `- 外貌与服装特征: ${item.appearance}` : '',
+          item?.personality ? `- 性格特征: ${item.personality}` : '',
+          scenesText ? `- 出场场次: ${scenesText}` : '',
+        ].filter(Boolean);
+        return {
+          targetId,
+          speak: speakText,
+          title: `角色资产：${name}`,
+          contextSummary: summaryLines.join('\n'),
+        };
+      }
+
+      if (resolved?.category === 'location' || targetId.startsWith('assets.item.location.')) {
+        const summaryLines = [
+          `【当前聚焦的剧本场景资产】`,
+          isVersion ? `- 版本ID: ${itemId}` : `- 资产ID: ${itemId}`,
+          parentItem ? `- 所属主资产ID: ${parentItem.id} (${parentItem.name})` : '',
+          `- 场景名: ${name}`,
+          item?.description ? `- 资产识别描述: ${item.description}` : '',
+          item?.type || parentItem?.type ? `- 内外景: ${item?.type || parentItem?.type}` : '',
+          item?.timeOfDay ? `- 时间段: ${item.timeOfDay}` : '',
+          item?.atmosphere ? `- 环境氛围: ${item.atmosphere}` : '',
+          item?.visualDetails ? `- 视觉细节: ${item.visualDetails}` : '',
+          scenesText ? `- 出场场次: ${scenesText}` : '',
+        ].filter(Boolean);
+        return {
+          targetId,
+          speak: speakText,
+          title: `场景资产：${name}`,
+          contextSummary: summaryLines.join('\n'),
+        };
+      }
+
       const summaryLines = [
         `【当前聚焦的剧本道具资产】`,
-        parentProp ? `- 版本ID: ${propId}` : `- 资产ID: ${propId}`,
-        parentProp ? `- 所属主资产ID: ${parentProp.id} (${parentProp.name})` : '',
+        isVersion ? `- 版本ID: ${itemId}` : `- 资产ID: ${itemId}`,
+        parentItem ? `- 所属主资产ID: ${parentItem.id} (${parentItem.name})` : '',
         `- 道具名: ${name}`,
-        prop?.description ? `- 资产识别描述: ${prop.description}` : '',
-        prop?.owner || parentProp?.owner ? `- 归属者: ${prop?.owner || parentProp?.owner}` : '',
-        prop?.materialAndState ? `- 材质与状态: ${prop.materialAndState}` : '',
-        prop?.storySignificance ? `- 剧情辨识信息: ${prop.storySignificance}` : '',
-        prop?.sourceScenes?.length ? `- 出场场次: ${prop.sourceScenes.join('、')}` : '',
+        item?.description ? `- 资产识别描述: ${item.description}` : '',
+        item?.owner || parentItem?.owner ? `- 归属者: ${item?.owner || parentItem?.owner}` : '',
+        item?.materialAndState ? `- 材质与状态: ${item.materialAndState}` : '',
+        item?.storySignificance ? `- 剧情辨识信息: ${item.storySignificance}` : '',
+        scenesText ? `- 出场场次: ${scenesText}` : '',
       ].filter(Boolean);
       return {
         targetId,
-        speak: `选了道具【${name}】，需要我做什么？`,
+        speak: speakText,
         title: `道具资产：${name}`,
         contextSummary: summaryLines.join('\n'),
       };
@@ -1564,15 +1649,15 @@ export default function App() {
           ].join('\n'),
         };
       }
-      const preview = (proj.scriptText || '').slice(0, 1200);
+      const preview = (proj?.scriptText || '').slice(0, 1200);
       return {
         targetId: 'script.text',
         speak: '选了剧本正文，需要我做什么？',
-        title: `剧本正文：${proj.name || '当前项目'}`,
+        title: `剧本正文：${proj?.name || '当前项目'}`,
         contextSummary: [
           `【当前聚焦目标：剧本正文 (script.text)】`,
-          `- 项目名称: ${proj.name || '未命名项目'}`,
-          `- 剧本总字数: ${(proj.scriptText || '').length}`,
+          `- 项目名称: ${proj?.name || '未命名项目'}`,
+          `- 剧本总字数: ${(proj?.scriptText || '').length}`,
           preview ? `- 剧本开头节选:\n${preview}` : '',
         ].filter(Boolean).join('\n'),
       };
@@ -1595,9 +1680,9 @@ export default function App() {
         title: '资产清单面板',
         contextSummary: [
           `【当前聚焦目标：资产清单面板 (assets.panel)】`,
-          `- 角色数量: ${proj.characters?.length || 0}`,
-          `- 场景数量: ${proj.locations?.length || 0}`,
-          `- 道具数量: ${proj.props?.length || 0}`,
+          `- 角色数量: ${proj?.characters?.length || 0}`,
+          `- 场景数量: ${proj?.locations?.length || 0}`,
+          `- 道具数量: ${proj?.props?.length || 0}`,
         ].join('\n'),
       };
     }
@@ -1652,21 +1737,53 @@ export default function App() {
   }, [buildUiTargetFocusInfo]);
 
   const handleDragAgentEnd = useCallback((finalCanvasX: number, finalCanvasY: number, screenX: number, screenY: number) => {
-    // 1. Precise Hit-Test: Check both the Agent cursor arrow tip and release pointer position
     const tipScreenX = finalCanvasX * tScale.get() + tx.get();
     const tipScreenY = finalCanvasY * tScale.get() + ty.get();
-    const uiTarget = resolveAgentUiTargetAtPoint(tipScreenX, tipScreenY) || resolveAgentUiTargetAtPoint(screenX, screenY);
+    const inDockCards = isPointInDockCardRects(tipScreenX, tipScreenY);
+    const storedPos = resolveAgentCursorStoragePoint(tipScreenX, tipScreenY, finalCanvasX, finalCanvasY, inDockCards);
 
-    if (uiTarget) {
-      setContextMenus(prev => { const next = { ...prev }; delete next['user']; return next; });
-      agentFocusManager.setPrimaryFocus(uiTarget.targetId, 'inspect', 'drag_agent');
+    // When Agent is sleeping, dragging only repositions the sleeping pointer and NEVER wakes it
+    if (agentStateRef.current.isSleeping) {
       setAgentState(prev => ({
         ...prev,
-        x: finalCanvasX,
-        y: finalCanvasY,
+        ...storedPos,
+        isMoving: false,
+      }));
+      return;
+    }
+
+    // 1. Precise Hit-Test: Check both the Agent cursor arrow tip and release pointer position
+    const uiTarget = resolveAgentUiTargetAtPoint(tipScreenX, tipScreenY) || resolveAgentUiTargetAtPoint(screenX, screenY);
+
+    clearSleepWakeHint();
+    if (uiTarget) {
+      setContextMenus(prev => { const next = { ...prev }; delete next['user']; return next; });
+      const parsed = parseAssetAgentTargetId(uiTarget.targetId);
+      const isMultiSelected = Boolean(
+        parsed && selectedAssetIdsRef.current.has(parsed.itemId) && selectedAssetIdsRef.current.size > 1
+      );
+
+      let targetIds = [uiTarget.targetId];
+      if (isMultiSelected) {
+        targetIds = resolveAllAssetTargetIds(currentProjectRef.current, selectedAssetIdsRef.current, uiTarget.targetId);
+        agentFocusManager.batchSetFocus({
+          primary: uiTarget.targetId,
+          references: targetIds.filter(id => id !== uiTarget.targetId),
+          role: 'inspect',
+          sourceTool: 'drag_agent',
+          cursorMode: 'inspect',
+        });
+      } else {
+        agentFocusManager.setPrimaryFocus(uiTarget.targetId, 'inspect', 'drag_agent');
+      }
+
+      setAgentState(prev => ({
+        ...prev,
+        ...storedPos,
         speak: uiTarget.speak,
         isMoving: false,
-        visible: true
+        visible: true,
+        isSleeping: false,
       }));
       setAgentQuickInput({
         isOpen: true,
@@ -1675,7 +1792,7 @@ export default function App() {
         canvasX: finalCanvasX,
         canvasY: finalCanvasY,
         targetId: uiTarget.targetId,
-        targetIds: [uiTarget.targetId],
+        targetIds,
         focusTrigger: Date.now()
       });
       return;
@@ -1684,12 +1801,14 @@ export default function App() {
     // 2. Perform hit test on cards using pure data layer (reverse order for top-most z-index)
     const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
     let hitCard: CardData | null = null;
-    for (let i = allCards.length - 1; i >= 0; i--) {
-      const c = allCards[i];
-      const dim = getCardSize(c);
-      if (finalCanvasX >= c.x && finalCanvasX <= c.x + dim.width && finalCanvasY >= c.y && finalCanvasY <= c.y + dim.height) {
-        hitCard = c;
-        break;
+    if (!inDockCards) {
+      for (let i = allCards.length - 1; i >= 0; i--) {
+        const c = allCards[i];
+        const dim = getCardSize(c);
+        if (finalCanvasX >= c.x && finalCanvasX <= c.x + dim.width && finalCanvasY >= c.y && finalCanvasY <= c.y + dim.height) {
+          hitCard = c;
+          break;
+        }
       }
     }
 
@@ -1725,11 +1844,11 @@ export default function App() {
 
       setAgentState(prev => ({
         ...prev,
-        x: finalCanvasX,
-        y: finalCanvasY,
+        ...storedPos,
         speak: promptText,
         isMoving: false,
-        visible: true
+        visible: true,
+        isSleeping: false,
       }));
       setAgentQuickInput({
         isOpen: true,
@@ -1747,11 +1866,11 @@ export default function App() {
       const promptText = "我能帮什么忙？";
       setAgentState(prev => ({
         ...prev,
-        x: finalCanvasX,
-        y: finalCanvasY,
+        ...storedPos,
         speak: promptText,
         isMoving: false,
-        visible: true
+        visible: true,
+        isSleeping: false,
       }));
       setAgentQuickInput({
         isOpen: true,
@@ -1765,14 +1884,21 @@ export default function App() {
         focusTrigger: Date.now()
       });
     }
-  }, [cards, resolveAgentUiTargetAtPoint, tScale, tx, ty]);
+  }, [cards, clearSleepWakeHint, resolveAgentUiTargetAtPoint, tScale, tx, ty]);
 
-  // Click on Agent pointer to toggle hide/show
+  // Click on Agent pointer to toggle sleep / wake state
   const handleClickAgentPointer = useCallback(() => {
-    // If HUD is open/visible (has speak or quickInput), clicking hides it
-    if (agentState.speak || agentQuickInput?.isOpen) {
+    // If Agent is awake and HUD is open/visible, clicking puts Agent into sleep state
+    if (!agentState.isSleeping && (agentState.speak || agentQuickInput?.isOpen)) {
       if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
-      setAgentState(prev => ({ ...prev, speak: undefined }));
+      agentFocusManager.clearAll();
+      setContextMenus(prev => {
+        if (!prev['user']) return prev;
+        const next = { ...prev };
+        delete next['user'];
+        return next;
+      });
+      setAgentState(prev => ({ ...prev, speak: undefined, isSleeping: true }));
       
       // Clear the current active card draft and persist delete to IndexedDB on close
       const currentTarget = agentQuickInput?.targetId || 'global';
@@ -1781,37 +1907,58 @@ export default function App() {
 
       setAgentQuickInput(null);
     } else {
-      const screenX = agentState.x * tScale.get() + tx.get();
-      const screenY = agentState.y * tScale.get() + ty.get();
+      clearSleepWakeHint();
+      const camera = { tx: tx.get(), ty: ty.get(), scale: tScale.get() || 1 };
+      const { x: screenX, y: screenY } = toScreenPoint(agentState, camera);
+      const { x: canvasX, y: canvasY } = toCanvasPoint(agentState, camera);
       const uiTarget = resolveAgentUiTargetAtPoint(screenX, screenY);
       if (uiTarget) {
-        agentFocusManager.setPrimaryFocus(uiTarget.targetId, 'inspect', 'pointer_click');
+        const parsed = parseAssetAgentTargetId(uiTarget.targetId);
+        const isMultiSelected = Boolean(
+          parsed && selectedAssetIdsRef.current.has(parsed.itemId) && selectedAssetIdsRef.current.size > 1
+        );
+
+        let targetIds = [uiTarget.targetId];
+        if (isMultiSelected) {
+          targetIds = resolveAllAssetTargetIds(currentProjectRef.current, selectedAssetIdsRef.current, uiTarget.targetId);
+          agentFocusManager.batchSetFocus({
+            primary: uiTarget.targetId,
+            references: targetIds.filter(id => id !== uiTarget.targetId),
+            role: 'inspect',
+            sourceTool: 'pointer_click',
+            cursorMode: 'inspect',
+          });
+        } else {
+          agentFocusManager.setPrimaryFocus(uiTarget.targetId, 'inspect', 'pointer_click');
+        }
+
         setAgentState(prev => ({
           ...prev,
           speak: uiTarget.speak,
           isMoving: false,
-          visible: true
+          visible: true,
+          isSleeping: false,
         }));
         setAgentQuickInput({
           isOpen: true,
           x: screenX,
           y: screenY,
-          canvasX: agentState.x,
-          canvasY: agentState.y,
+          canvasX,
+          canvasY,
           targetId: uiTarget.targetId,
-          targetIds: [uiTarget.targetId],
+          targetIds,
           focusTrigger: Date.now()
         });
         return;
       }
 
-      // If HUD is hidden, clicking restores it
+      // If sleeping or HUD is hidden, clicking wakes Agent and restores HUD
       const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
       let hitCard: CardData | null = null;
       for (let i = allCards.length - 1; i >= 0; i--) {
         const c = allCards[i];
         const dim = getCardSize(c);
-        if (agentState.x >= c.x && agentState.x <= c.x + dim.width && agentState.y >= c.y && agentState.y <= c.y + dim.height) {
+        if (canvasX >= c.x && canvasX <= c.x + dim.width && canvasY >= c.y && canvasY <= c.y + dim.height) {
           hitCard = c;
           break;
         }
@@ -1848,14 +1995,15 @@ export default function App() {
           ...prev,
           speak: promptText,
           isMoving: false,
-          visible: true
+          visible: true,
+          isSleeping: false,
         }));
         setAgentQuickInput({
           isOpen: true,
           x: screenX,
           y: screenY,
-          canvasX: agentState.x,
-          canvasY: agentState.y,
+          canvasX,
+          canvasY,
           targetId: hitCard.id,
           targetIds,
           lastReply,
@@ -1868,14 +2016,15 @@ export default function App() {
           ...prev,
           speak: promptText,
           isMoving: false,
-          visible: true
+          visible: true,
+          isSleeping: false,
         }));
         setAgentQuickInput({
           isOpen: true,
           x: screenX,
           y: screenY,
-          canvasX: agentState.x,
-          canvasY: agentState.y,
+          canvasX,
+          canvasY,
           targetId: null,
           targetIds: [],
           lastReply: undefined,
@@ -1883,7 +2032,7 @@ export default function App() {
         });
       }
     }
-  }, [agentState.speak, agentState.x, agentState.y, agentQuickInput?.isOpen, cards, resolveAgentUiTargetAtPoint, tScale, tx, ty]);
+  }, [agentState, agentQuickInput?.isOpen, cards, clearSleepWakeHint, resolveAgentUiTargetAtPoint, tScale, tx, ty]);
 
   // Canvas Reference Picker Session State
   const [pickerSession, setPickerSession] = useState<{
@@ -1898,6 +2047,24 @@ export default function App() {
   } | null>(null);
   const pickerSessionRef = useRef(pickerSession);
   pickerSessionRef.current = pickerSession;
+
+  // Script Asset Canvas Bind Picker Session State
+  const [assetBindPickerSession, setAssetBindPickerSession] = useState<{
+    target: AssetBindPickerTarget;
+    pickedCardIds: string[];
+    label: string;
+    setPrimary: boolean;
+    restoreDrawerOpen: boolean;
+  } | null>(null);
+  const assetBindPickerSessionRef = useRef(assetBindPickerSession);
+  assetBindPickerSessionRef.current = assetBindPickerSession;
+
+  const [requestedBindModalTarget, setRequestedBindModalTarget] = useState<{
+    category: AssetCategory;
+    assetId: string;
+    parentId?: string;
+    nonce: number;
+  } | null>(null);
 
   const nanoDragRef = useRef<{
     cardId: string;
@@ -1969,6 +2136,7 @@ export default function App() {
           ...prev,
           x: cardCenterX,
           y: cardCenterY,
+          coordinateSpace: 'canvas',
           visible: true,
           isMoving: true,
           isActive: true,
@@ -4347,6 +4515,100 @@ export default function App() {
     setPickerSession(null);
   }, [pickerSession, handleUpdateCard, tx, ty, tScale, triggerTweenZoom]);
 
+  const handleStartCanvasAssetBind = useCallback((target: AssetBindPickerTarget) => {
+    setPickerSession(null);
+    const shouldRestore = scriptViewRef.current.drawerOpen;
+    setDrawerOpen(false);
+    setAssetBindPickerSession({
+      target,
+      pickedCardIds: [],
+      label: '',
+      setPrimary: true,
+      restoreDrawerOpen: shouldRestore,
+    });
+  }, [setDrawerOpen]);
+
+  const handleToggleAssetBindPickedCard = useCallback((cardId: string) => {
+    const targetCardObj = cardsRef.current.find((c) => c.id === cardId);
+    if (!targetCardObj || !isCanvasCardEligibleForAssetBind(targetCardObj)) return;
+    setAssetBindPickerSession((prev) => {
+      if (!prev) return null;
+      return {
+        ...prev,
+        pickedCardIds: toggleCanvasBindPickedCardId(prev.pickedCardIds, targetCardObj),
+      };
+    });
+  }, []);
+
+  const handleCancelAssetBindPicker = useCallback(() => {
+    const session = assetBindPickerSessionRef.current;
+    if (!session) return;
+    setAssetBindPickerSession(null);
+    if (session.restoreDrawerOpen) {
+      setDrawerOpen(true);
+    }
+  }, [setDrawerOpen]);
+
+  const handleSwitchAssetBindToModal = useCallback(() => {
+    const session = assetBindPickerSessionRef.current;
+    if (!session) return;
+    const { target, restoreDrawerOpen } = session;
+    setAssetBindPickerSession(null);
+    if (restoreDrawerOpen) {
+      setDrawerOpen(true);
+    }
+    setRequestedBindModalTarget({
+      category: target.category,
+      assetId: target.assetId,
+      parentId: target.parentId,
+      nonce: Date.now(),
+    });
+  }, [setDrawerOpen]);
+
+  const handleConfirmAssetBindPicker = useCallback(() => {
+    const session = assetBindPickerSessionRef.current;
+    if (!session || session.pickedCardIds.length === 0) return;
+
+    let workingProject = currentProjectRef.current;
+    let accumulatedUpdates: Partial<ScriptProject> = {};
+    const trimmedLabel = session.label.trim() || undefined;
+
+    session.pickedCardIds.forEach((cardId, idx) => {
+      const { updatedProject } = executeProjectAssetMutation(
+        'asset.bindImage',
+        {
+          id: session.target.assetId,
+          assetId: session.target.assetId,
+          type: session.target.category,
+          action: 'bind',
+          cardId,
+          label: trimmedLabel,
+          setPrimary: session.setPrimary && idx === 0,
+          source: 'canvas',
+        },
+        workingProject,
+        cardsRef.current
+      );
+      if (Object.keys(updatedProject).length > 0) {
+        workingProject = { ...workingProject, ...updatedProject };
+        accumulatedUpdates = { ...accumulatedUpdates, ...updatedProject };
+      }
+    });
+
+    if (Object.keys(accumulatedUpdates).length > 0) {
+      handleUpdateCurrentProject(accumulatedUpdates);
+    }
+
+    setAssetBindPickerSession(null);
+    if (session.restoreDrawerOpen) {
+      setDrawerOpen(true);
+    }
+    showToastNotice(
+      `已从画布绑定 ${session.pickedCardIds.length} 张图像至「${session.target.displayName}」`,
+      { dotColor: 'bg-emerald-500' }
+    );
+  }, [handleUpdateCurrentProject, setDrawerOpen]);
+
   // High-performance batched check (via rAF) during canvas panning/zooming
   useEffect(() => {
     let rafId: number | null = null;
@@ -4504,21 +4766,38 @@ export default function App() {
   }, []);
 
   const handleCardSelectWrapped = useCallback((e: React.PointerEvent, id: string, selectOnlyOnPointerUp?: boolean) => {
+    const assetBindSession = assetBindPickerSessionRef.current;
+    if (assetBindSession) {
+      e.stopPropagation();
+      if (!selectOnlyOnPointerUp) {
+        handleToggleAssetBindPickedCard(id);
+      }
+      return;
+    }
     const session = pickerSessionRef.current;
     if (session) {
       if (id !== session.targetCardId) {
         e.stopPropagation();
-        handleTogglePickerCard(id);
+        if (!selectOnlyOnPointerUp) {
+          handleTogglePickerCard(id);
+        }
       }
     } else {
       handleCardSelect(e, id, selectOnlyOnPointerUp);
     }
-  }, [handleCardSelect, handleTogglePickerCard]);
+  }, [handleCardSelect, handleTogglePickerCard, handleToggleAssetBindPickedCard]);
 
   const handleCardDelete = useCallback((id: string) => {
     agentFocusManager.removeFocus(id);
     setCards(prev => prev.filter(c => c.id !== id));
     setSelectedCardIds(prev => prev.filter(cid => cid !== id));
+    setAgentQuickInput(prev => {
+      if (!prev) return prev;
+      const nextIds = prev.targetIds?.filter(cid => cid !== id);
+      const nextTargetId = prev.targetId === id ? (nextIds?.[0] || null) : prev.targetId;
+      if (nextTargetId === prev.targetId && nextIds?.length === prev.targetIds?.length) return prev;
+      return { ...prev, targetId: nextTargetId, targetIds: nextIds };
+    });
   }, []);
 
   // State for Context Menu
@@ -4666,6 +4945,15 @@ export default function App() {
           agentFocusManager.batchRemoveFocus(currentSelection);
           setCards(prev => prev.filter(c => !currentSelection.includes(c.id)));
           setSelectedCardIds([]);
+          setAgentQuickInput(prev => {
+            if (!prev) return prev;
+            const nextIds = prev.targetIds?.filter(cid => !currentSelection.includes(cid));
+            const nextTargetId = prev.targetId && currentSelection.includes(prev.targetId)
+              ? (nextIds?.[0] || null)
+              : prev.targetId;
+            if (nextTargetId === prev.targetId && nextIds?.length === prev.targetIds?.length) return prev;
+            return { ...prev, targetId: nextTargetId, targetIds: nextIds };
+          });
         }
       }
     };
@@ -4728,14 +5016,19 @@ export default function App() {
     };
   }, []); // We use refs for state to avoid re-binding on every selection change
 
-  const handleContextMenu = (e: React.MouseEvent) => {
-    e.preventDefault();
-    
+  const summonAgentAtClientPoint = useCallback((
+    clientX: number,
+    clientY: number,
+    isTrusted: boolean,
+    targetElement?: Element | null
+  ) => {
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
-    
-    const cursorX = e.clientX - rect.left;
-    const cursorY = e.clientY - rect.top;
+
+    clearSleepWakeHint();
+
+    const cursorX = clientX - rect.left;
+    const cursorY = clientY - rect.top;
     const canvasX = (cursorX - tx.get()) / tScale.get();
     const canvasY = (cursorY - ty.get()) / tScale.get();
 
@@ -4749,9 +5042,11 @@ export default function App() {
     );
 
     // 1. First check if right-click is on any Script / Asset / UI panel target
-    const uiTarget = resolveAgentUiTargetAtPoint(e.clientX, e.clientY);
+    const uiTarget = resolveAgentUiTargetAtPoint(clientX, clientY);
+    const inDockCards = isPointInDockCardRects(clientX, clientY);
+    const summonPos = resolveAgentCursorStoragePoint(clientX, clientY, canvasX, canvasY, inDockCards);
     if (uiTarget) {
-      const ownerId = e.nativeEvent.isTrusted ? 'user' : 'agent';
+      const ownerId = isTrusted ? 'user' : 'agent';
       // Never show blank-canvas creation menu when right-clicking Script/Asset UI panels
       setContextMenus(prev => {
         const next = { ...prev };
@@ -4763,24 +5058,42 @@ export default function App() {
       }
 
       if (ownerId === 'user') {
-        agentFocusManager.setPrimaryFocus(uiTarget.targetId, 'inspect', 'context_menu');
+        const parsed = parseAssetAgentTargetId(uiTarget.targetId);
+        const isMultiSelected = Boolean(
+          parsed && selectedAssetIdsRef.current.has(parsed.itemId) && selectedAssetIdsRef.current.size > 1
+        );
+
+        let targetIds = [uiTarget.targetId];
+        if (isMultiSelected) {
+          targetIds = resolveAllAssetTargetIds(currentProjectRef.current, selectedAssetIdsRef.current, uiTarget.targetId);
+          agentFocusManager.batchSetFocus({
+            primary: uiTarget.targetId,
+            references: targetIds.filter(id => id !== uiTarget.targetId),
+            role: 'inspect',
+            sourceTool: 'context_menu',
+            cursorMode: 'inspect',
+          });
+        } else {
+          agentFocusManager.setPrimaryFocus(uiTarget.targetId, 'inspect', 'context_menu');
+        }
+
         setAgentQuickInput({
           isOpen: true,
-          x: e.clientX,
-          y: e.clientY,
+          x: clientX,
+          y: clientY,
           canvasX: canvasX,
           canvasY: canvasY,
           targetId: uiTarget.targetId,
-          targetIds: [uiTarget.targetId],
+          targetIds,
           focusTrigger: Date.now()
         });
         setAgentState(prev => ({
           ...prev,
-          x: canvasX,
-          y: canvasY,
+          ...summonPos,
           speak: uiTarget.speak,
           isMoving: true,
-          visible: true
+          visible: true,
+          isSleeping: false,
         }));
         setTimeout(() => {
           setAgentState(prev => ({ ...prev, isMoving: false }));
@@ -4789,7 +5102,8 @@ export default function App() {
       return;
     }
     
-    const cardElement = (e.target as Element).closest('[data-card-id]');
+    const hitDomElement = targetElement || (typeof document !== 'undefined' ? document.elementFromPoint(clientX, clientY) : null);
+    const cardElement = hitDomElement?.closest ? hitDomElement.closest('[data-card-id]') : null;
     let targetId = cardElement ? cardElement.getAttribute('data-card-id') : null;
     
     // Perform instant world-coordinate hit-testing to identify the target card if not found from DOM
@@ -4809,9 +5123,9 @@ export default function App() {
       if (!targetId) {
         // 在空白画布右键时，仅弹出普通创建卡片上下文菜单，不打扰也不移动正在工作的 Agent
         const menuWidth = 260;
-        const clampedX = typeof window !== 'undefined' ? Math.max(12, Math.min(e.clientX, window.innerWidth - menuWidth - 20)) : e.clientX;
-        const clampedY = typeof window !== 'undefined' ? Math.max(12, Math.min(e.clientY, window.innerHeight - 155)) : e.clientY;
-        const ownerId = e.nativeEvent.isTrusted ? 'user' : 'agent';
+        const clampedX = typeof window !== 'undefined' ? Math.max(12, Math.min(clientX, window.innerWidth - menuWidth - 20)) : clientX;
+        const clampedY = typeof window !== 'undefined' ? Math.max(12, Math.min(clientY, window.innerHeight - 155)) : clientY;
+        const ownerId = isTrusted ? 'user' : 'agent';
         setContextMenus(prev => ({
           ...prev,
           [ownerId]: {
@@ -4824,7 +5138,7 @@ export default function App() {
         }));
         return;
       }
-      if (e.nativeEvent.isTrusted) {
+      if (isTrusted) {
         detachActiveTaskToConcurrentCursor();
       }
     }
@@ -4842,7 +5156,7 @@ export default function App() {
       }
     }
 
-    const ownerId = e.nativeEvent.isTrusted ? 'user' : 'agent';
+    const ownerId = isTrusted ? 'user' : 'agent';
     if (ownerId === 'user') {
       const hitCard = targetId ? cardsRef.current.find(c => c.id === targetId) : undefined;
       const lastReplyObj = hitCard && hitCard.chatHistory && hitCard.chatHistory.length > 0
@@ -4881,14 +5195,14 @@ export default function App() {
     const menuHeight = 135;
     const hudHeight = 80;
 
-    const clampedX = typeof window !== 'undefined' ? Math.max(12, Math.min(e.clientX, window.innerWidth - menuWidth - 20)) : e.clientX;
+    const clampedX = typeof window !== 'undefined' ? Math.max(12, Math.min(clientX, window.innerWidth - menuWidth - 20)) : clientX;
     
     // When opening on blank canvas, cascade menu down below the Agent cursor and HUD so they don't overlap
-    let menuY = e.clientY + hudHeight;
+    let menuY = clientY + hudHeight;
     if (typeof window !== 'undefined') {
       if (menuY + menuHeight > window.innerHeight - 16) {
-        if (e.clientY - menuHeight - 12 >= 16) {
-          menuY = e.clientY - menuHeight - 12;
+        if (clientY - menuHeight - 12 >= 16) {
+          menuY = clientY - menuHeight - 12;
         } else {
           menuY = Math.max(12, window.innerHeight - menuHeight - 16);
         }
@@ -4929,16 +5243,184 @@ export default function App() {
       const promptText = buildDynamicSelectionPrompt(targetCards);
       setAgentState(prev => ({
         ...prev,
-        x: canvasX,
-        y: canvasY,
+        ...summonPos,
         speak: promptText,
         isMoving: true,
-        visible: true
+        visible: true,
+        isSleeping: false,
       }));
       setTimeout(() => {
         setAgentState(prev => ({ ...prev, isMoving: false }));
       }, 400);
     }
+  }, [cards, clearSleepWakeHint, detachActiveTaskToConcurrentCursor, isAgentRunning, isAgentThinking, resolveAgentUiTargetAtPoint, tScale, tx, ty]);
+
+  // Global right-click sleep/wake interceptor (380ms long-press right-click wakes Agent; short right-click while sleeping shows wake hint while preserving context menus)
+  useEffect(() => {
+    const LONG_PRESS_WAKE_MS = 380;
+
+    const onPointerDownCapture = (e: PointerEvent) => {
+      if (e.button !== 2) {
+        clearSleepWakeHint();
+        return;
+      }
+      if (rightClickWakePressRef.current.timer) {
+        clearTimeout(rightClickWakePressRef.current.timer);
+        rightClickWakePressRef.current.timer = null;
+      }
+      rightClickWakePressRef.current.startX = e.clientX;
+      rightClickWakePressRef.current.startY = e.clientY;
+      rightClickWakePressRef.current.wokeByLongPress = false;
+
+      if (!agentStateRef.current.isSleeping) return;
+
+      const targetEl = e.target as Element | null;
+      const clientX = e.clientX;
+      const clientY = e.clientY;
+      const isTrusted = e.isTrusted;
+
+      rightClickWakePressRef.current.timer = setTimeout(() => {
+        rightClickWakePressRef.current.timer = null;
+        rightClickWakePressRef.current.wokeByLongPress = true;
+        summonAgentAtClientPoint(clientX, clientY, isTrusted, targetEl);
+      }, LONG_PRESS_WAKE_MS);
+    };
+
+    const onKeyDownCapture = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        clearSleepWakeHint();
+      }
+    };
+
+    const onPointerMoveCapture = (e: PointerEvent) => {
+      if (!rightClickWakePressRef.current.timer) return;
+      const dist = Math.hypot(
+        e.clientX - rightClickWakePressRef.current.startX,
+        e.clientY - rightClickWakePressRef.current.startY
+      );
+      if (dist > 8) {
+        clearTimeout(rightClickWakePressRef.current.timer);
+        rightClickWakePressRef.current.timer = null;
+      }
+    };
+
+    const onPointerUpOrCancelCapture = (e: PointerEvent) => {
+      if (e.button !== 2) return;
+      if (rightClickWakePressRef.current.timer) {
+        // Released before LONG_PRESS_WAKE_MS elapsed -> short right-click while sleeping!
+        clearTimeout(rightClickWakePressRef.current.timer);
+        rightClickWakePressRef.current.timer = null;
+        if (agentStateRef.current.isSleeping) {
+          showSleepWakeHint(e.clientX, e.clientY);
+        }
+      }
+    };
+
+    const onContextMenuCapture = (e: MouseEvent) => {
+      // Note: On Linux & macOS, `contextmenu` fires immediately on right-button press (before pointerup),
+      // whereas on Windows it fires on pointerup. Never clear the hold timer here!
+      if (rightClickWakePressRef.current.wokeByLongPress) {
+        rightClickWakePressRef.current.wokeByLongPress = false;
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+
+      if (agentStateRef.current.isSleeping) {
+        // Do NOT stopPropagation here so component-level context menus (e.g. AssetItemContextMenu
+        // in ProjectScriptBible and blank-canvas AgentContextMenu in handleContextMenu) still open normally!
+        const targetEl = e.target as Element | null;
+        if (targetEl?.closest?.('[data-asset-item="true"]')) {
+          setContextMenus(prev => {
+            if (!prev['user']) return prev;
+            const next = { ...prev };
+            delete next['user'];
+            return next;
+          });
+        }
+        // If contextmenu was triggered without an active pointerdown timer (e.g. keyboard/synthetic contextmenu), show hint immediately
+        if (!rightClickWakePressRef.current.timer) {
+          showSleepWakeHint(e.clientX, e.clientY);
+        }
+      }
+    };
+
+    window.addEventListener('pointerdown', onPointerDownCapture, true);
+    window.addEventListener('pointermove', onPointerMoveCapture, true);
+    window.addEventListener('pointerup', onPointerUpOrCancelCapture, true);
+    window.addEventListener('pointercancel', onPointerUpOrCancelCapture, true);
+    window.addEventListener('contextmenu', onContextMenuCapture, true);
+    window.addEventListener('keydown', onKeyDownCapture, true);
+    return () => {
+      window.removeEventListener('pointerdown', onPointerDownCapture, true);
+      window.removeEventListener('pointermove', onPointerMoveCapture, true);
+      window.removeEventListener('pointerup', onPointerUpOrCancelCapture, true);
+      window.removeEventListener('pointercancel', onPointerUpOrCancelCapture, true);
+      window.removeEventListener('contextmenu', onContextMenuCapture, true);
+      window.removeEventListener('keydown', onKeyDownCapture, true);
+    };
+  }, [clearSleepWakeHint, showSleepWakeHint, summonAgentAtClientPoint]);
+
+  const handleContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault();
+    if (agentStateRef.current.isSleeping) {
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (rect) {
+        const cursorX = e.clientX - rect.left;
+        const cursorY = e.clientY - rect.top;
+        const canvasX = (cursorX - tx.get()) / tScale.get();
+        const canvasY = (cursorY - ty.get()) / tScale.get();
+        const uiTarget = resolveAgentUiTargetAtPoint(e.clientX, e.clientY);
+
+        let targetId: string | null = null;
+        if (!uiTarget) {
+          const hitDomElement = (e.target as Element | null) || (typeof document !== 'undefined' ? document.elementFromPoint(e.clientX, e.clientY) : null);
+          const cardElement = hitDomElement?.closest ? hitDomElement.closest('[data-card-id]') : null;
+          targetId = cardElement ? cardElement.getAttribute('data-card-id') : null;
+          if (!targetId) {
+            const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
+            for (let i = allCards.length - 1; i >= 0; i--) {
+              const c = allCards[i];
+              const dim = getCardSize(c);
+              if (canvasX >= c.x && canvasX <= c.x + dim.width && canvasY >= c.y && canvasY <= c.y + dim.height) {
+                targetId = c.id;
+                break;
+              }
+            }
+          }
+        }
+
+        const ownerId = e.nativeEvent.isTrusted ? 'user' : 'agent';
+        if (!uiTarget && !targetId) {
+          // Blank canvas has a creation context menu: show it normally without waking or moving the sleeping Agent
+          const menuWidth = 260;
+          const clampedX = typeof window !== 'undefined' ? Math.max(12, Math.min(e.clientX, window.innerWidth - menuWidth - 20)) : e.clientX;
+          const clampedY = typeof window !== 'undefined' ? Math.max(12, Math.min(e.clientY, window.innerHeight - 155)) : e.clientY;
+          setContextMenus(prev => ({
+            ...prev,
+            [ownerId]: {
+              x: clampedX,
+              y: clampedY,
+              canvasX,
+              canvasY,
+              targetId: null,
+            },
+          }));
+        } else {
+          setContextMenus(prev => {
+            if (!prev[ownerId]) return prev;
+            const next = { ...prev };
+            delete next[ownerId];
+            return next;
+          });
+        }
+      }
+      if (!rightClickWakePressRef.current.timer) {
+        showSleepWakeHint(e.clientX, e.clientY);
+      }
+      return;
+    }
+    summonAgentAtClientPoint(e.clientX, e.clientY, e.nativeEvent.isTrusted, e.target as Element | null);
   };
 
   const handleCreateCard = (ownerId: string = 'user', isVideo = false) => {
@@ -5187,7 +5669,7 @@ export default function App() {
         const cardObj = cardsRef.current.find(c => c.id === cardId);
         if (cardObj) {
           const dim = getCardSize(cardObj);
-          setAgentState(prev => ({ ...prev, x: cardObj.x + dim.width / 2, y: cardObj.y + dim.height / 2, visible: true, isMoving: true }));
+          setAgentState(prev => ({ ...prev, x: cardObj.x + dim.width / 2, y: cardObj.y + dim.height / 2, coordinateSpace: 'canvas', visible: true, isMoving: true }));
           await sleep(350);
           setAgentState(prev => ({ ...prev, isMoving: false, isActive: action !== 'mouse.move' && action !== 'mouse.hover' }));
           await sleep(150);
@@ -5201,7 +5683,17 @@ export default function App() {
     const supportedActions = (target.dataset.agentActions || '').split(' ').filter(Boolean);
     if (!supportedActions.includes(action)) throw new Error(`组件 ${targetId} 不支持动作：${action}`);
     const rect = target.getBoundingClientRect();
-    setAgentState(prev => ({ ...prev, x: (rect.left + rect.width / 2 - tx.get()) / tScale.get(), y: (rect.top + rect.height / 2 - ty.get()) / tScale.get(), visible: true, isMoving: true }));
+    const targetScreenX = rect.left + rect.width / 2;
+    const targetScreenY = rect.top + rect.height / 2;
+    const isDockTarget = Boolean(target.closest('[data-dock-card="true"]')) || isPointInDockCardRects(targetScreenX, targetScreenY);
+    const targetPos = resolveAgentCursorStoragePoint(
+      targetScreenX,
+      targetScreenY,
+      (targetScreenX - tx.get()) / (tScale.get() || 1),
+      (targetScreenY - ty.get()) / (tScale.get() || 1),
+      isDockTarget
+    );
+    setAgentState(prev => ({ ...prev, ...targetPos, visible: true, isMoving: true }));
     await sleep(350);
     setAgentState(prev => ({ ...prev, isMoving: false, isActive: action !== 'mouse.move' && action !== 'mouse.hover' }));
     // The semantic UI adapter below applies the same page transition after the
@@ -5224,6 +5716,7 @@ export default function App() {
         ...prev,
         x: centerX + 20,
         y: centerY - 20,
+        coordinateSpace: 'canvas',
         visible: true,
         isMoving: true,
         isActive: false,
@@ -5248,11 +5741,12 @@ export default function App() {
         const scaleVal = tScale.get() || 1;
         const targetX = (centerX - tx.get()) / scaleVal;
         const targetY = (centerY - ty.get()) / scaleVal;
+        const isDockTarget = Boolean(target.closest('[data-dock-card="true"]')) || isPointInDockCardRects(centerX, centerY);
+        const targetPos = resolveAgentCursorStoragePoint(centerX, centerY, targetX, targetY, isDockTarget);
 
         setAgentState(prev => ({
           ...prev,
-          x: targetX,
-          y: targetY,
+          ...targetPos,
           visible: true,
           isMoving: true,
           isActive: false,
@@ -5275,6 +5769,7 @@ export default function App() {
           ...prev,
           x: cardObj.x + dim.width / 2,
           y: cardObj.y + dim.height / 2,
+          coordinateSpace: 'canvas',
           visible: true,
           isMoving: true,
           isActive: false,
@@ -5519,9 +6014,11 @@ export default function App() {
     if (call.name === 'experience.search' || call.name === 'script.directory' || call.name === 'script.read' || call.name === 'script.search' || call.name === 'asset.list' || call.name === 'asset.searchProvenanceCandidates') {
       return executeProjectReadTool(call.name, call.arguments, currentProjectRef.current);
     }
-    if (call.name === 'asset.create' || call.name === 'asset.update' || call.name === 'asset.delete' || call.name === 'asset.commitProvenance') {
-      const { updatedProject, output } = executeProjectAssetMutation(call.name, call.arguments, currentProjectRef.current);
-      handleUpdateCurrentProject(updatedProject);
+    if (call.name === 'asset.create' || call.name === 'asset.update' || call.name === 'asset.delete' || call.name === 'asset.commitProvenance' || call.name === 'asset.bindImage') {
+      const { updatedProject, output } = executeProjectAssetMutation(call.name, call.arguments, currentProjectRef.current, cardsRef.current);
+      if (Object.keys(updatedProject).length > 0) {
+        handleUpdateCurrentProject(updatedProject);
+      }
       if (task.cardContext) {
         task.cardContext = refreshTaskCardContext(task.cardContext, currentProjectRef.current, cardsRef.current);
       }
@@ -5920,6 +6417,39 @@ export default function App() {
       const activeCardId = activeCard?.id || cleanTargetId || `card_${Date.now()}`;
       const effectivePrompt = prompt || activeCard?.prompt || '美观生动的画面';
       const effectiveRatio = aspectRatio || activeCard?.ratio || '16:9';
+      const bindToAssetId = typeof call.arguments?.bindToAssetId === 'string' ? call.arguments.bindToAssetId.trim() : '';
+      const bindAsPrimary = typeof call.arguments?.bindAsPrimary === 'boolean' ? call.arguments.bindAsPrimary : true;
+      const bindLabel = typeof call.arguments?.bindLabel === 'string' ? call.arguments.bindLabel.trim() : '';
+
+      const tryBindGeneratedCardToAsset = () => {
+        if (!bindToAssetId) return null;
+        try {
+          const liveCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
+          const { updatedProject, output } = executeProjectAssetMutation(
+            'asset.bindImage',
+            {
+              id: bindToAssetId,
+              assetId: bindToAssetId,
+              action: 'bind',
+              cardId: activeCardId,
+              source: 'agent',
+              label: bindLabel || cardName,
+              setPrimary: bindAsPrimary,
+            },
+            currentProjectRef.current,
+            liveCards
+          );
+          if (Object.keys(updatedProject).length > 0) {
+            handleUpdateCurrentProject(updatedProject);
+          }
+          if (task.cardContext) {
+            task.cardContext = refreshTaskCardContext(task.cardContext, currentProjectRef.current, cardsRef.current);
+          }
+          return output;
+        } catch (bindErr) {
+          return { bindWarning: (bindErr as Error).message };
+        }
+      };
 
       if (activeCard) {
         handleUpdateCard(activeCard.id, {
@@ -5951,6 +6481,7 @@ export default function App() {
         if (activeCard) {
           handleUpdateCard(activeCard.id, { state: 'draft' }, false);
         }
+        const boundResult = tryBindGeneratedCardToAsset();
         return {
           success: true,
           cardId: activeCardId,
@@ -5960,6 +6491,7 @@ export default function App() {
           autoStarted: false,
           prompt: effectivePrompt,
           referenceCount: collectedRefImages.length,
+          ...(boundResult ? { boundAsset: boundResult } : {}),
           message: isForked
             ? `从卡片【${cleanTargetId || '源卡片'}】复刻衍生出生图卡片【${cardName} (${activeCardId})】，参考图与新提示词已就位（处于草稿待生成状态）。`
             : `生图卡片【${cardName} (${activeCardId})】已配置完成，参考图与提示词已就位（处于草稿待生成状态）。`
@@ -5974,6 +6506,7 @@ export default function App() {
           ratio: effectiveRatio,
         }, true);
       }
+      const initialBindResult = tryBindGeneratedCardToAsset();
 
       try {
         const savedApiKey = localStorage.getItem('deepseek_api_key') || localStorage.getItem('qwen_api_key') || '';
@@ -6029,6 +6562,7 @@ export default function App() {
             autoStarted: true,
             mcpTaskId: taskId,
             prompt: effectivePrompt,
+            ...(initialBindResult ? { boundAsset: initialBindResult } : {}),
             message: isForked
               ? `已从【${cleanTargetId || '源卡片'}】复刻衍生新卡片【${cardName} (${activeCardId})】并在界面启动排队渲染，任务句柄 [${taskId}]。`
               : `生图卡片【${cardName} (${activeCardId})】已在界面启动加载渲染，任务句柄 [${taskId}] 正在排队中。`
@@ -6064,6 +6598,7 @@ export default function App() {
           state: 'idle',
           lastGeneratedPrompt: effectivePrompt,
         }, true);
+        const finalBindResult = tryBindGeneratedCardToAsset() || initialBindResult;
 
         return {
           success: true,
@@ -6072,6 +6607,7 @@ export default function App() {
           cardState: 'completed',
           imageUrl: newMediaUrl,
           prompt: effectivePrompt,
+          ...(finalBindResult ? { boundAsset: finalBindResult } : {}),
           message: isNewTarget
             ? `已自动新建独立生图卡片【${cardName} (${activeCard.id})】并绑定 ${collectedRefImages.length} 张参考图素材，画面已成功渲染发布！`
             : `卡片【${cardName}】画面已成功生成并实时更新挂载到画布卡片上！`
@@ -6081,11 +6617,30 @@ export default function App() {
           state: 'error',
           generationError: (err as Error).message,
         }, true);
+        if (bindToAssetId && initialBindResult && !activeCard.imageUrl && !activeCard.thumbnailUrl && !activeCard.mcpTaskId) {
+          try {
+            const { updatedProject } = executeProjectAssetMutation(
+              'asset.bindImage',
+              {
+                id: bindToAssetId,
+                assetId: bindToAssetId,
+                action: 'unbind',
+                cardId: activeCardId,
+              },
+              currentProjectRef.current,
+              cardsRef.current
+            );
+            if (Object.keys(updatedProject).length > 0) {
+              handleUpdateCurrentProject(updatedProject);
+            }
+          } catch {}
+        }
         throw err;
       }
     }
     if (call.name === 'user.ask') {
-      const currentSpeak = agentStateRef.current?.speak;
+      const latestAnswerEvent = [...task.events].reverse().find(e => e.type === 'answer' && (e.speak?.trim() || e.text?.trim()));
+      const currentSpeak = latestAnswerEvent?.speak?.trim() || agentStateRef.current?.speak;
       const rawQuestion = call.arguments?.question ? String(call.arguments.question) : '';
       const parsedQuestion = rawQuestion ? parseAgentCommunication(rawQuestion) : null;
       const fallbackQuestion = parsedQuestion?.shortText || parsedQuestion?.fullText || rawQuestion || '需要您的确认或输入：';
@@ -6103,6 +6658,8 @@ export default function App() {
       }
 
       const targetCardId = task.cardContext?.cardId || task.cardContext?.targetId || agentFocus.primaryCardId || null;
+
+      setIsAgentAsking(true);
 
       setAgentQuickInput(prev => ({
         ...prev,
@@ -6332,6 +6889,7 @@ export default function App() {
       detachedCursor?: {
         x: number;
         y: number;
+        coordinateSpace?: AgentCoordinateSpace;
         targetId?: string | null;
         speak?: string;
       };
@@ -6450,6 +7008,7 @@ export default function App() {
                 badgeNumber,
                 x: initCursor.x,
                 y: initCursor.y,
+                coordinateSpace: initCursor.coordinateSpace || 'canvas',
                 visible: true,
                 isActive: false,
                 isMoving: true,
@@ -6580,15 +7139,37 @@ export default function App() {
                   setAgentState(prev => ({ ...prev, speak: '...', visible: true }));
                 }
               }
-              const res = await fetch('/api/agent/turn', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(requestBody),
-                signal,
-              });
-              const body = await res.json().catch(() => ({}));
-              if (!res.ok) throw new Error(body.error || 'Agent 轮次失败');
-              const result = body as AgentTurnResult;
+               let res: Response | null = null;
+               let lastErr: any = null;
+               for (let attempt = 0; attempt <= 2; attempt++) {
+                 try {
+                   res = await fetch('/api/agent/turn', {
+                     method: 'POST',
+                     headers: { 'Content-Type': 'application/json' },
+                     body: JSON.stringify(requestBody),
+                     signal,
+                   });
+                   if (res.ok || res.status < 500) break;
+                 } catch (err: any) {
+                   lastErr = err;
+                   if (signal?.aborted) throw err;
+                   if (attempt < 2) {
+                     await new Promise(r => setTimeout(r, (attempt + 1) * 1000));
+                     continue;
+                   }
+                 }
+               }
+               if (!res) throw lastErr || new Error('网络连接失败 (Failed to fetch)');
+               const body = await res.json().catch(() => null);
+               if (!res.ok) throw new Error(body?.error || `Agent 轮次失败 (HTTP ${res.status})`);
+               if (!body || typeof body !== 'object' || (!Array.isArray(body.narration) && !Array.isArray(body.toolCalls) && !body.response && !body.speak && !body.fullAnswer)) {
+                 throw new Error(body?.error || 'Agent 响应数据解析失败或连接中断，请点击重试按钮继续');
+               }
+              const result: AgentTurnResult = {
+                ...body,
+                narration: Array.isArray(body.narration) ? body.narration : [],
+                toolCalls: Array.isArray(body.toolCalls) ? body.toolCalls : [],
+              };
 
               if (result.thinkingLevel === 0 || result.thinkingLevel === 1) {
                 task.thinkingLevel = result.thinkingLevel;
@@ -6933,9 +7514,13 @@ export default function App() {
               })),
             });
 
-            const latestAnswer = [...task.events].reverse().find(e => e.type === 'answer' && e.text && e.text.trim());
-            const parsedLatest = latestAnswer ? parseAgentCommunication(latestAnswer.text) : null;
-            const shortSpeech = parsedLatest ? (parsedLatest.shortText || parsedLatest.fullText) : undefined;
+            const latestAnswer = [...task.events].reverse().find(
+              e => e.type === 'answer' && ((e.speak && e.speak.trim()) || (e.text && e.text.trim()))
+            );
+            const parsedLatest = latestAnswer ? parseAgentCommunication(latestAnswer.text || '') : null;
+            const shortSpeech =
+              (latestAnswer?.speak && latestAnswer.speak.trim()) ||
+              (parsedLatest ? (parsedLatest.shortText || parsedLatest.fullText) : undefined);
 
             if (isDetachedTask) {
               if (shortSpeech) {
@@ -6962,6 +7547,7 @@ export default function App() {
                       ...prev[task.id],
                       isRunning: false,
                       isThinking: false,
+                      isAsking: true,
                       cursorMode: 'default' as const,
                       speak: shortSpeech || prev[task.id].speak,
                     },
@@ -6978,6 +7564,7 @@ export default function App() {
                       ...prev[task.id],
                       isRunning: false,
                       isThinking: false,
+                      isAsking: false,
                       cursorMode: 'default' as const,
                       speak: shortSpeech || (status === 'completed' ? '已完成核验' : prev[task.id].speak),
                     },
@@ -6994,6 +7581,19 @@ export default function App() {
                     return next;
                   });
                 }, 2400);
+              } else {
+                setConcurrentTaskCursors(prev => {
+                  if (!prev[task.id] || !prev[task.id].isAsking) return prev;
+                  const next = {
+                    ...prev,
+                    [task.id]: {
+                      ...prev[task.id],
+                      isAsking: false,
+                    },
+                  };
+                  concurrentTaskCursorsRef.current = next;
+                  return next;
+                });
               }
             } else if (isPrimaryTask) {
               if (!isProcessingInspectQueueRef.current && shortSpeech) {
@@ -7006,24 +7606,35 @@ export default function App() {
               }
 
               if (status === 'waiting_user') {
+                setIsAgentAsking(true);
                 setIsAgentThinking(false);
                 setIsAgentRunning(false);
                 isAgentRunningRef.current = false;
                 agentFocusManager.setCursorMode('default');
               } else if (status === 'completed' || status === 'paused' || status === 'cancelled' || status === 'failed') {
+                setIsAgentAsking(false);
                 if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
                 if (!isProcessingInspectQueueRef.current && inspectQueueRef.current.length === 0) {
                   resetAgentStateToDefault();
                   setAgentState(prev => {
                     if (!prev.speak || isThinkingOrLoadingPhrase(prev.speak)) {
-                      const fallbackAnswer = [...task.events].reverse().find(e => e.type === 'answer' && e.text && e.text.trim() && !isThinkingOrLoadingPhrase(e.text));
-                      const parsed = fallbackAnswer ? parseAgentCommunication(fallbackAnswer.text) : null;
-                      const speech = parsed ? (parsed.shortText || parsed.fullText) : undefined;
+                      const fallbackAnswer = [...task.events].reverse().find(
+                        e =>
+                          e.type === 'answer' &&
+                          ((e.speak && e.speak.trim() && !isThinkingOrLoadingPhrase(e.speak)) ||
+                            (e.text && e.text.trim() && !isThinkingOrLoadingPhrase(e.text)))
+                      );
+                      const parsed = fallbackAnswer ? parseAgentCommunication(fallbackAnswer.text || '') : null;
+                      const speech =
+                        (fallbackAnswer?.speak && fallbackAnswer.speak.trim()) ||
+                        (parsed ? (parsed.shortText || parsed.fullText) : undefined);
                       return { ...prev, speak: speech };
                     }
                     return prev;
                   });
                 }
+              } else {
+                setIsAgentAsking(false);
               }
             }
 
@@ -7047,7 +7658,7 @@ export default function App() {
                           id: a.id,
                           role: 'assistant' as const,
                           text: parsed.fullText,
-                          shortText: parsed.shortText,
+                          shortText: (a.speak && a.speak.trim()) || parsed.shortText,
                           timestamp: a.createdAt || Date.now(),
                         };
                       })
@@ -7071,7 +7682,7 @@ export default function App() {
                         id: a.id,
                         role: 'assistant' as const,
                         text: parsed.fullText,
-                        shortText: parsed.shortText,
+                        shortText: (a.speak && a.speak.trim()) || parsed.shortText,
                         timestamp: a.createdAt || Date.now(),
                       };
                     })
@@ -7182,8 +7793,10 @@ export default function App() {
     const rect = el?.getBoundingClientRect();
     const screenX = rect ? rect.left + Math.min(rect.width * 0.65, 220) : 320;
     const screenY = rect ? rect.top + rect.height * 0.5 : 280;
-    const targetCanvasX = (screenX - tx.get()) / tScale.get();
-    const targetCanvasY = (screenY - ty.get()) / tScale.get();
+    const targetCanvasX = (screenX - tx.get()) / (tScale.get() || 1);
+    const targetCanvasY = (screenY - ty.get()) / (tScale.get() || 1);
+    const inDock = Boolean(el?.closest('[data-dock-card="true"]')) || isPointInDockCardRects(screenX, screenY);
+    const cursorPos = resolveAgentCursorStoragePoint(screenX, screenY, targetCanvasX, targetCanvasY, inDock);
 
     const categoryLabel = category === 'character' ? '角色' : category === 'location' ? '场景' : '道具';
     const descParts = [
@@ -7212,8 +7825,7 @@ export default function App() {
       agentFocusManager.setPrimaryFocus(targetAgentId, 'working', 'verify_provenance');
       setAgentState(prev => ({
         ...prev,
-        x: targetCanvasX,
-        y: targetCanvasY,
+        ...cursorPos,
         speak: `正在核验「${item.name}」出处...`,
         isMoving: true,
         visible: true,
@@ -7236,14 +7848,93 @@ export default function App() {
         forceNewTask: true,
         detachedCursor: primaryBusy
           ? {
-              x: targetCanvasX,
-              y: targetCanvasY,
+              ...cursorPos,
               targetId: targetAgentId,
               speak: `正在核验「${item.name}」出处...`,
             }
           : undefined,
         onFinally: () => {
           setVerifyingAssetIds(prev => prev.filter(id => id !== item.id));
+        },
+      }
+    );
+  }, [tScale, tx, ty]);
+
+  const handleRequestGenerateAssetImage = useCallback(async (
+    category: AssetCategory,
+    item: any,
+    parentItem?: any
+  ) => {
+    if (!item?.id) return;
+    setGeneratingAssetIds(prev => (prev.includes(item.id) ? prev : [...prev, item.id]));
+
+    const targetAgentId = buildAssetAgentTargetId(category, item.id, parentItem?.id);
+    const safeTargetAttr = escapeAttrSelectorValue(targetAgentId);
+    const el = typeof document !== 'undefined'
+      ? (safeQuerySelector(document, `[data-agent-target="${safeTargetAttr}"]`) ||
+        safeQuerySelector(document, `[data-agent-id="${safeTargetAttr}"]`))
+      : null;
+    const rect = el?.getBoundingClientRect();
+    const screenX = rect ? rect.left + Math.min(rect.width * 0.65, 220) : 320;
+    const screenY = rect ? rect.top + rect.height * 0.5 : 280;
+    const targetCanvasX = (screenX - tx.get()) / (tScale.get() || 1);
+    const targetCanvasY = (screenY - ty.get()) / (tScale.get() || 1);
+    const inDock = Boolean(el?.closest('[data-dock-card="true"]')) || isPointInDockCardRects(screenX, screenY);
+    const cursorPos = resolveAgentCursorStoragePoint(screenX, screenY, targetCanvasX, targetCanvasY, inDock);
+
+    const categoryLabel = category === 'character' ? '角色' : category === 'location' ? '场景' : '道具';
+    const displayName = parentItem?.name ? `${parentItem.name} · ${item.name}` : item.name;
+    const suggestedPrompt = buildAssetImagePrompt({
+      category,
+      item,
+      parentItem,
+      artStyle: currentProjectRef.current?.universe?.artStyle,
+    });
+    const recommendedRatio = category === 'location' ? '16:9' : category === 'character' ? '3:4' : '1:1';
+    const generatePrompt = `请为${categoryLabel}资产「${displayName}」（assetId: "${item.id}", category: "${category}"）生成资产图并绑定到该资产。建议生图提示词：「${suggestedPrompt}」。请调用 card.generate（传入 prompt、aspectRatio: "${recommendedRatio}"、name: "${displayName}"、bindToAssetId: "${item.id}"、bindAsPrimary: true、autoStart: true），若先有现有卡片也可调用 asset.bindImage 绑定。`;
+
+    const primaryBusy = Boolean(
+      isAgentRunningRef.current ||
+      (activeTaskIdRef.current &&
+        runtimeRef.current?.getTask(activeTaskIdRef.current) &&
+        ['planning', 'waiting_tools', 'waiting_user'].includes(runtimeRef.current.getTask(activeTaskIdRef.current)!.status))
+    );
+
+    if (!primaryBusy) {
+      agentFocusManager.setPrimaryFocus(targetAgentId, 'working', 'generate_asset_image');
+      setAgentState(prev => ({
+        ...prev,
+        ...cursorPos,
+        speak: `正在为「${displayName}」生成资产图...`,
+        isMoving: true,
+        visible: true,
+        isSleeping: false,
+        cursorMode: 'working',
+      }));
+      setTimeout(() => {
+        setAgentState(prev => ({ ...prev, isMoving: false }));
+      }, 360);
+    }
+
+    await handleRunAgent(
+      generatePrompt,
+      undefined,
+      {
+        targetId: targetAgentId,
+        title: `生成资产图 · ${displayName}`,
+        markdownSummary: `正在为${categoryLabel}资产「${displayName}」（ID: ${item.id}）生成资产图并绑定`,
+      },
+      {
+        forceNewTask: true,
+        detachedCursor: primaryBusy
+          ? {
+              ...cursorPos,
+              targetId: targetAgentId,
+              speak: `正在为「${displayName}」生成资产图...`,
+            }
+          : undefined,
+        onFinally: () => {
+          setGeneratingAssetIds(prev => prev.filter(id => id !== item.id));
         },
       }
     );
@@ -7293,11 +7984,9 @@ export default function App() {
     try {
       const selectedIds = selectedCardIdsRef.current;
       const isMultiSelected = selectedIds.length > 1 && selectedIds.includes(targetCardId);
-      const targetGroup = isMultiSelected
-        ? selectedIds
-        : (agentQuickInput?.targetIds && agentQuickInput.targetIds.length > 1 && agentQuickInput.targetIds.includes(targetCardId) && selectedIds.length > 1
-            ? agentQuickInput.targetIds
-            : [targetCardId]);
+      const targetGroup = (agentQuickInput?.targetIds && agentQuickInput.targetIds.length > 1 && agentQuickInput.targetIds.includes(targetCardId))
+        ? agentQuickInput.targetIds
+        : (isMultiSelected ? selectedIds : [targetCardId]);
 
       const selectedCards = targetGroup.length > 1
         ? targetGroup.map(id => allCards.find(c => c.id === id)).filter((c): c is CardData => Boolean(c))
@@ -7371,6 +8060,8 @@ export default function App() {
   const handleSendTaskChat = async () => {
     const msg = taskChatMessage.trim();
     if (!msg) return;
+    clearSleepWakeHint();
+    setAgentState(prev => prev.isSleeping ? { ...prev, isSleeping: false } : prev);
     setTaskChatMessage('');
     setIsTaskChatOpen(false);
     setAgentQuickInput(prev => prev ? {
@@ -7446,6 +8137,7 @@ export default function App() {
       }
     }
     clearTimeout(zoomTimeoutRef.current);
+    workspace?.removeAttribute('data-middle-pan');
     workspace?.removeAttribute('data-zooming');
     workspace?.removeAttribute('data-panning');
     workspace?.removeAttribute('data-gesture');
@@ -7718,10 +8410,75 @@ export default function App() {
     
     targetTransform.current = { x: newX, y: newY, scale: newScale };
     
+    releaseScreenCursorsIfOutsideDock();
+
     animate(tScale, newScale, { type: 'tween', duration: 0.22, ease: 'easeOut' });
     animate(tx, newX, { type: 'tween', duration: 0.22, ease: 'easeOut' });
     animate(ty, newY, { type: 'tween', duration: 0.22, ease: 'easeOut' });
-  }, [tScale, tx, ty, restoreCanvasStyles, resetOverviewPrompt]);
+  }, [tScale, tx, ty, restoreCanvasStyles, resetOverviewPrompt, releaseScreenCursorsIfOutsideDock]);
+
+  const handleFocusCanvasCard = useCallback((cardId: string, occupiedLeftWidth?: number) => {
+    const liveCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
+    const targetCard = liveCards.find(c => c.id === cardId);
+    if (!targetCard) {
+      showToastNotice('未在画布中找到对应的图像卡片', { dotColor: 'bg-red-500' });
+      return;
+    }
+
+    resetOverviewPrompt();
+    preOverviewTransform.current = null;
+    overviewBoxScaleRef.current = 1.0;
+    setOverviewCursorBox(null);
+    setIsOverviewMode(false);
+    isOverviewModeRef.current = false;
+
+    const dim = getCardSize(targetCard);
+    const nextTransform = computeUncoveredCanvasFocusTransform({
+      cardX: targetCard.x,
+      cardY: targetCard.y,
+      cardWidth: dim.width,
+      cardHeight: dim.height,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+      occupiedLeftWidth,
+      targetScale: 1,
+    });
+
+    targetTransform.current = {
+      x: nextTransform.x,
+      y: nextTransform.y,
+      scale: nextTransform.scale,
+    };
+
+    // Degrade expensive styles during camera tween (Intent-Driven Lazy Restoration)
+    triggerTweenZoom(450);
+    const workspace = document.getElementById('canvas-workspace');
+    if (workspace && workspace.getAttribute('data-zooming') !== 'true') {
+      workspace.setAttribute('data-zooming', 'true');
+      workspace.setAttribute('data-gesture', 'true');
+      isZoomingRef.current = true;
+      setIsZooming(true);
+    }
+    clearTimeout(zoomTimeoutRef.current);
+    zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, CANVAS_IDLE_MS);
+
+    releaseScreenCursorsIfOutsideDock();
+
+    animate(tScale, nextTransform.scale, { type: 'tween', duration: 0.45, ease: [0.16, 1, 0.3, 1] });
+    animate(tx, nextTransform.x, { type: 'tween', duration: 0.45, ease: [0.16, 1, 0.3, 1] });
+    animate(ty, nextTransform.y, { type: 'tween', duration: 0.45, ease: [0.16, 1, 0.3, 1] });
+
+    setSelectedCardIds([cardId]);
+  }, [
+    cards,
+    tScale,
+    tx,
+    ty,
+    resetOverviewPrompt,
+    triggerTweenZoom,
+    restoreCanvasStyles,
+    releaseScreenCursorsIfOutsideDock,
+  ]);
 
   const handleZoomIn = useCallback(() => {
     resetOverviewPrompt();
@@ -7980,6 +8737,14 @@ export default function App() {
 
       // Keep the adaptive queue running across wheel ticks; visibility updates reprioritize it.
 
+      if (agentStateRef.current.coordinateSpace === 'screen') {
+        const now = performance.now();
+        if (now - lastDockCheckMsRef.current > 300) {
+          lastDockCheckMsRef.current = now;
+          releaseScreenCursorsIfOutsideDock();
+        }
+      }
+
       // 2. Clear the fallback timeout on every wheel tick
       lastCameraChangeRef.current = performance.now();
       clearTimeout(zoomTimeoutRef.current);
@@ -8026,17 +8791,42 @@ export default function App() {
       container.removeEventListener('gestureend', preventGesture);
       container.removeEventListener('wheel', handleWheel);
     };
-  }, [tx, ty, tScale, restoreCanvasStyles]);
+  }, [tx, ty, tScale, restoreCanvasStyles, releaseScreenCursorsIfOutsideDock]);
 
-  const isCanvasOverlayTarget = (target: EventTarget | null) =>
-    target instanceof Element && Boolean(target.closest(
-      'button, input, textarea, select, form, aside, [role="dialog"], [role="menu"], [data-prevent-canvas-wheel]'
-    ));
+  const clearMiddlePanPointerTransparency = useCallback(() => {
+    document.getElementById('canvas-workspace')?.removeAttribute('data-middle-pan');
+  }, []);
+
+  const startCanvasMiddlePan = useCallback((e: React.PointerEvent) => {
+    releaseScreenCursorsIfOutsideDock();
+    // Bypass React state to eliminate start-of-drag stutter and immediately make canvas cards pointer-transparent
+    document.getElementById('canvas-workspace')?.setAttribute('data-middle-pan', 'true');
+    isDraggingCanvasRef.current = true;
+    hasActivatedPanRef.current = false;
+    window.dispatchEvent(new CustomEvent('abort-mount-queue'));
+
+    document.body.style.cursor = 'grabbing';
+    lastPointer.current = { x: e.clientX, y: e.clientY };
+    panStartPointerRef.current = { x: e.clientX, y: e.clientY };
+    try {
+      containerRef.current?.setPointerCapture(e.pointerId);
+    } catch {}
+  }, [releaseScreenCursorsIfOutsideDock]);
+
+  useEffect(() => {
+    const handleWindowBlur = () => {
+      if (isDraggingCanvasRef.current) {
+        isDraggingCanvasRef.current = false;
+        document.body.style.cursor = 'default';
+      }
+      clearMiddlePanPointerTransparency();
+    };
+    window.addEventListener('blur', handleWindowBlur);
+    return () => window.removeEventListener('blur', handleWindowBlur);
+  }, [clearMiddlePanPointerTransparency]);
 
   const onPointerDown = (e: React.PointerEvent) => {
-    const isPromptPanelMiddleClick = e.button === 1 && e.target instanceof Element &&
-      Boolean(e.target.closest('.generation-card-bottom-panel'));
-    if (!isPromptPanelMiddleClick && isCanvasOverlayTarget(e.target)) return;
+    if (isCanvasOverlayControlTarget(e.target)) return;
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
 
@@ -8106,6 +8896,12 @@ export default function App() {
             }
           }
 
+          if (clickedCard && assetBindPickerSession) {
+            e.stopPropagation();
+            handleToggleAssetBindPickedCard(clickedCard.id);
+            return;
+          }
+
           if (clickedCard && pickerSession) {
             e.stopPropagation();
             handleTogglePickerCard(clickedCard.id);
@@ -8160,16 +8956,8 @@ export default function App() {
     }
     // Only start dragging on middle click
     if (e.button !== 1) return;
-    
-    // Bypass React state to eliminate the 16ms start-of-drag stutter
-    isDraggingCanvasRef.current = true;
-    hasActivatedPanRef.current = false;
-    window.dispatchEvent(new CustomEvent('abort-mount-queue'));
-    
-    document.body.style.cursor = 'grabbing';
-    lastPointer.current = { x: e.clientX, y: e.clientY };
-    panStartPointerRef.current = { x: e.clientX, y: e.clientY };
-    containerRef.current?.setPointerCapture(e.pointerId);
+
+    startCanvasMiddlePan(e);
   };
 
   const onPointerMove = (e: React.PointerEvent) => {
@@ -8277,6 +9065,7 @@ export default function App() {
 
   const onPointerUp = (e: React.PointerEvent) => {
     isDraggingCanvasRef.current = false;
+    clearMiddlePanPointerTransparency();
     document.body.style.cursor = 'default';
     
     // Per Intent-Driven Lazy Restoration:
@@ -8323,12 +9112,21 @@ export default function App() {
     }
     
     setSelectionBox(null);
-    containerRef.current?.releasePointerCapture(e.pointerId);
+    try {
+      if (containerRef.current?.hasPointerCapture?.(e.pointerId)) {
+        containerRef.current.releasePointerCapture(e.pointerId);
+      }
+    } catch {}
   };
 
   useEffect(() => {
-    // Escape key listener to exit picker session
+    // Escape key listener to exit picker sessions
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && assetBindPickerSession) {
+        e.preventDefault();
+        handleCancelAssetBindPicker();
+        return;
+      }
       if (e.key === 'Escape' && pickerSession) {
         e.preventDefault();
         handleCancelPickerSession();
@@ -8336,7 +9134,7 @@ export default function App() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [pickerSession, handleCancelPickerSession]);
+  }, [pickerSession, handleCancelPickerSession, assetBindPickerSession, handleCancelAssetBindPicker]);
 
   useEffect(() => {
     // INTENT SIGNAL: The user opened a massive overlay. The canvas is now a background.
@@ -8344,6 +9142,12 @@ export default function App() {
       restoreCanvasStyles();
     }
   }, [showSettings, isScriptDrawerOpen, restoreCanvasStyles]);
+
+  useEffect(() => {
+    if (!isScriptDrawerOpen) {
+      releaseScreenCursorsIfOutsideDock(true);
+    }
+  }, [isScriptDrawerOpen, releaseScreenCursorsIfOutsideDock]);
 
   const visibleCards = useMemo(() => {
     const selectedIds = new Set(selectedCardIds);
@@ -8683,14 +9487,26 @@ export default function App() {
       data-agent-target="canvas.viewport"
       data-agent-actions="mouse.move mouse.hover mouse.drag mouse.scroll mouse.click mouse.doubleClick"
       className={`w-screen h-screen overflow-hidden bg-[#e7e7e7] dark:bg-[#1c1c1e] relative select-none touch-none ${isOverviewMode ? 'overview-active-mode' : ''}`}
-      onPointerDownCapture={(e) => {
-        if (e.button === 1 && e.target instanceof Element && e.target.closest('.generation-card-bottom-panel')) {
+      onMouseDownCapture={(e) => {
+        if (shouldPassThroughCanvasCardMiddleButton(e.button, e.target)) {
           e.preventDefault();
           e.stopPropagation();
-          onPointerDown(e);
+        }
+      }}
+      onAuxClickCapture={(e) => {
+        if (shouldPassThroughCanvasCardMiddleButton(e.button, e.target)) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+      }}
+      onPointerDownCapture={(e) => {
+        if (shouldPassThroughCanvasCardMiddleButton(e.button, e.target)) {
+          e.preventDefault();
+          e.stopPropagation();
+          startCanvasMiddlePan(e);
           return;
         }
-        if (isCanvasOverlayTarget(e.target)) return;
+        if (isCanvasOverlayControlTarget(e.target)) return;
         // If in overview mode and user left-clicks, navigate and dive down into the clicked position!
         if (e.button === 0 && (preOverviewTransform.current || isOverviewModeRef.current)) {
           e.stopPropagation();
@@ -8799,6 +9615,8 @@ export default function App() {
       <ProjectScriptBible
         currentProject={currentProject}
         projects={projects}
+        cards={cards}
+        isCardsLoading={isLoading}
         onSelectProject={handleSelectProject}
         onCreateProject={handleCreateProject}
         onRenameProject={handleRenameProject}
@@ -8817,12 +9635,23 @@ export default function App() {
         onTocItemOpened={handleTocItemOpened}
         onSelectionChange={setScriptSelection}
         onRequestGenerateAsset={handleRequestGenerateAsset}
+        onRequestGenerateAssetImage={handleRequestGenerateAssetImage}
+        onStartCanvasAssetBind={handleStartCanvasAssetBind}
+        requestedBindModalTarget={requestedBindModalTarget}
+        onFocusCanvasCard={handleFocusCanvasCard}
         onRequestVerifyAssetProvenance={handleRequestVerifyAssetProvenance}
         verifyingAssetIds={verifyingAssetIds}
+        generatingAssetIds={generatingAssetIds}
         agentFocusedTargetId={agentFocus.primaryCardId || (agentQuickInput?.isOpen ? agentQuickInput.targetId : null)}
-        agentFocusedTargetIds={(Object.values(concurrentTaskCursors) as ConcurrentTaskCursorState[])
-          .map(c => c.targetId)
-          .filter((id): id is string => Boolean(id))}
+        agentFocusedTargetIds={Array.from(
+          new Set([
+            ...(agentFocus.referenceCardIds || []),
+            ...(Object.values(concurrentTaskCursors) as ConcurrentTaskCursorState[]).map(c => c.targetId),
+          ].filter((id): id is string => Boolean(id)))
+        )}
+        isAgentSleeping={Boolean(agentState.isSleeping)}
+        selectedAssetIds={selectedAssetIds}
+        onSelectedAssetIdsChange={setSelectedAssetIds}
       />
 
       {/* Top Right Controls */}
@@ -8898,7 +9727,12 @@ export default function App() {
             agentTargetCardIds={targetCardIds}
             agentReferenceCardIds={agentFocus.referenceCardIds}
             agentFocusMap={agentFocus.focusedMap}
-            pickerSession={pickerSession}
+            pickerSession={
+              pickerSession ||
+              (assetBindPickerSession
+                ? { targetCardId: '', selectedCardIds: assetBindPickerSession.pickedCardIds }
+                : null)
+            }
             scale={tScale}
             tx={tx}
             ty={ty}
@@ -8926,14 +9760,21 @@ export default function App() {
         {/* Canvas Items: All cards follow the same LOD lifecycle, including selected cards. */}
         {!isOverviewMode && isDomCardsActive && visibleCards.map(card => {
           const hasImage = Boolean(card.imageUrl || card.originalImageUrl || card.thumbnailUrl);
-          const isPickerSelectable = Boolean(pickerSession && card.id !== pickerSession.targetCardId && hasImage);
+          const isRefPickerSelectable = Boolean(pickerSession && card.id !== pickerSession.targetCardId && hasImage);
+          const isAssetBindSelectable = Boolean(assetBindPickerSession && isCanvasCardEligibleForAssetBind(card));
+          const isPickerSelectable = isRefPickerSelectable || isAssetBindSelectable;
           const pickerIndex = pickerSession 
             ? pickerSession.selectedReferences.findIndex(ref => 
                 ref.sourceCardId === card.id || 
                 (ref.url && (ref.url === card.imageUrl || ref.url === card.originalImageUrl || ref.url === card.thumbnailUrl))
               )
-            : -1;
+            : assetBindPickerSession
+              ? assetBindPickerSession.pickedCardIds.indexOf(card.id)
+              : -1;
           const pickerSelectionIndex = pickerIndex !== -1 ? pickerIndex + 1 : undefined;
+          const isPickerAlreadyBound = Boolean(
+            assetBindPickerSession?.target.alreadyBoundCardIds.includes(card.id)
+          );
           const focusItem = agentFocus.focusedMap[card.id];
           const isQuickInputTarget = Boolean(
             agentQuickInput?.isOpen && (agentQuickInput.targetIds?.includes(card.id) || agentQuickInput.targetId === card.id)
@@ -8956,8 +9797,9 @@ export default function App() {
               isPickerTarget={pickerSession?.targetCardId === card.id}
               isPickerSelectable={isPickerSelectable}
               pickerSelectionIndex={pickerSelectionIndex}
+              isPickerAlreadyBound={isPickerAlreadyBound}
               onStartCanvasPicker={handleStartCanvasPicker}
-              isSelected={selectedCardIds.includes(card.id)}
+              isSelected={selectedCardIds.includes(card.id) && !pickerSession && !assetBindPickerSession}
               isAgentTarget={isAgentTarget}
               agentFocusRole={agentFocusRole}
               agentInspectScenario={agentInspectScenario}
@@ -8971,6 +9813,7 @@ export default function App() {
               onDelete={handleCardDelete}
               onUpdate={handleUpdateCard}
               onForkCard={handleForkCard}
+              onBindToScriptAsset={(targetCardId) => setBindingCanvasCardId(targetCardId)}
               onHover={setHoveredCardId}
             />
           );
@@ -9112,6 +9955,7 @@ export default function App() {
             agentState={{
               x: cursor.x,
               y: cursor.y,
+              coordinateSpace: cursor.coordinateSpace,
               visible: cursor.visible,
               isActive: cursor.isActive,
               isMoving: cursor.isMoving,
@@ -9123,6 +9967,7 @@ export default function App() {
             isZooming={isZooming}
             isAgentRunning={cursor.isRunning}
             isAgentThinking={cursor.isThinking}
+            isAgentAsking={Boolean(cursor.isAsking)}
             selectedCards={[]}
             isDarkMode={isDarkMode}
             badgeNumber={cursor.badgeNumber}
@@ -9146,9 +9991,10 @@ export default function App() {
         isZooming={isZooming}
         isAgentRunning={isAgentRunning || isProcessingInspectQueueRef.current || isAgentThinking}
         isAgentThinking={isAgentThinking}
+        isAgentAsking={isAgentAsking}
         selectedCards={activeSelectedCards}
         isDarkMode={isDarkMode}
-        badgeNumber={(isAgentRunning || isAgentThinking || Object.keys(concurrentTaskCursors).length > 0) ? activeTaskBadgeNumber : undefined}
+        badgeNumber={(isAgentRunning || isAgentThinking || isAgentAsking || Object.keys(concurrentTaskCursors).length > 0) ? activeTaskBadgeNumber : undefined}
         quickInput={
           agentQuickInput?.isOpen
             ? {
@@ -9195,6 +10041,7 @@ export default function App() {
                       placeholder: "输入你的想法...",
                     }));
                     if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
+                    setIsAgentAsking(false);
                     isAgentRunningRef.current = true;
                     setIsAgentThinking(true);
                     setIsAgentRunning(true);
@@ -9218,6 +10065,7 @@ export default function App() {
                     placeholder: "输入你的想法...",
                   }));
                   if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
+                  setIsAgentAsking(false);
                   isAgentRunningRef.current = true;
                   setIsAgentThinking(true);
                   setIsAgentRunning(true);
@@ -9234,13 +10082,19 @@ export default function App() {
                     isAgentRunningRef.current = false;
                     return;
                   }
-                  if (currentTarget) {
+                  const isReplyingToWaitingUserTask = Boolean(
+                    activeTaskIdRef.current &&
+                    runtimeRef.current?.getTask(activeTaskIdRef.current)?.status === 'waiting_user'
+                  );
+                  if (isReplyingToWaitingUserTask) {
+                    await handleRunAgent(prompt);
+                  } else if (currentTarget) {
                     const isMultiSelection = selectedCardIds.length > 1 && selectedCardIds.includes(currentTarget);
-                    const isMultiInput = agentQuickInput?.targetIds && agentQuickInput.targetIds.length > 1 && agentQuickInput.targetIds.includes(currentTarget) && isMultiSelection;
+                    const isMultiInput = Boolean(agentQuickInput?.targetIds && agentQuickInput.targetIds.length > 1 && agentQuickInput.targetIds.includes(currentTarget));
 
-                    const targetGroup = isMultiSelection
-                      ? selectedCardIds
-                      : (isMultiInput ? agentQuickInput!.targetIds! : [currentTarget]);
+                    const targetGroup = isMultiInput
+                      ? agentQuickInput!.targetIds!
+                      : (isMultiSelection ? selectedCardIds : [currentTarget]);
 
                     const references = targetGroup.filter(id => id !== currentTarget);
 
@@ -9278,6 +10132,7 @@ export default function App() {
                     delete next['user'];
                     return next;
                   });
+                  setIsAgentAsking(false);
                   if (agentQuickInput.onAskResolve) {
                     const askResolver = agentQuickInput.onAskResolve;
                     const currentKey = agentQuickInput.targetId || 'global';
@@ -9302,12 +10157,13 @@ export default function App() {
             : null
         }
         onClickPointer={handleClickAgentPointer}
-        onDragAgent={(newCanvasX, newCanvasY) => {
+        onDragAgent={(newX, newY, coordinateSpace) => {
           setAgentState(prev => ({
             ...prev,
-            x: newCanvasX,
-            y: newCanvasY,
-            isMoving: false
+            x: newX,
+            y: newY,
+            coordinateSpace,
+            isMoving: false,
           }));
         }}
         onDragAgentEnd={handleDragAgentEnd}
@@ -9319,6 +10175,29 @@ export default function App() {
         onEndAgentBoxSelect={handleEndAgentBoxSelect}
       />
 
+      {/* Short Right-Click Wake Hint when Agent is Sleeping */}
+      <AnimatePresence>
+        {sleepWakeHint && (
+          <motion.div
+            key="agent-sleep-wake-hint"
+            data-testid="agent-sleep-wake-hint"
+            initial={{ opacity: 0, y: 2 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -2 }}
+            transition={{ duration: 0.12, ease: [0.16, 1, 0.3, 1] }}
+            className="fixed z-[10000] pointer-events-none select-none text-[11px] font-normal leading-none text-[#a45cf8] whitespace-nowrap"
+            style={{
+              left: typeof window !== 'undefined' ? Math.max(12, Math.min(sleepWakeHint.x + 6, window.innerWidth - 130)) : sleepWakeHint.x + 6,
+              top: typeof window !== 'undefined'
+                ? (sleepWakeHint.y >= 36 ? Math.min(sleepWakeHint.y - 24, window.innerHeight - 28) : sleepWakeHint.y + 12)
+                : sleepWakeHint.y - 24,
+            }}
+          >
+            长按右键唤醒agent
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Resident Bottom-Right Mira Dialogue Box */}
       {isTaskPanelCollapsed ? (
         <aside
@@ -9327,8 +10206,12 @@ export default function App() {
           title="点击展开对话框"
         >
           <div className="flex items-center gap-1.5">
-            <Sparkles size={14} className="text-purple-600 dark:text-purple-400" />
-            <span className="text-[12px] font-semibold text-slate-800 dark:text-slate-100">Mira</span>
+            <div className="w-4 h-4 text-purple-600 dark:text-purple-400 flex items-center justify-center shrink-0">
+              <svg width="14" height="14" viewBox="0 0 92 92" xmlns="http://www.w3.org/2000/svg">
+                <path d="M29.53 21.45A1.00 1.00 0 0 0 27.85 22.14L25.78 69.68A1.00 1.00 0 0 0 27.43 70.48L43.21 56.85L64.01 55.33A1.00 1.00 0 0 0 64.61 53.60Z" fill="currentColor" stroke={isDarkMode ? "#d8b6fe" : "#4c127e"} strokeWidth="6" strokeLinejoin="round" strokeLinecap="round" paintOrder="stroke fill"/>
+              </svg>
+            </div>
+            <span className="text-[12px] font-semibold text-slate-800 dark:text-slate-100">七七</span>
           </div>
           {agentTask ? (
             <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium flex items-center gap-1 ${
@@ -9362,9 +10245,13 @@ export default function App() {
           <div className="flex items-center justify-between gap-2">
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-1.5">
-                <Sparkles size={13} className="text-purple-600 dark:text-purple-400" />
+                <div className="w-3.5 h-3.5 text-purple-600 dark:text-purple-400 flex items-center justify-center shrink-0">
+                  <svg width="12" height="12" viewBox="0 0 92 92" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M29.53 21.45A1.00 1.00 0 0 0 27.85 22.14L25.78 69.68A1.00 1.00 0 0 0 27.43 70.48L43.21 56.85L64.01 55.33A1.00 1.00 0 0 0 64.61 53.60Z" fill="currentColor" stroke={isDarkMode ? "#d8b6fe" : "#4c127e"} strokeWidth="6" strokeLinejoin="round" strokeLinecap="round" paintOrder="stroke fill"/>
+                  </svg>
+                </div>
                 <p className="text-[12px] font-semibold text-purple-600 dark:text-purple-400 tracking-wide">
-                  {agentTask ? 'Mira · 当前任务' : 'Mira · AI 助手'}
+                  {agentTask ? '七七 · 当前任务' : '七七 · AI 助手'}
                 </p>
               </div>
               <p className="mt-0.5 text-[12px] font-medium text-slate-800 dark:text-slate-100 truncate" title={agentTask ? agentTask.title : '随时输入想法或任务指令'}>
@@ -9476,8 +10363,12 @@ export default function App() {
               <div className="flex justify-start">
                 <div className="bg-purple-50/80 dark:bg-purple-950/30 border border-purple-100 dark:border-purple-900/40 text-purple-950 dark:text-purple-200 rounded-2xl corner-squircle px-3.5 py-2.5 text-[12px] leading-relaxed shadow-xs">
                   <p className="font-semibold text-purple-700 dark:text-purple-400 mb-1 flex items-center gap-1.5">
-                    <Sparkles size={13} />
-                    你好，我是 Mira
+                    <div className="w-3.5 h-3.5 text-purple-600 dark:text-purple-400 flex items-center justify-center shrink-0">
+                      <svg width="12" height="12" viewBox="0 0 92 92" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M29.53 21.45A1.00 1.00 0 0 0 27.85 22.14L25.78 69.68A1.00 1.00 0 0 0 27.43 70.48L43.21 56.85L64.01 55.33A1.00 1.00 0 0 0 64.61 53.60Z" fill="currentColor" stroke={isDarkMode ? "#d8b6fe" : "#4c127e"} strokeWidth="6" strokeLinejoin="round" strokeLinecap="round" paintOrder="stroke fill"/>
+                      </svg>
+                    </div>
+                    你好，我是 七七
                   </p>
                   <p className="text-slate-600 dark:text-slate-300 text-[12px]">
                     随时在下方输入指令，我可以协助你管理无限画布、创建与拆解分镜、提取剧本资产或生成视频。
@@ -9491,7 +10382,7 @@ export default function App() {
                 <span className="inline-block w-1.5 h-1.5 rounded-full bg-purple-500 animate-bounce" />
                 <span className="inline-block w-1.5 h-1.5 rounded-full bg-purple-500 animate-bounce [animation-delay:0.2s]" />
                 <span className="inline-block w-1.5 h-1.5 rounded-full bg-purple-500 animate-bounce [animation-delay:0.4s]" />
-                <span className="ml-1 text-[11px] font-medium text-slate-500 dark:text-slate-400">Mira 正在执行...</span>
+                <span className="ml-1 text-[11px] font-medium text-slate-500 dark:text-slate-400">七七 正在执行...</span>
               </div>
             )}
           </div>
@@ -9613,11 +10504,11 @@ export default function App() {
                 }));
                 if (currentTarget) {
                   const isMultiSelection = selectedCardIds.length > 1 && selectedCardIds.includes(currentTarget);
-                  const isMultiInput = agentQuickInput?.targetIds && agentQuickInput.targetIds.length > 1 && agentQuickInput.targetIds.includes(currentTarget) && isMultiSelection;
+                  const isMultiInput = Boolean(agentQuickInput?.targetIds && agentQuickInput.targetIds.length > 1 && agentQuickInput.targetIds.includes(currentTarget));
 
-                  const targetGroup = isMultiSelection
-                    ? selectedCardIds
-                    : (isMultiInput ? agentQuickInput!.targetIds! : [currentTarget]);
+                  const targetGroup = isMultiInput
+                    ? agentQuickInput!.targetIds!
+                    : (isMultiSelection ? selectedCardIds : [currentTarget]);
 
                   const references = targetGroup.filter(id => id !== currentTarget);
 
@@ -9698,34 +10589,6 @@ export default function App() {
         onZoomOut={handleZoomOut}
         onZoomReset={handleZoomReset}
       />
-
-      {/* Floating Toolbar */}
-      <div 
-        className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-gray-100 dark:bg-neutral-800 border border-gray-300 dark:border-[#404040] shadow-lg rounded-[20px] corner-squircle p-1.5 z-50"
-        onPointerDown={e => e.stopPropagation()}
-      >
-        <button 
-          onClick={undo}
-          disabled={history.past.length === 0}
-          className="p-2 rounded-xl corner-squircle hover:bg-gray-200 dark:hover:bg-neutral-700 disabled:opacity-50 disabled:hover:bg-transparent transition-colors"
-          title="撤销 (Ctrl+Z)"
-        >
-          <Undo2 className="w-4 h-4 text-gray-700 dark:text-neutral-300" />
-        </button>
-        <div className="w-[1px] h-4 bg-gray-300 dark:bg-neutral-600" />
-        <button 
-          onClick={redo}
-          disabled={history.future.length === 0}
-          className="p-2 rounded-xl corner-squircle hover:bg-gray-200 dark:hover:bg-neutral-700 disabled:opacity-50 disabled:hover:bg-transparent transition-colors"
-          title="重做 (Ctrl+Y / Ctrl+Shift+Z)"
-        >
-          <Redo2 className="w-4 h-4 text-gray-700 dark:text-neutral-300" />
-        </button>
-      </div>
-
-
-
-
 
       {/* Top Reference Picker Control Bar & Tray (Positioned below the top toast area) */}
       <AnimatePresence>
@@ -9842,6 +10705,238 @@ export default function App() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* Top Script Asset Canvas Bind Picker HUD */}
+      <AnimatePresence>
+        {assetBindPickerSession && (
+          <motion.div
+            data-canvas-asset-bind-hud="true"
+            initial={{ opacity: 0, y: -20, scale: 0.96 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -20, scale: 0.96 }}
+            transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+            className={`fixed ${topNotices.length > 0 ? 'top-20' : 'top-4'} left-1/2 -translate-x-1/2 z-[110] flex flex-col items-center gap-2 w-max max-w-[min(96vw,calc(100vw-380px))] min-w-[320px] select-none pointer-events-auto`}
+            onPointerDown={(e) => e.stopPropagation()}
+          >
+            <div className="flex flex-wrap items-center justify-center gap-2.5 px-3.5 py-2 rounded-2xl corner-squircle bg-white/95 dark:bg-[#1a1a1d]/95 backdrop-blur-md border border-gray-200/90 dark:border-neutral-700/80 shadow-[0_16px_40px_rgba(0,0,0,0.18)] dark:shadow-[0_16px_40px_rgba(0,0,0,0.45)] text-xs text-gray-900 dark:text-neutral-100">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className={`px-2 py-0.5 rounded-md text-[10px] font-bold shrink-0 ${
+                  assetBindPickerSession.target.category === 'character'
+                    ? 'bg-blue-100 dark:bg-blue-950 text-blue-600 dark:text-blue-400'
+                    : assetBindPickerSession.target.category === 'location'
+                      ? 'bg-emerald-100 dark:bg-emerald-950 text-emerald-600 dark:text-emerald-400'
+                      : 'bg-amber-100 dark:bg-amber-950 text-amber-600 dark:text-amber-400'
+                }`}>
+                  {assetBindPickerSession.target.category === 'character'
+                    ? '角色'
+                    : assetBindPickerSession.target.category === 'location'
+                      ? '场景'
+                      : '道具'}
+                </span>
+                <span className="font-bold truncate max-w-[180px]">
+                  从画布绑定 · {assetBindPickerSession.target.displayName}
+                </span>
+                <span className="hidden 2xl:inline text-gray-300 dark:text-neutral-700">|</span>
+                <span className="hidden 2xl:inline text-gray-500 dark:text-neutral-400">
+                  点击画布图像卡片（支持平移/缩放）
+                </span>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 pl-2 border-l border-gray-200 dark:border-neutral-700/80">
+                <input
+                  type="text"
+                  value={assetBindPickerSession.label}
+                  onChange={(e) => {
+                    const nextVal = e.target.value;
+                    setAssetBindPickerSession((prev) => (prev ? { ...prev, label: nextVal } : null));
+                  }}
+                  placeholder="备注标签（可选）"
+                  className="w-32 px-2.5 py-1 rounded-lg bg-gray-100/90 dark:bg-neutral-800/90 border border-gray-200/80 dark:border-neutral-700 text-[11px] text-gray-900 dark:text-neutral-100 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                />
+                <label className="flex items-center gap-1 text-[11px] font-medium text-gray-700 dark:text-neutral-300 cursor-pointer whitespace-nowrap">
+                  <input
+                    type="checkbox"
+                    checked={assetBindPickerSession.setPrimary}
+                    onChange={(e) => {
+                      const nextChecked = e.target.checked;
+                      setAssetBindPickerSession((prev) => (prev ? { ...prev, setPrimary: nextChecked } : null));
+                    }}
+                    className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                  />
+                  <Star className="w-3 h-3 text-amber-500" />
+                  <span>设为资产主图</span>
+                </label>
+
+                <button
+                  type="button"
+                  onClick={handleSwitchAssetBindToModal}
+                  className="px-2.5 py-1 rounded-xl text-[11px] font-medium text-gray-600 dark:text-neutral-300 hover:text-blue-600 dark:hover:text-blue-300 hover:bg-gray-100 dark:hover:bg-neutral-800 transition-colors flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                >
+                  <ImagePlus className="w-3 h-3" />
+                  <span>列表/本地上传</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleCancelAssetBindPicker}
+                  className="px-2.5 py-1 rounded-xl text-[11px] font-medium text-gray-600 dark:text-neutral-300 hover:text-gray-900 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-neutral-800 transition-colors flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                >
+                  <span>取消</span>
+                  <span className="text-[10px] opacity-65 bg-gray-200/80 dark:bg-neutral-800 px-1 py-0.5 rounded">Esc</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleConfirmAssetBindPicker}
+                  disabled={assetBindPickerSession.pickedCardIds.length === 0}
+                  className={`px-3.5 py-1.5 rounded-xl font-semibold text-xs flex items-center gap-1.5 transition-all shadow-sm whitespace-nowrap ${
+                    assetBindPickerSession.pickedCardIds.length > 0
+                      ? 'bg-blue-600 hover:bg-blue-500 text-white cursor-pointer active:scale-95 shadow-[0_0_16px_rgba(37,99,235,0.35)]'
+                      : 'bg-gray-200 dark:bg-neutral-800 text-gray-400 dark:text-neutral-500 cursor-not-allowed'
+                  }`}
+                >
+                  <span>确认绑定</span>
+                  {assetBindPickerSession.pickedCardIds.length > 0 && (
+                    <span className="px-1.5 py-0.2 rounded-full bg-white/25 text-white text-[10px] tabular-nums">
+                      {assetBindPickerSession.pickedCardIds.length}
+                    </span>
+                  )}
+                </button>
+              </div>
+            </div>
+
+            {assetBindPickerSession.pickedCardIds.length > 0 && (
+              <motion.div
+                initial={{ opacity: 0, y: -8, scale: 0.95 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: -8, scale: 0.95 }}
+                transition={{ duration: 0.15 }}
+                className="p-2 px-3 rounded-2xl bg-white/95 dark:bg-neutral-950/90 backdrop-blur-md border border-gray-200/90 dark:border-neutral-800 shadow-[0_16px_36px_rgba(0,0,0,0.2)] w-fit max-w-[94vw] max-h-[26vh] overflow-y-auto scrollbar-thin"
+              >
+                <div className="flex flex-wrap items-start justify-center gap-x-3 gap-y-2">
+                  {assetBindPickerSession.pickedCardIds.map((cardId, idx) => {
+                    const cardObj = cards.find((c) => c.id === cardId);
+                    const img = cardObj?.thumbnailUrl || cardObj?.imageUrl || cardObj?.originalImageUrl;
+                    const cardName = cardObj?.fileName || cardObj?.name || `卡片 #${cardId.slice(-5)}`;
+                    return (
+                      <button
+                        key={cardId}
+                        type="button"
+                        onClick={() => handleToggleAssetBindPickedCard(cardId)}
+                        title={`${cardName}（点击移除）`}
+                        className="flex flex-col items-center gap-1 group shrink-0 cursor-pointer"
+                      >
+                        <div className="relative h-14 rounded-xl overflow-hidden border-2 border-blue-500 shadow-md bg-gray-100 dark:bg-neutral-900 transition-all group-hover:scale-[1.03] group-hover:border-red-500">
+                          {img ? (
+                            <img
+                              src={img}
+                              alt={cardName}
+                              loading="lazy"
+                              decoding="async"
+                              referrerPolicy="no-referrer"
+                              className="h-full w-auto max-w-[100px] object-contain block"
+                            />
+                          ) : (
+                            <div className="h-full w-14 bg-gray-200 dark:bg-neutral-800 flex items-center justify-center text-xs font-bold text-gray-500 dark:text-neutral-300">
+                              #{idx + 1}
+                            </div>
+                          )}
+                          <div className="absolute top-1 left-1 px-1.5 py-0.5 rounded-md bg-blue-600/90 text-[10px] text-white font-bold leading-none shadow-xs">
+                            {idx + 1}
+                          </div>
+                          <div className="absolute inset-0 bg-red-600/80 opacity-0 group-hover:opacity-100 flex flex-col items-center justify-center transition-opacity text-white">
+                            <span className="text-xs font-bold leading-none">✕</span>
+                            <span className="text-[9px] font-medium mt-0.5">移除</span>
+                          </div>
+                        </div>
+                        <span className="text-[10px] text-gray-700 dark:text-neutral-300 max-w-[90px] truncate font-medium leading-tight group-hover:text-red-500 transition-colors">
+                          {cardName}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </motion.div>
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {bindingCanvasCardId && (() => {
+        const targetCard = cards.find(c => c.id === bindingCanvasCardId) || null;
+        if (!targetCard) return null;
+        const cardsMap = buildCardSnapshotMap(cards);
+        const options: CanvasCardAssetOption[] = [];
+        const collectGroup = (category: AssetCategory, list: any[]) => {
+          const merged = mergeMultiVersionAssetList(
+            category === 'character' ? 'characters' : category === 'location' ? 'locations' : 'props',
+            list || []
+          );
+          for (const item of merged) {
+            const versions = Array.isArray(item.versions) ? item.versions : [];
+            if (versions.length > 1) {
+              for (const ver of versions) {
+                const entries = resolveAssetImageEntries(ver, cardsMap);
+                options.push({
+                  key: `${category}:${ver.id}`,
+                  category,
+                  assetId: ver.id,
+                  parentId: item.id,
+                  displayName: `${item.name} · ${ver.name}`,
+                  subtitle: String(ver.appearance || ver.atmosphere || ver.materialAndState || ver.description || '').trim(),
+                  boundCount: entries.length,
+                  alreadyBound: entries.some(e => e.cardId === targetCard.id),
+                });
+              }
+            } else {
+              const entries = resolveAssetImageEntries(item, cardsMap);
+              options.push({
+                key: `${category}:${item.id}`,
+                category,
+                assetId: item.id,
+                displayName: item.name,
+                subtitle: String(item.appearance || item.atmosphere || item.materialAndState || item.description || '').trim(),
+                boundCount: entries.length,
+                alreadyBound: entries.some(e => e.cardId === targetCard.id),
+              });
+            }
+          }
+        };
+        collectGroup('character', currentProject.characters || []);
+        collectGroup('location', currentProject.locations || []);
+        collectGroup('prop', currentProject.props || []);
+
+        return (
+          <div data-image-bind-modal="true">
+            <CanvasCardBindAssetModal
+              isOpen={true}
+              card={targetCard}
+              options={options}
+              onClose={() => setBindingCanvasCardId(null)}
+              onSelectAsset={(opt, setPrimary) => {
+                const { updatedProject } = executeProjectAssetMutation(
+                  'asset.bindImage',
+                  {
+                    id: opt.assetId,
+                    assetId: opt.assetId,
+                    type: opt.category,
+                    action: 'bind',
+                    cardId: targetCard.id,
+                    source: 'canvas',
+                    setPrimary,
+                  },
+                  currentProjectRef.current,
+                  cardsRef.current
+                );
+                if (Object.keys(updatedProject).length > 0) {
+                  handleUpdateCurrentProject(updatedProject);
+                }
+                showToastNotice(`已将画布卡片绑定至「${opt.displayName}」`, { dotColor: 'bg-emerald-500' });
+              }}
+            />
+          </div>
+        );
+      })()}
 
       {/* One temporary blur layer above both card renderers. */}
       {entryBlurBatch > 0 && <EntryBlurOverlay key={entryBlurBatch} />}

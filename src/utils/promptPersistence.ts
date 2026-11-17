@@ -75,7 +75,15 @@ export function isObsoletePromptText(text: string): boolean {
     text.includes('合并整理为最新的认知状态 JSON。\n\n【当前认知状态（上一轮旧状态）】') ||
     text.includes('负责协助用户从剧本到生图到视频的流程') ||
     text.includes('"notesMode": "overwrite"\n}\n\n【当前认知状态（上一轮旧状态）】') ||
-    text.includes('将宏观任务拆解为分批推进的具体子步骤；每个子步骤必须定义为')
+    text.includes('将宏观任务拆解为分批推进的具体子步骤；每个子步骤必须定义为') ||
+    text.includes('进入执行阶段前，必须制定步骤化的“当前计划”，驱动执行阶段连续执行：') ||
+    text.includes('执行任务通用规范——严格遵循“四步走”闭环推进（搜集足够的信息 → 制定足够清晰的计划 → 实施 → 验收）：\n1. 搜集足够的信息') ||
+    text.includes('- 用户沟通：{- 对用户说的话（完整版）：“简洁说明当前进展或阶段结论；注意调用工具不等于完成任务，需等工具返回结果并核验”') ||
+    text.includes('0. 检索同类任务经验（初次规划必做）') ||
+    text.includes('则保持为 pending",') ||
+    text.includes('仅在调用 sys.endTask 结案汇报、调用 user.ask 向用户提问或无需调工具直接回复时，同时输出“- 对用户说的话（简版）”与“- 对用户说的话（完整版）”') ||
+    text.includes('当前子步骤处于“已读取待写入落盘”还是“已写入落盘完成”状态？') ||
+    text.includes('[ ] 3. 全局验收结案')
   );
 }
 

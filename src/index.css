@@ -94,9 +94,24 @@
 
 /* 4K Performance & Intent-Driven Lazy Degradation:
    Aggressively strip heavy DOM rendering and expensive CSS effects during active zooming/panning for Asset Cards & Generation Cards */
+#canvas-workspace[data-middle-pan="true"],
+#canvas-workspace[data-middle-pan="true"] *,
 #canvas-workspace[data-zooming="true"],
 #canvas-workspace[data-panning="true"],
 #canvas-workspace[data-gesture="true"] {
+  pointer-events: none !important;
+}
+
+body[data-middle-pan="true"] [data-dock-card="true"] {
+  background: transparent !important;
+  background-color: transparent !important;
+  backdrop-filter: none !important;
+  box-shadow: none !important;
+  pointer-events: none !important;
+}
+
+body[data-middle-pan="true"] [data-dock-card="true"] > * {
+  opacity: 0 !important;
   pointer-events: none !important;
 }
 
@@ -259,6 +274,10 @@
 .animate-agent-float {
   animation: agent-cursor-float 2.4s ease-in-out infinite;
   will-change: transform;
+}
+
+body[data-lightbox-open="true"] .animate-agent-float {
+  animation-play-state: paused !important;
 }
 
 /* GPU Hardware Acceleration & Layer Promotion:

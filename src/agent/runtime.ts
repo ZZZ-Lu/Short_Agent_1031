@@ -11,6 +11,7 @@ export interface RuntimeEvent {
   turnId: string;
   type: 'user' | 'thought' | 'tool' | 'answer' | 'system';
   text: string;
+  speak?: string;
   toolName?: string;
   callId?: string;
   status?: RuntimeToolStatus;
@@ -232,25 +233,27 @@ export class AgentRuntime {
           break;
         }
 
-        const hasUserAskTool = Array.isArray(result.toolCalls) && result.toolCalls.some(
+        const safeNarration = Array.isArray(result?.narration) ? result.narration : [];
+        const safeToolCalls = Array.isArray(result?.toolCalls) ? result.toolCalls : [];
+
+        const hasUserAskTool = safeToolCalls.some(
           call => !call.validationError && (
             call.name === 'user.ask' ||
             (call.name === 'sys.endTask' && typeof call.arguments?.waitForUser === 'string' && Boolean(call.arguments.waitForUser))
           )
         );
-        const isOnlySelectContext = Array.isArray(result.toolCalls) &&
-          result.toolCalls.length > 0 &&
-          result.toolCalls.every(
+        const isOnlySelectContext =
+          safeToolCalls.length > 0 &&
+          safeToolCalls.every(
             call => !call.validationError && (call.name === 'sys.selectContext' || call.name === 'experience.search')
           );
-        const isAuxAssetCheckOnly = Array.isArray(result.toolCalls) &&
-          result.toolCalls.length > 0 &&
-          result.toolCalls.every(call => !call.validationError && (call.name === 'asset.list' || call.name === 'sys.selectContext'));
+        const isAuxAssetCheckOnly =
+          safeToolCalls.length > 0 &&
+          safeToolCalls.every(call => !call.validationError && (call.name === 'asset.list' || call.name === 'sys.selectContext'));
         const isConsecutiveLevel1ScriptRead =
           (task.context?.level ?? 0) === 1 &&
-          Array.isArray(result.toolCalls) &&
-          result.toolCalls.length > 0 &&
-          result.toolCalls.every(
+          safeToolCalls.length > 0 &&
+          safeToolCalls.every(
             call =>
               !call.validationError &&
               (call.name === 'script.read' ||
@@ -260,9 +263,9 @@ export class AgentRuntime {
                 call.name === 'asset.searchProvenanceCandidates' ||
                 call.name === 'sys.selectContext')
           );
-        const hasAllValidationErrors = Array.isArray(result.toolCalls) &&
-          result.toolCalls.length > 0 &&
-          result.toolCalls.every(call => Boolean(call.validationError));
+        const hasAllValidationErrors =
+          safeToolCalls.length > 0 &&
+          safeToolCalls.every(call => Boolean(call.validationError));
 
         // The debug transport snapshot is for the developer trace only. It
         // must never become part of the next model request's history.
@@ -273,7 +276,7 @@ export class AgentRuntime {
         const isEnteringLevel1WithRead =
           isOnlySelectContext &&
           (task.context?.level ?? 0) === 0 &&
-          result.toolCalls.some(
+          safeToolCalls.some(
             call =>
               call.name === 'sys.selectContext' &&
               Array.isArray(call.arguments?.tools) &&
@@ -348,10 +351,11 @@ export class AgentRuntime {
                 .slice(-4)
             : [];
         task.observations = [...preservedObservations];
-        result.narration.forEach(text => this.addEvent(task, { turnId, type: 'thought', text }));
+        safeNarration.forEach(text => this.addEvent(task, { turnId, type: 'thought', text }));
         const fullAnswer = result.response || result.speak || result.fullAnswer;
+        const shortSpeak = result.speak && result.speak.trim() ? result.speak.trim() : undefined;
         if (fullAnswer) {
-          this.addEvent(task, { turnId, type: 'answer', text: fullAnswer });
+          this.addEvent(task, { turnId, type: 'answer', text: fullAnswer, speak: shortSpeak });
         }
 
         // Sync cognitive state fields if returned in the turn result
@@ -392,13 +396,13 @@ export class AgentRuntime {
           break;
         }
 
-        if (result.toolCalls.length === 0 && !this.isInterrupted(task, signal)) {
+        if (safeToolCalls.length === 0 && !this.isInterrupted(task, signal)) {
           // Check if this task is an active multi-step autonomous task with unfinished work
           const planList = Array.isArray(task.plan) && task.plan.length > 0 ? task.plan : (Array.isArray(result.plan) && result.plan.length > 0 ? result.plan : []);
           const hasPendingPlan = planList.some(p => p && p.status !== 'completed');
           const isAutonomousMode = task.context?.level === 1 || task.thinkingLevel === 1;
-          const hasExecutedTools = task.events.some(e => e.type === 'tool' && e.status === 'succeeded');
-          const narrationText = Array.isArray(result.narration) ? result.narration.join('\n') : '';
+          const hasExecutedTools = task.events.some(e => e.type === 'tool' && e.status === 'succeeded' && e.toolName !== 'user.ask');
+          const narrationText = safeNarration.join('\n');
           const hasUncheckedPlanInNarration = /(?:^|\n)\s*(?:[-*+]|\d+\.)?\s*\[\s*\]\s+\S/.test(narrationText);
 
           const isUnfinishedTask = hasPendingPlan || isAutonomousMode || hasExecutedTools || hasUncheckedPlanInNarration;
@@ -447,8 +451,52 @@ export class AgentRuntime {
               console.warn('Dedicated state node execution failed:', nodeErr);
             }
           }
-          task.status = 'completed';
-          if (result.speak) task.summary = result.speak;
+
+          // 🌟 核心设计：没有调用工具时，通过 sys.nudge 提醒 Agent 本轮未输出工具指令，
+          // 至于到底要不要调、调什么工具，完全由 Agent 自己的思考与当前计划自主决定。
+          // 只有当明确调用了 sys.endTask 成功时任务才真正完成，否则保持 planning / 允许自主重试或继续循环。
+          const hasExplicitEndTask = task.events.some(
+            e => e.type === 'tool' && e.status === 'succeeded' && e.toolName === 'sys.endTask'
+          );
+
+          if (hasExplicitEndTask) {
+            task.status = 'completed';
+            if (result.speak) task.summary = result.speak;
+            this.publish(task);
+            break;
+          }
+
+          if (emptyToolCount < MAX_EMPTY_TOOL_RETRIES) {
+            emptyToolCount++;
+            recoveryCount++;
+            const nudgeCallId = `nudge_${Date.now()}`;
+            const nudgeMsg = '【系统提示】检测到本轮未输出任何 {{调用 ...}} 工具指令。当前任务尚未结束（未通过 sys.endTask 结案）。请根据当前状态自行判断是否需要调用工具或询问用户。';
+
+            task.observations.push({
+              role: 'tool',
+              content: {
+                callId: nudgeCallId,
+                name: 'sys.nudge',
+                status: 'failed',
+                error: nudgeMsg,
+              },
+            });
+            this.addEvent(task, {
+              turnId,
+              type: 'system',
+              text: `【系统干预】第 ${emptyToolCount} 次检测到本轮未输出工具指令，正在提醒 Agent 自主判定...`,
+            });
+            this.publish(task);
+            continue;
+          }
+
+          // 超出重试次数后才交由常规未完成逻辑处理
+          task.status = 'waiting_user';
+          const pauseMsg = result.speak
+            ? `${result.speak}（任务已暂停：未输出执行指令）`
+            : '任务已暂停：未输出执行指令。';
+          task.summary = pauseMsg;
+          this.addEvent(task, { turnId, type: 'system', text: pauseMsg });
           this.publish(task);
           break;
         }
@@ -460,7 +508,7 @@ export class AgentRuntime {
         emptyToolCount = 0;
         recoveryCount = 0;
         task.status = 'waiting_tools';
-        task.pendingCallIds = result.toolCalls.map(call => call.id);
+        task.pendingCallIds = safeToolCalls.map(call => call.id);
         this.publish(task);
 
         // Preserve explicit Agent ordering around UI mutations. Consecutive
@@ -474,7 +522,7 @@ export class AgentRuntime {
           if (this.isInterrupted(task, signal)) return;
           await Promise.all(batch.map(call => this.runTool(task, turnId, call, signal)));
         };
-        for (const call of result.toolCalls) {
+        for (const call of safeToolCalls) {
           if (this.isInterrupted(task, signal)) break;
           if (this.options.isParallelSafe?.(call)) {
             readBatch.push(call);
@@ -518,9 +566,17 @@ export class AgentRuntime {
       } else if ((task.status as RuntimeTaskStatus) === 'paused') {
         this.publish(task);
       } else {
-        task.status = 'failed';
         const message = error instanceof Error ? error.message : 'Agent 执行失败';
-        this.addEvent(task, { type: 'answer', text: message, error: message });
+        const isNetworkIssue = message.includes('Failed to fetch') || message.includes('NetworkError') || message.includes('network') || message.includes('网络连接');
+        if (isNetworkIssue) {
+          task.status = 'paused';
+          const pauseMsg = '网络连接中断（Failed to fetch），任务已安全暂停。';
+          task.summary = pauseMsg;
+          this.addEvent(task, { type: 'system', text: '【系统提示】网络连接已断开，您可以检查网络后点击「继续执行」恢复任务。' });
+        } else {
+          task.status = 'failed';
+          this.addEvent(task, { type: 'answer', text: message, error: message });
+        }
         this.publish(task);
       }
     } finally {
@@ -687,7 +743,7 @@ export class AgentRuntime {
       const latestThought = thoughtEvents.length > 0 ? thoughtEvents[thoughtEvents.length - 1].text.trim() : undefined;
 
       if (!existingAnswer && questionText) {
-        this.addEvent(task, { turnId, type: 'answer', text: questionText });
+        this.addEvent(task, { turnId, type: 'answer', text: questionText, speak: questionText });
       }
       task.summary = communicationText || questionText;
       task.pendingAskCallId = call.id;
@@ -736,6 +792,7 @@ export class AgentRuntime {
       }
       const existingAnswer = task.events.find(e => e.turnId === turnId && e.type === 'answer');
       const communicationText = existingAnswer?.text || '';
+      const shortSpeak = existingAnswer?.speak || '';
       const responseSuggestsPending = /后台|渲染|排队|稍候|生成中|等待生成|正在生成|提交生成/i.test(communicationText);
 
       // Check if recent observations or tool calls in this task contain active pending card.generate
@@ -761,28 +818,28 @@ export class AgentRuntime {
         task.status = 'waiting_user';
         const waitForUserText = call.arguments.waitForUser;
         if (!existingAnswer) {
-          this.addEvent(task, { turnId, type: 'answer', text: waitForUserText });
+          this.addEvent(task, { turnId, type: 'answer', text: waitForUserText, speak: waitForUserText });
         }
         const fullAsk = communicationText || waitForUserText;
         const lastLog = task.negotiationLog[task.negotiationLog.length - 1];
         if (fullAsk && (!lastLog || lastLog.role !== 'agent' || lastLog.content !== fullAsk)) {
           task.negotiationLog.push({ role: 'agent', content: fullAsk, timestamp: Date.now() });
         }
-        task.summary = fullAsk || task.summary;
+        task.summary = shortSpeak || fullAsk || task.summary;
       } else if (isPaused) {
         task.status = 'paused';
         const pauseMsg = communicationText || '任务已挂起暂停，等待后台事件唤醒。';
         if (!existingAnswer) {
-          this.addEvent(task, { turnId, type: 'answer', text: pauseMsg });
+          this.addEvent(task, { turnId, type: 'answer', text: pauseMsg, speak: pauseMsg });
         }
-        task.summary = pauseMsg || task.summary;
+        task.summary = shortSpeak || pauseMsg || task.summary;
       } else {
         task.status = 'completed';
         const finalMsg = communicationText || '任务完成。';
         if (!existingAnswer) {
-          this.addEvent(task, { turnId, type: 'answer', text: finalMsg });
+          this.addEvent(task, { turnId, type: 'answer', text: finalMsg, speak: finalMsg });
         }
-        task.summary = finalMsg || task.summary;
+        task.summary = shortSpeak || finalMsg || task.summary;
       }
       this.updateLastTool(task, call.id, 'succeeded', `已完成：${call.name}`, { output: '任务已结束' });
       this.publish(task);

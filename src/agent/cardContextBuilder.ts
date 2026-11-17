@@ -1,5 +1,6 @@
 import type { CardData } from '../components/GenerationCard';
 import type { ScriptProject } from '../types/script';
+import { resolveAssetItemFromProject } from '../utils/assetAgentTarget';
 
 export interface CardLineageNode {
   id: string;
@@ -613,103 +614,74 @@ export function refreshTaskCardContext(
     };
   }
 
-  if (targetId.startsWith('assets.item.character.')) {
-    const charId = targetId.slice('assets.item.character.'.length);
-    let char: any = project.characters?.find(c => c.id === charId);
-    let parentChar: any = null;
-    if (!char && Array.isArray(project.characters)) {
-      for (const c of project.characters) {
-        const ver = Array.isArray(c.versions) ? c.versions.find((v: any) => v.id === charId) : null;
-        if (ver) {
-          char = ver;
-          parentChar = c;
-          break;
-        }
-      }
-    }
-    if (!char) return cardContext;
-    const name = parentChar ? `${parentChar.name}（${char?.name || charId}）` : (char?.name || charId);
-    const summaryLines = [
-      `【当前聚焦的剧本角色资产】`,
-      parentChar ? `- 版本ID: ${charId}` : `- 资产ID: ${charId}`,
-      parentChar ? `- 所属主资产ID: ${parentChar.id} (${parentChar.name})` : '',
-      `- 角色名: ${name}`,
-      char?.description ? `- 资产识别描述: ${char.description}` : '',
-      char?.role || parentChar?.role ? `- 身份/定位: ${char?.role || parentChar?.role}` : '',
-      char?.appearance ? `- 外貌与服装特征: ${char.appearance}` : '',
-      char?.personality ? `- 性格特征: ${char.personality}` : '',
-      char?.sourceScenes?.length ? `- 出场场次: ${char.sourceScenes.join('、')}` : '',
-    ].filter(Boolean);
-    return {
-      ...cardContext,
-      targetId,
-      title: `角色资产：${name}`,
-      markdownSummary: summaryLines.join('\n'),
-    };
-  }
+  if (targetId.startsWith('assets.item.')) {
+    const resolved = resolveAssetItemFromProject(project, targetId);
+    if (!resolved) return cardContext;
 
-  if (targetId.startsWith('assets.item.location.')) {
-    const locId = targetId.slice('assets.item.location.'.length);
-    let loc: any = project.locations?.find(l => l.id === locId);
-    let parentLoc: any = null;
-    if (!loc && Array.isArray(project.locations)) {
-      for (const l of project.locations) {
-        const ver = Array.isArray(l.versions) ? l.versions.find((v: any) => v.id === locId) : null;
-        if (ver) {
-          loc = ver;
-          parentLoc = l;
-          break;
-        }
-      }
-    }
-    if (!loc) return cardContext;
-    const name = parentLoc ? `${parentLoc.name}（${loc?.name || locId}）` : (loc?.name || locId);
-    const summaryLines = [
-      `【当前聚焦的剧本场景资产】`,
-      parentLoc ? `- 版本ID: ${locId}` : `- 资产ID: ${locId}`,
-      parentLoc ? `- 所属主资产ID: ${parentLoc.id} (${parentLoc.name})` : '',
-      `- 场景名: ${name}`,
-      loc?.description ? `- 资产识别描述: ${loc.description}` : '',
-      loc?.type || parentLoc?.type ? `- 内外景: ${loc?.type || parentLoc?.type}` : '',
-      loc?.timeOfDay ? `- 时间段: ${loc.timeOfDay}` : '',
-      loc?.atmosphere ? `- 环境氛围: ${loc.atmosphere}` : '',
-      loc?.visualDetails ? `- 视觉细节: ${loc.visualDetails}` : '',
-      loc?.sourceScenes?.length ? `- 出场场次: ${loc.sourceScenes.join('、')}` : '',
-    ].filter(Boolean);
-    return {
-      ...cardContext,
-      targetId,
-      title: `场景资产：${name}`,
-      markdownSummary: summaryLines.join('\n'),
-    };
-  }
+    const { category, item, parentItem, isVersion } = resolved;
+    const itemId = String(item?.id || targetId);
+    const name = parentItem ? `${parentItem.name}（${item?.name || itemId}）` : (item?.name || itemId);
+    const boundImages = Array.isArray(item?.images) ? item.images : [];
+    const boundSummary = boundImages.length > 0
+      ? `- 已绑定图像: ${boundImages.length} 张 (${boundImages.map((img: any) => `${img.isPrimary ? '★主图 ' : ''}${img.cardId ? `card:${img.cardId}` : img.id}`).join(', ')})`
+      : '';
 
-  if (targetId.startsWith('assets.item.prop.')) {
-    const propId = targetId.slice('assets.item.prop.'.length);
-    let prop: any = project.props?.find(p => p.id === propId);
-    let parentProp: any = null;
-    if (!prop && Array.isArray(project.props)) {
-      for (const p of project.props) {
-        const ver = Array.isArray(p.versions) ? p.versions.find((v: any) => v.id === propId) : null;
-        if (ver) {
-          prop = ver;
-          parentProp = p;
-          break;
-        }
-      }
+    const scenesText = Array.isArray(item?.sourceScenes) && item.sourceScenes.length ? item.sourceScenes.join('、') : '';
+
+    if (category === 'character') {
+      const summaryLines = [
+        `【当前聚焦的剧本角色资产】`,
+        isVersion ? `- 版本ID: ${itemId}` : `- 资产ID: ${itemId}`,
+        parentItem ? `- 所属主资产ID: ${parentItem.id} (${parentItem.name})` : '',
+        `- 角色名: ${name}`,
+        item?.description ? `- 资产识别描述: ${item.description}` : '',
+        item?.role || parentItem?.role ? `- 身份/定位: ${item?.role || parentItem?.role}` : '',
+        item?.appearance ? `- 外貌与服装特征: ${item.appearance}` : '',
+        item?.personality ? `- 性格特征: ${item.personality}` : '',
+        scenesText ? `- 出场场次: ${scenesText}` : '',
+        boundSummary,
+      ].filter(Boolean);
+      return {
+        ...cardContext,
+        targetId,
+        title: `角色资产：${name}`,
+        markdownSummary: summaryLines.join('\n'),
+      };
     }
-    if (!prop) return cardContext;
-    const name = parentProp ? `${parentProp.name}（${prop?.name || propId}）` : (prop?.name || propId);
+
+    if (category === 'location') {
+      const summaryLines = [
+        `【当前聚焦的剧本场景资产】`,
+        isVersion ? `- 版本ID: ${itemId}` : `- 资产ID: ${itemId}`,
+        parentItem ? `- 所属主资产ID: ${parentItem.id} (${parentItem.name})` : '',
+        `- 场景名: ${name}`,
+        item?.description ? `- 资产识别描述: ${item.description}` : '',
+        item?.type || parentItem?.type ? `- 内外景: ${item?.type || parentItem?.type}` : '',
+        item?.timeOfDay ? `- 时间段: ${item.timeOfDay}` : '',
+        item?.atmosphere ? `- 环境氛围: ${item.atmosphere}` : '',
+        item?.visualDetails ? `- 视觉细节: ${item.visualDetails}` : '',
+        scenesText ? `- 出场场次: ${scenesText}` : '',
+        boundSummary,
+      ].filter(Boolean);
+      return {
+        ...cardContext,
+        targetId,
+        title: `场景资产：${name}`,
+        markdownSummary: summaryLines.join('\n'),
+      };
+    }
+
     const summaryLines = [
       `【当前聚焦的剧本道具资产】`,
-      parentProp ? `- 版本ID: ${propId}` : `- 资产ID: ${propId}`,
-      parentProp ? `- 所属主资产ID: ${parentProp.id} (${parentProp.name})` : '',
+      isVersion ? `- 版本ID: ${itemId}` : `- 资产ID: ${itemId}`,
+      parentItem ? `- 所属主资产ID: ${parentItem.id} (${parentItem.name})` : '',
       `- 道具名: ${name}`,
-      prop?.description ? `- 资产识别描述: ${prop.description}` : '',
-      prop?.owner || parentProp?.owner ? `- 归属者: ${prop?.owner || parentProp?.owner}` : '',
-      prop?.materialAndState ? `- 材质与状态: ${prop.materialAndState}` : '',
-      prop?.storySignificance ? `- 剧情辨识信息: ${prop.storySignificance}` : '',
-      prop?.sourceScenes?.length ? `- 出场场次: ${prop.sourceScenes.join('、')}` : '',
+      item?.description ? `- 资产识别描述: ${item.description}` : '',
+      item?.owner || parentItem?.owner ? `- 归属者: ${item?.owner || parentItem?.owner}` : '',
+      item?.materialAndState ? `- 材质与状态: ${item.materialAndState}` : '',
+      item?.storySignificance ? `- 剧情辨识信息: ${item.storySignificance}` : '',
+      scenesText ? `- 出场场次: ${scenesText}` : '',
+      boundSummary,
     ].filter(Boolean);
     return {
       ...cardContext,

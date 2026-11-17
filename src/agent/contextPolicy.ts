@@ -28,7 +28,7 @@ export const TOOL_CATEGORIES: Record<string, ToolCategoryDefinition> = {
   asset: {
     id: 'asset',
     label: '资产工具箱',
-    description: '查询、新增、修改、删除角色/场景/道具资产，检索与锚定剧本出处',
+    description: '查询、新增、修改、删除角色/场景/道具资产，检索与锚定剧本出处，绑定资产图',
     tools: [
       'asset.list',
       'asset.create',
@@ -36,6 +36,7 @@ export const TOOL_CATEGORIES: Record<string, ToolCategoryDefinition> = {
       'asset.delete',
       'asset.searchProvenanceCandidates',
       'asset.commitProvenance',
+      'asset.bindImage',
     ],
     promptId: 'assets',
   },
@@ -610,6 +611,22 @@ export function summarizeToolOutputForStateNode(
   if (toolName === 'asset.commitProvenance') {
     const scenes = Array.isArray(out.sourceScenes) ? out.sourceScenes.join('、') : '';
     return `已提交核验出处 ${out.verifiedCount ?? 0} 条${scenes ? ` (${scenes})` : ''}`;
+  }
+
+  if (toolName === 'asset.bindImage') {
+    const assetName = out.assetName || out.id || '资产';
+    const action = out.action || 'bind';
+    const count = typeof out.imageCount === 'number' ? out.imageCount : (Array.isArray(out.images) ? out.images.length : 0);
+    if (action === 'list') {
+      return `资产 ${assetName} 当前绑定 ${count} 张图像`;
+    }
+    if (action === 'unbind') {
+      return `已解除资产 ${assetName} 图像绑定（剩余 ${count} 张）`;
+    }
+    if (action === 'setPrimary') {
+      return `已设置资产 ${assetName} 资产主图`;
+    }
+    return `已绑定图像到资产 ${assetName}（共 ${count} 张）`;
   }
 
   if (toolName === 'asset.searchProvenanceCandidates') {

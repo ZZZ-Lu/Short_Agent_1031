@@ -33,7 +33,10 @@ import {
   Layers,
   Maximize2,
   Minimize2,
-  Eye
+  Eye,
+  Link2,
+  MousePointerClick,
+  ImagePlus
 } from 'lucide-react';
 
 // Git-like Content-Addressed Storage Utils
@@ -100,8 +103,67 @@ import { ScriptCodeEditor, ScriptCodeEditorRef } from './script/ScriptCodeEditor
 import { assetExtractionService } from '../services/assetExtractionService';
 import { calculateAssetProvenance, resolveVerifiedProvenance, AssetProvenanceItem, AssetProvenanceHighlightSpan } from '../utils/assetProvenance';
 import { getAssetIdentificationText, getVersionIdentificationText, mergeMultiVersionAssetList, itemToVersion } from '../utils/assetVersions';
+import { buildAssetAgentTargetId, parseAssetAgentTargetId } from '../utils/assetAgentTarget';
+import { agentFocusManager } from '../agent/agentFocusManager';
+import {
+  getSelectionOverlayStyle,
+  resolveSelectionBorderMode,
+  type SelectionBorderMode,
+} from '../utils/selectionBorder';
+import { findAssetRowElement } from '../utils/domSelector';
 import { ScriptView } from '../agent/scriptTools';
-import { CardData } from './GenerationCard';
+import { CardData, compressImageBlob } from './GenerationCard';
+import { AssetItemContextMenu } from './AssetItemContextMenu';
+import type { AssetContextCategory, AssetContextMenuActionId } from '../utils/assetContextMenu';
+import {
+  buildDockTransitionPhase1,
+  buildDockTransitionPhase2,
+  buildDockTransitionPhase3Prepare,
+  buildDockTransitionPhase3Reveal,
+  buildDockTransitionPlan,
+  computeScriptBibleDockLayout,
+  createIdleWidthTransitionPanels,
+  resolveDockOccupiedRightEdge,
+  shouldForceExpandScriptOnRequestedViewChange,
+  WIDTH_TRANSITION_TIMINGS,
+  type DockWidthTransitionPanels,
+} from '../utils/scriptBibleDockLayout';
+import { AssetImageFeedPanel } from './AssetImageFeedPanel';
+import {
+  FullscreenImageLightbox,
+  type FullscreenImageLightboxData,
+} from './FullscreenImageLightbox';
+import { AssetBindImageModal, type AssetBindTargetInfo } from './AssetBindImageModal';
+import {
+  buildAssetImageFeed,
+  buildAssetBindPickerTarget,
+  bindImageToAssetItem,
+  setPrimaryAssetImageOnItem,
+  unbindImageFromAssetItem,
+  buildCardSnapshotMap,
+  getPrimaryAssetImageEntry,
+  resolveAssetImageEntries,
+  resolveAssetThumbFeedFocusTarget,
+  type AssetBindPickerTarget,
+  type AssetCategory,
+  type AssetImageFeedSection,
+  type FeedFocusTargetRequest,
+} from '../utils/assetImages';
+import { useProjectScopedState } from '../hooks/useProjectScopedState';
+import {
+  useShellWidthTransitionGuard,
+  useUnifiedPanelScrollMemory,
+} from '../hooks/useUnifiedPanelScrollMemory';
+import {
+  buildScrollScopeKey,
+  readScriptScrollAnchorFromStorage,
+  readScrollOffsetFromStorage,
+  resolveProjectScopedRawValue,
+  writeProjectScopedRawValue,
+  writeScriptScrollAnchorToStorage,
+  writeScrollOffsetToStorage,
+  type ScriptScrollAnchor,
+} from '../utils/scrollMemory';
 
 type TocItemType = 'episode' | 'scene' | 'chapter' | 'heading' | 'segment';
 
@@ -109,6 +171,7 @@ interface ProjectScriptBibleProps {
   currentProject: ScriptProject;
   projects: ScriptProject[];
   cards?: CardData[];
+  isCardsLoading?: boolean;
   onSelectProject: (projectId: string) => void;
   onCreateProject: (name: string) => void;
   onRenameProject: (projectId: string, newName: string) => void;
@@ -127,10 +190,23 @@ interface ProjectScriptBibleProps {
   onTocItemOpened: (item: { id: string; title: string; lineNumber: number; type: TocItemType }) => void;
   onSelectionChange: (selection: { text: string; start: number; end: number; lineStart: number; lineEnd: number } | null) => void;
   onRequestGenerateAsset?: (assetName: string, prompt: string) => void;
+  onRequestGenerateAssetImage?: (category: AssetCategory, item: any, parentItem?: any) => void;
+  onStartCanvasAssetBind?: (target: AssetBindPickerTarget) => void;
+  requestedBindModalTarget?: {
+    category: AssetCategory;
+    assetId: string;
+    parentId?: string;
+    nonce: number;
+  } | null;
+  onFocusCanvasCard?: (cardId: string, occupiedLeftWidth?: number) => void;
   agentFocusedTargetId?: string | null;
   agentFocusedTargetIds?: string[];
+  isAgentSleeping?: boolean;
   verifyingAssetIds?: string[];
+  generatingAssetIds?: string[];
   onRequestVerifyAssetProvenance?: (category: 'character' | 'location' | 'prop', item: any) => void;
+  selectedAssetIds?: Set<string>;
+  onSelectedAssetIdsChange?: (action: Set<string> | ((prev: Set<string>) => Set<string>)) => void;
 }
 
 type TabType = 'script' | 'assets' | 'universe' | 'cards';
@@ -439,6 +515,7 @@ export function ProjectScriptBible({
   currentProject,
   projects,
   cards = [],
+  isCardsLoading = false,
   onSelectProject,
   onCreateProject,
   onRenameProject,
@@ -457,159 +534,632 @@ export function ProjectScriptBible({
   onTocItemOpened,
   onSelectionChange,
   onRequestGenerateAsset,
+  onRequestGenerateAssetImage,
+  onStartCanvasAssetBind,
+  requestedBindModalTarget,
+  onFocusCanvasCard,
   agentFocusedTargetId,
   agentFocusedTargetIds = [],
+  isAgentSleeping = false,
   verifyingAssetIds = [],
-  onRequestVerifyAssetProvenance
+  generatingAssetIds = [],
+  onRequestVerifyAssetProvenance,
+  selectedAssetIds: propsSelectedAssetIds,
+  onSelectedAssetIdsChange
 }: ProjectScriptBibleProps) {
   const isTargetAgentFocused = useCallback((targetId: string) => {
     return agentFocusedTargetId === targetId || agentFocusedTargetIds.includes(targetId);
   }, [agentFocusedTargetId, agentFocusedTargetIds]);
-  // Navigation & filtering states inside drawer
+  const getAssetRowBorderClasses = useCallback((mode: SelectionBorderMode, isVersionRow: boolean) => {
+    if (mode === 'dual') {
+      return isVersionRow
+        ? 'bg-gradient-to-r from-blue-100/90 to-purple-100/85 dark:from-blue-900/55 dark:to-purple-900/45 text-gray-900 dark:text-neutral-100'
+        : 'bg-gradient-to-r from-blue-100/90 to-purple-100/85 dark:from-blue-900/55 dark:to-purple-900/45 text-gray-900 dark:text-neutral-100';
+    }
+    if (mode === 'agent') {
+      return isVersionRow
+        ? 'bg-purple-100/85 dark:bg-purple-900/45 text-purple-800 dark:text-purple-200'
+        : 'bg-purple-100/85 dark:bg-purple-900/45 text-purple-800 dark:text-purple-200';
+    }
+    if (mode === 'user') {
+      return isVersionRow
+        ? 'bg-blue-100/90 dark:bg-blue-900/60 text-blue-700 dark:text-blue-300'
+        : 'bg-blue-100/90 dark:bg-blue-900/60 text-blue-700 dark:text-blue-300 active:bg-blue-200/90 dark:active:bg-blue-800/80';
+    }
+    return isVersionRow
+      ? 'hover:bg-blue-50/80 dark:hover:bg-neutral-800/70 text-gray-600 dark:text-neutral-300'
+      : 'hover:bg-blue-100/80 dark:hover:bg-blue-900/50 text-gray-700 dark:text-neutral-200 hover:text-blue-700 dark:hover:text-blue-300 active:bg-blue-100/70 dark:active:bg-blue-900/40';
+  }, []);
+
+  const renderAssetRowSelectionBorderOverlay = useCallback((mode: SelectionBorderMode, isVersionRow: boolean) => {
+    if (mode === 'none') return null;
+    const radiusClass = isVersionRow ? 'rounded-lg' : 'rounded-xl corner-squircle';
+    return (
+      <div
+        aria-hidden
+        className={`${mode === 'dual' ? 'dual-selection-border ' : ''}absolute inset-0 pointer-events-none ${radiusClass} z-10 select-none`}
+        style={getSelectionOverlayStyle(mode, '2px')}
+      />
+    );
+  }, []);
+  const currentProjectRef = useRef(currentProject);
+  currentProjectRef.current = currentProject;
+  const prevProjectIdRef = useRef<string | undefined>(currentProject?.id);
+
+  // Navigation & filtering states inside drawer (synchronously scoped per project)
   const [activeTab, setActiveTab] = useState<TabType>('script');
-  const [activeSidePanel, setActiveSidePanel] = useState<'assets' | 'universe' | 'cards' | null>(() => {
-    if (typeof window !== 'undefined') {
-      const saved = (currentProject?.id ? localStorage.getItem(`script_bible_active_side_panel_${currentProject.id}`) : null) ||
-                    localStorage.getItem('script_bible_active_side_panel');
+
+  const readSidePanelForProject = useCallback(
+    (pid: string | undefined): 'assets' | 'universe' | 'cards' | null => {
+      if (typeof window === 'undefined') return 'assets';
+      const saved = resolveProjectScopedRawValue({
+        storage: window.localStorage,
+        projectId: pid,
+        projectKeyPrefix: 'script_bible_active_side_panel_',
+        fallbackGlobalKey: 'script_bible_active_side_panel',
+      });
       if (saved === 'null' || saved === 'closed') return null;
       if (saved === 'assets' || saved === 'universe' || saved === 'cards') return saved;
-    }
-    return 'assets';
+      return 'assets';
+    },
+    []
+  );
+
+  const writeSidePanelForProject = useCallback(
+    (pid: string | undefined, panel: 'assets' | 'universe' | 'cards' | null) => {
+      if (typeof window === 'undefined') return;
+      const val = panel === null ? 'null' : panel;
+      writeProjectScopedRawValue({
+        storage: window.localStorage,
+        projectId: pid,
+        projectKeyPrefix: 'script_bible_active_side_panel_',
+        value: val,
+        globalKey: 'script_bible_active_side_panel',
+      });
+      if (panel !== null) {
+        writeProjectScopedRawValue({
+          storage: window.localStorage,
+          projectId: pid,
+          projectKeyPrefix: 'script_bible_last_open_side_panel_',
+          value: panel,
+          globalKey: 'script_bible_last_open_side_panel',
+        });
+      }
+    },
+    []
+  );
+
+  const [activeSidePanel, setActiveSidePanel] = useProjectScopedState<
+    'assets' | 'universe' | 'cards' | null
+  >({
+    projectId: currentProject?.id,
+    readValue: readSidePanelForProject,
+    writeValue: writeSidePanelForProject,
   });
 
-  useEffect(() => {
-    try {
-      const val = activeSidePanel === null ? 'null' : activeSidePanel;
-      localStorage.setItem('script_bible_active_side_panel', val);
-      if (currentProject?.id) {
-        localStorage.setItem(`script_bible_active_side_panel_${currentProject.id}`, val);
-      }
-      if (activeSidePanel !== null) {
-        localStorage.setItem('script_bible_last_open_side_panel', activeSidePanel);
-        if (currentProject?.id) {
-          localStorage.setItem(`script_bible_last_open_side_panel_${currentProject.id}`, activeSidePanel);
-        }
-      }
-    } catch {}
-  }, [activeSidePanel, currentProject?.id]);
+  const readScriptExpandedForProject = useCallback((pid: string | undefined): boolean => {
+    if (typeof window === 'undefined') return true;
+    const saved = resolveProjectScopedRawValue({
+      storage: window.localStorage,
+      projectId: pid,
+      projectKeyPrefix: 'script_bible_script_expanded_',
+      fallbackGlobalKey: 'script_bible_script_expanded',
+    });
+    return saved !== 'false';
+  }, []);
 
-  useEffect(() => {
-    if (currentProject?.id && typeof window !== 'undefined') {
-      const saved = localStorage.getItem(`script_bible_active_side_panel_${currentProject.id}`);
-      if (saved !== null) {
-        if (saved === 'null' || saved === 'closed') {
-          setActiveSidePanel(null);
-        } else if (saved === 'assets' || saved === 'universe' || saved === 'cards') {
-          setActiveSidePanel(saved);
+  const writeScriptExpandedForProject = useCallback((pid: string | undefined, expanded: boolean) => {
+    if (typeof window === 'undefined') return;
+    writeProjectScopedRawValue({
+      storage: window.localStorage,
+      projectId: pid,
+      projectKeyPrefix: 'script_bible_script_expanded_',
+      value: String(expanded),
+      globalKey: 'script_bible_script_expanded',
+    });
+  }, []);
+
+  const [isScriptExpanded, setIsScriptExpanded] = useProjectScopedState<boolean>({
+    projectId: currentProject?.id,
+    readValue: readScriptExpandedForProject,
+    writeValue: writeScriptExpandedForProject,
+  });
+
+  const readImagesExpandedForProject = useCallback((pid: string | undefined): boolean => {
+    if (typeof window === 'undefined') return true;
+    const saved = resolveProjectScopedRawValue({
+      storage: window.localStorage,
+      projectId: pid,
+      projectKeyPrefix: 'script_bible_images_expanded_',
+      fallbackGlobalKey: 'script_bible_images_expanded',
+    });
+    return saved !== 'false';
+  }, []);
+
+  const writeImagesExpandedForProject = useCallback((pid: string | undefined, expanded: boolean) => {
+    if (typeof window === 'undefined') return;
+    writeProjectScopedRawValue({
+      storage: window.localStorage,
+      projectId: pid,
+      projectKeyPrefix: 'script_bible_images_expanded_',
+      value: String(expanded),
+      globalKey: 'script_bible_images_expanded',
+    });
+  }, []);
+
+  const [isImagesExpanded, setIsImagesExpanded] = useProjectScopedState<boolean>({
+    projectId: currentProject?.id,
+    readValue: readImagesExpandedForProject,
+    writeValue: writeImagesExpandedForProject,
+  });
+
+  const readImagesWideForProject = useCallback((pid: string | undefined): boolean => {
+    if (typeof window === 'undefined') return false;
+    const saved = resolveProjectScopedRawValue({
+      storage: window.localStorage,
+      projectId: pid,
+      projectKeyPrefix: 'script_bible_images_wide_',
+      fallbackGlobalKey: 'script_bible_images_wide',
+    });
+    return saved === 'true';
+  }, []);
+
+  const writeImagesWideForProject = useCallback((pid: string | undefined, wide: boolean) => {
+    if (typeof window === 'undefined') return;
+    writeProjectScopedRawValue({
+      storage: window.localStorage,
+      projectId: pid,
+      projectKeyPrefix: 'script_bible_images_wide_',
+      value: String(wide),
+      globalKey: 'script_bible_images_wide',
+    });
+  }, []);
+
+  const [isImagesWide, setIsImagesWide] = useProjectScopedState<boolean>({
+    projectId: currentProject?.id,
+    readValue: readImagesWideForProject,
+    writeValue: writeImagesWideForProject,
+  });
+
+  type DockVisualStateSnapshot = {
+    scriptExpanded: boolean;
+    sidePanel: 'assets' | 'universe' | 'cards' | null;
+    imagesExpanded: boolean;
+    imagesWide: boolean;
+  };
+  type DockVisualEntry = DockVisualStateSnapshot & {
+    projectId: string | undefined;
+  };
+
+  // Visual dock state drives outer dockLayout; lags intended state by Phase 1 fade-out
+  // so inner card content freezes/unmounts before outer shells glide cleanly without scaling or reflowing.
+  const [visualDockEntry, setVisualDockEntry] = useState<DockVisualEntry>(() => ({
+    projectId: currentProject?.id,
+    scriptExpanded: isScriptExpanded,
+    sidePanel: activeSidePanel,
+    imagesExpanded: isImagesExpanded,
+    imagesWide: isImagesWide,
+  }));
+  const visualDock: DockVisualStateSnapshot =
+    visualDockEntry.projectId === currentProject?.id
+      ? {
+          scriptExpanded: visualDockEntry.scriptExpanded,
+          sidePanel: visualDockEntry.sidePanel,
+          imagesExpanded: visualDockEntry.imagesExpanded,
+          imagesWide: visualDockEntry.imagesWide,
         }
-      }
+      : {
+          scriptExpanded: isScriptExpanded,
+          sidePanel: activeSidePanel,
+          imagesExpanded: isImagesExpanded,
+          imagesWide: isImagesWide,
+        };
+  if (visualDockEntry.projectId !== currentProject?.id) {
+    setVisualDockEntry({
+      projectId: currentProject?.id,
+      scriptExpanded: isScriptExpanded,
+      sidePanel: activeSidePanel,
+      imagesExpanded: isImagesExpanded,
+      imagesWide: isImagesWide,
+    });
+  }
+
+  const [widthTransitionPanels, setWidthTransitionPanels] = useState<DockWidthTransitionPanels>(() =>
+    createIdleWidthTransitionPanels()
+  );
+  const visualDockRef = useRef<DockVisualStateSnapshot>(visualDock);
+  visualDockRef.current = visualDock;
+  const intendedDockRef = useRef<DockVisualStateSnapshot>({
+    scriptExpanded: isScriptExpanded,
+    sidePanel: activeSidePanel,
+    imagesExpanded: isImagesExpanded,
+    imagesWide: isImagesWide,
+  });
+  intendedDockRef.current = {
+    scriptExpanded: isScriptExpanded,
+    sidePanel: activeSidePanel,
+    imagesExpanded: isImagesExpanded,
+    imagesWide: isImagesWide,
+  };
+  const widthChoreographyTimersRef = useRef<number[]>([]);
+  const widthChoreographyRafsRef = useRef<number[]>([]);
+  const widthChoreographyActiveRef = useRef(false);
+
+  const clearWidthChoreography = useCallback(() => {
+    for (const timerId of widthChoreographyTimersRef.current) {
+      window.clearTimeout(timerId);
     }
-  }, [currentProject?.id]);
-
-  const [isMiniCardHovered, setIsMiniCardHovered] = useState(false);
-  const [miniCardLeft, setMiniCardLeft] = useState(500);
-
-  const handleMiniCardMouseEnter = useCallback(() => {
-    setIsMiniCardHovered(true);
-    // 鼠标悬停时平移滑出，无需放大
-    setMiniCardLeft(526);
+    for (const rafId of widthChoreographyRafsRef.current) {
+      cancelAnimationFrame(rafId);
+    }
+    widthChoreographyTimersRef.current = [];
+    widthChoreographyRafsRef.current = [];
+    widthChoreographyActiveRef.current = false;
   }, []);
 
-  const handleMiniCardMouseMove = useCallback((e: React.MouseEvent) => {
-    setIsMiniCardHovered(true);
-    // 鼠标在水平方向平移跟踪，最左保持在 524px (确保平移滑出)，最右延伸不超过 546px，仅平移不放大
-    const targetLeft = Math.min(546, Math.max(524, e.clientX - 30));
-    setMiniCardLeft(targetLeft);
+  const setVisualDockState = useCallback(
+    (pid: string | undefined, state: DockVisualStateSnapshot) => {
+      visualDockRef.current = state;
+      setVisualDockEntry({
+        projectId: pid,
+        ...state,
+      });
+    },
+    []
+  );
+
+  useEffect(() => {
+    return () => {
+      clearWidthChoreography();
+    };
+  }, [clearWidthChoreography]);
+
+  useEffect(() => {
+    clearWidthChoreography();
+    setWidthTransitionPanels(createIdleWidthTransitionPanels());
+  }, [currentProject?.id, clearWidthChoreography]);
+
+  const [viewportWidth, setViewportWidth] = useState<number>(() =>
+    typeof window !== 'undefined' ? window.innerWidth : 1440
+  );
+  const viewportWidthRef = useRef(viewportWidth);
+  viewportWidthRef.current = viewportWidth;
+  const isOpenRef = useRef(isOpen);
+  isOpenRef.current = isOpen;
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const handleResize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  const handleMiniCardMouseLeave = useCallback(() => {
-    setIsMiniCardHovered(false);
-    setMiniCardLeft(500);
+  const [hoveredMiniPanel, setHoveredMiniPanel] = useState<'script' | 'assets' | 'images' | null>(null);
+  const [miniCardClientX, setMiniCardClientX] = useState<number | null>(null);
+
+  const handleMiniCardMouseEnter = useCallback((panel: 'script' | 'assets' | 'images' = 'assets') => {
+    setHoveredMiniPanel(panel);
+    setMiniCardClientX(null);
   }, []);
 
-  const handleCloseSidePanel = useCallback(() => {
-    setIsMiniCardHovered(false);
-    setMiniCardLeft(500);
-    setActiveSidePanel(null);
+  const handleMiniCardMouseMove = useCallback((e: React.MouseEvent, panel: 'script' | 'assets' | 'images' = 'assets') => {
+    setHoveredMiniPanel(panel);
+    setMiniCardClientX(e.clientX);
+  }, []);
+
+  const handleMiniCardMouseLeave = useCallback((panel?: 'script' | 'assets' | 'images') => {
+    setHoveredMiniPanel((prev) => (!panel || prev === panel ? null : prev));
+    setMiniCardClientX(null);
   }, []);
 
   useEffect(() => {
-    if (activeSidePanel === null) {
-      setIsMiniCardHovered(false);
-      setMiniCardLeft(500);
+    if (activeSidePanel !== null) {
+      setHoveredMiniPanel((prev) => (prev === 'assets' ? null : prev));
     }
   }, [activeSidePanel]);
+
+  useEffect(() => {
+    if (isScriptExpanded) {
+      setHoveredMiniPanel((prev) => (prev === 'script' ? null : prev));
+    }
+  }, [isScriptExpanded]);
+
+  useEffect(() => {
+    if (isImagesExpanded) {
+      setHoveredMiniPanel((prev) => (prev === 'images' ? null : prev));
+    }
+  }, [isImagesExpanded]);
+
+  useEffect(() => {
+    if (!isOpen || activeTab !== 'script') {
+      clearWidthChoreography();
+      setVisualDockState(currentProjectRef.current?.id, intendedDockRef.current);
+      setWidthTransitionPanels(createIdleWidthTransitionPanels());
+    }
+  }, [isOpen, activeTab, clearWidthChoreography, setVisualDockState]);
+
+  const applyDockTransition = useCallback(
+    (patch: Partial<DockVisualStateSnapshot>) => {
+      const pid = currentProjectRef.current?.id;
+      const currentIntended = intendedDockRef.current;
+      const nextIntended: DockVisualStateSnapshot = {
+        ...currentIntended,
+        ...patch,
+      };
+
+      if (patch.scriptExpanded !== undefined && patch.scriptExpanded !== currentIntended.scriptExpanded) {
+        setIsScriptExpanded(patch.scriptExpanded);
+      }
+      if (patch.sidePanel !== undefined && patch.sidePanel !== currentIntended.sidePanel) {
+        setActiveSidePanel(patch.sidePanel);
+      }
+      if (patch.imagesExpanded !== undefined && patch.imagesExpanded !== currentIntended.imagesExpanded) {
+        setIsImagesExpanded(patch.imagesExpanded);
+      }
+      if (patch.imagesWide !== undefined && patch.imagesWide !== currentIntended.imagesWide) {
+        setIsImagesWide(patch.imagesWide);
+      }
+      intendedDockRef.current = nextIntended;
+
+      if (!isOpenRef.current || activeTabRef.current !== 'script') {
+        clearWidthChoreography();
+        setVisualDockState(pid, nextIntended);
+        setWidthTransitionPanels(createIdleWidthTransitionPanels());
+        return;
+      }
+
+      clearWidthChoreography();
+
+      const currentVisual = visualDockRef.current;
+      const prevLayout = computeScriptBibleDockLayout({
+        isScriptExpanded: currentVisual.scriptExpanded,
+        isAssetsExpanded: currentVisual.sidePanel !== null,
+        isImagesExpanded: currentVisual.imagesExpanded,
+        isImagesWide: currentVisual.imagesWide,
+        viewportWidth: viewportWidthRef.current,
+        hoveredMiniPanel: null,
+        miniCardClientX: null,
+      });
+      const nextLayout = computeScriptBibleDockLayout({
+        isScriptExpanded: nextIntended.scriptExpanded,
+        isAssetsExpanded: nextIntended.sidePanel !== null,
+        isImagesExpanded: nextIntended.imagesExpanded,
+        isImagesWide: nextIntended.imagesWide,
+        viewportWidth: viewportWidthRef.current,
+        hoveredMiniPanel: null,
+        miniCardClientX: null,
+      });
+
+      const plan = buildDockTransitionPlan({ prevLayout, nextLayout });
+      if (!plan.hasAnyAffected) {
+        setVisualDockState(pid, nextIntended);
+        setWidthTransitionPanels(createIdleWidthTransitionPanels());
+        return;
+      }
+
+      widthChoreographyActiveRef.current = true;
+
+      // Phase 1: Fade out mini-cards (expanding) or lock inner pixel width & fade out (collapsing / resizing)
+      setWidthTransitionPanels(buildDockTransitionPhase1(plan));
+
+      // Phase 2: Hide inner subtrees / keep expanded content unmounted and glide ONLY outer shells
+      const resizeTimer = window.setTimeout(() => {
+        setWidthTransitionPanels((prev) => buildDockTransitionPhase2(prev, plan));
+        setVisualDockState(pid, nextIntended);
+      }, WIDTH_TRANSITION_TIMINGS.fadeOutMs);
+      widthChoreographyTimersRef.current.push(resizeTimer);
+
+      // Phase 3: Mount/unhide at opacity: 0 at final width so DOM + scroll layout settle, then rAF fade-in
+      const resizeEndMs = WIDTH_TRANSITION_TIMINGS.fadeOutMs + WIDTH_TRANSITION_TIMINGS.shellResizeMs;
+      plan.revealOrder.forEach((panelKey, index) => {
+        const action = plan.actions[panelKey];
+        const revealTimer = window.setTimeout(() => {
+          setWidthTransitionPanels((prev) => buildDockTransitionPhase3Prepare(prev, panelKey, action));
+          const rafId = requestAnimationFrame(() => {
+            setWidthTransitionPanels((prev) => buildDockTransitionPhase3Reveal(prev, panelKey, action));
+          });
+          widthChoreographyRafsRef.current.push(rafId);
+        }, resizeEndMs + index * WIDTH_TRANSITION_TIMINGS.revealStaggerMs);
+        widthChoreographyTimersRef.current.push(revealTimer);
+      });
+
+      const settleMs =
+        resizeEndMs +
+        Math.max(0, plan.revealOrder.length - 1) * WIDTH_TRANSITION_TIMINGS.revealStaggerMs +
+        WIDTH_TRANSITION_TIMINGS.fadeInMs +
+        32;
+      const settleTimer = window.setTimeout(() => {
+        widthChoreographyActiveRef.current = false;
+        setWidthTransitionPanels(createIdleWidthTransitionPanels());
+      }, settleMs);
+      widthChoreographyTimersRef.current.push(settleTimer);
+    },
+    [
+      clearWidthChoreography,
+      setActiveSidePanel,
+      setIsImagesExpanded,
+      setIsImagesWide,
+      setIsScriptExpanded,
+      setVisualDockState,
+    ]
+  );
+
+  const handleCloseSidePanel = useCallback(() => {
+    setHoveredMiniPanel((prev) => (prev === 'assets' ? null : prev));
+    setMiniCardClientX(null);
+    applyDockTransition({ sidePanel: null });
+  }, [applyDockTransition]);
+
+  const handleToggleImagesWide = useCallback(() => {
+    applyDockTransition({ imagesWide: !intendedDockRef.current.imagesWide });
+  }, [applyDockTransition]);
+
+  const dockLayout = useMemo(
+    () =>
+      computeScriptBibleDockLayout({
+        isScriptExpanded: visualDock.scriptExpanded,
+        isAssetsExpanded: activeTab === 'script' && visualDock.sidePanel !== null,
+        isImagesExpanded: activeTab === 'script' && visualDock.imagesExpanded,
+        isImagesWide: visualDock.imagesWide,
+        viewportWidth,
+        hoveredMiniPanel,
+        miniCardClientX,
+      }),
+    [visualDock, activeTab, viewportWidth, hoveredMiniPanel, miniCardClientX]
+  );
+
+  const handleFocusCanvasCardFromFeed = useCallback(
+    (cardId: string) => {
+      if (!onFocusCanvasCard) return;
+      const settledLayout = computeScriptBibleDockLayout({
+        isScriptExpanded: intendedDockRef.current.scriptExpanded,
+        isAssetsExpanded: activeTab === 'script' && intendedDockRef.current.sidePanel !== null,
+        isImagesExpanded: activeTab === 'script' && intendedDockRef.current.imagesExpanded,
+        isImagesWide: intendedDockRef.current.imagesWide,
+        viewportWidth,
+        hoveredMiniPanel: null,
+        miniCardClientX: null,
+      });
+      const occupiedLeftWidth = resolveDockOccupiedRightEdge(
+        settledLayout,
+        activeTab === 'script'
+      );
+      onFocusCanvasCard(cardId, occupiedLeftWidth);
+    },
+    [onFocusCanvasCard, activeTab, viewportWidth]
+  );
 
   const changeActiveTab = useCallback((tab: TabType) => {
     setActiveTab(tab);
     onViewChange(tab);
   }, [onViewChange]);
 
-  const [assetFilter, setAssetFilter] = useState<AssetFilterType>(() => {
-    if (typeof window !== 'undefined') {
-      const saved = (currentProject?.id ? localStorage.getItem(`script_bible_asset_filter_${currentProject.id}`) : null) ||
-                    localStorage.getItem('script_bible_asset_filter');
-      if (saved === 'all' || saved === 'characters' || saved === 'locations' || saved === 'props') {
-        return saved;
-      }
+  const readAssetFilterForProject = useCallback((pid: string | undefined): AssetFilterType => {
+    if (typeof window === 'undefined') return 'all';
+    const saved = resolveProjectScopedRawValue({
+      storage: window.localStorage,
+      projectId: pid,
+      projectKeyPrefix: 'script_bible_asset_filter_',
+      fallbackGlobalKey: 'script_bible_asset_filter',
+    });
+    if (saved === 'all' || saved === 'characters' || saved === 'locations' || saved === 'props') {
+      return saved;
     }
     return 'all';
+  }, []);
+
+  const writeAssetFilterForProject = useCallback(
+    (pid: string | undefined, filter: AssetFilterType) => {
+      if (typeof window === 'undefined') return;
+      writeProjectScopedRawValue({
+        storage: window.localStorage,
+        projectId: pid,
+        projectKeyPrefix: 'script_bible_asset_filter_',
+        value: filter,
+        globalKey: 'script_bible_asset_filter',
+      });
+    },
+    []
+  );
+
+  const [assetFilter, setAssetFilter] = useProjectScopedState<AssetFilterType>({
+    projectId: currentProject?.id,
+    readValue: readAssetFilterForProject,
+    writeValue: writeAssetFilterForProject,
   });
 
-  useEffect(() => {
-    try {
-      localStorage.setItem('script_bible_asset_filter', assetFilter);
-      if (currentProject?.id) {
-        localStorage.setItem(`script_bible_asset_filter_${currentProject.id}`, assetFilter);
-      }
-    } catch {}
-  }, [assetFilter, currentProject?.id]);
-
-  useEffect(() => {
-    if (currentProject?.id && typeof window !== 'undefined') {
-      const saved = localStorage.getItem(`script_bible_asset_filter_${currentProject.id}`);
-      if (saved === 'all' || saved === 'characters' || saved === 'locations' || saved === 'props') {
-        setAssetFilter(saved);
-      }
-    }
-  }, [currentProject?.id]);
+  const isScriptShellWidthTransitioning = useShellWidthTransitionGuard(
+    dockLayout.script.width,
+    isOpen && activeTab === 'script' && visualDock.scriptExpanded
+  );
+  const isSidePanelShellWidthTransitioning = useShellWidthTransitionGuard(
+    dockLayout.assets.width,
+    isOpen && activeTab === 'script' && visualDock.sidePanel !== null
+  );
 
   const sidePanelContentRef = useRef<HTMLDivElement>(null);
+  const effectiveProjectId = currentProject?.id || 'default';
+  const sidePanelScrollSpec = useMemo(
+    () => ({
+      kind: 'sidePanel' as const,
+      projectId: effectiveProjectId,
+      subKey: (visualDock.sidePanel || 'assets') as 'assets' | 'universe' | 'cards',
+    }),
+    [effectiveProjectId, visualDock.sidePanel]
+  );
+  const sidePanelScopeKey = useMemo(
+    () => buildScrollScopeKey(sidePanelScrollSpec),
+    [sidePanelScrollSpec]
+  );
+  const isSidePanelTransitioning =
+    isSidePanelShellWidthTransitioning ||
+    widthTransitionPanels.assets.hidden ||
+    widthTransitionPanels.assets.opacity < 1;
+  const sidePanelContentVersion = `${assetFilter}:${currentProject.characters?.length || 0}:${currentProject.locations?.length || 0}:${currentProject.props?.length || 0}:${cards?.length || 0}`;
+
+  const sidePanelScrollMemory = useUnifiedPanelScrollMemory({
+    scopeKey: sidePanelScopeKey,
+    readPersistedScrollTop: () =>
+      typeof window !== 'undefined'
+        ? readScrollOffsetFromStorage(window.localStorage, sidePanelScrollSpec)
+        : 0,
+    writePersistedScrollTop: (top) => {
+      if (typeof window !== 'undefined') {
+        writeScrollOffsetToStorage(window.localStorage, sidePanelScrollSpec, top);
+      }
+    },
+    getScrollElement: () => sidePanelContentRef.current,
+    isActiveAndVisible:
+      isOpen &&
+      activeTab === 'script' &&
+      visualDock.sidePanel !== null &&
+      widthTransitionPanels.assets.mountExpandedContent &&
+      !widthTransitionPanels.assets.hidden,
+    isTransitioning: isSidePanelTransitioning,
+    contentVersion: sidePanelContentVersion,
+    maxWaitMs: 1600,
+  });
 
   const handleSidePanelScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
-    const top = e.currentTarget.scrollTop;
-    if (currentProject?.id && activeSidePanel) {
-      try {
-        localStorage.setItem(`script_side_panel_scroll_${currentProject.id}_${activeSidePanel}`, String(top));
-      } catch {}
-    }
+    setAssetContextMenu(null);
+    sidePanelScrollMemory.handleScrollEvent(e.currentTarget.scrollTop);
     setActiveAssetHighlight(prev => {
       if (!prev || !scriptCardRef.current) return prev;
-      const el = document.querySelector(`[data-agent-target$=".${prev.id}"]`) as HTMLElement | null;
+      const el = findAssetRowElement(document, {
+        category: prev.category,
+        itemId: prev.id,
+        isVersion: prev.isVersion,
+      });
       if (!el) return prev;
       const rowRect = el.getBoundingClientRect();
       const cardRect = scriptCardRef.current.getBoundingClientRect();
       const newY = rowRect.top - cardRect.top + rowRect.height / 2;
       return { ...prev, yTop: newY, cardHeight: cardRect.height || prev.cardHeight };
     });
-  }, [currentProject?.id, activeSidePanel]);
+  }, [sidePanelScrollMemory.handleScrollEvent]);
 
-  useEffect(() => {
-    if (activeSidePanel && currentProject?.id && sidePanelContentRef.current) {
-      try {
-        const stored = localStorage.getItem(`script_side_panel_scroll_${currentProject.id}_${activeSidePanel}`);
-        if (stored) {
-          const top = parseFloat(stored) || 0;
-          requestAnimationFrame(() => {
-            if (sidePanelContentRef.current) {
-              sidePanelContentRef.current.scrollTop = top;
-            }
-          });
-        }
-      } catch {}
-    }
-  }, [activeSidePanel, currentProject?.id]);
-  const [scriptDraft, setScriptDraft] = useState(currentProject?.scriptText || '');
+  const [scriptDraftEntry, setScriptDraftEntry] = useState<{ projectId: string; text: string }>(() => ({
+    projectId: currentProject?.id || '',
+    text: currentProject?.scriptText || '',
+  }));
+  const currentProjectIdStr = currentProject?.id || '';
+  const scriptDraft =
+    scriptDraftEntry.projectId === currentProjectIdStr
+      ? scriptDraftEntry.text
+      : (currentProject?.scriptText || '');
+  const setScriptDraft = useCallback((updater: React.SetStateAction<string>) => {
+    const pid = currentProjectRef.current?.id || '';
+    const fallbackText = currentProjectRef.current?.scriptText || '';
+    setScriptDraftEntry((prev) => {
+      const base = prev.projectId === pid ? prev.text : fallbackText;
+      const next = typeof updater === 'function' ? updater(base) : updater;
+      if (prev.projectId === pid && prev.text === next) return prev;
+      return { projectId: pid, text: next };
+    });
+  }, []);
+
   const [currentSceneIndicator, setCurrentSceneIndicator] = useState('全局');
   const [versionStatus, setVersionStatus] = useState('已同步');
   const [autoSaveEnabled, setAutoSaveEnabled] = useState(false);
@@ -617,13 +1167,29 @@ export function ProjectScriptBible({
   const lastAssessedTextRef = useRef(currentProject?.scriptText || '');
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [isAnimationSettled, setIsAnimationSettled] = useState(false);
-  const [isPositionReady, setIsPositionReady] = useState(false);
+  const [isScriptExpandSettled, setIsScriptExpandSettled] = useState<boolean>(() => isScriptExpanded);
   const [isExtractingAssets, setIsExtractingAssets] = useState(false);
   const [extractionFeedback, setExtractionFeedback] = useState<string | null>(null);
 
   // Asset Management state (Batch Selection, Add & Edit, Multi-version collapse)
-  const [selectedAssetIds, setSelectedAssetIds] = useState<Set<string>>(new Set());
-  const [isMultiSelectMode, setIsMultiSelectMode] = useState(false);
+  const [internalSelectedAssetIds, setInternalSelectedAssetIds] = useState<Set<string>>(new Set());
+  const selectedAssetIds = propsSelectedAssetIds ?? internalSelectedAssetIds;
+  const setSelectedAssetIds = useCallback((action: Set<string> | ((prev: Set<string>) => Set<string>)) => {
+    if (onSelectedAssetIdsChange) {
+      onSelectedAssetIdsChange(action);
+    } else {
+      setInternalSelectedAssetIds(action);
+    }
+  }, [onSelectedAssetIdsChange]);
+  const [lastClickedAssetId, setLastClickedAssetId] = useState<string | null>(null);
+  const [boxSelection, setBoxSelection] = useState<{
+    startX: number;
+    startY: number;
+    currentX: number;
+    currentY: number;
+    isDragging: boolean;
+  } | null>(null);
+  const assetListContainerRef = useRef<HTMLDivElement>(null);
   const [isAddAssetOpen, setIsAddAssetOpen] = useState(false);
   const [viewingAsset, setViewingAsset] = useState<{ category: 'character' | 'location' | 'prop'; item: any; parentName?: string } | null>(null);
   const [addCategory, setAddCategory] = useState<'character' | 'location' | 'prop'>('character');
@@ -641,16 +1207,16 @@ export function ProjectScriptBible({
   });
 
   const displayCharacters = useMemo(
-    () => mergeMultiVersionAssetList('characters', currentProject.characters || []),
-    [currentProject.characters]
+    () => mergeMultiVersionAssetList('characters', (currentProject?.characters || []).filter((c): c is ScriptCharacter => Boolean(c && c.id))),
+    [currentProject?.characters]
   );
   const displayLocations = useMemo(
-    () => mergeMultiVersionAssetList('locations', currentProject.locations || []),
-    [currentProject.locations]
+    () => mergeMultiVersionAssetList('locations', (currentProject?.locations || []).filter((l): l is ScriptLocation => Boolean(l && l.id))),
+    [currentProject?.locations]
   );
   const displayProps = useMemo(
-    () => mergeMultiVersionAssetList('props', currentProject.props || []),
-    [currentProject.props]
+    () => mergeMultiVersionAssetList('props', (currentProject?.props || []).filter((p): p is ScriptProp => Boolean(p && p.id))),
+    [currentProject?.props]
   );
 
   const toggleMultiVersionCollapse = useCallback((assetId: string, e?: React.MouseEvent) => {
@@ -666,6 +1232,39 @@ export function ProjectScriptBible({
   const handleViewAssetDetails = (category: 'character' | 'location' | 'prop', item: any, parentName?: string) => {
     setViewingAsset({ category, item, parentName });
   };
+
+  const [assetContextMenu, setAssetContextMenu] = useState<{
+    isOpen: boolean;
+    x: number;
+    y: number;
+    category: AssetContextCategory;
+    item: any;
+    parentItem?: any;
+  } | null>(null);
+
+  const handleCloseAssetContextMenu = useCallback(() => {
+    setAssetContextMenu(null);
+  }, []);
+
+  const [bindImageModalTarget, setBindImageModalTarget] = useState<AssetBindTargetInfo | null>(null);
+  const [focusFeedAssetKey, setFocusFeedAssetKey] = useState<FeedFocusTargetRequest | null>(null);
+  const focusFeedNonceRef = useRef(0);
+  const triggerFocusFeedAsset = useCallback(
+    (target: string | Omit<FeedFocusTargetRequest, 'nonce'>) => {
+      focusFeedNonceRef.current += 1;
+      const normalized = typeof target === 'string' ? { key: target } : target;
+      setFocusFeedAssetKey({ ...normalized, nonce: focusFeedNonceRef.current });
+    },
+    []
+  );
+  const [detailModalLightboxImage, setDetailModalLightboxImage] = useState<FullscreenImageLightboxData | null>(null);
+  const cardsById = useMemo(() => buildCardSnapshotMap(cards || []), [cards]);
+
+  useEffect(() => {
+    if (!isOpen || activeSidePanel === null) {
+      setAssetContextMenu(null);
+    }
+  }, [isOpen, activeSidePanel]);
 
   const scriptCardRef = useRef<HTMLDivElement>(null);
   const [hoveredMatchIdx, setHoveredMatchIdx] = useState<number | null>(null);
@@ -690,9 +1289,16 @@ export function ProjectScriptBible({
     item: any,
     e?: React.MouseEvent<HTMLDivElement>,
     forceActivate: boolean = false,
-    parentName?: string
+    parentName?: string,
+    isVersionOverride?: boolean,
+    options?: {
+      rowEl?: HTMLElement | null;
+      feedFocusOverride?: Omit<FeedFocusTargetRequest, 'nonce'> | null;
+      skipFeedFocus?: boolean;
+    }
   ) => {
-    const isVersionClick = Boolean(parentName);
+    if (!item || !item.id) return;
+    const isVersionClick = typeof isVersionOverride === 'boolean' ? isVersionOverride : Boolean(parentName);
     if (
       !forceActivate &&
       activeAssetHighlight?.id === item.id &&
@@ -705,15 +1311,20 @@ export function ProjectScriptBible({
     } else {
       let rawY = 140;
       let cardH = 600;
-      if (e?.currentTarget) {
-        const rowRect = e.currentTarget.getBoundingClientRect();
+      const measuredRowEl = options?.rowEl || e?.currentTarget || null;
+      if (measuredRowEl) {
+        const rowRect = measuredRowEl.getBoundingClientRect();
         if (scriptCardRef.current) {
           const cardRect = scriptCardRef.current.getBoundingClientRect();
           cardH = cardRect.height || 600;
           rawY = rowRect.top - cardRect.top + rowRect.height / 2;
         }
       } else {
-        const el = document.querySelector(`[data-agent-target$=".${item.id}"]`) as HTMLElement | null;
+        const el = findAssetRowElement(document, {
+          category,
+          itemId: String(item.id),
+          isVersion: isVersionClick,
+        });
         if (el && scriptCardRef.current) {
           const rowRect = el.getBoundingClientRect();
           const cardRect = scriptCardRef.current.getBoundingClientRect();
@@ -733,64 +1344,370 @@ export function ProjectScriptBible({
         yTop: rawY,
         cardHeight: cardH,
       });
+      if (!options?.skipFeedFocus) {
+        if (options?.feedFocusOverride) {
+          triggerFocusFeedAsset(options.feedFocusOverride);
+        } else {
+          triggerFocusFeedAsset({ key: `${category}:${item.id}`, alignMode: 'nearest' });
+        }
+      }
       setActiveAssetMatchIndex(null);
       setActiveMultiHighlightSpans([]);
       setActiveProvenanceTargetChar(null);
     }
-  }, [activeAssetHighlight]);
+  }, [activeAssetHighlight, triggerFocusFeedAsset]);
 
-  // Synchronize asset highlight when Agent focuses an asset item via drag or right-click
-  useEffect(() => {
-    if (!agentFocusedTargetId || !agentFocusedTargetId.startsWith('assets.item.')) return;
-    const findInList = (list: any[], id: string): { item: any; parentName?: string } | null => {
-      for (const entry of list || []) {
-        if (entry.id === id) return { item: entry };
+  const applyAssetImageUpdater = useCallback((
+    category: AssetCategory,
+    assetId: string,
+    updater: (item: any) => any,
+    parentId?: string
+  ) => {
+    const updateList = (list: any[]) =>
+      list.map((entry) => {
+        if (parentId) {
+          if (entry.id !== parentId) return entry;
+          const prevVersions: ScriptAssetVersion[] = Array.isArray(entry.versions) ? entry.versions : [];
+          let updatedPrimaryVersion: ScriptAssetVersion | null = null;
+          const nextVersions = prevVersions.map((v, idx) => {
+            if (v.id !== assetId) return v;
+            const nextV = updater(v);
+            if (idx === 0 && v.id === entry.id) {
+              updatedPrimaryVersion = nextV;
+            }
+            return nextV;
+          });
+          return {
+            ...entry,
+            ...(updatedPrimaryVersion
+              ? {
+                  images: updatedPrimaryVersion.images,
+                  referenceImage: updatedPrimaryVersion.referenceImage,
+                }
+              : {}),
+            versions: nextVersions,
+          };
+        }
+        if (entry.id !== assetId) return entry;
+        const nextEntry = updater(entry);
+        if (Array.isArray(nextEntry.versions) && nextEntry.versions.length > 0) {
+          const nextVersions = nextEntry.versions.map((v: ScriptAssetVersion, idx: number) =>
+            idx === 0 && v.id === assetId
+              ? { ...v, images: nextEntry.images, referenceImage: nextEntry.referenceImage }
+              : v
+          );
+          return { ...nextEntry, versions: nextVersions };
+        }
+        return nextEntry;
+      });
+
+    if (category === 'character') {
+      onUpdateProject({ characters: updateList(displayCharacters) });
+    } else if (category === 'location') {
+      onUpdateProject({ locations: updateList(displayLocations) });
+    } else {
+      onUpdateProject({ props: updateList(displayProps) });
+    }
+  }, [displayCharacters, displayLocations, displayProps, onUpdateProject]);
+
+  const findAssetTargetById = useCallback((
+    category: AssetCategory,
+    assetId: string,
+    parentId?: string
+  ): { item: any; parentItem?: any } | null => {
+    const list =
+      category === 'character'
+        ? displayCharacters
+        : category === 'location'
+          ? displayLocations
+          : displayProps;
+    for (const entry of list) {
+      if (parentId) {
+        if (entry.id === parentId && Array.isArray(entry.versions)) {
+          const hit = entry.versions.find((v) => v.id === assetId);
+          if (hit) return { item: hit, parentItem: entry };
+        }
+      } else {
+        if (entry.id === assetId) return { item: entry };
         if (Array.isArray(entry.versions)) {
-          const ver = entry.versions.find((v: any) => v.id === id);
-          if (ver) return { item: ver, parentName: entry.name };
+          const hit = entry.versions.find((v) => v.id === assetId);
+          if (hit) return { item: hit, parentItem: entry };
         }
       }
-      return null;
-    };
+    }
+    return null;
+  }, [displayCharacters, displayLocations, displayProps]);
 
-    if (agentFocusedTargetId.startsWith('assets.item.character.')) {
-      const id = agentFocusedTargetId.replace('assets.item.character.', '');
-      const hit = findInList(displayCharacters, id);
-      if (hit && activeAssetHighlight?.id !== hit.item.id) {
-        handleSelectAssetHighlight('character', hit.item, undefined, true, hit.parentName);
+  const handleBindCanvasCardToSection = useCallback((
+    category: AssetCategory,
+    assetId: string,
+    parentId: string | undefined,
+    params: { card: CardData; label?: string; setPrimary: boolean }
+  ) => {
+    applyAssetImageUpdater(
+      category,
+      assetId,
+      (targetItem) =>
+        bindImageToAssetItem(
+          targetItem,
+          {
+            cardId: params.card.id,
+            imageUrl: params.card.imageUrl || params.card.originalImageUrl || undefined,
+            thumbnailUrl: params.card.thumbnailUrl || params.card.imageUrl || undefined,
+            label: params.label || params.card.fileName || params.card.name || undefined,
+            prompt: params.card.prompt || undefined,
+            source: 'canvas',
+            setPrimary: params.setPrimary,
+          },
+          cardsById
+        ).updatedItem,
+      parentId
+    );
+    triggerFocusFeedAsset(`${category}:${assetId}`);
+  }, [applyAssetImageUpdater, cardsById, triggerFocusFeedAsset]);
+
+  const handleBindUploadedImageToSection = useCallback((
+    category: AssetCategory,
+    assetId: string,
+    parentId: string | undefined,
+    params: { dataUrl: string; label?: string; setPrimary: boolean }
+  ) => {
+    applyAssetImageUpdater(
+      category,
+      assetId,
+      (targetItem) =>
+        bindImageToAssetItem(
+          targetItem,
+          {
+            imageUrl: params.dataUrl,
+            thumbnailUrl: params.dataUrl,
+            label: params.label || '本地参考图',
+            source: 'upload',
+            setPrimary: params.setPrimary,
+          },
+          cardsById
+        ).updatedItem,
+      parentId
+    );
+    triggerFocusFeedAsset(`${category}:${assetId}`);
+  }, [applyAssetImageUpdater, cardsById, triggerFocusFeedAsset]);
+
+  const handleDropLocalFileOnFeedSection = useCallback(async (section: AssetImageFeedSection, file: File) => {
+    try {
+      const dataUrl = await compressImageBlob(file, 1280, 0.85);
+      handleBindUploadedImageToSection(section.category, section.assetId, section.parentId, {
+        dataUrl,
+        label: file.name.replace(/\.[^/.]+$/, '') || '本地图像',
+        setPrimary: section.images.length === 0,
+      });
+    } catch {}
+  }, [handleBindUploadedImageToSection]);
+
+  const handleSetPrimaryFeedImage = useCallback((section: AssetImageFeedSection, imageId: string) => {
+    applyAssetImageUpdater(
+      section.category,
+      section.assetId,
+      (targetItem) => setPrimaryAssetImageOnItem(targetItem, imageId, cardsById),
+      section.parentId
+    );
+  }, [applyAssetImageUpdater, cardsById]);
+
+  const handleUnbindFeedImage = useCallback((section: AssetImageFeedSection, imageId: string) => {
+    applyAssetImageUpdater(
+      section.category,
+      section.assetId,
+      (targetItem) => unbindImageFromAssetItem(targetItem, imageId, cardsById),
+      section.parentId
+    );
+  }, [applyAssetImageUpdater, cardsById]);
+
+  const handleSelectFeedSection = useCallback((section: AssetImageFeedSection) => {
+    const found = findAssetTargetById(section.category, section.assetId, section.parentId);
+    if (found) {
+      handleSelectAssetHighlight(section.category, found.item, undefined, true, found.parentItem?.name, section.isVersion);
+    }
+    // Only jump/scroll Asset List when it is currently expanded
+    if (activeSidePanel !== 'assets') return;
+
+    const requiredFilter: AssetFilterType =
+      section.category === 'character'
+        ? 'characters'
+        : section.category === 'location'
+          ? 'locations'
+          : 'props';
+    if (assetFilter !== 'all' && assetFilter !== requiredFilter) {
+      setAssetFilter('all');
+    }
+    if (section.parentId) {
+      setCollapsedMultiVersionIds((prev) => {
+        if (!prev.has(section.parentId!)) return prev;
+        const next = new Set(prev);
+        next.delete(section.parentId!);
+        return next;
+      });
+    }
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const scope: ParentNode = sidePanelContentRef.current || document;
+        const el = findAssetRowElement(scope, {
+          category: section.category,
+          itemId: section.assetId,
+          parentId: section.parentId,
+          isVersion: section.isVersion,
+        });
+        if (el) {
+          sidePanelScrollMemory.cancelPendingRestore();
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      });
+    });
+  }, [activeSidePanel, assetFilter, findAssetTargetById, handleSelectAssetHighlight, sidePanelScrollMemory.cancelPendingRestore]);
+
+  const handleOpenBindModalFromSection = useCallback((section: AssetImageFeedSection) => {
+    const found = findAssetTargetById(section.category, section.assetId, section.parentId);
+    if (found) {
+      setBindImageModalTarget({
+        category: section.category,
+        item: found.item,
+        parentItem: found.parentItem,
+      });
+    }
+  }, [findAssetTargetById]);
+
+  const handleStartCanvasBindFromSection = useCallback((section: AssetImageFeedSection) => {
+    const found = findAssetTargetById(section.category, section.assetId, section.parentId);
+    if (found && onStartCanvasAssetBind) {
+      onStartCanvasAssetBind(
+        buildAssetBindPickerTarget({
+          category: section.category,
+          item: found.item,
+          parentItem: found.parentItem,
+        })
+      );
+    }
+  }, [findAssetTargetById, onStartCanvasAssetBind]);
+
+  useEffect(() => {
+    if (!requestedBindModalTarget) return;
+    const found = findAssetTargetById(
+      requestedBindModalTarget.category,
+      requestedBindModalTarget.assetId,
+      requestedBindModalTarget.parentId
+    );
+    if (found) {
+      setBindImageModalTarget({
+        category: requestedBindModalTarget.category,
+        item: found.item,
+        parentItem: found.parentItem,
+      });
+    }
+  }, [requestedBindModalTarget, findAssetTargetById]);
+
+  const handleRequestGenerateFromSection = useCallback((section: AssetImageFeedSection) => {
+    const found = findAssetTargetById(section.category, section.assetId, section.parentId);
+    if (found) {
+      applyDockTransition({ imagesExpanded: true });
+      onRequestGenerateAssetImage?.(section.category, found.item, found.parentItem);
+    }
+  }, [findAssetTargetById, onRequestGenerateAssetImage, applyDockTransition]);
+
+  const handleOpenAssetContextMenu = useCallback((
+    e: React.MouseEvent<HTMLDivElement>,
+    category: AssetContextCategory,
+    item: any,
+    parentItem?: any
+  ) => {
+    e.preventDefault();
+    // Allow contextmenu event to bubble up to App.tsx handleContextMenu so
+    // right-clicking an asset item summons the Agent cursor (Agent-only purple if unselected,
+    // or dual-color if user already selected it) without forcing user selection state.
+    setAssetContextMenu({
+      isOpen: true,
+      x: e.clientX,
+      y: e.clientY,
+      category,
+      item,
+      parentItem,
+    });
+  }, []);
+
+  // Dismiss stale asset context menu if Agent focus moves to another target
+  useEffect(() => {
+    if (!agentFocusedTargetId || !agentFocusedTargetId.startsWith('assets.item.')) return;
+    const parsedTarget = parseAssetAgentTargetId(agentFocusedTargetId);
+    setAssetContextMenu((prev) => {
+      if (
+        parsedTarget &&
+        prev?.item?.id === parsedTarget.itemId &&
+        Boolean(prev.parentItem) === parsedTarget.isVersion &&
+        (!parsedTarget.parentId || prev.parentItem?.id === parsedTarget.parentId)
+      ) {
+        return prev;
       }
-    } else if (agentFocusedTargetId.startsWith('assets.item.location.')) {
-      const id = agentFocusedTargetId.replace('assets.item.location.', '');
-      const hit = findInList(displayLocations, id);
-      if (hit && activeAssetHighlight?.id !== hit.item.id) {
-        handleSelectAssetHighlight('location', hit.item, undefined, true, hit.parentName);
-      }
-    } else if (agentFocusedTargetId.startsWith('assets.item.prop.')) {
-      const id = agentFocusedTargetId.replace('assets.item.prop.', '');
-      const hit = findInList(displayProps, id);
-      if (hit && activeAssetHighlight?.id !== hit.item.id) {
-        handleSelectAssetHighlight('prop', hit.item, undefined, true, hit.parentName);
+      return null;
+    });
+  }, [agentFocusedTargetId]);
+
+  // Synchronize agent focus to cover all multi-selected asset items when agent targets one of them
+  useEffect(() => {
+    if (!agentFocusedTargetId || !agentFocusedTargetId.startsWith('assets.item.')) return;
+    const parsed = parseAssetAgentTargetId(agentFocusedTargetId);
+    if (!parsed) return;
+
+    if (selectedAssetIds.has(parsed.itemId) && selectedAssetIds.size > 1) {
+      const referenceTargetIds: string[] = [];
+      selectedAssetIds.forEach(id => {
+        if (id !== parsed.itemId) {
+          for (const cat of ['character', 'location', 'prop'] as const) {
+            const found = findAssetTargetById(cat, id);
+            if (found) {
+              const tId = buildAssetAgentTargetId(cat, found.item.id, found.parentItem?.id);
+              if (tId && tId !== agentFocusedTargetId) {
+                referenceTargetIds.push(tId);
+              }
+              break;
+            }
+          }
+        }
+      });
+
+      const currentRefs = agentFocusManager.getSnapshot().referenceCardIds;
+      const currentRefsSet = new Set(currentRefs);
+      const isAlreadyBatchFocused = referenceTargetIds.every(r => currentRefsSet.has(r)) && currentRefsSet.size === referenceTargetIds.length;
+      if (!isAlreadyBatchFocused) {
+        agentFocusManager.batchSetFocus({
+          primary: agentFocusedTargetId,
+          references: referenceTargetIds,
+          role: 'inspect',
+          sourceTool: 'context_menu',
+        });
       }
     }
-  }, [agentFocusedTargetId, displayCharacters, displayLocations, displayProps, activeAssetHighlight?.id, handleSelectAssetHighlight]);
+  }, [agentFocusedTargetId, selectedAssetIds, findAssetTargetById]);
 
-  // Cancel asset highlight when clicking on blank space (outside asset items and provenance overlay)
+  // Cancel asset highlight and selection when clicking on blank space (outside asset items and provenance overlay)
   useEffect(() => {
-    if (!activeAssetHighlight) return;
+    if (!activeAssetHighlight && selectedAssetIds.size === 0) return;
 
     const handleDocumentClick = (e: MouseEvent) => {
       const target = e.target as HTMLElement | null;
       if (!target) return;
 
-      // Keep selection if clicking inside an asset item, inside CandidateMatchesOverlay, or inside the script card (editor, text, toolbar)
+      // Keep selection if clicking inside an asset item, inside its context menu, inside CandidateMatchesOverlay, Agent HUD, or inside the script card
       if (
         target.closest('[data-asset-item]') ||
+        target.closest('[data-asset-context-menu]') ||
         target.closest('[data-provenance-overlay]') ||
+        target.closest('[data-agent-target="images.panel"]') ||
+        target.closest('[data-agent-cursor-root="true"]') ||
+        target.closest('[data-image-bind-modal]') ||
         (scriptCardRef.current && scriptCardRef.current.contains(target))
       ) {
         return;
       }
 
+      setSelectedAssetIds(new Set());
+      setLastClickedAssetId(null);
       setActiveAssetHighlight(null);
       setActiveMultiHighlightSpans([]);
       setActiveProvenanceTargetChar(null);
@@ -805,7 +1722,7 @@ export function ProjectScriptBible({
       clearTimeout(timer);
       document.removeEventListener('click', handleDocumentClick);
     };
-  }, [activeAssetHighlight]);
+  }, [activeAssetHighlight, selectedAssetIds.size]);
 
 
 
@@ -822,45 +1739,167 @@ export function ProjectScriptBible({
     }
   }, [viewingAsset, currentProject]);
 
-  const toggleSelectAsset = (id: string) => {
-    setSelectedAssetIds(prev => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
+  const handleAssetRowClick = (
+    id: string,
+    category: 'character' | 'location' | 'prop',
+    item: any,
+    e: React.MouseEvent,
+    isVersion = false,
+    parentName?: string
+  ) => {
+    if (e.metaKey || e.ctrlKey) {
+      e.stopPropagation();
+      setSelectedAssetIds(prev => {
+        const next = new Set(prev);
+        if (next.has(id)) next.delete(id);
+        else next.add(id);
+        return next;
+      });
+      setLastClickedAssetId(id);
+    } else if (e.shiftKey && lastClickedAssetId) {
+      e.stopPropagation();
+      const visibleIds: string[] = [];
+      if (assetFilter === 'all' || assetFilter === 'characters') {
+        displayCharacters.forEach(c => {
+          if (c?.id) visibleIds.push(c.id);
+          if (Array.isArray(c.versions)) {
+            c.versions.forEach(v => { if (v?.id) visibleIds.push(v.id); });
+          }
+        });
+      }
+      if (assetFilter === 'all' || assetFilter === 'locations') {
+        displayLocations.forEach(l => {
+          if (l?.id) visibleIds.push(l.id);
+          if (Array.isArray(l.versions)) {
+            l.versions.forEach(v => { if (v?.id) visibleIds.push(v.id); });
+          }
+        });
+      }
+      if (assetFilter === 'all' || assetFilter === 'props') {
+        displayProps.forEach(p => {
+          if (p?.id) visibleIds.push(p.id);
+          if (Array.isArray(p.versions)) {
+            p.versions.forEach(v => { if (v?.id) visibleIds.push(v.id); });
+          }
+        });
+      }
+
+      const startIdx = visibleIds.indexOf(lastClickedAssetId);
+      const endIdx = visibleIds.indexOf(id);
+      if (startIdx !== -1 && endIdx !== -1) {
+        const min = Math.min(startIdx, endIdx);
+        const max = Math.max(startIdx, endIdx);
+        setSelectedAssetIds(prev => {
+          const next = new Set(prev);
+          for (let i = min; i <= max; i++) {
+            next.add(visibleIds[i]);
+          }
+          return next;
+        });
+      }
+    } else {
+      if (selectedAssetIds.has(id)) {
+        // Unselect: clicking an already selected asset item cancels its selected state
+        setSelectedAssetIds(prev => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+        if (activeAssetHighlight?.id === id) {
+          setActiveAssetHighlight(null);
+          setActiveMultiHighlightSpans([]);
+          setActiveProvenanceTargetChar(null);
+          setIsCandidateOverlayExpanded(false);
+        }
+        setLastClickedAssetId(null);
+      } else {
+        setSelectedAssetIds(new Set([id]));
+        setLastClickedAssetId(id);
+        handleSelectAssetHighlight(category, item, e, isVersion, parentName);
+      }
+    }
   };
 
-  const allAssetIds = useMemo(() => {
-    const ids: string[] = [];
-    if (assetFilter === 'all' || assetFilter === 'characters') {
-      displayCharacters.forEach(c => ids.push(c.id));
+  const handleContainerMouseDown = (e: React.MouseEvent<HTMLDivElement>, containerRef: React.RefObject<HTMLDivElement | null>) => {
+    const target = e.target as HTMLElement;
+    if (target.closest('[data-asset-item="true"]') || target.closest('button') || target.closest('input')) {
+      return;
     }
-    if (assetFilter === 'all' || assetFilter === 'locations') {
-      displayLocations.forEach(l => ids.push(l.id));
-    }
-    if (assetFilter === 'all' || assetFilter === 'props') {
-      displayProps.forEach(p => ids.push(p.id));
-    }
-    return ids;
-  }, [displayCharacters, displayLocations, displayProps, assetFilter]);
+    const container = containerRef.current;
+    if (!container) return;
+    const rect = container.getBoundingClientRect();
+    const startX = e.clientX - rect.left + container.scrollLeft;
+    const startY = e.clientY - rect.top + container.scrollTop;
 
-  const isAllSelected = allAssetIds.length > 0 && allAssetIds.every(id => selectedAssetIds.has(id));
+    setBoxSelection({
+      startX,
+      startY,
+      currentX: startX,
+      currentY: startY,
+      isDragging: false,
+    });
 
-  const handleToggleSelectAll = () => {
-    if (isAllSelected) {
-      setSelectedAssetIds(prev => {
-        const next = new Set(prev);
-        allAssetIds.forEach(id => next.delete(id));
-        return next;
+    let didDrag = false;
+
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      const curX = moveEvent.clientX - rect.left + container.scrollLeft;
+      const curY = moveEvent.clientY - rect.top + container.scrollTop;
+      setBoxSelection(prev => {
+        if (!prev) return null;
+        const dx = Math.abs(curX - prev.startX);
+        const dy = Math.abs(curY - prev.startY);
+        const isDragging = prev.isDragging || dx > 5 || dy > 5;
+
+        if (isDragging) {
+          didDrag = true;
+          const boxLeft = Math.min(prev.startX, curX);
+          const boxRight = Math.max(prev.startX, curX);
+          const boxTop = Math.min(prev.startY, curY);
+          const boxBottom = Math.max(prev.startY, curY);
+
+          const assetRows = container.querySelectorAll('[data-asset-item="true"]');
+          const newlySelected = new Set<string>(e.shiftKey || e.ctrlKey || e.metaKey ? selectedAssetIds : []);
+          assetRows.forEach(row => {
+            const rowRect = row.getBoundingClientRect();
+            const rLeft = rowRect.left - rect.left + container.scrollLeft;
+            const rRight = rowRect.right - rect.left + container.scrollLeft;
+            const rTop = rowRect.top - rect.top + container.scrollTop;
+            const rBottom = rowRect.bottom - rect.top + container.scrollTop;
+
+            if (!(rRight < boxLeft || rLeft > boxRight || rBottom < boxTop || rTop > boxBottom)) {
+              const assetId = row.getAttribute('data-asset-id') || parseAssetAgentTargetId(row.getAttribute('data-agent-target'))?.itemId;
+              if (assetId) newlySelected.add(assetId);
+            }
+          });
+          setSelectedAssetIds(newlySelected);
+        }
+
+        return {
+          ...prev,
+          currentX: curX,
+          currentY: curY,
+          isDragging,
+        };
       });
-    } else {
-      setSelectedAssetIds(prev => {
-        const next = new Set(prev);
-        allAssetIds.forEach(id => next.add(id));
-        return next;
-      });
-    }
+    };
+
+    const onMouseUp = () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+      setBoxSelection(null);
+      if (!didDrag && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+        // Simple click on empty container space -> clear all selections!
+        setSelectedAssetIds(new Set());
+        setLastClickedAssetId(null);
+        setActiveAssetHighlight(null);
+        setActiveMultiHighlightSpans([]);
+        setActiveProvenanceTargetChar(null);
+        setIsCandidateOverlayExpanded(false);
+      }
+    };
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
   };
 
   const handleBatchDeleteAssets = () => {
@@ -1097,7 +2136,7 @@ export function ProjectScriptBible({
     }
     
     setIsExtractingAssets(true);
-    setActiveSidePanel('assets');
+    applyDockTransition({ sidePanel: 'assets' });
     setExtractionFeedback('正在深入分析剧本全文，提取实体资产...');
     
     try {
@@ -1120,26 +2159,14 @@ export function ProjectScriptBible({
   };
 
 
-  // Position memory for each project's script reading location
-  const [scrollPositions, setScrollPositions] = useState<Record<string, number>>(() => {
-    try {
-      const saved = localStorage.getItem('script_scroll_positions');
-      if (!saved) return {};
-      const parsed = JSON.parse(saved);
-      const cleaned: Record<string, number> = {};
-      for (const k in parsed) {
-        cleaned[k] = typeof parsed[k] === 'number' ? parsed[k] : (parsed[k]?.top || 0);
-      }
-      return cleaned;
-    } catch {
-      return {};
-    }
-  });
-  const scrollPositionsRef = useRef<Record<string, number>>({});
-  scrollPositionsRef.current = scrollPositions;
-  const isRestoringScrollRef = useRef(false);
+  // Script CodeMirror scroll attachment helpers
   const inferenceAttemptedRef = useRef<Set<string>>(new Set());
   const editorRef = useRef<ScriptCodeEditorRef | null>(null);
+  const cancelScriptPendingRestoreRef = useRef<(() => void) | null>(null);
+  const [scriptEditorMountNonce, setScriptEditorMountNonce] = useState(0);
+  const handleScriptEditorReady = useCallback(() => {
+    setScriptEditorMountNonce((n) => n + 1);
+  }, []);
 
   // Project selector dropdown inside card
   const [isProjectDropdownOpen, setIsProjectDropdownOpen] = useState(false);
@@ -1169,14 +2196,159 @@ export function ProjectScriptBible({
   const cardContainerRef = useRef<HTMLDivElement>(null);
   const tocListRef = useRef<HTMLDivElement>(null);
 
+  const prevRequestedViewRef = useRef<ScriptView | null>(null);
+
   useEffect(() => {
+    const isInitialMount = prevRequestedViewRef.current === null;
+    const prevView = prevRequestedViewRef.current ?? requestedView;
+    prevRequestedViewRef.current = requestedView;
+
+    if (shouldForceExpandScriptOnRequestedViewChange({
+      prevRequestedView: prevView,
+      nextRequestedView: requestedView,
+      isInitialMount,
+    })) {
+      applyDockTransition({ scriptExpanded: true });
+    }
+
     if (requestedView === 'directory') {
       setActiveTab('script');
       onTocOpenChange(true);
       return;
     }
     setActiveTab(requestedView);
-  }, [requestedView, onTocOpenChange]);
+  }, [requestedView, onTocOpenChange, applyDockTransition]);
+
+  const imageFeed = useMemo(
+    () =>
+      buildAssetImageFeed({
+        characters: displayCharacters,
+        locations: displayLocations,
+        props: displayProps,
+        assetFilter,
+        cards: cards || [],
+      }),
+    [displayCharacters, displayLocations, displayProps, assetFilter, cards]
+  );
+
+  const liveViewingAsset = useMemo(() => {
+    if (!viewingAsset?.item) return null;
+    const found = findAssetTargetById(viewingAsset.category, viewingAsset.item.id);
+    return {
+      category: viewingAsset.category,
+      item: found?.item || viewingAsset.item,
+      parentName: viewingAsset.parentName || found?.parentItem?.name,
+      parentItem: found?.parentItem,
+    };
+  }, [viewingAsset, findAssetTargetById]);
+
+  const liveBindImageModalTarget = useMemo<AssetBindTargetInfo | null>(() => {
+    if (!bindImageModalTarget?.item) return null;
+    const found = findAssetTargetById(
+      bindImageModalTarget.category,
+      bindImageModalTarget.item.id,
+      bindImageModalTarget.parentItem?.id
+    );
+    return {
+      category: bindImageModalTarget.category,
+      item: found?.item || bindImageModalTarget.item,
+      parentItem: found?.parentItem || bindImageModalTarget.parentItem,
+    };
+  }, [bindImageModalTarget, findAssetTargetById]);
+
+  const handleAssetThumbClick = useCallback(
+    (
+      e: React.MouseEvent<HTMLButtonElement>,
+      category: AssetCategory,
+      item: any,
+      parentItem?: any
+    ) => {
+      e.stopPropagation();
+      if (!item || !item.id) return;
+      const rowEl =
+        (e.currentTarget.closest('[data-asset-item="true"]') as HTMLElement | null) ||
+        e.currentTarget;
+      const rowRect = rowEl.getBoundingClientRect();
+      const anchorClientY = rowRect.top + rowRect.height / 2;
+      const canLinkRightFeed = Boolean(
+        activeTab === 'script' && isImagesExpanded && visualDockRef.current.imagesExpanded
+      );
+      const resolvedTarget = canLinkRightFeed
+        ? resolveAssetThumbFeedFocusTarget({
+            category,
+            item,
+            cardsById,
+          })
+        : null;
+      handleSelectAssetHighlight(
+        category,
+        item,
+        undefined,
+        true,
+        parentItem?.name,
+        Boolean(parentItem),
+        {
+          rowEl,
+          skipFeedFocus: !canLinkRightFeed,
+          feedFocusOverride: resolvedTarget
+            ? {
+                ...resolvedTarget,
+                anchorClientY,
+                alignMode: 'vertical-anchor',
+              }
+            : null,
+        }
+      );
+    },
+    [activeTab, cardsById, handleSelectAssetHighlight, isImagesExpanded]
+  );
+
+  const renderAssetThumbBadge = useCallback(
+    (category: AssetCategory, item: any, parentItem?: any) => {
+      const entries = resolveAssetImageEntries(item, cardsById);
+      if (entries.length === 0) return null;
+      const primary = getPrimaryAssetImageEntry(item, cardsById);
+      const thumbSrc = primary?.thumbnailUrl || primary?.imageUrl;
+      const itemLabel = parentItem?.name
+        ? `${parentItem.name} · ${item?.name || ''}`
+        : String(item?.name || '资产');
+      return (
+        <button
+          type="button"
+          data-asset-thumb-trigger="true"
+          onClick={(e) => handleAssetThumbClick(e, category, item, parentItem)}
+          className="inline-flex items-center gap-1 shrink-0 rounded-md cursor-pointer transition-transform duration-150 hover:scale-105 active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/70"
+          title={`已绑定 ${entries.length} 张资产图 · 点击定位右侧对应图像`}
+          aria-label={`定位 ${itemLabel} 的资产图`}
+        >
+          {primary?.cardState === 'generating' ? (
+            <span className="w-5 h-5 rounded-md bg-purple-100 dark:bg-purple-950/60 border border-purple-400/50 flex items-center justify-center animate-pulse">
+              <Sparkles className="w-2.5 h-2.5 text-purple-500" />
+            </span>
+          ) : thumbSrc ? (
+            <img
+              src={thumbSrc}
+              alt=""
+              loading={thumbSrc.startsWith('data:') ? 'eager' : 'lazy'}
+              decoding="async"
+              referrerPolicy="no-referrer"
+              className="w-5 h-5 rounded-md object-cover border border-black/10 dark:border-white/15 shrink-0 hover:border-blue-500/60 dark:hover:border-blue-400/60 transition-colors"
+            />
+          ) : (
+            <span className="w-5 h-5 rounded-md bg-gray-100 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 flex items-center justify-center hover:border-blue-500/60 transition-colors">
+              <ImageIcon className="w-3 h-3 text-gray-400" />
+            </span>
+          )}
+          {entries.length > 1 && (
+            <span className="text-[10px] font-mono px-1 py-0.2 rounded bg-purple-500/10 text-purple-600 dark:text-purple-300 font-semibold">
+              {entries.length}
+            </span>
+          )}
+        </button>
+      );
+    },
+    [cardsById, handleAssetThumbClick]
+  );
 
   // TOC scroll position memory
   const tocScrollPositionsRef = useRef<Record<string, number>>({});
@@ -1587,6 +2759,7 @@ export function ProjectScriptBible({
     setActiveProvenanceTargetChar(jumpChar);
 
     requestAnimationFrame(() => {
+      cancelScriptPendingRestoreRef.current?.();
       editorRef.current?.scrollToOffset(jumpChar, { center: true, behavior: 'smooth' });
     });
   }, [activeAssetHighlight, activeTab, changeActiveTab, scriptDraft]);
@@ -1598,6 +2771,7 @@ export function ProjectScriptBible({
     }
 
     const performJump = () => {
+      cancelScriptPendingRestoreRef.current?.();
       editorRef.current?.scrollToOffset(item.charIndex, {
         center: false,
         behavior: 'smooth',
@@ -1711,6 +2885,7 @@ export function ProjectScriptBible({
     const match = searchMatches[index];
     if (!match) return;
 
+    cancelScriptPendingRestoreRef.current?.();
     editorRef.current?.scrollToOffset(match.start, {
       center: true,
       behavior: 'smooth',
@@ -1821,10 +2996,33 @@ export function ProjectScriptBible({
     setTimeout(() => setReplaceFeedback(null), 2500);
   }, [searchText, searchMatches.length, isCaseSensitive, scriptDraft, replaceText, onUpdateProject, onSelectionChange]);
 
-  // Sync script draft when currentProject changes
+  // Sync script draft & per-project ephemeral state when currentProject changes
   useEffect(() => {
-    setScriptDraft(currentProject?.scriptText || '');
+    const didProjectChange = prevProjectIdRef.current !== currentProject?.id;
+    prevProjectIdRef.current = currentProject?.id;
+
+    setScriptDraftEntry({
+      projectId: currentProject?.id || '',
+      text: currentProject?.scriptText || '',
+    });
+    lastAssessedTextRef.current = currentProject?.scriptText || '';
     setActiveMultiHighlightSpans([]);
+
+    if (didProjectChange) {
+      setActiveAssetHighlight(null);
+      setFocusFeedAssetKey(null);
+      setActiveAssetMatchIndex(null);
+      setActiveProvenanceTargetChar(null);
+      setPreviewVersionId(null);
+      setCollapsedMultiVersionIds(new Set());
+      setSelectedAssetIds(new Set());
+      try {
+        setVersions(JSON.parse(localStorage.getItem(`script_versions_${currentProject?.id}`) || '[]'));
+      } catch {
+        setVersions([]);
+      }
+    }
+
     if (Array.isArray(currentProject?.tocConfig?.patterns) && currentProject.tocConfig!.patterns!.length > 0) {
       setInferredPatterns(currentProject.tocConfig!.patterns!);
       return;
@@ -1837,11 +3035,10 @@ export function ProjectScriptBible({
     }
   }, [currentProject]);
 
-  // Separate Card animation from textarea rendering
+  // Separate Card animation from CodeMirror rendering
   useEffect(() => {
     if (isOpen) {
       setIsAnimationSettled(false);
-      setIsPositionReady(false);
       // Wait exactly for card scale/opacity animation (200ms) to settle completely
       const timer = setTimeout(() => {
         setIsAnimationSettled(true);
@@ -1849,46 +3046,93 @@ export function ProjectScriptBible({
       return () => clearTimeout(timer);
     } else {
       setIsAnimationSettled(false);
-      setIsPositionReady(false);
     }
   }, [isOpen]);
 
-  // Synchronously restore scroll position upon CodeMirror mount
+  // Keep Script expand settled state aligned with visual shell expansion & mountExpandedContent
   useEffect(() => {
-    if (isAnimationSettled && isOpen) {
-      const targetScroll = scrollPositionsRef.current[currentProject.id] || 0;
-      isRestoringScrollRef.current = true;
-      requestAnimationFrame(() => {
-        if (editorRef.current) {
-          editorRef.current.scrollToTop(targetScroll);
-        }
-        requestAnimationFrame(() => {
-          setIsPositionReady(true);
-          setTimeout(() => {
-            isRestoringScrollRef.current = false;
-          }, 100);
-        });
-      });
-    } else {
-      setIsPositionReady(false);
+    setIsScriptExpandSettled(
+      visualDock.scriptExpanded && widthTransitionPanels.script.mountExpandedContent
+    );
+  }, [visualDock.scriptExpanded, widthTransitionPanels.script.mountExpandedContent]);
+
+  const scriptScrollSpec = useMemo(
+    () => ({
+      kind: 'script' as const,
+      projectId: effectiveProjectId,
+    }),
+    [effectiveProjectId]
+  );
+  const scriptScopeKey = useMemo(
+    () => buildScrollScopeKey(scriptScrollSpec),
+    [scriptScrollSpec]
+  );
+  const scriptAnchorCacheRef = useRef<{ projectId: string; anchor: ScriptScrollAnchor } | null>(null);
+  const readScriptAnchor = useCallback((): ScriptScrollAnchor => {
+    if (typeof window === 'undefined') return { top: 0 };
+    if (scriptAnchorCacheRef.current?.projectId === effectiveProjectId) {
+      return scriptAnchorCacheRef.current.anchor;
     }
-  }, [isAnimationSettled, isOpen, currentProject.id]);
+    const anchor = readScriptScrollAnchorFromStorage(window.localStorage, effectiveProjectId);
+    scriptAnchorCacheRef.current = { projectId: effectiveProjectId, anchor };
+    return anchor;
+  }, [effectiveProjectId]);
 
-  const saveScrollDebounceRef = useRef<NodeJS.Timeout | null>(null);
+  const isScriptTransitioning =
+    isScriptShellWidthTransitioning ||
+    widthTransitionPanels.script.hidden ||
+    widthTransitionPanels.script.opacity < 1;
 
-  const handleScriptScroll = useCallback((top: number) => {
-    if (isRestoringScrollRef.current || !isPositionReady) return;
-    scrollPositionsRef.current[currentProject.id] = top;
+  const isScriptReadyToMount =
+    isAnimationSettled &&
+    isScriptExpandSettled &&
+    isOpen &&
+    activeTab === 'script' &&
+    visualDock.scriptExpanded &&
+    widthTransitionPanels.script.mountExpandedContent &&
+    !widthTransitionPanels.script.hidden;
 
-    if (saveScrollDebounceRef.current) {
-      clearTimeout(saveScrollDebounceRef.current);
-    }
-    saveScrollDebounceRef.current = setTimeout(() => {
-      try {
-        localStorage.setItem('script_scroll_positions', JSON.stringify(scrollPositionsRef.current));
-      } catch {}
-    }, 300);
-  }, [currentProject.id, isPositionReady]);
+  const scriptScrollMemory = useUnifiedPanelScrollMemory({
+    scopeKey: scriptScopeKey,
+    readPersistedScrollTop: () => readScriptAnchor().top,
+    captureScrollMetadata: () => editorRef.current?.getScrollAnchor() ?? null,
+    writePersistedScrollTop: (top, metadata) => {
+      if (typeof window !== 'undefined') {
+        const metaAnchor =
+          metadata && typeof metadata === 'object' ? (metadata as ScriptScrollAnchor) : null;
+        const nextAnchor: ScriptScrollAnchor = metaAnchor
+          ? { ...metaAnchor, top }
+          : { top };
+        scriptAnchorCacheRef.current = { projectId: effectiveProjectId, anchor: nextAnchor };
+        writeScriptScrollAnchorToStorage(window.localStorage, effectiveProjectId, nextAnchor);
+      }
+    },
+    resolveRestoreTargetTop: () => {
+      const anchor = readScriptAnchor();
+      if (typeof anchor.anchorPos !== 'number') {
+        return anchor.top;
+      }
+      const resolved = editorRef.current?.resolveScrollTopForAnchor(anchor);
+      return typeof resolved === 'number' ? resolved : anchor.top;
+    },
+    getScrollElement: () => editorRef.current?.getEditorView()?.scrollDOM ?? null,
+    isActiveAndVisible: isScriptReadyToMount,
+    isTransitioning: isScriptTransitioning,
+    isFilteredView: Boolean(previewVersionId),
+    contentVersion: `${effectiveProjectId}:${scriptDraft.length}:${activeMultiHighlightSpans.length}`,
+    maxWaitMs: 1800,
+    attachSignal: scriptEditorMountNonce,
+  });
+
+  cancelScriptPendingRestoreRef.current = scriptScrollMemory.cancelPendingRestore;
+  const isPositionReady = scriptScrollMemory.isPositionReady;
+
+  const handleScriptScroll = useCallback(
+    (top: number) => {
+      scriptScrollMemory.handleScrollEvent(top);
+    },
+    [scriptScrollMemory.handleScrollEvent]
+  );
 
   // Click outside to close project dropdown menu
   useEffect(() => {
@@ -2149,7 +3393,7 @@ export function ProjectScriptBible({
     <>
       {/* Single Unified Capsule Entry (Top-Left Floating Trigger Group) */}
       <div 
-        className="fixed top-4 left-4 z-40 flex items-center gap-1.5" 
+        className="fixed top-4 left-4 z-[70] flex items-center gap-1.5" 
         ref={dropdownRef}
         onPointerDown={(e) => e.stopPropagation()}
       >
@@ -2390,16 +3634,111 @@ export function ProjectScriptBible({
             initial="hidden"
             animate="visible"
             exit="exit"
+            data-dock-card="true"
             data-prevent-canvas-wheel="true"
-            data-agent-target="script.panel"
-            className={`fixed top-[58px] bottom-4 left-4 w-[520px] max-w-[calc(100vw-32px)] z-50 flex flex-col select-text pointer-events-auto transform-gpu bg-[#f3f4f6] dark:bg-[#1C1C1E] border rounded-[24px] corner-squircle shadow-2xl overflow-hidden transition-shadow duration-200 ${
-              agentFocusedTargetId === 'script.text' || agentFocusedTargetId === 'script.panel'
-                ? 'border-purple-500/80 ring-2 ring-purple-500/50'
-                : 'border-gray-300 dark:border-white/10'
+            data-agent-target={visualDock.scriptExpanded ? 'script.panel' : 'script.collapsed'}
+            onMouseEnter={() => {
+              if (!visualDock.scriptExpanded) handleMiniCardMouseEnter('script');
+            }}
+            onMouseMove={(e) => {
+              if (!visualDock.scriptExpanded) handleMiniCardMouseMove(e, 'script');
+            }}
+            onMouseLeave={() => {
+              if (!visualDock.scriptExpanded) handleMiniCardMouseLeave('script');
+            }}
+            style={{
+              left: `${dockLayout.script.left}px`,
+              width: `${dockLayout.script.width}px`,
+              zIndex: dockLayout.script.zIndex,
+              transitionProperty: 'left, width, height, box-shadow',
+              transitionDuration: `${WIDTH_TRANSITION_TIMINGS.shellResizeMs}ms`,
+              transitionTimingFunction: 'cubic-bezier(0.22, 1, 0.36, 1)',
+              ...(dockLayout.script.expanded
+                ? { maxWidth: `${dockLayout.script.maxWidth}px` }
+                : { height: `${dockLayout.script.height ?? 112}px` }),
+            }}
+            className={`fixed top-[58px] flex pointer-events-auto transform-gpu bg-[#f3f4f6] dark:bg-[#1C1C1E] border corner-squircle overflow-hidden ${
+              visualDock.scriptExpanded
+                ? `bottom-4 flex-col select-text rounded-[24px] shadow-2xl ${
+                    agentFocusedTargetId === 'script.text' || agentFocusedTargetId === 'script.panel'
+                      ? 'border-purple-500/80 ring-2 ring-purple-500/50'
+                      : 'border-gray-300 dark:border-white/10'
+                  }`
+                : `select-none rounded-[20px] group ${
+                    hoveredMiniPanel === 'script'
+                      ? 'shadow-xl border-blue-500/60'
+                      : 'border-gray-300 dark:border-white/10 shadow-md'
+                  }`
             }`}
             onPointerDown={(e) => e.stopPropagation()}
             onWheel={(e) => e.stopPropagation()}
           >
+            {!visualDock.scriptExpanded ? (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setHoveredMiniPanel((prev) => (prev === 'script' ? null : prev));
+                  applyDockTransition({ scriptExpanded: true });
+                }}
+                aria-label="展开剧本正文面板"
+                title="放大剧本正文面板"
+                style={{
+                  opacity: widthTransitionPanels.script.miniOpacity,
+                  visibility: widthTransitionPanels.script.miniHidden ? 'hidden' : 'visible',
+                  pointerEvents:
+                    widthTransitionPanels.script.miniOpacity < 1 || widthTransitionPanels.script.miniHidden
+                      ? 'none'
+                      : undefined,
+                  transition:
+                    widthTransitionPanels.script.fadeDurationMs > 0
+                      ? `opacity ${widthTransitionPanels.script.fadeDurationMs}ms ease-out`
+                      : undefined,
+                }}
+                className={`w-full h-full flex flex-col justify-center py-2.5 select-none overflow-hidden cursor-pointer ${
+                  dockLayout.script.miniAlign === 'right'
+                    ? 'items-end pr-2 pl-1'
+                    : dockLayout.script.miniAlign === 'left'
+                      ? 'items-start pl-2 pr-1'
+                      : 'items-center px-1.5'
+                }`}
+              >
+                <div className="flex flex-col items-center gap-2">
+                  <span className="w-6 h-6 rounded-lg bg-white/80 dark:bg-white/[0.06] border border-gray-200/80 dark:border-white/10 flex items-center justify-center text-gray-400 group-hover:text-blue-600 dark:group-hover:text-blue-400 group-hover:border-blue-400/50 transition-colors shadow-2xs shrink-0">
+                    <Maximize2 className="w-3 h-3" />
+                  </span>
+                  <div className="flex flex-col items-center gap-1">
+                    <BookText className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 shrink-0" />
+                    <span className="[writing-mode:vertical-lr] tracking-[0.2em] text-xs font-black text-gray-900 dark:text-neutral-100 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors whitespace-nowrap">
+                      剧本
+                    </span>
+                  </div>
+                </div>
+              </button>
+            ) : !widthTransitionPanels.script.mountExpandedContent ? null : (
+            <div
+              style={{
+                opacity: widthTransitionPanels.script.opacity,
+                visibility: widthTransitionPanels.script.hidden ? 'hidden' : 'visible',
+                pointerEvents:
+                  widthTransitionPanels.script.opacity < 1 || widthTransitionPanels.script.hidden
+                    ? 'none'
+                    : undefined,
+                transition:
+                  widthTransitionPanels.script.fadeDurationMs > 0
+                    ? `opacity ${widthTransitionPanels.script.fadeDurationMs}ms ease-out`
+                    : undefined,
+                ...(widthTransitionPanels.script.frozenWidth != null
+                  ? {
+                      width: `${widthTransitionPanels.script.frozenWidth}px`,
+                      minWidth: `${widthTransitionPanels.script.frozenWidth}px`,
+                      maxWidth: `${widthTransitionPanels.script.frozenWidth}px`,
+                      flexShrink: 0,
+                    }
+                  : {}),
+              }}
+              className="flex flex-col h-full w-full min-h-0 overflow-hidden"
+            >
             {/* 上卡片: 菜单与工具栏面板 */}
             <div
               className="shrink-0 relative z-0 border-b border-gray-300/80 dark:border-white/[0.04]"
@@ -2415,16 +3754,20 @@ export function ProjectScriptBible({
                   </div>
                 </div>
 
-                {/* Right action: Close button */}
+                {/* Right action: Collapse / Minimize button */}
                 <button
                   type="button"
-                  onClick={onClose}
-                  data-agent-target="script.close"
+                  onClick={() => {
+                    setHoveredMiniPanel((prev) => (prev === 'script' ? null : prev));
+                    applyDockTransition({ scriptExpanded: false });
+                  }}
+                  aria-label="收起剧本正文面板"
+                  data-agent-target="script.collapse"
                   data-agent-actions="mouse.move mouse.click mouse.hover"
-                  className="p-1.5 rounded-xl corner-squircle text-gray-400 hover:text-gray-700 dark:hover:text-neutral-200 hover:bg-black/5 dark:hover:bg-white/10 transition-colors"
-                  title="收起剧本面板"
+                  className="p-1.5 rounded-xl corner-squircle text-gray-400 hover:text-gray-700 dark:hover:text-neutral-200 hover:bg-black/5 dark:hover:bg-white/10 transition-colors cursor-pointer"
+                  title="缩小剧本正文面板"
                 >
-                  <X className="w-4 h-4" />
+                  <Minimize2 className="w-4 h-4" />
                 </button>
               </div>
 
@@ -2908,43 +4251,6 @@ export function ProjectScriptBible({
                     <div className="flex items-center gap-1 overflow-x-auto no-scrollbar">
                       <button
                         type="button"
-                        onClick={() => {
-                          setIsMultiSelectMode(prev => !prev);
-                          if (isMultiSelectMode) {
-                            setSelectedAssetIds(new Set());
-                          }
-                        }}
-                        className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg font-semibold transition-colors whitespace-nowrap shrink-0 ${
-                          isMultiSelectMode
-                            ? 'bg-blue-600 text-white shadow-2xs'
-                            : 'text-gray-600 dark:text-neutral-400 hover:text-gray-900 dark:hover:text-white bg-white/80 dark:bg-neutral-800'
-                        }`}
-                        title="切换多选模式"
-                      >
-                        <Check className={`w-3.5 h-3.5 ${isMultiSelectMode ? 'text-white' : 'text-gray-400'}`} />
-                        <span>多选</span>
-                      </button>
-
-                      {isMultiSelectMode && (
-                        <>
-                          <div className="h-4 w-px bg-gray-200 dark:bg-neutral-700 mx-1 shrink-0" />
-                          <button
-                            type="button"
-                            onClick={handleToggleSelectAll}
-                            className="flex items-center gap-1.5 px-2 py-1 rounded-lg font-semibold text-gray-600 dark:text-neutral-400 hover:text-gray-900 dark:hover:text-white transition-colors whitespace-nowrap shrink-0"
-                            title="全选/取消全选"
-                          >
-                            <div className={`w-3.5 h-3.5 rounded-sm flex items-center justify-center transition-colors ${isAllSelected ? 'bg-blue-600 text-white' : 'bg-gray-200/80 dark:bg-neutral-700/80 text-transparent'}`}>
-                              {isAllSelected && <Check className="w-3 h-3 text-white" />}
-                            </div>
-                            <span>全选</span>
-                          </button>
-                        </>
-                      )}
-                      <div className="h-4 w-px bg-gray-200 dark:bg-neutral-700 mx-1 shrink-0" />
-
-                      <button
-                        type="button"
                         data-agent-target="assets.filter.all"
                         onClick={() => setAssetFilter('all')}
                         className={`px-2.5 py-1 rounded-lg font-semibold transition-colors whitespace-nowrap ${
@@ -2996,42 +4302,8 @@ export function ProjectScriptBible({
                       </button>
                     </div>
 
-                  {/* Right: Actions */}
-                  <div className="flex items-center gap-1.5 shrink-0">
-                    {selectedAssetIds.size > 0 && (
-                      <button
-                        type="button"
-                        onClick={handleBatchDeleteAssets}
-                        className="flex items-center gap-1 px-2.5 py-1 rounded-lg font-semibold bg-red-500 hover:bg-red-600 text-white transition-colors shadow-2xs"
-                        title="删除所有选中的资产"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                        <span>删除({selectedAssetIds.size})</span>
-                      </button>
-                    )}
-
-                    <button
-                      type="button"
-                      onClick={() => handleOpenAddAsset(assetFilter === 'all' ? 'character' : assetFilter as any)}
-                      className="flex items-center gap-1 px-2.5 py-1 rounded-lg font-semibold bg-blue-600 hover:bg-blue-500 text-white transition-colors shadow-2xs"
-                      title="手动新建资产"
-                    >
-                      <Plus className="w-3.5 h-3.5" />
-                      <span>新建资产</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={handleExtractAssets}
-                      disabled={isExtractingAssets}
-                      data-agent-target="assets.extract.all"
-                      className="flex items-center gap-1 px-2.5 py-1 rounded-lg font-semibold bg-purple-500/10 text-purple-600 dark:text-purple-400 hover:bg-purple-500/20 transition-colors disabled:opacity-50"
-                      title="基于当前剧本正文全文执行实体提取与消歧"
-                    >
-                      {isExtractingAssets ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
-                      <span>提取全部</span>
-                    </button>
-                  </div>
+                  {/* Right: Actions (only batch delete when selected) */}
+                  
                 </div>
               </div>
             )}
@@ -3050,7 +4322,7 @@ export function ProjectScriptBible({
                 <div className="flex-1 flex flex-col min-h-0 relative min-w-0">
                   {/* Floating candidate provenance badges vertically aligned with right side clicked asset item */}
                   <AnimatePresence>
-                    {activeAssetHighlight && (
+                    {visualDock.scriptExpanded && activeAssetHighlight && (
                       <CandidateMatchesOverlay
                         key={activeAssetHighlight.id}
                         yTop={activeAssetHighlight.yTop || 120}
@@ -3106,7 +4378,7 @@ export function ProjectScriptBible({
                     )}
                   </AnimatePresence>
 
-                  {isAnimationSettled ? (
+                  {isAnimationSettled && isScriptExpandSettled ? (
                     <div className="relative flex-1 flex flex-col min-h-0 w-full h-full overflow-hidden">
                       <ScriptCodeEditor
                         key={`script-${currentProject.id}`}
@@ -3114,6 +4386,7 @@ export function ProjectScriptBible({
                         value={previewVersionId ? getPreviewText() : scriptDraft}
                         readOnly={!!previewVersionId}
                         onChange={handleScriptTextChange}
+                        onEditorReady={handleScriptEditorReady}
                         placeholder="在此直接输入或粘贴剧本正文...&#10;&#10;例如：&#10;【场 1】内景. 房间 - 夜&#10;主角坐在桌前，窗外微风拂过...&#10;&#10;【场 2】外景. 街道 - 日&#10;阳光穿透树梢，洒在人行道上..."
                         annotations={editorAnnotations}
                         onEscape={handleDismissProvenanceHighlights}
@@ -3145,7 +4418,7 @@ export function ProjectScriptBible({
                           }
                         }}
                         onScroll={handleScriptScroll}
-                        className={`transition-all duration-150 ease-out ${
+                        className={`transition-opacity duration-150 ease-out ${
                           isPositionReady ? 'opacity-100' : 'opacity-0 pointer-events-none'
                         }`}
                       />
@@ -3155,18 +4428,12 @@ export function ProjectScriptBible({
                   )}
 
                   {/* Bottom Right Floating Stats */}
-                  <div className={`absolute bottom-5 right-6 pointer-events-none select-none flex items-center gap-2.5 text-gray-400 dark:text-neutral-500 transition-all duration-200 ${
-                    isCandidateOverlayExpanded ? 'opacity-30 blur-none' : 'opacity-60 blur-none'
+                  <div className={`absolute bottom-4 right-5 pointer-events-none select-none flex items-center gap-1.5 text-[11px] font-medium tabular-nums text-gray-400 dark:text-neutral-500 whitespace-nowrap transition-opacity duration-200 ${
+                    isCandidateOverlayExpanded ? 'opacity-30' : 'opacity-65'
                   }`}>
-                    <div className="flex flex-col items-center">
-                      <span className="text-[11px] font-medium tabular-nums leading-none">{(scriptDraft || '').length}</span>
-                      <span className="text-[10px] leading-none mt-1.5">字</span>
-                    </div>
-                    <span className="text-[12px] leading-none mt-3.5 opacity-60">·</span>
-                    <div className="flex flex-col items-center">
-                      <span className="text-[11px] font-medium tabular-nums leading-none">{scriptDraft ? scriptDraft.split('\n').length : 0}</span>
-                      <span className="text-[10px] leading-none mt-1.5">行</span>
-                    </div>
+                    <span>{(scriptDraft || '').length} 字</span>
+                    <span className="opacity-60">·</span>
+                    <span>{scriptDraft ? scriptDraft.split('\n').length : 0} 行</span>
                   </div>
 
                   {/* 目录打开后的列表卡片: 范围限制在正文卡片内 */}
@@ -3242,7 +4509,23 @@ export function ProjectScriptBible({
                 </div>
               </div>
             ) : (
-              <div className="flex-1 overflow-y-auto p-3 space-y-3">
+              <div
+                ref={assetListContainerRef}
+                onScroll={() => setAssetContextMenu(null)}
+                onMouseDown={(e) => handleContainerMouseDown(e, assetListContainerRef)}
+                className="flex-1 overflow-y-auto p-3 space-y-3 relative"
+              >
+                {boxSelection && boxSelection.isDragging && (
+                  <div
+                    className="absolute pointer-events-none z-50 bg-blue-500/15 border border-blue-500/50 rounded-lg"
+                    style={{
+                      left: Math.min(boxSelection.startX, boxSelection.currentX),
+                      top: Math.min(boxSelection.startY, boxSelection.currentY),
+                      width: Math.abs(boxSelection.currentX - boxSelection.startX),
+                      height: Math.abs(boxSelection.currentY - boxSelection.startY),
+                    }}
+                  />
+                )}
                 {/* TAB 2: ASSETS OUTLINE */}
                 {activeTab === 'assets' && (
                 <div className="flex flex-col gap-2">
@@ -3296,7 +4579,12 @@ export function ProjectScriptBible({
                         const prompt = `Cinematic character portrait of ${char.name}, ${char.role}, ${char.age}. ${char.appearance}. Style: ${currentProject.universe.artStyle}, ${currentProject.universe.colorTone}, 35mm photograph, hyperdetailed master film still.`;
                         const isSelected = selectedAssetIds.has(char.id);
                         const isHighlightActive = activeAssetHighlight?.id === char.id && !activeAssetHighlight?.isVersion;
-                        const isAgentFocused = isTargetAgentFocused(`assets.item.character.${char.id}`);
+                        const charTargetId = buildAssetAgentTargetId('character', char.id);
+                        const isAgentFocused = isTargetAgentFocused(charTargetId);
+                        const charBorderMode = resolveSelectionBorderMode({
+                          isUserSelected: isSelected || isHighlightActive,
+                          isAgentFocused,
+                        });
                         const identText = getAssetIdentificationText('character', char);
                         const versions: ScriptAssetVersion[] = Array.isArray(char.versions) ? char.versions : [];
                         const hasMultipleVersions = versions.length > 1;
@@ -3305,46 +4593,26 @@ export function ProjectScriptBible({
                           <div key={char.id} className="flex flex-col">
                             <div
                               data-asset-item="true"
-                              data-agent-target={`assets.item.character.${char.id}`}
-                              onClick={(e) => {
-                                if (isMultiSelectMode) {
-                                  toggleSelectAsset(char.id);
-                                } else {
-                                  handleSelectAssetHighlight('character', char, e);
-                                }
-                              }}
+                              data-asset-version="false"
+                              data-asset-id={char.id}
+                              data-agent-target={charTargetId}
+                              data-selection-border-mode={charBorderMode}
+                              onClick={(e) => handleAssetRowClick(char.id, 'character', char, e)}
                               onContextMenu={(e) => {
-                                handleSelectAssetHighlight('character', char, e, true);
+                                handleOpenAssetContextMenu(e, 'character', char);
                               }}
-                              className={`w-full relative px-3 py-2.5 rounded-xl corner-squircle transition-all duration-150 select-none active:scale-[0.985] active:brightness-95 cursor-pointer group flex items-center justify-between gap-3 ${
-                                isAgentFocused
-                                  ? 'bg-purple-100/90 dark:bg-purple-900/50 text-purple-700 dark:text-purple-200 ring-2 ring-purple-500/70'
-                                  : isSelected || isHighlightActive
-                                    ? 'bg-blue-100/90 dark:bg-blue-900/60 text-blue-700 dark:text-blue-300 ring-1 ring-blue-500/40 active:bg-blue-200/90 dark:active:bg-blue-800/80'
-                                    : 'hover:bg-blue-100/80 dark:hover:bg-blue-900/50 text-gray-700 dark:text-neutral-200 hover:text-blue-700 dark:hover:text-blue-300 active:bg-blue-100/70 dark:active:bg-blue-900/40'
-                              }`}
+                              className={`w-full relative px-3 py-2.5 rounded-xl corner-squircle transition-all duration-150 select-none active:scale-[0.985] active:brightness-95 cursor-pointer group flex items-center justify-between gap-3 ${getAssetRowBorderClasses(charBorderMode, false)}`}
                             >
+                              {renderAssetRowSelectionBorderOverlay(charBorderMode, false)}
                               <div className="flex items-center gap-2.5 min-w-0 w-full flex-1 pr-1">
                                 <div className="w-5 h-5 flex items-center justify-center shrink-0">
-                                  {isMultiSelectMode ? (
-                                    <div
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        toggleSelectAsset(char.id);
-                                      }}
-                                      className={`w-3.5 h-3.5 rounded-sm flex items-center justify-center cursor-pointer transition-colors ${
-                                        isSelected ? 'bg-blue-600 text-white' : 'bg-gray-200/80 dark:bg-neutral-700/80 text-transparent'
-                                      }`}
-                                    >
-                                      {isSelected && <Check className="w-3 h-3 text-white" />}
-                                    </div>
-                                  ) : (
+                                  
                                     <div className="text-blue-500 flex items-center justify-center">
                                       <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
                                         <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/>
                                       </svg>
                                     </div>
-                                  )}
+                                  
                                 </div>
                                 <span className="text-xs font-bold text-gray-900 dark:text-neutral-100 whitespace-nowrap shrink-0 max-w-[200px] truncate" title={char.name}>{char.name}</span>
                                 <span className="text-[11px] text-gray-400 dark:text-neutral-400 truncate flex-1 min-w-0" title={identText}>
@@ -3361,92 +4629,34 @@ export function ProjectScriptBible({
                                     <ChevronDown className={`w-3 h-3 transition-transform ${isCollapsed ? '-rotate-90' : ''}`} />
                                   </button>
                                 )}
-                              </div>
-                              <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto transition-opacity duration-150 bg-white/95 dark:bg-neutral-800/95 backdrop-blur-xs px-2 py-1 rounded-lg border border-gray-200/80 dark:border-neutral-700/80 shadow-xs z-10">
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleOpenAddAsset('character', char);
-                                  }}
-                                  className="p-1 text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-gray-200/60 dark:hover:bg-neutral-700/60 rounded-lg transition-colors"
-                                  title="新增服装/造型版本"
-                                >
-                                  <Plus className="w-3.5 h-3.5" />
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleViewAssetDetails('character', char);
-                                  }}
-                                  className="p-1 text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-gray-200/60 dark:hover:bg-neutral-700/60 rounded-lg transition-colors"
-                                  title="查看资产详情"
-                                >
-                                  <Eye className="w-3.5 h-3.5" />
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleCopyText(prompt, char.id);
-                                  }}
-                                  className="p-1 text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-gray-200/60 dark:hover:bg-neutral-700/60 rounded-lg transition-colors"
-                                  title="复制出图提示词"
-                                >
-                                  {copiedId === char.id ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleOpenEditAsset('character', char);
-                                  }}
-                                  className="p-1 text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-gray-200/60 dark:hover:bg-neutral-700/60 rounded-lg transition-colors"
-                                  title="编辑角色资产"
-                                >
-                                  <Edit3 className="w-3.5 h-3.5" />
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleDeleteSingleAsset('character', char.id);
-                                  }}
-                                  className="p-1 text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950/40 rounded-lg transition-colors"
-                                  title="删除资产"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
+                                </div>
                             </div>
                             {hasMultipleVersions && !isCollapsed && (
                               <div className="ml-5 pl-2.5 border-l border-gray-200/80 dark:border-neutral-700/80 flex flex-col gap-1 mt-1 mb-1.5">
                                 {versions.map((ver) => {
                                   const verHighlight = activeAssetHighlight?.id === ver.id && Boolean(activeAssetHighlight?.isVersion);
-                                  const verFocused = isTargetAgentFocused(`assets.item.character.${ver.id}`);
+                                  const verTargetId = buildAssetAgentTargetId('character', ver.id, char.id);
+                                  const verFocused = isTargetAgentFocused(verTargetId);
+                                  const verBorderMode = resolveSelectionBorderMode({
+                                    isUserSelected: verHighlight,
+                                    isAgentFocused: verFocused,
+                                  });
                                   const verIdent = getVersionIdentificationText('character', ver);
                                   return (
                                     <div
                                       key={ver.id}
                                       data-asset-item="true"
-                                      data-agent-target={`assets.item.character.${ver.id}`}
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        handleSelectAssetHighlight('character', ver, e, false, char.name);
-                                      }}
+                                      data-asset-version="true"
+                                      data-asset-id={ver.id}
+                                      data-agent-target={verTargetId}
+                                      data-selection-border-mode={verBorderMode}
+                                      onClick={(e) => handleAssetRowClick(ver.id, 'character', ver, e, false, char.name)}
                                       onContextMenu={(e) => {
-                                        e.stopPropagation();
-                                        handleSelectAssetHighlight('character', ver, e, true, char.name);
+                                        handleOpenAssetContextMenu(e, 'character', ver, char);
                                       }}
-                                      className={`w-full relative px-2.5 py-2 rounded-lg transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none ${
-                                        verFocused
-                                          ? 'bg-purple-100/90 dark:bg-purple-900/50 text-purple-700 dark:text-purple-200 ring-1 ring-purple-500/60'
-                                          : verHighlight
-                                            ? 'bg-blue-100/80 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300 ring-1 ring-blue-500/30'
-                                            : 'hover:bg-blue-50/80 dark:hover:bg-neutral-800/70 text-gray-600 dark:text-neutral-300'
-                                      }`}
+                                      className={`w-full relative px-2.5 py-2 rounded-lg transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none ${getAssetRowBorderClasses(verBorderMode, true)}`}
                                     >
+                                      {renderAssetRowSelectionBorderOverlay(verBorderMode, true)}
                                       <div className="flex items-center gap-2 min-w-0 w-full flex-1 pr-1">
                                         <span className="w-1.5 h-1.5 rounded-full bg-blue-400/80 shrink-0" />
                                         <span className="text-[11px] font-bold text-gray-800 dark:text-neutral-200 shrink-0 whitespace-nowrap" title={ver.name}>
@@ -3455,41 +4665,6 @@ export function ProjectScriptBible({
                                         <span className="text-[11px] text-gray-400 dark:text-neutral-400 truncate flex-1 min-w-0" title={verIdent}>
                                           {verIdent}
                                         </span>
-                                      </div>
-                                      <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto transition-opacity duration-150 bg-white/95 dark:bg-neutral-800/95 backdrop-blur-xs px-1.5 py-0.5 rounded-md border border-gray-200/80 dark:border-neutral-700/80 shadow-xs z-10">
-                                        <button
-                                          type="button"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            handleViewAssetDetails('character', ver, char.name);
-                                          }}
-                                          className="p-0.5 text-gray-400 hover:text-blue-500 rounded"
-                                          title="查看版本详情"
-                                        >
-                                          <Eye className="w-3 h-3" />
-                                        </button>
-                                        <button
-                                          type="button"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            handleOpenEditAsset('character', ver, char);
-                                          }}
-                                          className="p-0.5 text-gray-400 hover:text-blue-500 rounded"
-                                          title="编辑版本"
-                                        >
-                                          <Edit3 className="w-3 h-3" />
-                                        </button>
-                                        <button
-                                          type="button"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            handleDeleteSingleAsset('character', ver.id, char.id);
-                                          }}
-                                          className="p-0.5 text-gray-400 hover:text-red-500 rounded"
-                                          title="删除版本"
-                                        >
-                                          <Trash2 className="w-3 h-3" />
-                                        </button>
                                       </div>
                                     </div>
                                   );
@@ -3505,7 +4680,12 @@ export function ProjectScriptBible({
                         const prompt = `Cinematic wide environment establishing shot of ${loc.name}, ${loc.type}, ${loc.timeOfDay}. Atmosphere: ${loc.atmosphere}. Details: ${loc.visualDetails}. Style: ${currentProject.universe.artStyle}, ${currentProject.universe.cinematography}, film still.`;
                         const isSelected = selectedAssetIds.has(loc.id);
                         const isHighlightActive = activeAssetHighlight?.id === loc.id && !activeAssetHighlight?.isVersion;
-                        const isAgentFocused = isTargetAgentFocused(`assets.item.location.${loc.id}`);
+                        const locTargetId = buildAssetAgentTargetId('location', loc.id);
+                        const isAgentFocused = isTargetAgentFocused(locTargetId);
+                        const locBorderMode = resolveSelectionBorderMode({
+                          isUserSelected: isSelected || isHighlightActive,
+                          isAgentFocused,
+                        });
                         const identText = getAssetIdentificationText('location', loc);
                         const versions: ScriptAssetVersion[] = Array.isArray(loc.versions) ? loc.versions : [];
                         const hasMultipleVersions = versions.length > 1;
@@ -3514,46 +4694,26 @@ export function ProjectScriptBible({
                           <div key={loc.id} className="flex flex-col">
                             <div
                               data-asset-item="true"
-                              data-agent-target={`assets.item.location.${loc.id}`}
-                              onClick={(e) => {
-                                if (isMultiSelectMode) {
-                                  toggleSelectAsset(loc.id);
-                                } else {
-                                  handleSelectAssetHighlight('location', loc, e);
-                                }
-                              }}
+                              data-asset-version="false"
+                              data-asset-id={loc.id}
+                              data-agent-target={locTargetId}
+                              data-selection-border-mode={locBorderMode}
+                              onClick={(e) => handleAssetRowClick(loc.id, 'location', loc, e)}
                               onContextMenu={(e) => {
-                                handleSelectAssetHighlight('location', loc, e, true);
+                                handleOpenAssetContextMenu(e, 'location', loc);
                               }}
-                              className={`w-full relative px-3 py-2.5 rounded-xl corner-squircle transition-all duration-150 select-none active:scale-[0.985] active:brightness-95 cursor-pointer group flex items-center justify-between gap-3 ${
-                                isAgentFocused
-                                  ? 'bg-purple-100/90 dark:bg-purple-900/50 text-purple-700 dark:text-purple-200 ring-2 ring-purple-500/70'
-                                  : isSelected || isHighlightActive
-                                    ? 'bg-blue-100/90 dark:bg-blue-900/60 text-blue-700 dark:text-blue-300 ring-1 ring-blue-500/40 active:bg-blue-200/90 dark:active:bg-blue-800/80'
-                                    : 'hover:bg-blue-100/80 dark:hover:bg-blue-900/50 text-gray-700 dark:text-neutral-200 hover:text-blue-700 dark:hover:text-blue-300 active:bg-blue-100/70 dark:active:bg-blue-900/40'
-                              }`}
+                              className={`w-full relative px-3 py-2.5 rounded-xl corner-squircle transition-all duration-150 select-none active:scale-[0.985] active:brightness-95 cursor-pointer group flex items-center justify-between gap-3 ${getAssetRowBorderClasses(locBorderMode, false)}`}
                             >
+                              {renderAssetRowSelectionBorderOverlay(locBorderMode, false)}
                               <div className="flex items-center gap-2.5 min-w-0 w-full flex-1 pr-1">
                                 <div className="w-5 h-5 flex items-center justify-center shrink-0">
-                                  {isMultiSelectMode ? (
-                                    <div
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        toggleSelectAsset(loc.id);
-                                      }}
-                                      className={`w-3.5 h-3.5 rounded-sm flex items-center justify-center cursor-pointer transition-colors ${
-                                        isSelected ? 'bg-blue-600 text-white' : 'bg-gray-200/80 dark:bg-neutral-700/80 text-transparent'
-                                      }`}
-                                    >
-                                      {isSelected && <Check className="w-3 h-3 text-white" />}
-                                    </div>
-                                  ) : (
+                                  
                                     <div className="text-emerald-500 flex items-center justify-center">
                                       <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
                                         <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/>
                                       </svg>
                                     </div>
-                                  )}
+                                  
                                 </div>
                                 <span className="text-xs font-bold text-gray-900 dark:text-neutral-100 whitespace-nowrap shrink-0 max-w-[200px] truncate" title={loc.name}>{loc.name}</span>
                                 <span className="text-[11px] text-gray-400 dark:text-neutral-400 truncate flex-1 min-w-0" title={identText}>
@@ -3570,92 +4730,34 @@ export function ProjectScriptBible({
                                     <ChevronDown className={`w-3 h-3 transition-transform ${isCollapsed ? '-rotate-90' : ''}`} />
                                   </button>
                                 )}
-                              </div>
-                              <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto transition-opacity duration-150 bg-white/95 dark:bg-neutral-800/95 backdrop-blur-xs px-2 py-1 rounded-lg border border-gray-200/80 dark:border-neutral-700/80 shadow-xs z-10">
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleOpenAddAsset('location', loc);
-                                  }}
-                                  className="p-1 text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-gray-200/60 dark:hover:bg-neutral-700/60 rounded-lg transition-colors"
-                                  title="新增日景/夜景版本"
-                                >
-                                  <Plus className="w-3.5 h-3.5" />
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleViewAssetDetails('location', loc);
-                                  }}
-                                  className="p-1 text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-gray-200/60 dark:hover:bg-neutral-700/60 rounded-lg transition-colors"
-                                  title="查看资产详情"
-                                >
-                                  <Eye className="w-3.5 h-3.5" />
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleCopyText(prompt, loc.id);
-                                  }}
-                                  className="p-1 text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-gray-200/60 dark:hover:bg-neutral-700/60 rounded-lg transition-colors"
-                                  title="复制出图提示词"
-                                >
-                                  {copiedId === loc.id ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleOpenEditAsset('location', loc);
-                                  }}
-                                  className="p-1 text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-gray-200/60 dark:hover:bg-neutral-700/60 rounded-lg transition-colors"
-                                  title="编辑场景资产"
-                                >
-                                  <Edit3 className="w-3.5 h-3.5" />
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleDeleteSingleAsset('location', loc.id);
-                                  }}
-                                  className="p-1 text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950/40 rounded-lg transition-colors"
-                                  title="删除资产"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
+                            </div>
                             </div>
                             {hasMultipleVersions && !isCollapsed && (
                               <div className="ml-5 pl-2.5 border-l border-gray-200/80 dark:border-neutral-700/80 flex flex-col gap-1 mt-1 mb-1.5">
                                 {versions.map((ver) => {
                                   const verHighlight = activeAssetHighlight?.id === ver.id && Boolean(activeAssetHighlight?.isVersion);
-                                  const verFocused = isTargetAgentFocused(`assets.item.location.${ver.id}`);
+                                  const verTargetId = buildAssetAgentTargetId('location', ver.id, loc.id);
+                                  const verFocused = isTargetAgentFocused(verTargetId);
+                                  const verBorderMode = resolveSelectionBorderMode({
+                                    isUserSelected: verHighlight,
+                                    isAgentFocused: verFocused,
+                                  });
                                   const verIdent = getVersionIdentificationText('location', ver);
                                   return (
                                     <div
                                       key={ver.id}
                                       data-asset-item="true"
-                                      data-agent-target={`assets.item.location.${ver.id}`}
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        handleSelectAssetHighlight('location', ver, e, false, loc.name);
-                                      }}
+                                      data-asset-version="true"
+                                      data-asset-id={ver.id}
+                                      data-agent-target={verTargetId}
+                                      data-selection-border-mode={verBorderMode}
+                                      onClick={(e) => handleAssetRowClick(ver.id, 'location', ver, e, false, loc.name)}
                                       onContextMenu={(e) => {
-                                        e.stopPropagation();
-                                        handleSelectAssetHighlight('location', ver, e, true, loc.name);
+                                        handleOpenAssetContextMenu(e, 'location', ver, loc);
                                       }}
-                                      className={`w-full relative px-2.5 py-2 rounded-lg transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none ${
-                                        verFocused
-                                          ? 'bg-purple-100/90 dark:bg-purple-900/50 text-purple-700 dark:text-purple-200 ring-1 ring-purple-500/60'
-                                          : verHighlight
-                                            ? 'bg-blue-100/80 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300 ring-1 ring-blue-500/30'
-                                            : 'hover:bg-blue-50/80 dark:hover:bg-neutral-800/70 text-gray-600 dark:text-neutral-300'
-                                      }`}
+                                      className={`w-full relative px-2.5 py-2 rounded-lg transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none ${getAssetRowBorderClasses(verBorderMode, true)}`}
                                     >
+                                      {renderAssetRowSelectionBorderOverlay(verBorderMode, true)}
                                       <div className="flex items-center gap-2 min-w-0 w-full flex-1 pr-1">
                                         <span className="w-1.5 h-1.5 rounded-full bg-emerald-400/80 shrink-0" />
                                         <span className="text-[11px] font-bold text-gray-800 dark:text-neutral-200 shrink-0 whitespace-nowrap" title={ver.name}>
@@ -3664,41 +4766,6 @@ export function ProjectScriptBible({
                                         <span className="text-[11px] text-gray-400 dark:text-neutral-400 truncate flex-1 min-w-0" title={verIdent}>
                                           {verIdent}
                                         </span>
-                                      </div>
-                                      <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto transition-opacity duration-150 bg-white/95 dark:bg-neutral-800/95 backdrop-blur-xs px-1.5 py-0.5 rounded-md border border-gray-200/80 dark:border-neutral-700/80 shadow-xs z-10">
-                                        <button
-                                          type="button"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            handleViewAssetDetails('location', ver, loc.name);
-                                          }}
-                                          className="p-0.5 text-gray-400 hover:text-blue-500 rounded"
-                                          title="查看版本详情"
-                                        >
-                                          <Eye className="w-3 h-3" />
-                                        </button>
-                                        <button
-                                          type="button"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            handleOpenEditAsset('location', ver, loc);
-                                          }}
-                                          className="p-0.5 text-gray-400 hover:text-blue-500 rounded"
-                                          title="编辑版本"
-                                        >
-                                          <Edit3 className="w-3 h-3" />
-                                        </button>
-                                        <button
-                                          type="button"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            handleDeleteSingleAsset('location', ver.id, loc.id);
-                                          }}
-                                          className="p-0.5 text-gray-400 hover:text-red-500 rounded"
-                                          title="删除版本"
-                                        >
-                                          <Trash2 className="w-3 h-3" />
-                                        </button>
                                       </div>
                                     </div>
                                   );
@@ -3714,7 +4781,12 @@ export function ProjectScriptBible({
                         const prompt = `Close-up studio cinematography shot of ${prop.name}. Material and state: ${prop.materialAndState}. Significant story object. Style: ${currentProject.universe.artStyle}, ${currentProject.universe.colorTone}, pristine high detail.`;
                         const isSelected = selectedAssetIds.has(prop.id);
                         const isHighlightActive = activeAssetHighlight?.id === prop.id && !activeAssetHighlight?.isVersion;
-                        const isAgentFocused = isTargetAgentFocused(`assets.item.prop.${prop.id}`);
+                        const propTargetId = buildAssetAgentTargetId('prop', prop.id);
+                        const isAgentFocused = isTargetAgentFocused(propTargetId);
+                        const propBorderMode = resolveSelectionBorderMode({
+                          isUserSelected: isSelected || isHighlightActive,
+                          isAgentFocused,
+                        });
                         const identText = getAssetIdentificationText('prop', prop);
                         const versions: ScriptAssetVersion[] = Array.isArray(prop.versions) ? prop.versions : [];
                         const hasMultipleVersions = versions.length > 1;
@@ -3723,46 +4795,26 @@ export function ProjectScriptBible({
                           <div key={prop.id} className="flex flex-col">
                             <div
                               data-asset-item="true"
-                              data-agent-target={`assets.item.prop.${prop.id}`}
-                              onClick={(e) => {
-                                if (isMultiSelectMode) {
-                                  toggleSelectAsset(prop.id);
-                                } else {
-                                  handleSelectAssetHighlight('prop', prop, e);
-                                }
-                              }}
+                              data-asset-version="false"
+                              data-asset-id={prop.id}
+                              data-agent-target={propTargetId}
+                              data-selection-border-mode={propBorderMode}
+                              onClick={(e) => handleAssetRowClick(prop.id, 'prop', prop, e)}
                               onContextMenu={(e) => {
-                                handleSelectAssetHighlight('prop', prop, e, true);
+                                handleOpenAssetContextMenu(e, 'prop', prop);
                               }}
-                              className={`w-full relative px-3 py-2.5 rounded-xl corner-squircle transition-all duration-150 select-none active:scale-[0.985] active:brightness-95 cursor-pointer group flex items-center justify-between gap-3 ${
-                                isAgentFocused
-                                  ? 'bg-purple-100/90 dark:bg-purple-900/50 text-purple-700 dark:text-purple-200 ring-2 ring-purple-500/70'
-                                  : isSelected || isHighlightActive
-                                    ? 'bg-blue-100/90 dark:bg-blue-900/60 text-blue-700 dark:text-blue-300 ring-1 ring-blue-500/40 active:bg-blue-200/90 dark:active:bg-blue-800/80'
-                                    : 'hover:bg-blue-100/80 dark:hover:bg-blue-900/50 text-gray-700 dark:text-neutral-200 hover:text-blue-700 dark:hover:text-blue-300 active:bg-blue-100/70 dark:active:bg-blue-900/40'
-                              }`}
+                              className={`w-full relative px-3 py-2.5 rounded-xl corner-squircle transition-all duration-150 select-none active:scale-[0.985] active:brightness-95 cursor-pointer group flex items-center justify-between gap-3 ${getAssetRowBorderClasses(propBorderMode, false)}`}
                             >
+                              {renderAssetRowSelectionBorderOverlay(propBorderMode, false)}
                               <div className="flex items-center gap-2.5 min-w-0 w-full flex-1 pr-1">
                                 <div className="w-5 h-5 flex items-center justify-center shrink-0">
-                                  {isMultiSelectMode ? (
-                                    <div
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        toggleSelectAsset(prop.id);
-                                      }}
-                                      className={`w-3.5 h-3.5 rounded-sm flex items-center justify-center cursor-pointer transition-colors ${
-                                        isSelected ? 'bg-blue-600 text-white' : 'bg-gray-200/80 dark:bg-neutral-700/80 text-transparent'
-                                      }`}
-                                    >
-                                      {isSelected && <Check className="w-3 h-3 text-white" />}
-                                    </div>
-                                  ) : (
+                                  
                                     <div className="text-amber-500 flex items-center justify-center">
                                       <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
                                         <path d="M21 16.5c0 .38-.21.71-.53.88l-7.9 4.44c-.16.09-.34.14-.57.14s-.41-.05-.57-.14l-7.9-4.44A1.003 1.003 0 013 16.5v-9c0-.38.21-.71.53-.88l7.9-4.44c.16-.09.34-.14.57-.14s.41.05.57.14l7.9 4.44c.32.17.53.5.53.88v9zM12 4.15L6.04 7.5 12 10.85 17.96 7.5 12 4.15zM5 15.91l6 3.38v-6.72L5 9.19v6.72zm14 0v-6.72l-6 3.38v6.72l6-3.38z"/>
                                       </svg>
                                     </div>
-                                  )}
+                                  
                                 </div>
                                 <span className="text-xs font-bold text-gray-900 dark:text-neutral-100 whitespace-nowrap shrink-0 max-w-[200px] truncate" title={prop.name}>{prop.name}</span>
                                 <span className="text-[11px] text-gray-400 dark:text-neutral-400 truncate flex-1 min-w-0" title={identText}>
@@ -3779,92 +4831,34 @@ export function ProjectScriptBible({
                                     <ChevronDown className={`w-3 h-3 transition-transform ${isCollapsed ? '-rotate-90' : ''}`} />
                                   </button>
                                 )}
-                              </div>
-                              <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto transition-opacity duration-150 bg-white/95 dark:bg-neutral-800/95 backdrop-blur-xs px-2 py-1 rounded-lg border border-gray-200/80 dark:border-neutral-700/80 shadow-xs z-10">
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleOpenAddAsset('prop', prop);
-                                  }}
-                                  className="p-1 text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-gray-200/60 dark:hover:bg-neutral-700/60 rounded-lg transition-colors"
-                                  title="新增道具状态版本"
-                                >
-                                  <Plus className="w-3.5 h-3.5" />
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleViewAssetDetails('prop', prop);
-                                  }}
-                                  className="p-1 text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-gray-200/60 dark:hover:bg-neutral-700/60 rounded-lg transition-colors"
-                                  title="查看资产详情"
-                                >
-                                  <Eye className="w-3.5 h-3.5" />
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleCopyText(prompt, prop.id);
-                                  }}
-                                  className="p-1 text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-gray-200/60 dark:hover:bg-neutral-700/60 rounded-lg transition-colors"
-                                  title="复制出图提示词"
-                                >
-                                  {copiedId === prop.id ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleOpenEditAsset('prop', prop);
-                                  }}
-                                  className="p-1 text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-gray-200/60 dark:hover:bg-neutral-700/60 rounded-lg transition-colors"
-                                  title="编辑道具资产"
-                                >
-                                  <Edit3 className="w-3.5 h-3.5" />
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleDeleteSingleAsset('prop', prop.id);
-                                  }}
-                                  className="p-1 text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950/40 rounded-lg transition-colors"
-                                  title="删除资产"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
+                            </div>
                             </div>
                             {hasMultipleVersions && !isCollapsed && (
                               <div className="ml-5 pl-2.5 border-l border-gray-200/80 dark:border-neutral-700/80 flex flex-col gap-1 mt-1 mb-1.5">
                                 {versions.map((ver) => {
                                   const verHighlight = activeAssetHighlight?.id === ver.id && Boolean(activeAssetHighlight?.isVersion);
-                                  const verFocused = isTargetAgentFocused(`assets.item.prop.${ver.id}`);
+                                  const verTargetId = buildAssetAgentTargetId('prop', ver.id, prop.id);
+                                  const verFocused = isTargetAgentFocused(verTargetId);
+                                  const verBorderMode = resolveSelectionBorderMode({
+                                    isUserSelected: verHighlight,
+                                    isAgentFocused: verFocused,
+                                  });
                                   const verIdent = getVersionIdentificationText('prop', ver);
                                   return (
                                     <div
                                       key={ver.id}
                                       data-asset-item="true"
-                                      data-agent-target={`assets.item.prop.${ver.id}`}
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        handleSelectAssetHighlight('prop', ver, e, false, prop.name);
-                                      }}
+                                      data-asset-version="true"
+                                      data-asset-id={ver.id}
+                                      data-agent-target={verTargetId}
+                                      data-selection-border-mode={verBorderMode}
+                                      onClick={(e) => handleAssetRowClick(ver.id, 'prop', ver, e, false, prop.name)}
                                       onContextMenu={(e) => {
-                                        e.stopPropagation();
-                                        handleSelectAssetHighlight('prop', ver, e, true, prop.name);
+                                        handleOpenAssetContextMenu(e, 'prop', ver, prop);
                                       }}
-                                      className={`w-full relative px-2.5 py-2 rounded-lg transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none ${
-                                        verFocused
-                                          ? 'bg-purple-100/90 dark:bg-purple-900/50 text-purple-700 dark:text-purple-200 ring-1 ring-purple-500/60'
-                                          : verHighlight
-                                            ? 'bg-blue-100/80 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300 ring-1 ring-blue-500/30'
-                                            : 'hover:bg-blue-50/80 dark:hover:bg-neutral-800/70 text-gray-600 dark:text-neutral-300'
-                                      }`}
+                                      className={`w-full relative px-2.5 py-2 rounded-lg transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none ${getAssetRowBorderClasses(verBorderMode, true)}`}
                                     >
+                                      {renderAssetRowSelectionBorderOverlay(verBorderMode, true)}
                                       <div className="flex items-center gap-2 min-w-0 w-full flex-1 pr-1">
                                         <span className="w-1.5 h-1.5 rounded-full bg-amber-400/80 shrink-0" />
                                         <span className="text-[11px] font-bold text-gray-800 dark:text-neutral-200 shrink-0 whitespace-nowrap" title={ver.name}>
@@ -3873,41 +4867,6 @@ export function ProjectScriptBible({
                                         <span className="text-[11px] text-gray-400 dark:text-neutral-400 truncate flex-1 min-w-0" title={verIdent}>
                                           {verIdent}
                                         </span>
-                                      </div>
-                                      <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto transition-opacity duration-150 bg-white/95 dark:bg-neutral-800/95 backdrop-blur-xs px-1.5 py-0.5 rounded-md border border-gray-200/80 dark:border-neutral-700/80 shadow-xs z-10">
-                                        <button
-                                          type="button"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            handleViewAssetDetails('prop', ver, prop.name);
-                                          }}
-                                          className="p-0.5 text-gray-400 hover:text-blue-500 rounded"
-                                          title="查看版本详情"
-                                        >
-                                          <Eye className="w-3 h-3" />
-                                        </button>
-                                        <button
-                                          type="button"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            handleOpenEditAsset('prop', ver, prop);
-                                          }}
-                                          className="p-0.5 text-gray-400 hover:text-blue-500 rounded"
-                                          title="编辑版本"
-                                        >
-                                          <Edit3 className="w-3 h-3" />
-                                        </button>
-                                        <button
-                                          type="button"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            handleDeleteSingleAsset('prop', ver.id, prop.id);
-                                          }}
-                                          className="p-0.5 text-gray-400 hover:text-red-500 rounded"
-                                          title="删除版本"
-                                        >
-                                          <Trash2 className="w-3 h-3" />
-                                        </button>
                                       </div>
                                     </div>
                                   );
@@ -4092,6 +5051,8 @@ export function ProjectScriptBible({
             </div>
           )}
         </div>
+            </div>
+            )}
       </motion.div>
 
         {/* 卡片二: 独立侧边栏面板 Card (单一实体容器，打开时左侧卡片先出右侧后出，关闭时右侧卡片先消失左侧后收回) */}
@@ -4101,63 +5062,113 @@ export function ProjectScriptBible({
             initial="hidden"
             animate="visible"
             exit="exit"
-            layout
-            transition={{
-              layout: { duration: 0.22, ease: scriptBibleCardEase },
-            }}
+            data-dock-card="true"
             data-prevent-canvas-wheel="true"
-            onClick={() => {
-              if (activeSidePanel === null) {
-                const lastOpen = (currentProject?.id ? localStorage.getItem(`script_bible_last_open_side_panel_${currentProject.id}`) : null) ||
-                                 localStorage.getItem('script_bible_last_open_side_panel');
-                const panelToOpen = (lastOpen === 'assets' || lastOpen === 'universe' || lastOpen === 'cards') ? (lastOpen as 'assets' | 'universe' | 'cards') : 'assets';
-                setActiveSidePanel(panelToOpen);
-              }
-            }}
+            data-agent-target={visualDock.sidePanel !== null ? 'assets.panel.container' : 'assets.collapsed'}
             onMouseEnter={() => {
-              if (activeSidePanel === null) handleMiniCardMouseEnter();
+              if (visualDock.sidePanel === null) handleMiniCardMouseEnter('assets');
             }}
             onMouseMove={(e) => {
-              if (activeSidePanel === null) handleMiniCardMouseMove(e);
+              if (visualDock.sidePanel === null) handleMiniCardMouseMove(e, 'assets');
             }}
             onMouseLeave={() => {
-              if (activeSidePanel === null) handleMiniCardMouseLeave();
+              if (visualDock.sidePanel === null) handleMiniCardMouseLeave('assets');
             }}
-            style={{ left: `${activeSidePanel !== null ? 552 : miniCardLeft}px` }}
-            className={`fixed top-[58px] z-40 flex select-none pointer-events-auto transform-gpu bg-[#f3f4f6] dark:bg-[#1C1C1E] border border-gray-300 dark:border-white/10 corner-squircle overflow-hidden ${
-              activeSidePanel !== null
-                ? 'bottom-4 w-[520px] max-w-[calc(100vw-568px)] z-50 rounded-[24px] shadow-2xl flex-col select-text cursor-default'
-                : `w-[60px] h-[92px] rounded-[20px] cursor-pointer transition-shadow duration-200 group ${
-                    isMiniCardHovered
+            style={{
+              left: `${dockLayout.assets.left}px`,
+              width: `${dockLayout.assets.width}px`,
+              zIndex: dockLayout.assets.zIndex,
+              transitionProperty: 'left, width, height, box-shadow',
+              transitionDuration: `${WIDTH_TRANSITION_TIMINGS.shellResizeMs}ms`,
+              transitionTimingFunction: 'cubic-bezier(0.22, 1, 0.36, 1)',
+              ...(dockLayout.assets.expanded
+                ? { maxWidth: `${dockLayout.assets.maxWidth}px` }
+                : { height: `${dockLayout.assets.height ?? 112}px` }),
+            }}
+            className={`fixed top-[58px] flex select-none pointer-events-auto transform-gpu bg-[#f3f4f6] dark:bg-[#1C1C1E] border border-gray-300 dark:border-white/10 corner-squircle overflow-hidden ${
+              visualDock.sidePanel !== null
+                ? 'bottom-4 rounded-[24px] shadow-2xl flex-col select-text cursor-default'
+                : `rounded-[20px] group ${
+                    hoveredMiniPanel === 'assets'
                       ? 'shadow-xl border-blue-500/60'
-                      : 'shadow-sm'
+                      : 'shadow-md'
                   }`
             }`}
             onPointerDown={(e) => e.stopPropagation()}
             onWheel={(e) => e.stopPropagation()}
-            title={activeSidePanel === null ? '点击展开资产清单' : undefined}
           >
-            {activeSidePanel === null ? (
+            {visualDock.sidePanel === null ? (
               /* 折叠状态: 0.5倍微缩实心卡片内部 */
-              <div
-                className="w-full h-full flex flex-col items-end justify-center pr-2.5 pl-1 py-2 select-none overflow-hidden"
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setHoveredMiniPanel((prev) => (prev === 'assets' ? null : prev));
+                  const lastOpen = (currentProject?.id ? localStorage.getItem(`script_bible_last_open_side_panel_${currentProject.id}`) : null) ||
+                                   localStorage.getItem('script_bible_last_open_side_panel');
+                  const panelToOpen = (lastOpen === 'assets' || lastOpen === 'universe' || lastOpen === 'cards') ? (lastOpen as 'assets' | 'universe' | 'cards') : 'assets';
+                  applyDockTransition({ sidePanel: panelToOpen });
+                }}
+                aria-label="展开资产清单面板"
+                title="放大资产清单面板"
+                style={{
+                  opacity: widthTransitionPanels.assets.miniOpacity,
+                  visibility: widthTransitionPanels.assets.miniHidden ? 'hidden' : 'visible',
+                  pointerEvents:
+                    widthTransitionPanels.assets.miniOpacity < 1 || widthTransitionPanels.assets.miniHidden
+                      ? 'none'
+                      : undefined,
+                  transition:
+                    widthTransitionPanels.assets.fadeDurationMs > 0
+                      ? `opacity ${widthTransitionPanels.assets.fadeDurationMs}ms ease-out`
+                      : undefined,
+                }}
+                className={`w-full h-full flex flex-col justify-center py-2.5 select-none overflow-hidden cursor-pointer ${
+                  dockLayout.assets.miniAlign === 'right'
+                    ? 'items-end pr-2 pl-1'
+                    : dockLayout.assets.miniAlign === 'left'
+                      ? 'items-start pl-2 pr-1'
+                      : 'items-center px-1.5'
+                }`}
               >
-                {/* 资产图标 + 粗体竖排标题 “资产”：加上 0.22s 延迟淡入，与大卡片图标保持一致 */}
-                <motion.div
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  transition={{ delay: 0.22, duration: 0.15 }}
-                  className="flex flex-col items-center gap-1.5"
-                >
-                  <Box className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 shrink-0" />
-                  <span className="[writing-mode:vertical-lr] tracking-[0.2em] text-xs font-black text-gray-900 dark:text-neutral-100 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors whitespace-nowrap">
-                    资产
+                {/* 放大图标 + 资产图标 + 粗体竖排标题 “资产” */}
+                <div className="flex flex-col items-center gap-2">
+                  <span className="w-6 h-6 rounded-lg bg-white/80 dark:bg-white/[0.06] border border-gray-200/80 dark:border-white/10 flex items-center justify-center text-gray-400 group-hover:text-blue-600 dark:group-hover:text-blue-400 group-hover:border-blue-400/50 transition-colors shadow-2xs shrink-0">
+                    <Maximize2 className="w-3 h-3" />
                   </span>
-                </motion.div>
-              </div>
-            ) : (
+                  <div className="flex flex-col items-center gap-1">
+                    <Box className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 shrink-0" />
+                    <span className="[writing-mode:vertical-lr] tracking-[0.2em] text-xs font-black text-gray-900 dark:text-neutral-100 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors whitespace-nowrap">
+                      资产
+                    </span>
+                  </div>
+                </div>
+              </button>
+            ) : !widthTransitionPanels.assets.mountExpandedContent ? null : (
               /* 展开状态: 完整独立大卡片内部 */
-              <div className="flex flex-col h-full w-full select-text overflow-hidden">
+              <div
+                style={{
+                  opacity: widthTransitionPanels.assets.opacity,
+                  visibility: widthTransitionPanels.assets.hidden ? 'hidden' : 'visible',
+                  pointerEvents:
+                    widthTransitionPanels.assets.opacity < 1 || widthTransitionPanels.assets.hidden
+                      ? 'none'
+                      : undefined,
+                  transition:
+                    widthTransitionPanels.assets.fadeDurationMs > 0
+                      ? `opacity ${widthTransitionPanels.assets.fadeDurationMs}ms ease-out`
+                      : undefined,
+                  ...(widthTransitionPanels.assets.frozenWidth != null
+                    ? {
+                        width: `${widthTransitionPanels.assets.frozenWidth}px`,
+                        minWidth: `${widthTransitionPanels.assets.frozenWidth}px`,
+                        maxWidth: `${widthTransitionPanels.assets.frozenWidth}px`,
+                        flexShrink: 0,
+                      }
+                    : {}),
+                }}
+                className="flex flex-col h-full w-full select-text overflow-hidden"
+              >
               {/* 上卡片: 标题与工具栏面板 */}
               <div
                 className="shrink-0 relative z-0 border-b border-gray-300/80 dark:border-white/[0.04]"
@@ -4178,14 +5189,15 @@ export function ProjectScriptBible({
                     </div>
                   </div>
 
-                  {/* 右侧关闭按钮 */}
+                  {/* 右侧缩小按钮 */}
                   <button
                     type="button"
                     onClick={handleCloseSidePanel}
-                    className="p-1.5 rounded-xl corner-squircle text-gray-400 hover:text-gray-700 dark:hover:text-neutral-200 hover:bg-black/5 dark:hover:bg-white/10 transition-colors"
-                    title="收起资产面板"
+                    aria-label="收起资产清单面板"
+                    className="p-1.5 rounded-xl corner-squircle text-gray-400 hover:text-gray-700 dark:hover:text-neutral-200 hover:bg-black/5 dark:hover:bg-white/10 transition-colors cursor-pointer"
+                    title="缩小资产清单面板"
                   >
-                    <X className="w-4 h-4" />
+                    <Minimize2 className="w-4 h-4" />
                   </button>
                 </div>
 
@@ -4195,43 +5207,6 @@ export function ProjectScriptBible({
                       <div className="flex items-center gap-2 min-w-0">
 
                         <div className="flex items-center gap-1 overflow-x-auto no-scrollbar">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setIsMultiSelectMode(prev => !prev);
-                              if (isMultiSelectMode) {
-                                setSelectedAssetIds(new Set());
-                              }
-                            }}
-                            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg font-semibold transition-colors whitespace-nowrap shrink-0 ${
-                              isMultiSelectMode
-                                ? 'bg-blue-600 text-white shadow-2xs'
-                                : 'text-gray-600 dark:text-neutral-400 hover:text-gray-900 dark:hover:text-white bg-white/80 dark:bg-neutral-800'
-                            }`}
-                            title="切换多选模式"
-                          >
-                            <Check className={`w-3.5 h-3.5 ${isMultiSelectMode ? 'text-white' : 'text-gray-400'}`} />
-                            <span>多选</span>
-                          </button>
-
-                          {isMultiSelectMode && (
-                            <>
-                              <div className="h-4 w-px bg-gray-200 dark:bg-neutral-700 mx-1 shrink-0" />
-                              <button
-                                type="button"
-                                onClick={handleToggleSelectAll}
-                                className="flex items-center gap-1.5 px-2 py-1 rounded-lg font-semibold text-gray-600 dark:text-neutral-400 hover:text-gray-900 dark:hover:text-white transition-colors whitespace-nowrap shrink-0"
-                                title="全选/取消全选"
-                              >
-                                <div className={`w-3.5 h-3.5 rounded-sm flex items-center justify-center transition-colors ${isAllSelected ? 'bg-blue-600 text-white' : 'bg-gray-200/80 dark:bg-neutral-700/80 text-transparent'}`}>
-                                  {isAllSelected && <Check className="w-3 h-3 text-white" />}
-                                </div>
-                                <span>全选</span>
-                              </button>
-                            </>
-                          )}
-                          <div className="h-4 w-px bg-gray-200 dark:bg-neutral-700 mx-1 shrink-0" />
-
                           <button
                             type="button"
                             data-agent-target="assets.filter.all"
@@ -4283,38 +5258,7 @@ export function ProjectScriptBible({
                         </div>
                       </div>
 
-                      <div className="flex items-center gap-1.5 shrink-0">
-                        {selectedAssetIds.size > 0 && (
-                          <button
-                            type="button"
-                            onClick={handleBatchDeleteAssets}
-                            className="flex items-center gap-1 px-2 py-1 rounded-lg font-semibold bg-red-500 hover:bg-red-600 text-white transition-colors shadow-2xs"
-                            title="删除选中的资产"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                            <span>删除({selectedAssetIds.size})</span>
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => handleOpenAddAsset(assetFilter === 'all' ? 'character' : (assetFilter as any))}
-                          className="flex items-center gap-1 px-2.5 py-1 rounded-lg font-semibold bg-blue-600 hover:bg-blue-500 text-white transition-colors shadow-2xs"
-                          title="手动新建资产"
-                        >
-                          <Plus className="w-3.5 h-3.5" />
-                          <span>新建资产</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={handleExtractAssets}
-                          disabled={isExtractingAssets}
-                          className="flex items-center gap-1 px-2.5 py-1 rounded-lg font-semibold bg-purple-500/10 text-purple-600 dark:text-purple-400 hover:bg-purple-500/20 transition-colors disabled:opacity-50"
-                          title="一键提取剧本实体"
-                        >
-                          {isExtractingAssets ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
-                          <span>提取全部</span>
-                        </button>
-                      </div>
+                      
                     </div>
                 </div>
               </div>
@@ -4322,11 +5266,24 @@ export function ProjectScriptBible({
               {/* 侧栏主体内容 */}
               <div
                 ref={sidePanelContentRef}
-                data-agent-target={activeSidePanel === 'assets' ? 'assets.panel' : activeSidePanel === 'universe' ? 'universe.panel' : 'cards.panel'}
+                data-agent-target={visualDock.sidePanel === 'assets' ? 'assets.panel' : visualDock.sidePanel === 'universe' ? 'universe.panel' : 'cards.panel'}
                 onScroll={handleSidePanelScroll}
-                className="flex-1 overflow-y-auto p-3 space-y-2 min-h-0"
+                onMouseDown={(e) => handleContainerMouseDown(e, sidePanelContentRef)}
+                style={{ overflowAnchor: 'none' }}
+                className="flex-1 overflow-y-auto p-3 space-y-2 min-h-0 relative"
               >
-                {activeSidePanel === 'assets' && (
+                {boxSelection && boxSelection.isDragging && (
+                  <div
+                    className="absolute pointer-events-none z-50 bg-blue-500/15 border border-blue-500/50 rounded-lg"
+                    style={{
+                      left: Math.min(boxSelection.startX, boxSelection.currentX),
+                      top: Math.min(boxSelection.startY, boxSelection.currentY),
+                      width: Math.abs(boxSelection.currentX - boxSelection.startX),
+                      height: Math.abs(boxSelection.currentY - boxSelection.startY),
+                    }}
+                  />
+                )}
+                {visualDock.sidePanel === 'assets' && (
                   <div className="flex flex-col gap-2">
                     {extractionFeedback && (
                       <div role="alert" className="p-2 bg-purple-50 dark:bg-purple-950/60 rounded-xl text-[11px] font-medium text-purple-700 dark:text-purple-300 flex items-center gap-2">
@@ -4355,7 +5312,12 @@ export function ProjectScriptBible({
                         {(assetFilter === 'all' || assetFilter === 'characters') && displayCharacters.map((char) => {
                           const isSelected = selectedAssetIds.has(char.id);
                           const isHighlightActive = activeAssetHighlight?.id === char.id && !activeAssetHighlight?.isVersion;
-                          const isAgentFocused = isTargetAgentFocused(`assets.item.character.${char.id}`);
+                          const charTargetId = buildAssetAgentTargetId('character', char.id);
+                          const isAgentFocused = isTargetAgentFocused(charTargetId);
+                          const charBorderMode = resolveSelectionBorderMode({
+                            isUserSelected: isSelected || isHighlightActive,
+                            isAgentFocused,
+                          });
                           const identText = getAssetIdentificationText('character', char);
                           const versions: ScriptAssetVersion[] = Array.isArray(char.versions) ? char.versions : [];
                           const hasMultipleVersions = versions.length > 1;
@@ -4364,49 +5326,30 @@ export function ProjectScriptBible({
                             <div key={char.id} className="flex flex-col">
                               <div
                                 data-asset-item="true"
-                                data-agent-target={`assets.item.character.${char.id}`}
-                                onClick={(e) => {
-                                  if (isMultiSelectMode) {
-                                    toggleSelectAsset(char.id);
-                                  } else {
-                                    handleSelectAssetHighlight('character', char, e);
-                                  }
-                                }}
+                                data-asset-version="false"
+                                data-asset-id={char.id}
+                                data-agent-target={charTargetId}
+                                data-selection-border-mode={charBorderMode}
+                                onClick={(e) => handleAssetRowClick(char.id, 'character', char, e)}
                                 onContextMenu={(e) => {
-                                  handleSelectAssetHighlight('character', char, e, true);
+                                  handleOpenAssetContextMenu(e, 'character', char);
                                 }}
-                                className={`w-full relative px-2.5 py-2.5 rounded-xl corner-squircle transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none active:scale-[0.985] active:brightness-95 ${
-                                  isAgentFocused
-                                    ? 'bg-purple-100/90 dark:bg-purple-900/50 text-purple-700 dark:text-purple-200 ring-2 ring-purple-500/70'
-                                    : isSelected || isHighlightActive
-                                      ? 'bg-blue-100/90 dark:bg-blue-900/60 text-blue-700 dark:text-blue-300 ring-1 ring-blue-500/40 active:bg-blue-200/90 dark:active:bg-blue-800/80'
-                                      : 'hover:bg-blue-100/80 dark:hover:bg-blue-900/50 text-gray-700 dark:text-neutral-200 hover:text-blue-700 dark:hover:text-blue-300 active:bg-blue-100/70 dark:active:bg-blue-900/40'
-                                }`}
+                                className={`w-full relative px-2.5 py-2.5 rounded-xl corner-squircle transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none active:scale-[0.985] active:brightness-95 ${getAssetRowBorderClasses(charBorderMode, false)}`}
                               >
+                                {renderAssetRowSelectionBorderOverlay(charBorderMode, false)}
                                 <div className="flex items-center gap-2 min-w-0 w-full flex-1 pr-1">
                                   <div className="w-4 h-4 flex items-center justify-center shrink-0">
-                                    {isMultiSelectMode ? (
-                                      <div
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          toggleSelectAsset(char.id);
-                                        }}
-                                        className={`w-3.5 h-3.5 rounded-sm flex items-center justify-center cursor-pointer transition-colors ${
-                                          isSelected ? 'bg-blue-600 text-white' : 'bg-gray-200/80 dark:bg-neutral-700/80 text-transparent'
-                                        }`}
-                                      >
-                                        {isSelected && <Check className="w-3 h-3 text-white" />}
-                                      </div>
-                                    ) : (
+                                    
                                       <div className="text-blue-500 flex items-center justify-center">
                                         <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
                                           <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/>
                                         </svg>
                                       </div>
-                                    )}
+                                    
                                   </div>
                                   <span className="text-xs font-bold shrink-0 max-w-[180px] truncate" title={char.name}>{char.name}</span>
                                   <span className="text-[11px] text-gray-400 dark:text-neutral-400 truncate min-w-0 flex-1" title={identText}>{identText}</span>
+                                  {renderAssetThumbBadge('character', char)}
                                   {hasMultipleVersions && (
                                     <button
                                       type="button"
@@ -4419,49 +5362,38 @@ export function ProjectScriptBible({
                                     </button>
                                   )}
                                 </div>
-                                <div className="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto transition-opacity duration-150 bg-white/95 dark:bg-neutral-800/95 backdrop-blur-xs px-1.5 py-0.5 rounded-lg border border-gray-200/80 dark:border-neutral-700/80 shadow-xs z-10">
-                                  <button onClick={(e) => { e.stopPropagation(); handleOpenAddAsset('character', char); }} className="p-1 text-gray-400 hover:text-blue-500 rounded" title="新增服装/造型版本"><Plus className="w-3 h-3" /></button>
-                                  <button onClick={(e) => { e.stopPropagation(); handleViewAssetDetails('character', char); }} className="p-1 text-gray-400 hover:text-blue-500 rounded" title="查看资产详情"><Eye className="w-3.5 h-3.5" /></button>
-                                  <button onClick={(e) => { e.stopPropagation(); handleOpenEditAsset('character', char); }} className="p-1 text-gray-400 hover:text-blue-500 rounded" title="编辑资产"><Edit3 className="w-3 h-3" /></button>
-                                  <button onClick={(e) => { e.stopPropagation(); handleDeleteSingleAsset('character', char.id); }} className="p-1 text-gray-400 hover:text-red-500 rounded" title="删除资产"><Trash2 className="w-3 h-3" /></button>
-                                </div>
                               </div>
                               {hasMultipleVersions && !isCollapsed && (
                                 <div className="ml-4 pl-2.5 border-l border-gray-200/80 dark:border-neutral-700/80 flex flex-col gap-1 mt-1 mb-1.5">
                                   {versions.map((ver) => {
                                     const verHighlight = activeAssetHighlight?.id === ver.id && Boolean(activeAssetHighlight?.isVersion);
-                                    const verFocused = isTargetAgentFocused(`assets.item.character.${ver.id}`);
+                                    const verTargetId = buildAssetAgentTargetId('character', ver.id, char.id);
+                                    const verFocused = isTargetAgentFocused(verTargetId);
+                                    const verBorderMode = resolveSelectionBorderMode({
+                                      isUserSelected: verHighlight,
+                                      isAgentFocused: verFocused,
+                                    });
                                     const verIdent = getVersionIdentificationText('character', ver);
                                     return (
                                       <div
                                         key={ver.id}
                                         data-asset-item="true"
-                                        data-agent-target={`assets.item.character.${ver.id}`}
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          handleSelectAssetHighlight('character', ver, e, false, char.name);
+                                      data-asset-version="true"
+                                      data-asset-id={ver.id}
+                                      data-agent-target={verTargetId}
+                                      data-selection-border-mode={verBorderMode}
+                                      onClick={(e) => handleAssetRowClick(ver.id, 'character', ver, e, false, char.name)}
+                                      onContextMenu={(e) => {
+                                          handleOpenAssetContextMenu(e, 'character', ver, char);
                                         }}
-                                        onContextMenu={(e) => {
-                                          e.stopPropagation();
-                                          handleSelectAssetHighlight('character', ver, e, true, char.name);
-                                        }}
-                                        className={`w-full relative px-2 py-1.5 rounded-lg transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none ${
-                                          verFocused
-                                            ? 'bg-purple-100/90 dark:bg-purple-900/50 text-purple-700 dark:text-purple-200 ring-1 ring-purple-500/60'
-                                            : verHighlight
-                                              ? 'bg-blue-100/90 dark:bg-blue-900/60 text-blue-700 dark:text-blue-300 ring-1 ring-blue-500/40'
-                                              : 'hover:bg-blue-100/60 dark:hover:bg-blue-900/40 text-gray-600 dark:text-neutral-300'
-                                        }`}
+                                        className={`w-full relative px-2 py-1.5 rounded-lg transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none ${getAssetRowBorderClasses(verBorderMode, true)}`}
                                       >
+                                        {renderAssetRowSelectionBorderOverlay(verBorderMode, true)}
                                         <div className="flex items-center gap-1.5 min-w-0 w-full flex-1 pr-1">
                                           <span className="w-1.5 h-1.5 rounded-full bg-blue-400/80 shrink-0" />
                                           <span className="text-[11px] font-bold shrink-0 truncate max-w-[120px]" title={ver.name}>{ver.name}</span>
                                           <span className="text-[11px] text-gray-400 dark:text-neutral-400 truncate min-w-0 flex-1" title={verIdent}>{verIdent}</span>
-                                        </div>
-                                        <div className="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto transition-opacity duration-150 bg-white/95 dark:bg-neutral-800/95 backdrop-blur-xs px-1 py-0.5 rounded-md border border-gray-200/80 dark:border-neutral-700/80 shadow-xs z-10">
-                                          <button onClick={(e) => { e.stopPropagation(); handleViewAssetDetails('character', ver, char.name); }} className="p-0.5 text-gray-400 hover:text-blue-500 rounded" title="查看版本详情"><Eye className="w-3 h-3" /></button>
-                                          <button onClick={(e) => { e.stopPropagation(); handleOpenEditAsset('character', ver, char); }} className="p-0.5 text-gray-400 hover:text-blue-500 rounded" title="编辑版本"><Edit3 className="w-2.5 h-2.5" /></button>
-                                          <button onClick={(e) => { e.stopPropagation(); handleDeleteSingleAsset('character', ver.id, char.id); }} className="p-0.5 text-gray-400 hover:text-red-500 rounded" title="删除版本"><Trash2 className="w-2.5 h-2.5" /></button>
+                                          {renderAssetThumbBadge('character', ver, char)}
                                         </div>
                                       </div>
                                     );
@@ -4475,7 +5407,12 @@ export function ProjectScriptBible({
                         {(assetFilter === 'all' || assetFilter === 'locations') && displayLocations.map((loc) => {
                           const isSelected = selectedAssetIds.has(loc.id);
                           const isHighlightActive = activeAssetHighlight?.id === loc.id && !activeAssetHighlight?.isVersion;
-                          const isAgentFocused = isTargetAgentFocused(`assets.item.location.${loc.id}`);
+                          const locTargetId = buildAssetAgentTargetId('location', loc.id);
+                          const isAgentFocused = isTargetAgentFocused(locTargetId);
+                          const locBorderMode = resolveSelectionBorderMode({
+                            isUserSelected: isSelected || isHighlightActive,
+                            isAgentFocused,
+                          });
                           const identText = getAssetIdentificationText('location', loc);
                           const versions: ScriptAssetVersion[] = Array.isArray(loc.versions) ? loc.versions : [];
                           const hasMultipleVersions = versions.length > 1;
@@ -4484,49 +5421,30 @@ export function ProjectScriptBible({
                             <div key={loc.id} className="flex flex-col">
                               <div
                                 data-asset-item="true"
-                                data-agent-target={`assets.item.location.${loc.id}`}
-                                onClick={(e) => {
-                                  if (isMultiSelectMode) {
-                                    toggleSelectAsset(loc.id);
-                                  } else {
-                                    handleSelectAssetHighlight('location', loc, e);
-                                  }
-                                }}
+                                data-asset-version="false"
+                                data-asset-id={loc.id}
+                                data-agent-target={locTargetId}
+                                data-selection-border-mode={locBorderMode}
+                                onClick={(e) => handleAssetRowClick(loc.id, 'location', loc, e)}
                                 onContextMenu={(e) => {
-                                  handleSelectAssetHighlight('location', loc, e, true);
+                                  handleOpenAssetContextMenu(e, 'location', loc);
                                 }}
-                                className={`w-full relative px-2.5 py-2.5 rounded-xl corner-squircle transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none active:scale-[0.985] active:brightness-95 ${
-                                  isAgentFocused
-                                    ? 'bg-purple-100/90 dark:bg-purple-900/50 text-purple-700 dark:text-purple-200 ring-2 ring-purple-500/70'
-                                    : isSelected || isHighlightActive
-                                      ? 'bg-blue-100/90 dark:bg-blue-900/60 text-blue-700 dark:text-blue-300 ring-1 ring-blue-500/40 active:bg-blue-200/90 dark:active:bg-blue-800/80'
-                                      : 'hover:bg-blue-100/80 dark:hover:bg-blue-900/50 text-gray-700 dark:text-neutral-200 hover:text-blue-700 dark:hover:text-blue-300 active:bg-blue-100/70 dark:active:bg-blue-900/40'
-                                }`}
+                                className={`w-full relative px-2.5 py-2.5 rounded-xl corner-squircle transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none active:scale-[0.985] active:brightness-95 ${getAssetRowBorderClasses(locBorderMode, false)}`}
                               >
+                                {renderAssetRowSelectionBorderOverlay(locBorderMode, false)}
                                 <div className="flex items-center gap-2 min-w-0 w-full flex-1 pr-1">
                                   <div className="w-4 h-4 flex items-center justify-center shrink-0">
-                                    {isMultiSelectMode ? (
-                                      <div
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          toggleSelectAsset(loc.id);
-                                        }}
-                                        className={`w-3.5 h-3.5 rounded-sm flex items-center justify-center cursor-pointer transition-colors ${
-                                          isSelected ? 'bg-blue-600 text-white' : 'bg-gray-200/80 dark:bg-neutral-700/80 text-transparent'
-                                        }`}
-                                      >
-                                        {isSelected && <Check className="w-3 h-3 text-white" />}
-                                      </div>
-                                    ) : (
+                                    
                                       <div className="text-emerald-500 flex items-center justify-center">
                                         <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
                                           <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/>
                                         </svg>
                                       </div>
-                                    )}
+                                    
                                   </div>
                                   <span className="text-xs font-bold shrink-0 max-w-[180px] truncate" title={loc.name}>{loc.name}</span>
                                   <span className="text-[11px] text-gray-400 dark:text-neutral-400 truncate min-w-0 flex-1" title={identText}>{identText}</span>
+                                  {renderAssetThumbBadge('location', loc)}
                                   {hasMultipleVersions && (
                                     <button
                                       type="button"
@@ -4539,49 +5457,38 @@ export function ProjectScriptBible({
                                     </button>
                                   )}
                                 </div>
-                                <div className="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto transition-opacity duration-150 bg-white/95 dark:bg-neutral-800/95 backdrop-blur-xs px-1.5 py-0.5 rounded-lg border border-gray-200/80 dark:border-neutral-700/80 shadow-xs z-10">
-                                  <button onClick={(e) => { e.stopPropagation(); handleOpenAddAsset('location', loc); }} className="p-1 text-gray-400 hover:text-blue-500 rounded" title="新增日景/夜景版本"><Plus className="w-3 h-3" /></button>
-                                  <button onClick={(e) => { e.stopPropagation(); handleViewAssetDetails('location', loc); }} className="p-1 text-gray-400 hover:text-blue-500 rounded" title="查看资产详情"><Eye className="w-3.5 h-3.5" /></button>
-                                  <button onClick={(e) => { e.stopPropagation(); handleOpenEditAsset('location', loc); }} className="p-1 text-gray-400 hover:text-blue-500 rounded" title="编辑资产"><Edit3 className="w-3 h-3" /></button>
-                                  <button onClick={(e) => { e.stopPropagation(); handleDeleteSingleAsset('location', loc.id); }} className="p-1 text-gray-400 hover:text-red-500 rounded" title="删除资产"><Trash2 className="w-3 h-3" /></button>
-                                </div>
                               </div>
                               {hasMultipleVersions && !isCollapsed && (
                                 <div className="ml-4 pl-2.5 border-l border-gray-200/80 dark:border-neutral-700/80 flex flex-col gap-1 mt-1 mb-1.5">
                                   {versions.map((ver) => {
                                     const verHighlight = activeAssetHighlight?.id === ver.id && Boolean(activeAssetHighlight?.isVersion);
-                                    const verFocused = isTargetAgentFocused(`assets.item.location.${ver.id}`);
+                                    const verTargetId = buildAssetAgentTargetId('location', ver.id, loc.id);
+                                    const verFocused = isTargetAgentFocused(verTargetId);
+                                    const verBorderMode = resolveSelectionBorderMode({
+                                      isUserSelected: verHighlight,
+                                      isAgentFocused: verFocused,
+                                    });
                                     const verIdent = getVersionIdentificationText('location', ver);
                                     return (
                                       <div
                                         key={ver.id}
                                         data-asset-item="true"
-                                        data-agent-target={`assets.item.location.${ver.id}`}
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          handleSelectAssetHighlight('location', ver, e, false, loc.name);
+                                      data-asset-version="true"
+                                      data-asset-id={ver.id}
+                                      data-agent-target={verTargetId}
+                                      data-selection-border-mode={verBorderMode}
+                                      onClick={(e) => handleAssetRowClick(ver.id, 'location', ver, e, false, loc.name)}
+                                      onContextMenu={(e) => {
+                                          handleOpenAssetContextMenu(e, 'location', ver, loc);
                                         }}
-                                        onContextMenu={(e) => {
-                                          e.stopPropagation();
-                                          handleSelectAssetHighlight('location', ver, e, true, loc.name);
-                                        }}
-                                        className={`w-full relative px-2 py-1.5 rounded-lg transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none ${
-                                          verFocused
-                                            ? 'bg-purple-100/90 dark:bg-purple-900/50 text-purple-700 dark:text-purple-200 ring-1 ring-purple-500/60'
-                                            : verHighlight
-                                              ? 'bg-blue-100/90 dark:bg-blue-900/60 text-blue-700 dark:text-blue-300 ring-1 ring-blue-500/40'
-                                              : 'hover:bg-blue-100/60 dark:hover:bg-blue-900/40 text-gray-600 dark:text-neutral-300'
-                                        }`}
+                                        className={`w-full relative px-2 py-1.5 rounded-lg transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none ${getAssetRowBorderClasses(verBorderMode, true)}`}
                                       >
+                                        {renderAssetRowSelectionBorderOverlay(verBorderMode, true)}
                                         <div className="flex items-center gap-1.5 min-w-0 w-full flex-1 pr-1">
                                           <span className="w-1.5 h-1.5 rounded-full bg-emerald-400/80 shrink-0" />
                                           <span className="text-[11px] font-bold shrink-0 truncate max-w-[120px]" title={ver.name}>{ver.name}</span>
                                           <span className="text-[11px] text-gray-400 dark:text-neutral-400 truncate min-w-0 flex-1" title={verIdent}>{verIdent}</span>
-                                        </div>
-                                        <div className="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto transition-opacity duration-150 bg-white/95 dark:bg-neutral-800/95 backdrop-blur-xs px-1 py-0.5 rounded-md border border-gray-200/80 dark:border-neutral-700/80 shadow-xs z-10">
-                                          <button onClick={(e) => { e.stopPropagation(); handleViewAssetDetails('location', ver, loc.name); }} className="p-0.5 text-gray-400 hover:text-blue-500 rounded" title="查看版本详情"><Eye className="w-3 h-3" /></button>
-                                          <button onClick={(e) => { e.stopPropagation(); handleOpenEditAsset('location', ver, loc); }} className="p-0.5 text-gray-400 hover:text-blue-500 rounded" title="编辑版本"><Edit3 className="w-2.5 h-2.5" /></button>
-                                          <button onClick={(e) => { e.stopPropagation(); handleDeleteSingleAsset('location', ver.id, loc.id); }} className="p-0.5 text-gray-400 hover:text-red-500 rounded" title="删除版本"><Trash2 className="w-2.5 h-2.5" /></button>
+                                          {renderAssetThumbBadge('location', ver, loc)}
                                         </div>
                                       </div>
                                     );
@@ -4595,7 +5502,12 @@ export function ProjectScriptBible({
                         {(assetFilter === 'all' || assetFilter === 'props') && displayProps.map((prop) => {
                           const isSelected = selectedAssetIds.has(prop.id);
                           const isHighlightActive = activeAssetHighlight?.id === prop.id && !activeAssetHighlight?.isVersion;
-                          const isAgentFocused = isTargetAgentFocused(`assets.item.prop.${prop.id}`);
+                          const propTargetId = buildAssetAgentTargetId('prop', prop.id);
+                          const isAgentFocused = isTargetAgentFocused(propTargetId);
+                          const propBorderMode = resolveSelectionBorderMode({
+                            isUserSelected: isSelected || isHighlightActive,
+                            isAgentFocused,
+                          });
                           const identText = getAssetIdentificationText('prop', prop);
                           const versions: ScriptAssetVersion[] = Array.isArray(prop.versions) ? prop.versions : [];
                           const hasMultipleVersions = versions.length > 1;
@@ -4604,49 +5516,30 @@ export function ProjectScriptBible({
                             <div key={prop.id} className="flex flex-col">
                               <div
                                 data-asset-item="true"
-                                data-agent-target={`assets.item.prop.${prop.id}`}
-                                onClick={(e) => {
-                                  if (isMultiSelectMode) {
-                                    toggleSelectAsset(prop.id);
-                                  } else {
-                                    handleSelectAssetHighlight('prop', prop, e);
-                                  }
-                                }}
+                                data-asset-version="false"
+                                data-asset-id={prop.id}
+                                data-agent-target={propTargetId}
+                                data-selection-border-mode={propBorderMode}
+                                onClick={(e) => handleAssetRowClick(prop.id, 'prop', prop, e)}
                                 onContextMenu={(e) => {
-                                  handleSelectAssetHighlight('prop', prop, e, true);
+                                  handleOpenAssetContextMenu(e, 'prop', prop);
                                 }}
-                                className={`w-full relative px-2.5 py-2.5 rounded-xl corner-squircle transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none active:scale-[0.985] active:brightness-95 ${
-                                  isAgentFocused
-                                    ? 'bg-purple-100/90 dark:bg-purple-900/50 text-purple-700 dark:text-purple-200 ring-2 ring-purple-500/70'
-                                    : isSelected || isHighlightActive
-                                      ? 'bg-blue-100/90 dark:bg-blue-900/60 text-blue-700 dark:text-blue-300 ring-1 ring-blue-500/40 active:bg-blue-200/90 dark:active:bg-blue-800/80'
-                                      : 'hover:bg-blue-100/80 dark:hover:bg-blue-900/50 text-gray-700 dark:text-neutral-200 hover:text-blue-700 dark:hover:text-blue-300 active:bg-blue-100/70 dark:active:bg-blue-900/40'
-                                }`}
+                                className={`w-full relative px-2.5 py-2.5 rounded-xl corner-squircle transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none active:scale-[0.985] active:brightness-95 ${getAssetRowBorderClasses(propBorderMode, false)}`}
                               >
+                                {renderAssetRowSelectionBorderOverlay(propBorderMode, false)}
                                 <div className="flex items-center gap-2 min-w-0 w-full flex-1 pr-1">
                                   <div className="w-4 h-4 flex items-center justify-center shrink-0">
-                                    {isMultiSelectMode ? (
-                                      <div
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          toggleSelectAsset(prop.id);
-                                        }}
-                                        className={`w-3.5 h-3.5 rounded-sm flex items-center justify-center cursor-pointer transition-colors ${
-                                          isSelected ? 'bg-blue-600 text-white' : 'bg-gray-200/80 dark:bg-neutral-700/80 text-transparent'
-                                        }`}
-                                      >
-                                        {isSelected && <Check className="w-3 h-3 text-white" />}
-                                      </div>
-                                    ) : (
+                                    
                                       <div className="text-amber-500 flex items-center justify-center">
                                         <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
                                           <path d="M21 16.5c0 .38-.21.71-.53.88l-7.9 4.44c-.16.09-.34.14-.57.14s-.41-.05-.57-.14l-7.9-4.44A1.003 1.003 0 013 16.5v-9c0-.38.21-.71.53-.88l7.9-4.44c.16-.09.34-.14.57-.14s.41.05.57.14l7.9 4.44c.32.17.53.5.53.88v9zM12 4.15L6.04 7.5 12 10.85 17.96 7.5 12 4.15zM5 15.91l6 3.38v-6.72L5 9.19v6.72zm14 0v-6.72l-6 3.38v6.72l6-3.38z"/>
                                         </svg>
                                       </div>
-                                    )}
+                                    
                                   </div>
                                   <span className="text-xs font-bold shrink-0 max-w-[180px] truncate" title={prop.name}>{prop.name}</span>
                                   <span className="text-[11px] text-gray-400 dark:text-neutral-400 truncate min-w-0 flex-1" title={identText}>{identText}</span>
+                                  {renderAssetThumbBadge('prop', prop)}
                                   {hasMultipleVersions && (
                                     <button
                                       type="button"
@@ -4659,49 +5552,38 @@ export function ProjectScriptBible({
                                     </button>
                                   )}
                                 </div>
-                                <div className="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto transition-opacity duration-150 bg-white/95 dark:bg-neutral-800/95 backdrop-blur-xs px-1.5 py-0.5 rounded-lg border border-gray-200/80 dark:border-neutral-700/80 shadow-xs z-10">
-                                  <button onClick={(e) => { e.stopPropagation(); handleOpenAddAsset('prop', prop); }} className="p-1 text-gray-400 hover:text-blue-500 rounded" title="新增道具状态版本"><Plus className="w-3 h-3" /></button>
-                                  <button onClick={(e) => { e.stopPropagation(); handleViewAssetDetails('prop', prop); }} className="p-1 text-gray-400 hover:text-blue-500 rounded" title="查看资产详情"><Eye className="w-3.5 h-3.5" /></button>
-                                  <button onClick={(e) => { e.stopPropagation(); handleOpenEditAsset('prop', prop); }} className="p-1 text-gray-400 hover:text-blue-500 rounded" title="编辑资产"><Edit3 className="w-3 h-3" /></button>
-                                  <button onClick={(e) => { e.stopPropagation(); handleDeleteSingleAsset('prop', prop.id); }} className="p-1 text-gray-400 hover:text-red-500 rounded" title="删除资产"><Trash2 className="w-3 h-3" /></button>
-                                </div>
                               </div>
                               {hasMultipleVersions && !isCollapsed && (
                                 <div className="ml-4 pl-2.5 border-l border-gray-200/80 dark:border-neutral-700/80 flex flex-col gap-1 mt-1 mb-1.5">
                                   {versions.map((ver) => {
                                     const verHighlight = activeAssetHighlight?.id === ver.id && Boolean(activeAssetHighlight?.isVersion);
-                                    const verFocused = isTargetAgentFocused(`assets.item.prop.${ver.id}`);
+                                    const verTargetId = buildAssetAgentTargetId('prop', ver.id, prop.id);
+                                    const verFocused = isTargetAgentFocused(verTargetId);
+                                    const verBorderMode = resolveSelectionBorderMode({
+                                      isUserSelected: verHighlight,
+                                      isAgentFocused: verFocused,
+                                    });
                                     const verIdent = getVersionIdentificationText('prop', ver);
                                     return (
                                       <div
                                         key={ver.id}
                                         data-asset-item="true"
-                                        data-agent-target={`assets.item.prop.${ver.id}`}
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          handleSelectAssetHighlight('prop', ver, e, false, prop.name);
+                                      data-asset-version="true"
+                                      data-asset-id={ver.id}
+                                      data-agent-target={verTargetId}
+                                      data-selection-border-mode={verBorderMode}
+                                      onClick={(e) => handleAssetRowClick(ver.id, 'prop', ver, e, false, prop.name)}
+                                      onContextMenu={(e) => {
+                                          handleOpenAssetContextMenu(e, 'prop', ver, prop);
                                         }}
-                                        onContextMenu={(e) => {
-                                          e.stopPropagation();
-                                          handleSelectAssetHighlight('prop', ver, e, true, prop.name);
-                                        }}
-                                        className={`w-full relative px-2 py-1.5 rounded-lg transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none ${
-                                          verFocused
-                                            ? 'bg-purple-100/90 dark:bg-purple-900/50 text-purple-700 dark:text-purple-200 ring-1 ring-purple-500/60'
-                                            : verHighlight
-                                              ? 'bg-blue-100/90 dark:bg-blue-900/60 text-blue-700 dark:text-blue-300 ring-1 ring-blue-500/40'
-                                              : 'hover:bg-blue-100/60 dark:hover:bg-blue-900/40 text-gray-600 dark:text-neutral-300'
-                                        }`}
+                                        className={`w-full relative px-2 py-1.5 rounded-lg transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none ${getAssetRowBorderClasses(verBorderMode, true)}`}
                                       >
+                                        {renderAssetRowSelectionBorderOverlay(verBorderMode, true)}
                                         <div className="flex items-center gap-1.5 min-w-0 w-full flex-1 pr-1">
                                           <span className="w-1.5 h-1.5 rounded-full bg-amber-400/80 shrink-0" />
                                           <span className="text-[11px] font-bold shrink-0 truncate max-w-[120px]" title={ver.name}>{ver.name}</span>
                                           <span className="text-[11px] text-gray-400 dark:text-neutral-400 truncate min-w-0 flex-1" title={verIdent}>{verIdent}</span>
-                                        </div>
-                                        <div className="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto transition-opacity duration-150 bg-white/95 dark:bg-neutral-800/95 backdrop-blur-xs px-1 py-0.5 rounded-md border border-gray-200/80 dark:border-neutral-700/80 shadow-xs z-10">
-                                          <button onClick={(e) => { e.stopPropagation(); handleViewAssetDetails('prop', ver, prop.name); }} className="p-0.5 text-gray-400 hover:text-blue-500 rounded" title="查看版本详情"><Eye className="w-3 h-3" /></button>
-                                          <button onClick={(e) => { e.stopPropagation(); handleOpenEditAsset('prop', ver, prop); }} className="p-0.5 text-gray-400 hover:text-blue-500 rounded" title="编辑版本"><Edit3 className="w-2.5 h-2.5" /></button>
-                                          <button onClick={(e) => { e.stopPropagation(); handleDeleteSingleAsset('prop', ver.id, prop.id); }} className="p-0.5 text-gray-400 hover:text-red-500 rounded" title="删除版本"><Trash2 className="w-2.5 h-2.5" /></button>
+                                          {renderAssetThumbBadge('prop', ver, prop)}
                                         </div>
                                       </div>
                                     );
@@ -4716,7 +5598,7 @@ export function ProjectScriptBible({
                   </div>
                 )}
 
-                {activeSidePanel === 'universe' && (
+                {visualDock.sidePanel === 'universe' && (
                       <div className="flex flex-col gap-3">
                         <div className="p-3 bg-white dark:bg-neutral-800 rounded-2xl border border-gray-200/60 dark:border-[#404040] space-y-2">
                           <div className="flex items-center gap-2 text-xs font-bold text-gray-900 dark:text-white">
@@ -4738,7 +5620,7 @@ export function ProjectScriptBible({
                       </div>
                     )}
 
-                    {activeSidePanel === 'cards' && (
+                    {visualDock.sidePanel === 'cards' && (
                       <div className="flex flex-col gap-2">
                         <div className="p-3 bg-white dark:bg-neutral-800 rounded-2xl border border-gray-200/60 dark:border-[#404040] flex items-center justify-between">
                           <span className="text-xs font-bold">卡片总数</span>
@@ -4764,30 +5646,75 @@ export function ProjectScriptBible({
               )}
             </motion.div>
           )}
+
+          {/* 卡片三: 右侧图片面板 Card */}
+          {activeTab === 'script' && (
+            <AssetImageFeedPanel
+              projectId={currentProject?.id}
+              layout={dockLayout.images}
+              sections={imageFeed.sections}
+              timelineCards={imageFeed.timelineCards}
+              totalBoundImages={imageFeed.totalBoundImages}
+              isCardsLoading={isCardsLoading}
+              activeAssetId={activeAssetHighlight?.id ?? null}
+              activeAssetIsVersion={Boolean(activeAssetHighlight?.isVersion)}
+              activeCategory={activeAssetHighlight?.category ?? null}
+              isHovered={hoveredMiniPanel === 'images'}
+              onMiniMouseEnter={() => handleMiniCardMouseEnter('images')}
+              onMiniMouseMove={(e) => handleMiniCardMouseMove(e, 'images')}
+              onMiniMouseLeave={() => handleMiniCardMouseLeave('images')}
+              onExpand={() => {
+                setHoveredMiniPanel((prev) => (prev === 'images' ? null : prev));
+                applyDockTransition({ imagesExpanded: true });
+              }}
+              onCollapse={() => {
+                setHoveredMiniPanel((prev) => (prev === 'images' ? null : prev));
+                applyDockTransition({ imagesExpanded: false });
+              }}
+              isWideMode={visualDock.imagesWide}
+              onToggleWideMode={handleToggleImagesWide}
+              widthTransition={widthTransitionPanels.images}
+              onSelectSection={handleSelectFeedSection}
+              onStartCanvasBind={onStartCanvasAssetBind ? handleStartCanvasBindFromSection : undefined}
+              onOpenBindModal={handleOpenBindModalFromSection}
+              onRequestAgentGenerate={handleRequestGenerateFromSection}
+              onSetPrimaryImage={handleSetPrimaryFeedImage}
+              onUnbindImage={handleUnbindFeedImage}
+              onFocusCanvasCard={onFocusCanvasCard ? handleFocusCanvasCardFromFeed : undefined}
+              agentFocusedTargetId={agentFocusedTargetId}
+              agentFocusedTargetIds={agentFocusedTargetIds}
+              onDropLocalFile={(section, file) => {
+                void handleDropLocalFileOnFeedSection(section, file);
+              }}
+              focusFeedAssetKey={focusFeedAssetKey}
+              verifyingOrGeneratingAssetIds={[...verifyingAssetIds, ...generatingAssetIds]}
+            />
+          )}
           </>
         )}
       </AnimatePresence>
       {/* Asset Detail Modal */}
-      {viewingAsset && viewingAsset.item && (
+      {liveViewingAsset && liveViewingAsset.item && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-xs p-4" onPointerDown={e => e.stopPropagation()}>
-          <div className="bg-white dark:bg-neutral-850 rounded-2xl shadow-2xl border border-gray-200 dark:border-neutral-700 w-full max-w-md p-4 space-y-3.5">
+          <div className="bg-white dark:bg-neutral-850 rounded-2xl shadow-2xl border border-gray-200 dark:border-neutral-700 w-full max-w-md p-4 space-y-3.5 max-h-[85vh] overflow-y-auto">
             <div className="flex items-center justify-between pb-2 border-b border-gray-100 dark:border-neutral-750">
               <div className="flex items-center gap-2">
                 <span className={`px-2 py-0.5 rounded-md text-[10px] font-bold ${
-                  viewingAsset.category === 'character' ? 'bg-blue-100 dark:bg-blue-950 text-blue-600 dark:text-blue-400' :
-                  viewingAsset.category === 'location' ? 'bg-emerald-100 dark:bg-emerald-950 text-emerald-600 dark:text-emerald-400' :
+                  liveViewingAsset.category === 'character' ? 'bg-blue-100 dark:bg-blue-950 text-blue-600 dark:text-blue-400' :
+                  liveViewingAsset.category === 'location' ? 'bg-emerald-100 dark:bg-emerald-950 text-emerald-600 dark:text-emerald-400' :
                   'bg-amber-100 dark:bg-amber-950 text-amber-600 dark:text-amber-400'
                 }`}>
-                  {viewingAsset.category === 'character' ? '角色' : viewingAsset.category === 'location' ? '场景' : '道具'}
+                  {liveViewingAsset.category === 'character' ? '角色' : liveViewingAsset.category === 'location' ? '场景' : '道具'}
                 </span>
                 <h3 className="text-sm font-bold text-gray-900 dark:text-neutral-100">
-                  {viewingAsset.parentName ? `${viewingAsset.parentName} · ${viewingAsset.item.name}` : viewingAsset.item.name}
+                  {liveViewingAsset.parentName ? `${liveViewingAsset.parentName} · ${liveViewingAsset.item.name}` : liveViewingAsset.item.name}
                 </h3>
               </div>
               <button
                 type="button"
                 onClick={() => setViewingAsset(null)}
-                className="text-gray-400 hover:text-gray-600 dark:hover:text-neutral-300 p-1 rounded-lg"
+                aria-label="关闭资产详情"
+                className="text-gray-400 hover:text-gray-600 dark:hover:text-neutral-300 p-1 rounded-lg cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -4795,54 +5722,183 @@ export function ProjectScriptBible({
 
             {/* Details Content */}
             <div className="space-y-3 text-xs">
+              {/* Bound Images Strip */}
+              {(() => {
+                const boundImgs = resolveAssetImageEntries(liveViewingAsset.item, cardsById);
+                return (
+                  <div className="p-2.5 bg-gray-50 dark:bg-neutral-800 rounded-xl space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] font-semibold text-gray-400 dark:text-neutral-500 uppercase tracking-wider">
+                        资产图（{boundImgs.length}）
+                      </span>
+                      <div className="flex flex-wrap items-center gap-1.5 justify-end">
+                        {onStartCanvasAssetBind && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const targetInfo = buildAssetBindPickerTarget({
+                                category: liveViewingAsset.category,
+                                item: liveViewingAsset.item,
+                                parentItem: liveViewingAsset.parentItem,
+                              });
+                              setViewingAsset(null);
+                              onStartCanvasAssetBind(targetInfo);
+                            }}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-semibold bg-white dark:bg-neutral-700 text-blue-600 dark:text-blue-300 border border-blue-200 dark:border-blue-800 hover:bg-blue-50 cursor-pointer"
+                          >
+                            <MousePointerClick className="w-3 h-3" />
+                            <span>从画布绑定</span>
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setBindImageModalTarget({
+                              category: liveViewingAsset.category,
+                              item: liveViewingAsset.item,
+                              parentItem: liveViewingAsset.parentItem,
+                            });
+                          }}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-semibold bg-white dark:bg-neutral-700 text-blue-600 dark:text-blue-300 border border-blue-200 dark:border-blue-800 hover:bg-blue-50 cursor-pointer"
+                        >
+                          <ImagePlus className="w-3 h-3" />
+                          <span>列表或本地上传绑定</span>
+                        </button>
+                        {onRequestGenerateAssetImage && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              applyDockTransition({ imagesExpanded: true });
+                              onRequestGenerateAssetImage(
+                                liveViewingAsset.category,
+                                liveViewingAsset.item,
+                                liveViewingAsset.parentItem
+                              );
+                            }}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-semibold bg-purple-600 text-white hover:bg-purple-500 cursor-pointer"
+                          >
+                            <Sparkles className="w-3 h-3" />
+                            <span>生成绑定</span>
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    {boundImgs.length > 0 ? (
+                      <div className="grid grid-cols-3 gap-2">
+                        {boundImgs.map((img) => {
+                          const src = img.originalImageUrl || img.imageUrl || img.thumbnailUrl;
+                          const assetFullTitle = liveViewingAsset.parentName
+                            ? `${liveViewingAsset.parentName} · ${liveViewingAsset.item.name}`
+                            : liveViewingAsset.item.name;
+                          return (
+                            <button
+                              key={img.id}
+                              type="button"
+                              data-lightbox-source-id={`detail:${img.id}`}
+                              onClick={(e) => {
+                                if (src) {
+                                  const imgEl = e.currentTarget.querySelector('img') as HTMLImageElement | null;
+                                  const rectSource = (imgEl || e.currentTarget).getBoundingClientRect();
+                                  const naturalRatio =
+                                    imgEl && imgEl.naturalWidth > 0 && imgEl.naturalHeight > 0
+                                      ? imgEl.naturalWidth / imgEl.naturalHeight
+                                      : rectSource.width > 0 && rectSource.height > 0
+                                        ? rectSource.width / rectSource.height
+                                        : undefined;
+                                  setDetailModalLightboxImage({
+                                    src,
+                                    title: img.label || assetFullTitle,
+                                    subtitle: img.ratio ? `${assetFullTitle} · ${img.ratio}` : assetFullTitle,
+                                    originRect: {
+                                      left: rectSource.left,
+                                      top: rectSource.top,
+                                      width: rectSource.width,
+                                      height: rectSource.height,
+                                    },
+                                    aspectRatio: naturalRatio,
+                                    cardBorderRadius: 8,
+                                    sourceId: `detail:${img.id}`,
+                                  });
+                                }
+                              }}
+                              aria-label={`全屏查看 ${img.label || assetFullTitle}`}
+                              className={`relative rounded-lg overflow-hidden border bg-white dark:bg-neutral-900 cursor-pointer group ${
+                                img.isPrimary ? 'border-amber-400 ring-1 ring-amber-400/50' : 'border-gray-200 dark:border-neutral-700'
+                              }`}
+                            >
+                              <div className="h-16 w-full flex items-center justify-center bg-gray-100 dark:bg-neutral-900 overflow-hidden">
+                                {src ? (
+                                  <img src={src} alt={img.label || liveViewingAsset.item.name} className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-150" />
+                                ) : (
+                                  <ImageIcon className="w-4 h-4 text-gray-400" />
+                                )}
+                              </div>
+                              {img.isPrimary && (
+                                <span className="absolute top-1 left-1 px-1 py-0.2 rounded text-[9px] font-bold bg-amber-500 text-white">
+                                  主图
+                                </span>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <div className="text-[11px] text-gray-400 dark:text-neutral-500">
+                        暂未绑定资产图
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
               {/* Identification Description */}
               <div className="p-2.5 bg-gray-50 dark:bg-neutral-800 rounded-xl space-y-1">
                 <div className="text-[10px] font-semibold text-gray-400 dark:text-neutral-500 uppercase tracking-wider">
                   资产识别描述（首次出场 · 归属 · 防混淆特征）
                 </div>
                 <div className="text-xs font-medium text-gray-800 dark:text-neutral-200 leading-relaxed">
-                  {viewingAsset.parentName
-                    ? getVersionIdentificationText(viewingAsset.category, viewingAsset.item) || '未填写版本识别描述'
-                    : getAssetIdentificationText(viewingAsset.category, viewingAsset.item) || '未填写资产识别描述'}
+                  {liveViewingAsset.parentName
+                    ? getVersionIdentificationText(liveViewingAsset.category, liveViewingAsset.item) || '未填写版本识别描述'
+                    : getAssetIdentificationText(liveViewingAsset.category, liveViewingAsset.item) || '未填写资产识别描述'}
                 </div>
               </div>
 
               {/* Subtitle / Role / Type */}
               <div className="p-2.5 bg-gray-50 dark:bg-neutral-800 rounded-xl space-y-1">
                 <div className="text-[10px] font-semibold text-gray-400 dark:text-neutral-500 uppercase tracking-wider">
-                  {viewingAsset.category === 'character' ? '角色身份与设定' : viewingAsset.category === 'location' ? '场景类型与时段' : '持有者/所属人'}
+                  {liveViewingAsset.category === 'character' ? '角色身份与设定' : liveViewingAsset.category === 'location' ? '场景类型与时段' : '持有者/所属人'}
                 </div>
                 <div className="text-xs font-medium text-gray-800 dark:text-neutral-200">
-                  {viewingAsset.category === 'character' ? (viewingAsset.item.role || '主要角色') :
-                   viewingAsset.category === 'location' ? `${viewingAsset.item.type || 'INT'} · ${viewingAsset.item.timeOfDay || '日'}` :
-                   (viewingAsset.item.owner || '未知')}
+                  {liveViewingAsset.category === 'character' ? (liveViewingAsset.item.role || '主要角色') :
+                   liveViewingAsset.category === 'location' ? `${liveViewingAsset.item.type || 'INT'} · ${liveViewingAsset.item.timeOfDay || '日'}` :
+                   (liveViewingAsset.item.owner || '未知')}
                 </div>
               </div>
 
               {/* Main Description */}
               <div className="p-2.5 bg-gray-50 dark:bg-neutral-800 rounded-xl space-y-1">
                 <div className="text-[10px] font-semibold text-gray-400 dark:text-neutral-500 uppercase tracking-wider">
-                  {viewingAsset.category === 'character' ? '外貌与衣着特征' : viewingAsset.category === 'location' ? '空间氛围与光影影调' : '材质与物理状态'}
+                  {liveViewingAsset.category === 'character' ? '外貌与衣着特征' : liveViewingAsset.category === 'location' ? '空间氛围与光影影调' : '材质与物理状态'}
                 </div>
                 <div className="text-xs leading-relaxed text-gray-700 dark:text-neutral-300">
-                  {viewingAsset.category === 'character' ? (viewingAsset.item.appearance || '无具体特征描述') :
-                   viewingAsset.category === 'location' ? (viewingAsset.item.atmosphere || '无空间氛围描述') :
-                   (viewingAsset.item.materialAndState || '无材质说明')}
+                  {liveViewingAsset.category === 'character' ? (liveViewingAsset.item.appearance || '无具体特征描述') :
+                   liveViewingAsset.category === 'location' ? (liveViewingAsset.item.atmosphere || '无空间氛围描述') :
+                   (liveViewingAsset.item.materialAndState || '无材质说明')}
                 </div>
               </div>
 
               {/* Versions list if present */}
-              {Array.isArray(viewingAsset.item.versions) && viewingAsset.item.versions.length > 0 && (
+              {Array.isArray(liveViewingAsset.item.versions) && liveViewingAsset.item.versions.length > 0 && (
                 <div className="p-2.5 bg-gray-50 dark:bg-neutral-800 rounded-xl space-y-1.5">
                   <div className="text-[10px] font-semibold text-gray-400 dark:text-neutral-500 uppercase tracking-wider">
-                    多版本列表（{viewingAsset.item.versions.length} 个版本）
+                    多版本列表（{liveViewingAsset.item.versions.length} 个版本）
                   </div>
                   <div className="flex flex-col gap-1">
-                    {viewingAsset.item.versions.map((ver: ScriptAssetVersion) => (
+                    {liveViewingAsset.item.versions.map((ver: ScriptAssetVersion) => (
                       <div key={ver.id} className="text-xs flex items-center gap-2 text-gray-700 dark:text-neutral-300">
                         <span className="font-bold text-gray-900 dark:text-neutral-100 shrink-0">{ver.name}</span>
                         <span className="text-[11px] text-gray-400 dark:text-neutral-400 truncate">
-                          {getVersionIdentificationText(viewingAsset.category, ver)}
+                          {getVersionIdentificationText(liveViewingAsset.category, ver)}
                         </span>
                       </div>
                     ))}
@@ -4851,13 +5907,13 @@ export function ProjectScriptBible({
               )}
 
               {/* Secondary Details if present */}
-              {(viewingAsset.item.age || viewingAsset.item.visualDetails || viewingAsset.item.storySignificance) && (
+              {(liveViewingAsset.item.age || liveViewingAsset.item.visualDetails || liveViewingAsset.item.storySignificance) && (
                 <div className="p-2.5 bg-gray-50 dark:bg-neutral-800 rounded-xl space-y-1">
                   <div className="text-[10px] font-semibold text-gray-400 dark:text-neutral-500 uppercase tracking-wider">
-                    {viewingAsset.category === 'character' ? '年龄与附加说明' : viewingAsset.category === 'location' ? '建筑与环境细节' : '剧情关键因素'}
+                    {liveViewingAsset.category === 'character' ? '年龄与附加说明' : liveViewingAsset.category === 'location' ? '建筑与环境细节' : '剧情关键因素'}
                   </div>
                   <div className="text-xs text-gray-700 dark:text-neutral-300">
-                    {viewingAsset.item.age || viewingAsset.item.visualDetails || viewingAsset.item.storySignificance}
+                    {liveViewingAsset.item.age || liveViewingAsset.item.visualDetails || liveViewingAsset.item.storySignificance}
                   </div>
                 </div>
               )}
@@ -4868,11 +5924,11 @@ export function ProjectScriptBible({
                   <span>AI 视觉 Prompt 提示词</span>
                   <button
                     type="button"
-                    onClick={() => handleCopyText(getViewingAssetPrompt, viewingAsset.item.id)}
-                    className="flex items-center gap-1 text-blue-400 hover:text-blue-300 transition-colors"
+                    onClick={() => handleCopyText(getViewingAssetPrompt, liveViewingAsset.item.id)}
+                    className="flex items-center gap-1 text-blue-400 hover:text-blue-300 transition-colors cursor-pointer"
                   >
-                    {copiedId === viewingAsset.item.id ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
-                    <span>{copiedId === viewingAsset.item.id ? '已复制' : '复制提示词'}</span>
+                    {copiedId === liveViewingAsset.item.id ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                    <span>{copiedId === liveViewingAsset.item.id ? '已复制' : '复制提示词'}</span>
                   </button>
                 </div>
                 <div className="text-[11px] font-mono leading-relaxed text-neutral-300 break-words opacity-90">
@@ -4886,11 +5942,11 @@ export function ProjectScriptBible({
               <button
                 type="button"
                 onClick={() => {
-                  const { category, item } = viewingAsset;
+                  const { category, item, parentItem } = liveViewingAsset;
                   setViewingAsset(null);
-                  handleOpenEditAsset(category, item);
+                  handleOpenEditAsset(category, item, parentItem);
                 }}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/60 hover:bg-blue-100 dark:hover:bg-blue-900 transition-colors"
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/60 hover:bg-blue-100 dark:hover:bg-blue-900 transition-colors cursor-pointer"
               >
                 <Edit3 className="w-3.5 h-3.5" />
                 <span>编辑资产</span>
@@ -4898,7 +5954,7 @@ export function ProjectScriptBible({
               <button
                 type="button"
                 onClick={() => setViewingAsset(null)}
-                className="px-4 py-1.5 rounded-xl text-xs font-semibold bg-gray-100 dark:bg-neutral-800 text-gray-700 dark:text-neutral-300 hover:bg-gray-200 dark:hover:bg-neutral-700 transition-colors"
+                className="px-4 py-1.5 rounded-xl text-xs font-semibold bg-gray-100 dark:bg-neutral-800 text-gray-700 dark:text-neutral-300 hover:bg-gray-200 dark:hover:bg-neutral-700 transition-colors cursor-pointer"
               >
                 关闭
               </button>
@@ -5080,6 +6136,68 @@ export function ProjectScriptBible({
           </div>
         </div>
       )}
+
+      {assetContextMenu && (
+        <AssetItemContextMenu
+          isOpen={assetContextMenu.isOpen}
+          x={assetContextMenu.x}
+          y={assetContextMenu.y}
+          category={assetContextMenu.category}
+          itemName={assetContextMenu.item?.name}
+          parentName={assetContextMenu.parentItem?.name}
+          isVersion={Boolean(assetContextMenu.parentItem)}
+          cascadeBelowAgentHud={!isAgentSleeping}
+          onAction={(action: AssetContextMenuActionId) => {
+            const { category, item, parentItem } = assetContextMenu;
+            if (action === 'add-version' && !parentItem) {
+              handleOpenAddAsset(category, item);
+            } else if (action === 'view') {
+              handleViewAssetDetails(category, item, parentItem?.name);
+            } else if (action === 'edit') {
+              handleOpenEditAsset(category, item, parentItem);
+            } else if (action === 'bind-image') {
+              setBindImageModalTarget({ category, item, parentItem });
+            } else if (action === 'agent-generate-image') {
+              applyDockTransition({ imagesExpanded: true });
+              onRequestGenerateAssetImage?.(category, item, parentItem);
+            } else if (action === 'delete') {
+              handleDeleteSingleAsset(category, item.id, parentItem?.id);
+            }
+          }}
+          onClose={handleCloseAssetContextMenu}
+        />
+      )}
+
+      {liveBindImageModalTarget && (
+        <div data-image-bind-modal="true">
+          <AssetBindImageModal
+            isOpen={Boolean(liveBindImageModalTarget)}
+            target={liveBindImageModalTarget}
+            cards={cards || []}
+            onClose={() => setBindImageModalTarget(null)}
+            onBindCanvasCard={(params) => {
+              handleBindCanvasCardToSection(
+                liveBindImageModalTarget.category,
+                liveBindImageModalTarget.item.id,
+                liveBindImageModalTarget.parentItem?.id,
+                params
+              );
+            }}
+            onBindUploadedImage={(params) => {
+              handleBindUploadedImageToSection(
+                liveBindImageModalTarget.category,
+                liveBindImageModalTarget.item.id,
+                liveBindImageModalTarget.parentItem?.id,
+                params
+              );
+            }}
+          />
+        </div>
+      )}
+      <FullscreenImageLightbox
+        image={detailModalLightboxImage}
+        onClose={() => setDetailModalLightboxImage(null)}
+      />
     </>
   );
 }

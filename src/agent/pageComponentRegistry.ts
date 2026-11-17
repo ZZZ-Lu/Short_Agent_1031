@@ -40,7 +40,7 @@ export const PAGE_COMPONENT_REGISTRY: PageComponentDefinition[] = [
   { id: 'assets.extract.all', label: '资产-一键提取所有资产', location: '资产清单面板', description: '从剧本正文一键提取所有资产。', actions: ['mouse.move', 'mouse.click', 'mouse.hover'] },
   { id: 'assets.item.*', label: '资产条目', location: '资产清单面板', description: '某个具体的资产条目。', actions: ['mouse.move', 'mouse.click', 'mouse.hover'] },
   { id: 'assets.item.*.copy', label: '资产条目-复制提示词', location: '资产清单面板', description: '复制出图提示词。', actions: ['mouse.move', 'mouse.click', 'mouse.hover'] },
-  { id: 'assets.item.*.generate', label: '资产条目-生成图片', location: '资产清单面板', description: '定妆生成或环境生成。', actions: ['mouse.move', 'mouse.click', 'mouse.hover'] },
+  { id: 'assets.item.*.generate', label: '资产条目-生成图片', location: '资产清单面板', description: '资产图生成或环境生成。', actions: ['mouse.move', 'mouse.click', 'mouse.hover'] },
   { id: 'assets.empty.state', label: '资产空状态提示', location: '资产清单面板', description: '提示当前暂无资产条目，需点击一键提取按钮。', actions: ['mouse.hover'] },
   { id: 'script.view.universe', label: '画面风格标签', location: '剧本面板顶部', description: '切换到画面风格。', actions: ['mouse.move', 'mouse.click', 'mouse.hover'] },
   { id: 'script.view.cards', label: '卡片管理标签', location: '剧本面板顶部', description: '切换到卡片管理。', actions: ['mouse.move', 'mouse.click', 'mouse.hover'] },

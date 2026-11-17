@@ -27,6 +27,21 @@ test('Level 0 and Level 1 prompt templates share identical static header and are
 
   assert.ok(planningHeader.length >= 550, 'Shared header should exceed 4x64-token cache blocks');
   assert.equal(planningHeader, executionHeader, 'L0 and L1 shared header must be byte-for-byte identical');
+
+  assert.ok(planning.includes('前置环节：意图识别'));
+  assert.ok(planning.includes('路径 A') && planning.includes('路径 B') && planning.includes('路径 C'));
+  assert.equal(isObsoletePromptText('0. 检索同类任务经验（初次规划必做）：收到新任务'), true);
+  assert.equal(isObsoletePromptText('"title": "...若仅完成前置读取、读取失败或读错场次则保持为 pending", "status": "completed | pending"'), true);
+  assert.equal(
+    isObsoletePromptText('仅在调用 sys.endTask 结案汇报、调用 user.ask 向用户提问或无需调工具直接回复时，同时输出“- 对用户说的话（简版）”与“- 对用户说的话（完整版）”'),
+    true
+  );
+
+  // Lexical Isolation Guard: Level 1 execution prompt must NEVER contain 0-level-only tool identifiers
+  assert.equal(execution.includes('sys.endTask'), false, 'Level 1 prompt must not leak sys.endTask');
+  assert.equal(execution.includes('experience.search'), false, 'Level 1 prompt must not leak experience.search');
+  assert.ok(execution.includes('纯只读核验已完成'), 'Level 1 prompt must include explicit exit routing for read-only verification tasks');
+  assert.equal(planning.includes('[ ] 3. 全局验收结案'), false, 'Level 0 plan template must not inject 0-level closure steps into taskPlan');
 });
 
 test('splitPromptForPrefixCache cleanly separates static system prefix from dynamic user suffix', () => {

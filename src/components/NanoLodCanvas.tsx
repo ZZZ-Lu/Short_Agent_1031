@@ -501,10 +501,9 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     const vpBottom = (height - currentTy) / currentScale;
 
     // Color constants matching Nano-LOD design (sharp straight edges / no border radius)
-    // Matches DOM bg-gray-100 (#f3f4f6) and dark:bg-neutral-800 (#262626)
-    const colorGenerating = dark ? '#262626' : '#f3f4f6';
-    const colorMedia = dark ? '#262626' : '#f3f4f6';
-    const colorDraft = dark ? '#262626' : '#f3f4f6';
+    const colorGenerating = dark ? '#262626' : '#e5e7eb';
+    const colorMedia = dark ? '#262626' : '#d4d4d8';
+    const colorDraft = dark ? '#262626' : '#e5e7eb';
 
     const borderNormal = dark ? 'rgba(64, 64, 64, 0.85)' : 'rgba(212, 212, 216, 0.85)';
     const borderSelected = '#3b82f6';
@@ -638,16 +637,21 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       }
 
       if (transitionState.alpha !== targetAlpha) {
-        const elapsed = now - transitionState.startTime;
-        const duration = 500; // Exact 500ms smooth cross-fade duration as requested
-        const progress = Math.min(1, elapsed / duration);
-        // Smooth quadratic ease-out curve
-        const eased = 1 - Math.pow(1 - progress, 2);
-        transitionState.alpha = transitionState.startAlpha + (targetAlpha - transitionState.startAlpha) * eased;
-        if (progress < 1) {
-          scheduleDraw();
+        if (currentScale < getNanoLodThreshold()) {
+          // When zooming out to Nano LOD, immediately snap alpha to 1 so there is no transparent flash when DOM cards retire!
+          transitionState.alpha = 1;
         } else {
-          transitionState.alpha = targetAlpha;
+          const elapsed = now - transitionState.startTime;
+          const duration = 250;
+          const progress = Math.min(1, elapsed / duration);
+          // Smooth quadratic ease-out curve
+          const eased = 1 - Math.pow(1 - progress, 2);
+          transitionState.alpha = transitionState.startAlpha + (targetAlpha - transitionState.startAlpha) * eased;
+          if (progress < 1) {
+            scheduleDraw();
+          } else {
+            transitionState.alpha = targetAlpha;
+          }
         }
       }
 

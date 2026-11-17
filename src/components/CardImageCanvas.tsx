@@ -3,7 +3,7 @@ import {
   getOrLoadCanvasImage,
   calculateObjectCover,
 } from '../utils/imageTextureCache';
-import { getOrLoadThumbImage } from '../utils/thumbnail';
+import { getOrLoadThumbImage, thumbCache, thumbImageCache } from '../utils/thumbnail';
 import { capDprToBudget } from '../utils/devicePixelBudget';
 import { cardOutline } from '../utils/cardLodAppearance';
 
@@ -185,10 +185,20 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     ctx.imageSmoothingQuality = isGestureActive ? 'low' : 'high';
 
     // 1. Check loaded states for Placeholder (prefer pre-baked blur), Micro, Full, and Original
-    const placeholderUrl = blurPlaceholderUrl || thumbnailUrl;
-    const placeholderImg = placeholderUrl
-      ? getOrLoadThumbImage(placeholderUrl, scheduleDraw)
+    const effectiveThumbUrl =
+      thumbnailUrl ||
+      blurPlaceholderUrl ||
+      (cardId ? thumbCache.get(cardId) : undefined) ||
+      (imageUrl ? thumbCache.get(imageUrl) : undefined);
+
+    const placeholderImg = effectiveThumbUrl
+      ? getOrLoadThumbImage(effectiveThumbUrl, scheduleDraw)
       : null;
+
+    // Direct synchronous check from thumbImageCache for zero-lag paint
+    const cachedThumbImg = effectiveThumbUrl
+      ? thumbImageCache.get(effectiveThumbUrl)
+      : (cardId ? thumbImageCache.get(thumbCache.get(cardId) || '') : null);
 
     // Always initiate loading for the full-resolution preview image
     const fullImg = imageUrl
@@ -215,6 +225,9 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     };
 
     const fullImgReady = Boolean(fullImg && fullImg.complete && fullImg.naturalWidth > 0);
+    const thumbReadyImg = (placeholderImg && placeholderImg.complete && placeholderImg.naturalWidth > 0)
+      ? placeholderImg
+      : (cachedThumbImg && cachedThumbImg.complete && cachedThumbImg.naturalWidth > 0 ? cachedThumbImg : null);
 
     // Track image URL transition for seamless double-buffered image switching
     if (imageUrl && imageUrl !== lastLoadedUrlRef.current) {
@@ -230,11 +243,11 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
       }
     }
 
-    // 2. Base / Underlay Rendering (Keep rendering previous image at 100% opacity while new image loads)
+    // 2. Base / Underlay Rendering (Keep rendering previous image or instant thumbnail placeholder while full image loads)
     if (!fullImgReady && !transitionRef.current && prevImgRef.current?.img) {
       drawCover(prevImgRef.current.img, 1);
-    } else if (!fullImgReady && placeholderImg && placeholderImg.complete && placeholderImg.naturalWidth > 0) {
-      drawCover(placeholderImg, 1);
+    } else if (!fullImgReady && thumbReadyImg) {
+      drawCover(thumbReadyImg, 1);
     }
 
     // 3. New Image Rendering (Bottom Layer - 100% Opaque)
@@ -389,7 +402,11 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     };
   }, []);
 
-  const fallbackBgUrl = blurPlaceholderUrl || thumbnailUrl || imageUrl;
+  const fallbackBgUrl =
+    thumbnailUrl ||
+    blurPlaceholderUrl ||
+    (cardId ? thumbCache.get(cardId) : undefined) ||
+    imageUrl;
 
   return (
     <canvas

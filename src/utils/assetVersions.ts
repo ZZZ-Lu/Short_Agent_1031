@@ -213,6 +213,7 @@ export function normalizeAssetVersions(
     if (Array.isArray(v.verifiedProvenance)) verObj.verifiedProvenance = v.verifiedProvenance;
     if (typeof v.verifiedScriptHash === 'string') verObj.verifiedScriptHash = v.verifiedScriptHash;
     if (typeof v.referenceImage === 'string') verObj.referenceImage = v.referenceImage;
+    if (Array.isArray(v.images) && v.images.length) verObj.images = v.images.map((img: any) => ({ ...img }));
 
     result.push(verObj);
   });
@@ -323,6 +324,7 @@ export function itemToVersion(type: AssetCollectionType, item: Record<string, an
   if (Array.isArray(item.verifiedProvenance)) ver.verifiedProvenance = item.verifiedProvenance;
   if (typeof item.verifiedScriptHash === 'string') ver.verifiedScriptHash = item.verifiedScriptHash;
   if (typeof item.referenceImage === 'string') ver.referenceImage = item.referenceImage;
+  if (Array.isArray(item.images) && item.images.length) ver.images = item.images.map((img: any) => ({ ...img }));
   return ver;
 }
 
@@ -393,7 +395,9 @@ export function mergeMultiVersionAssetList<T extends Record<string, any>>(
   type: AssetCollectionType,
   items: T[]
 ): T[] {
-  const preNormalized = ensureInitialVersionWhenSingleVariant(type, items);
+  if (!Array.isArray(items)) return [];
+  const safeItems = items.some((i) => !i) ? items.filter(Boolean) : items;
+  const preNormalized = ensureInitialVersionWhenSingleVariant(type, safeItems);
   if (!Array.isArray(preNormalized) || preNormalized.length <= 1) return preNormalized;
 
   // Count how many items map to each candidate baseName

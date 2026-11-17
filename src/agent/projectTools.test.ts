@@ -1688,3 +1688,86 @@ test('同名场次（如两个 1-5）在 script.directory 中自动标出唯一 
   assert.equal(batch2.episodes[0].scenes[0].id, manorSceneId);
   assert.ok(batch2.charCount <= 2500);
 });
+
+test('asset.bindImage 工具支持为主资产与二级版本绑定、设为主图、列举和解绑画布卡片', () => {
+  let proj: ProjectData = {
+    id: 'p_bind',
+    scriptText: '',
+    characters: [
+      {
+        id: 'char_natalya',
+        name: '娜塔莉亚',
+        role: '女主',
+        versions: [
+          { id: 'char_natalya', name: '常服' },
+          { id: 'char_natalya_gown', name: '晨曦礼服' },
+        ],
+      },
+    ],
+    locations: [],
+    props: [],
+  };
+
+  const liveCards = [
+    { id: 'card_portrait_1', fileName: '常服立绘', imageUrl: 'https://img.example/1.png', prompt: '常服正视图', state: 'completed' },
+    { id: 'card_gown_2', fileName: '晨曦礼服资产图', imageUrl: 'https://img.example/2.png', prompt: '白色晨曦礼服', state: 'completed' },
+  ];
+
+  // 1. Bind card_portrait_1 to top-level character (should sync to versions[0] too since id matches)
+  const res1 = executeProjectAssetMutation('asset.bindImage', {
+    id: 'char_natalya',
+    cardId: 'canvas.card.card_portrait_1',
+    label: '常服资产图',
+  }, proj, liveCards);
+  assert.equal(res1.output.success, true);
+  assert.equal(res1.output.imageCount, 1);
+  proj = { ...proj, ...res1.updatedProject };
+  assert.equal(proj.characters[0].images?.length, 1);
+  assert.equal(proj.characters[0].versions[0].images?.length, 1);
+  assert.equal(proj.characters[0].referenceImage, 'https://img.example/1.png');
+
+  // 2. Bind two images to sub-version char_natalya_gown and switch primary
+  const res2 = executeProjectAssetMutation('asset.bindImage', {
+    assetId: 'char_natalya_gown',
+    cardId: 'card_gown_2',
+    label: '礼服初稿',
+  }, proj, liveCards);
+  proj = { ...proj, ...res2.updatedProject };
+
+  const res3 = executeProjectAssetMutation('asset.bindImage', {
+    assetId: 'char_natalya_gown',
+    imageUrl: 'data:image/jpeg;base64,abc',
+    label: '礼服高清修图',
+    setPrimary: false,
+  }, proj, liveCards);
+  proj = { ...proj, ...res3.updatedProject };
+  assert.equal(proj.characters[0].versions[1].images?.length, 2);
+  const secondImgId = (res3.output.images as any[]).find(img => img.label === '礼服高清修图').id;
+
+  const setPrimaryRes = executeProjectAssetMutation('asset.bindImage', {
+    id: 'char_natalya_gown',
+    action: 'setPrimary',
+    imageId: secondImgId,
+  }, proj, liveCards);
+  proj = { ...proj, ...setPrimaryRes.updatedProject };
+  assert.equal(setPrimaryRes.output.primaryImageId, secondImgId);
+  assert.equal(proj.characters[0].versions[1].referenceImage, 'data:image/jpeg;base64,abc');
+
+  // 3. List bound images
+  const listRes = executeProjectAssetMutation('asset.bindImage', {
+    id: 'char_natalya_gown',
+    action: 'list',
+  }, proj, liveCards);
+  assert.equal(listRes.output.imageCount, 2);
+
+  // 4. Unbind by cardId
+  const unbindRes = executeProjectAssetMutation('asset.bindImage', {
+    id: 'char_natalya_gown',
+    action: 'unbind',
+    cardId: 'card_gown_2',
+  }, proj, liveCards);
+  proj = { ...proj, ...unbindRes.updatedProject };
+  assert.equal(unbindRes.output.imageCount, 1);
+  assert.equal(proj.characters[0].versions[1].images?.length, 1);
+});
+

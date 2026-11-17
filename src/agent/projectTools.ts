@@ -21,6 +21,14 @@ import {
   getDefaultAssetVersionName,
   isSameInitialVersionLook,
 } from '../utils/assetVersions';
+import {
+  buildCardSnapshotMap,
+  bindImageToAssetItem,
+  resolveAssetImageEntries,
+  setPrimaryAssetImageOnItem,
+  unbindImageFromAssetItem,
+  type LiveCardSnapshot,
+} from '../utils/assetImages';
 import { searchExperiences } from './experienceRegistry';
 
 export type ProjectData = {
@@ -674,7 +682,8 @@ export interface ProjectAssetMutationResult {
 export function executeProjectAssetMutation(
   name: string,
   args: Record<string, unknown>,
-  project: ProjectData
+  project: ProjectData,
+  cards?: LiveCardSnapshot[]
 ): ProjectAssetMutationResult {
   const normalizeType = (t: unknown): 'characters' | 'locations' | 'props' => {
     if (t === 'character' || t === 'characters') return 'characters';
@@ -1527,6 +1536,157 @@ export function executeProjectAssetMutation(
         deletedCount: deletedIds.length,
         deletedIds,
         message: `成功删除 ${deletedIds.length} 个资产条目。`,
+      },
+    };
+  }
+
+  if (name === 'asset.bindImage') {
+    const rawId = typeof args.assetId === 'string' && args.assetId.trim()
+      ? args.assetId.trim()
+      : (typeof args.id === 'string' ? args.id.trim() : '');
+    const found = findAssetInProject(project, {
+      id: rawId || undefined,
+      name: args.name,
+      type: args.type,
+    });
+    if (!found) {
+      throw new Error(`绑定图像失败：未找到目标资产 "${rawId || String(args.name || '')}"。`);
+    }
+
+    const actionRaw = typeof args.action === 'string' ? args.action.trim() : 'bind';
+    const action = (['bind', 'unbind', 'setPrimary', 'list'].includes(actionRaw) ? actionRaw : 'bind') as
+      | 'bind'
+      | 'unbind'
+      | 'setPrimary'
+      | 'list';
+
+    const cardsById = buildCardSnapshotMap(cards || []);
+    const displayAssetName = found.parentItem
+      ? `${found.parentItem.name}（${found.item.name}）`
+      : String(found.item.name || found.item.id);
+
+    if (action === 'list') {
+      const entries = resolveAssetImageEntries(found.item, cardsById);
+      return {
+        updatedProject: {},
+        output: {
+          success: true,
+          action: 'list',
+          type: found.type,
+          id: found.item.id,
+          parentId: found.parentItem?.id,
+          assetName: displayAssetName,
+          imageCount: entries.length,
+          images: entries,
+          message: `资产【${displayAssetName}】当前共绑定 ${entries.length} 张图像。`,
+        },
+      };
+    }
+
+    const currentList = [...(Array.isArray(project[found.type]) ? project[found.type] : [])];
+    let nextTargetItem = found.item;
+
+    if (action === 'bind') {
+      const rawCardId = typeof args.cardId === 'string' && args.cardId.trim() ? args.cardId.trim() : undefined;
+      const cleanCardId = rawCardId && rawCardId.startsWith('canvas.card.')
+        ? rawCardId.slice('canvas.card.'.length)
+        : rawCardId;
+      const rawImageUrl = typeof args.imageUrl === 'string' && args.imageUrl.trim() ? args.imageUrl.trim() : undefined;
+      const rawThumbUrl = typeof args.thumbnailUrl === 'string' && args.thumbnailUrl.trim() ? args.thumbnailUrl.trim() : undefined;
+      if (!cleanCardId && !rawImageUrl) {
+        throw new Error('绑定图像失败：请提供画布卡片 ID (cardId) 或图像地址 (imageUrl)。');
+      }
+      const label = typeof args.label === 'string' && args.label.trim() ? args.label.trim() : undefined;
+      const prompt = typeof args.prompt === 'string' && args.prompt.trim() ? args.prompt.trim() : undefined;
+      const sourceArg = typeof args.source === 'string' ? args.source.trim() : '';
+      const resolvedSource = (['agent', 'canvas', 'upload'].includes(sourceArg)
+        ? sourceArg
+        : (cleanCardId ? 'agent' : 'upload')) as 'agent' | 'canvas' | 'upload';
+      const setPrimary = typeof args.setPrimary === 'boolean' ? args.setPrimary : undefined;
+
+      const bound = bindImageToAssetItem(
+        found.item,
+        {
+          cardId: cleanCardId,
+          imageUrl: rawImageUrl,
+          thumbnailUrl: rawThumbUrl,
+          label,
+          prompt,
+          source: resolvedSource,
+          setPrimary,
+        },
+        cardsById
+      );
+      nextTargetItem = bound.updatedItem;
+    } else if (action === 'setPrimary' || action === 'unbind') {
+      const existingEntries = resolveAssetImageEntries(found.item, cardsById);
+      const rawImageId = typeof args.imageId === 'string' && args.imageId.trim() ? args.imageId.trim() : '';
+      const rawCardId = typeof args.cardId === 'string' && args.cardId.trim()
+        ? args.cardId.trim().replace(/^canvas\.card\./, '')
+        : '';
+      const resolvedImageId = rawImageId || (rawCardId ? (existingEntries.find(e => e.cardId === rawCardId)?.id || '') : '');
+      if (!resolvedImageId) {
+        throw new Error(`${action === 'setPrimary' ? '设置主图' : '解绑图像'}失败：请提供 imageId 或已绑定的 cardId。`);
+      }
+      nextTargetItem = action === 'setPrimary'
+        ? setPrimaryAssetImageOnItem(found.item, resolvedImageId, cardsById)
+        : unbindImageFromAssetItem(found.item, resolvedImageId, cardsById);
+    }
+
+    if (found.parentItem && typeof found.versionIndex === 'number') {
+      const parentCopy = { ...currentList[found.index] };
+      const versionsCopy = Array.isArray(parentCopy.versions) ? [...parentCopy.versions] : [];
+      versionsCopy[found.versionIndex] = nextTargetItem;
+      parentCopy.versions = versionsCopy;
+      if (found.versionIndex === 0 && parentCopy.id === nextTargetItem.id) {
+        parentCopy.images = nextTargetItem.images;
+        parentCopy.referenceImage = nextTargetItem.referenceImage;
+      }
+      currentList[found.index] = parentCopy;
+    } else {
+      const updatedParent = { ...nextTargetItem };
+      if (
+        Array.isArray(updatedParent.versions) &&
+        updatedParent.versions.length > 0 &&
+        updatedParent.versions[0]?.id === updatedParent.id
+      ) {
+        updatedParent.versions = [
+          {
+            ...updatedParent.versions[0],
+            images: nextTargetItem.images,
+            referenceImage: nextTargetItem.referenceImage,
+          },
+          ...updatedParent.versions.slice(1),
+        ];
+      }
+      currentList[found.index] = updatedParent;
+    }
+
+    const finalEntries = resolveAssetImageEntries(nextTargetItem, cardsById);
+    const primaryEntry = finalEntries.find(e => e.isPrimary) || finalEntries[0] || null;
+    const actionMsg =
+      action === 'unbind'
+        ? `已解除资产【${displayAssetName}】的图像绑定（当前剩余 ${finalEntries.length} 张）。`
+        : action === 'setPrimary'
+          ? `已将资产【${displayAssetName}】的资产主图切换为 ${primaryEntry?.label || primaryEntry?.cardId || primaryEntry?.id || '选中图像'}。`
+          : `已成功将图像绑定至资产【${displayAssetName}】（当前共 ${finalEntries.length} 张）。`;
+
+    return {
+      updatedProject: {
+        [found.type]: currentList,
+      },
+      output: {
+        success: true,
+        action,
+        type: found.type,
+        id: nextTargetItem.id,
+        parentId: found.parentItem?.id,
+        assetName: displayAssetName,
+        imageCount: finalEntries.length,
+        primaryImageId: primaryEntry?.id,
+        images: finalEntries,
+        item: nextTargetItem,
+        message: actionMsg,
       },
     };
   }
