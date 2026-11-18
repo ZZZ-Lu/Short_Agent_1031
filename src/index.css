@@ -5,7 +5,6 @@
   border-radius: var(--card-corner-radius, 20px);
   corner-shape: squircle;
   overflow: hidden;
-  backface-visibility: hidden;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -13,7 +12,6 @@
   border-radius: var(--card-corner-radius, 20px);
   corner-shape: squircle;
   overflow: hidden;
-  backface-visibility: hidden;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -95,11 +93,21 @@
 /* 4K Performance & Intent-Driven Lazy Degradation:
    Aggressively strip heavy DOM rendering and expensive CSS effects during active zooming/panning for Asset Cards & Generation Cards */
 #canvas-workspace[data-middle-pan="true"],
-#canvas-workspace[data-middle-pan="true"] *,
+#canvas-workspace[data-middle-pan="true"] .generation-card,
+#canvas-workspace[data-middle-pan="true"] .asset-card,
+#canvas-workspace[data-middle-pan="true"] .generation-card-body,
+#canvas-workspace[data-middle-pan="true"] .generation-card-bottom-panel,
 #canvas-workspace[data-zooming="true"],
 #canvas-workspace[data-panning="true"],
 #canvas-workspace[data-gesture="true"] {
   pointer-events: none !important;
+}
+
+#canvas-workspace[data-zooming="true"],
+#canvas-workspace[data-panning="true"],
+#canvas-workspace[data-gesture="true"],
+#canvas-workspace[data-middle-pan="true"] {
+  will-change: transform;
 }
 
 body[data-middle-pan="true"] [data-dock-card="true"] {
@@ -159,9 +167,15 @@ body[data-middle-pan="true"] [data-dock-card="true"] > * {
   box-shadow: none !important;
 }
 
-#canvas-workspace[data-zooming="true"] .generation-card-bottom-panel *,
-#canvas-workspace[data-panning="true"] .generation-card-bottom-panel *,
-#canvas-workspace[data-gesture="true"] .generation-card-bottom-panel * {
+#canvas-workspace[data-zooming="true"] .generation-card-bottom-panel,
+#canvas-workspace[data-zooming="true"] .generation-card-bottom-panel textarea,
+#canvas-workspace[data-zooming="true"] .generation-card-bottom-panel button,
+#canvas-workspace[data-panning="true"] .generation-card-bottom-panel,
+#canvas-workspace[data-panning="true"] .generation-card-bottom-panel textarea,
+#canvas-workspace[data-panning="true"] .generation-card-bottom-panel button,
+#canvas-workspace[data-gesture="true"] .generation-card-bottom-panel,
+#canvas-workspace[data-gesture="true"] .generation-card-bottom-panel textarea,
+#canvas-workspace[data-gesture="true"] .generation-card-bottom-panel button {
   pointer-events: none !important;
   transition: none !important;
   animation: none !important;
@@ -207,6 +221,7 @@ body[data-middle-pan="true"] [data-dock-card="true"] > * {
 .card-header-tag {
   opacity: 0;
   transition: opacity 700ms cubic-bezier(0.16, 1, 0.3, 1);
+  text-rendering: geometricPrecision;
 }
 
 .card-header-tag.tag-visible {
@@ -221,6 +236,19 @@ body[data-middle-pan="true"] [data-dock-card="true"] > * {
   transition: none !important;
   animation: none !important;
   pointer-events: none !important;
+}
+
+#canvas-workspace[data-nano-retired="true"] > [data-card-id] {
+  visibility: hidden !important;
+  pointer-events: none !important;
+  will-change: auto !important;
+  transition: none !important;
+  animation: none !important;
+}
+
+#canvas-workspace[data-nano-retired="true"] .generation-card-bottom-panel,
+#canvas-workspace[data-nano-retired="true"] .card-selection-scaler {
+  will-change: auto !important;
 }
 
 /* Smooth LOD switch fade-in effect for tags when transitioning from Micro/Nano to Standard LOD */
@@ -290,10 +318,12 @@ canvas,
   backface-visibility: hidden;
 }
 
-/* The selection lift animates a scale on this wrapper. Keeping it promoted lets the
-   compositor scale the cached texture instead of re-rasterizing the whole card subtree
-   at the new scale — which is very expensive once the canvas is zoomed in. */
-.card-selection-scaler {
+/* Only promote card-selection-scaler to a GPU texture layer during active canvas
+   zoom/pan gestures so Chromium re-rasterizes card text, borders, and controls at full
+   resolution once the camera settles. */
+#canvas-workspace[data-zooming="true"] .card-selection-scaler,
+#canvas-workspace[data-panning="true"] .card-selection-scaler,
+#canvas-workspace[data-gesture="true"] .card-selection-scaler {
   will-change: transform;
 }
 

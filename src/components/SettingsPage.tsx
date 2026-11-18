@@ -686,15 +686,26 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
             type="button"
             role="button"
             onClick={() => setCanvasLoadingMode(loadingMode === 'immediate' ? 'lazy' : loadingMode === 'lazy' ? 'hybrid' : 'immediate')}
-            className={`flex h-8 items-center gap-1.5 rounded-lg border px-2.5 text-xs transition cursor-pointer ${
+            className={`flex h-8 items-center gap-1.5 rounded-lg border px-2.5 text-xs font-medium transition cursor-pointer ${
               loadingMode === 'immediate'
-                ? 'border-violet-500/40 bg-violet-50 text-violet-700 dark:border-violet-500/40 dark:bg-violet-950/40 dark:text-violet-300 font-medium'
-                : 'border-slate-200 text-slate-500 hover:bg-slate-50 dark:border-white/10 dark:text-slate-400 dark:hover:bg-white/10'
+                ? 'border-violet-500/40 bg-violet-50 text-violet-700 hover:bg-violet-100/70 dark:border-violet-500/40 dark:bg-violet-950/40 dark:text-violet-300 dark:hover:bg-violet-950/60'
+                : loadingMode === 'lazy'
+                  ? 'border-amber-500/40 bg-amber-50 text-amber-700 hover:bg-amber-100/70 dark:border-amber-500/40 dark:bg-amber-950/40 dark:text-amber-300 dark:hover:bg-amber-950/60'
+                  : 'border-emerald-500/40 bg-emerald-50 text-emerald-700 hover:bg-emerald-100/70 dark:border-emerald-500/40 dark:bg-emerald-950/40 dark:text-emerald-300 dark:hover:bg-emerald-950/60'
             }`}
             aria-label="切换画布加载模式"
             title="点击切换加载模式。即时模式在缩放、拖拽时分批加载；懒模式停止后加载；混合模式优先加载鼠标附近自适应焦圈内的卡片，远处停止后加载。"
           >
-            <Zap size={13} className={loadingMode === 'immediate' ? 'text-violet-600 dark:text-violet-400' : 'text-slate-400'} />
+            <Zap
+              size={13}
+              className={
+                loadingMode === 'immediate'
+                  ? 'text-violet-600 dark:text-violet-400'
+                  : loadingMode === 'lazy'
+                    ? 'text-amber-600 dark:text-amber-400'
+                    : 'text-emerald-600 dark:text-emerald-400'
+              }
+            />
             <span>{loadingMode === 'immediate' ? '即时分批加载（开启）' : loadingMode === 'lazy' ? '懒分批加载（开启）' : '混合分批加载（开启）'}</span>
           </button>
 

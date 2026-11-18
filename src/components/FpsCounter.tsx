@@ -1,5 +1,6 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "motion/react";
+import { formatFpsHudBadge } from "../utils/viewportCulling";
 
 export interface ToastNotice {
   id: string;
@@ -32,13 +33,15 @@ interface FpsCounterProps {
  * - Persistent primary capsule container that morphs width/height in-place without layout pop glitches.
  * - Secondary capsules are stacked vertically ONLY when multiple notices exist simultaneously.
  */
-export const FpsCounter: React.FC<FpsCounterProps> = ({ hasActiveTask = false, notices = [] }) => {
+export const FpsCounter: React.FC<FpsCounterProps> = React.memo(function FpsCounter({ hasActiveTask = false, notices = [] }) {
   const frameCountRef = useRef(0);
   const lastTimeRef = useRef(performance.now());
   const rafIdRef = useRef<number | null>(null);
+  const fpsRef = useRef(60);
   const dotRef = useRef<HTMLSpanElement | null>(null);
+  const fpsTextRef = useRef<HTMLSpanElement | null>(null);
+  const overviewProgressElRef = useRef<HTMLDivElement | null>(null);
   const primaryContentRef = useRef<HTMLDivElement | null>(null);
-  const [fps, setFps] = useState(60);
   const [primaryWidth, setPrimaryWidth] = useState<number | null>(null);
 
   const [eventToasts, setEventToasts] = useState<ToastNotice[]>([]);
@@ -71,7 +74,7 @@ export const FpsCounter: React.FC<FpsCounterProps> = ({ hasActiveTask = false, n
     };
   }, []);
 
-  // Continuous background FPS calculation
+  // Continuous background FPS calculation (direct DOM update; zero React re-renders)
   useEffect(() => {
     let active = true;
     const tick = () => {
@@ -85,17 +88,13 @@ export const FpsCounter: React.FC<FpsCounterProps> = ({ hasActiveTask = false, n
         const calculatedFps = Math.round((frameCountRef.current * 1000) / elapsed);
         frameCountRef.current = 0;
         lastTimeRef.current = now;
-        setFps(calculatedFps);
+        fpsRef.current = calculatedFps;
+        const badge = formatFpsHudBadge(calculatedFps);
+        if (fpsTextRef.current) {
+          fpsTextRef.current.textContent = badge.text;
+        }
         if (dotRef.current) {
-          const colorClass =
-            calculatedFps >= 58
-              ? "bg-emerald-500 animate-pulse"
-              : calculatedFps >= 45
-              ? "bg-teal-500"
-              : calculatedFps >= 30
-              ? "bg-amber-500"
-              : "bg-red-500";
-          dotRef.current.className = `w-1.5 h-1.5 rounded-full ${colorClass}`;
+          dotRef.current.className = badge.dotClassName;
         }
       }
 
@@ -110,6 +109,17 @@ export const FpsCounter: React.FC<FpsCounterProps> = ({ hasActiveTask = false, n
     };
   }, []);
 
+  useEffect(() => {
+    const handleOverviewProgress = (e: Event) => {
+      const progress = (e as CustomEvent<number>).detail;
+      if (overviewProgressElRef.current && typeof progress === "number") {
+        overviewProgressElRef.current.style.width = `${Math.min(100, Math.max(0, progress * 100))}%`;
+      }
+    };
+    window.addEventListener("mira-overview-progress", handleOverviewProgress);
+    return () => window.removeEventListener("mira-overview-progress", handleOverviewProgress);
+  }, []);
+
   // Combine prop notices and event toasts (deduplicated by ID)
   const activeNotices = [...notices];
   eventToasts.forEach((et) => {
@@ -120,14 +130,18 @@ export const FpsCounter: React.FC<FpsCounterProps> = ({ hasActiveTask = false, n
 
   const primaryNotice = activeNotices.length > 0 ? activeNotices[0] : null;
   const secondaryNotices = activeNotices.length > 1 ? activeNotices.slice(1) : [];
-  // Measure the newly rendered content before paint, then animate a numeric
-  // width instead of letting simultaneous entering/exiting content affect layout.
+  // Measure only when notice transitions, avoiding 500ms forced reflows on steady FPS ticks.
   useLayoutEffect(() => {
     const content = primaryContentRef.current;
     if (!content) return;
+    if (!primaryNotice) {
+      const badge = formatFpsHudBadge(fpsRef.current);
+      if (fpsTextRef.current) fpsTextRef.current.textContent = badge.text;
+      if (dotRef.current) dotRef.current.className = badge.dotClassName;
+    }
     const contentWidth = content.getBoundingClientRect().width;
     if (contentWidth > 0) setPrimaryWidth(Math.ceil(contentWidth + 30));
-  }, [primaryNotice?.id, primaryNotice?.text, fps]);
+  }, [primaryNotice?.id, primaryNotice?.text]);
 
   return (
     <div
@@ -150,8 +164,9 @@ export const FpsCounter: React.FC<FpsCounterProps> = ({ hasActiveTask = false, n
               className="flex items-center gap-2"
             >
               {/* Optional Progress Background Bar */}
-              {typeof primaryNotice.progress === "number" && primaryNotice.progress > 0 && (
+              {typeof primaryNotice.progress === "number" && (
                 <div
+                  ref={primaryNotice.id === "overview-prompt" ? overviewProgressElRef : undefined}
                   className="absolute inset-y-0 left-0 bg-blue-500/20 dark:bg-blue-400/25 border-r border-blue-500/50 dark:border-blue-400/50 transition-[width] duration-150 ease-out pointer-events-none"
                   style={{ width: `${Math.min(100, Math.max(0, primaryNotice.progress * 100))}%` }}
                 />
@@ -180,8 +195,8 @@ export const FpsCounter: React.FC<FpsCounterProps> = ({ hasActiveTask = false, n
             >
               <span ref={dotRef} className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />
               <span className="text-gray-400 dark:text-neutral-500">FPS:</span>
-              <span className="text-gray-700 dark:text-neutral-200 tabular-nums">
-                {fps}
+              <span ref={fpsTextRef} className="text-gray-700 dark:text-neutral-200 tabular-nums">
+                {fpsRef.current}
               </span>
             </motion.div>
           )}
@@ -216,4 +231,4 @@ export const FpsCounter: React.FC<FpsCounterProps> = ({ hasActiveTask = false, n
       </AnimatePresence>
     </div>
   );
-};
+});

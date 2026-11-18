@@ -3,6 +3,7 @@ const BITMAP_BUDGET = 32 * 1024 * 1024;
 const bitmaps = new Map<string, HTMLCanvasElement>();
 let bitmapBytes = 0;
 export const readyPromptPanels = new Set<string>();
+export const mountedDomCardIds = new Set<string>();
 
 type SurfaceCard = { prompt?: string; ratio?: string; res?: string; mcpModel?: string; mcpParameters?: unknown; state?: string; referenceImages?: { url: string; thumbnailUrl?: string; name?: string }[]; referenceImageUrl?: string | null; referenceImageName?: string };
 const revisions = new WeakMap<SurfaceCard, { dark: boolean; key: string }>();

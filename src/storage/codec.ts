@@ -20,6 +20,42 @@ export class CardCodec {
     return { [marker]: id, format };
   }
 
+  private async encodeReferenceItem(item: any): Promise<any> {
+    if (!item || typeof item !== 'object') return this.encode(item);
+    const cached = this.objects.get(item);
+    if (cached) return cached;
+    const itemBlob = item.fileData instanceof Blob ? item.fileData : undefined;
+    if (itemBlob) {
+      const id = this.reference(itemBlob, 'blob')[marker];
+      for (const k of ['url', 'thumbnailUrl', 'closeupThumbnailUrl', 'fullDetailThumbnailUrl', 'microLodThumbnailUrl']) {
+        if (typeof item[k] === 'string' && item[k].startsWith('blob:')) {
+          this.strings.set(item[k], id);
+        }
+      }
+    }
+    const fallbackUrl = [item.closeupThumbnailUrl, item.fullDetailThumbnailUrl, item.thumbnailUrl, item.microLodThumbnailUrl]
+      .find((u): u is string => typeof u === 'string' && u.length > 0 && !u.startsWith('blob:'));
+    const encodedItem: any = {};
+    for (const key of Object.keys(item)) {
+      const val = item[key];
+      if (typeof val === 'string' && val.startsWith('blob:') && !this.strings.has(val)) {
+        try {
+          encodedItem[key] = await this.encode(val);
+        } catch {
+          if (key === 'url' && fallbackUrl) {
+            encodedItem[key] = await this.encode(fallbackUrl);
+          } else if (key === 'url') {
+            encodedItem[key] = '';
+          }
+        }
+      } else {
+        encodedItem[key] = await this.encode(val);
+      }
+    }
+    this.objects.set(item, encodedItem);
+    return encodedItem;
+  }
+
   async encode(value: any): Promise<any> {
     if (value instanceof Blob) return this.reference(value, 'blob');
     if (typeof value === 'string') {
@@ -46,16 +82,54 @@ export class CardCodec {
     if (cached) return cached;
     const result: any = Array.isArray(value) ? [] : {};
     // Register known URL/Blob pairs to avoid fetching the same runtime resource.
+    const ownFallbackBlob =
+      value.fileData instanceof Blob ? value.fileData :
+      value.originalFileData instanceof Blob ? value.originalFileData :
+      value.trueOriginalFileData instanceof Blob ? value.trueOriginalFileData :
+      undefined;
     for (const [urlKey, blobKey] of [
       ['imageUrl', 'fileData'], ['originalImageUrl', 'originalFileData'],
       ['trueOriginalImageUrl', 'trueOriginalFileData'], ['url', 'fileData'],
-      ['referenceImageUrl', 'referenceImageFileData'],
+      ['thumbnailUrl', 'fileData'], ['closeupThumbnailUrl', 'fileData'],
+      ['fullDetailThumbnailUrl', 'fileData'], ['microLodThumbnailUrl', 'fileData'],
+      ['videoPosterUrl', 'fileData'],
     ]) {
-      if (typeof value[urlKey] === 'string' && value[urlKey].startsWith('blob:') && value[blobKey] instanceof Blob) {
-        this.strings.set(value[urlKey], this.reference(value[blobKey], 'blob')[marker]);
+      const blob = value[blobKey] instanceof Blob ? value[blobKey] : ownFallbackBlob;
+      if (typeof value[urlKey] === 'string' && value[urlKey].startsWith('blob:') && blob instanceof Blob) {
+        this.strings.set(value[urlKey], this.reference(blob, 'blob')[marker]);
       }
     }
-    for (const key of Object.keys(value)) result[key] = await this.encode(value[key]);
+    if (typeof value.referenceImageUrl === 'string' && value.referenceImageUrl.startsWith('blob:')) {
+      const refBlob =
+        value.referenceImageFileData instanceof Blob ? value.referenceImageFileData :
+        Array.isArray(value.referenceImages)
+          ? value.referenceImages.find((r: any) => r?.fileData instanceof Blob)?.fileData
+          : undefined;
+      if (refBlob instanceof Blob) {
+        this.strings.set(value.referenceImageUrl, this.reference(refBlob, 'blob')[marker]);
+      }
+    }
+    for (const key of Object.keys(value)) {
+      if (key === 'referenceImages' && Array.isArray(value.referenceImages)) {
+        const encodedRefs = [];
+        for (const item of value.referenceImages) {
+          const encodedItem = await this.encodeReferenceItem(item);
+          if (encodedItem && typeof encodedItem === 'object' && !encodedItem.url && !encodedItem.fileData && !encodedItem.sourceCardId) {
+            continue;
+          }
+          encodedRefs.push(encodedItem);
+        }
+        result[key] = encodedRefs;
+      } else if (key === 'referenceImageUrl' && typeof value.referenceImageUrl === 'string' && value.referenceImageUrl.startsWith('blob:') && !this.strings.has(value.referenceImageUrl)) {
+        try {
+          result[key] = await this.encode(value.referenceImageUrl);
+        } catch {
+          result[key] = null;
+        }
+      } else {
+        result[key] = await this.encode(value[key]);
+      }
+    }
     this.objects.set(value, result);
     return result;
   }

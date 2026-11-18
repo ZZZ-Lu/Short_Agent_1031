@@ -141,6 +141,20 @@ test('resource URL round-trip is durable and broken blob URLs fail closed', asyn
   assert.equal(await (await fetch(decoded.imageUrl)).text(), 'bytes');
   assert.equal(await decoded.fileData.text(), 'bytes');
   await assert.rejects(codec.card(card('bad', { imageUrl: 'blob:missing' })));
+
+  // Stale detached blob: URLs inside referenceImages fall back to durable thumbnail or are dropped without bricking save
+  const withStaleRef = await codec.card(card('ref-fallback', {
+    referenceImages: [
+      { url: 'blob:stale-1', closeupThumbnailUrl: 'data:image/png;base64,YWJj', name: '塞莱特斯' },
+      { url: 'blob:stale-2', name: '无效引用' },
+    ],
+    referenceImageUrl: 'blob:stale-1',
+  }));
+  codec.accept(codec.pending(withStaleRef.resources));
+  const decodedRef = codec.decode(withStaleRef.data);
+  assert.equal(decodedRef.referenceImages.length, 1);
+  assert.equal(decodedRef.referenceImages[0].url, 'data:image/png;base64,YWJj');
+  assert.equal(decodedRef.referenceImageUrl, null);
 });
 test('project ownership and consecutive saves remain isolated; duplicate IDs rejected', async () => {
   const { repo, backend } = harness();

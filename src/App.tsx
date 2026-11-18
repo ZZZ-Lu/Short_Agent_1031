@@ -21,8 +21,8 @@ import { fastGetImageDimensions } from './utils/imageHeader';
 import { resizeImageOffThread } from './utils/imageResize';
 import { yieldToMain } from './utils/yieldToMain';
 import { getOrLoadCanvasImage } from './utils/imageTextureCache';
-import { getCardWorldBounds, isCardIntersectingRectangle, getLodMountQuota, getNanoLodThreshold, CARD_DENSITY_HIGH_THRESHOLD, HIGH_RENDER_WEIGHT_THRESHOLD, calculateTotalRenderWeight, FRAME_BUDGET_MS } from './utils/viewportCulling';
-import { getHybridPointer, setHybridProximityProvider, isHybridCardNear, CANVAS_IDLE_MS, scheduleCanvasSurface, canLoadDuringCameraGesture, subscribeCanvasLoadingMode, getCanvasLoadingMode } from './utils/canvasPerformance';
+import { getCardWorldBounds, isCardIntersectingRectangle, getLodMountQuota, getLodUnmountQuota, UNMOUNT_TARGET_DURATION_MS, pickZoomOutUnmountBatch, getNanoLodThreshold, CARD_DENSITY_HIGH_THRESHOLD, HIGH_RENDER_WEIGHT_THRESHOLD, calculateTotalRenderWeight, FRAME_BUDGET_MS } from './utils/viewportCulling';
+import { getHybridPointer, setHybridProximityProvider, isHybridCardNear, CANVAS_IDLE_MS, scheduleCanvasSurface, canLoadDuringCameraGesture, subscribeCanvasLoadingMode, getCanvasLoadingMode, CANVAS_HYBRID_POINTER_WAKE_EVENT, setCameraZoomingOut, isCameraZoomingOut, setCameraTweenZooming } from './utils/canvasPerformance';
 import { isCanvasOverlayControlTarget, shouldPassThroughCanvasCardMiddleButton } from './utils/canvasPointerPassThrough';
 import { readyPromptPanels } from './utils/promptSurfaceCache';
 import { createCardMountStore, ProgressiveGenerationCard } from './components/ProgressiveGenerationCard';
@@ -454,25 +454,16 @@ export default function App() {
   const ty = useMotionValue(initialTransform.y);
   const tScale = useMotionValue(initialTransform.scale);
   
-  // Inject real-time scale as CSS variable for GPU-accelerated constant-width borders
+  const overviewViewportElRef = useRef<HTMLDivElement | null>(null);
+  const overviewCursorElRef = useRef<HTMLDivElement | null>(null);
+
   const updateCurrentScale = (latestScale: number) => {
     if (latestScale < getNanoLodThreshold()) pauseVideosForNanoLod();
-    const workspace = document.getElementById('canvas-workspace');
-    if (workspace) {
-      // Selection strokes compensate camera scale every frame, independently of
-      // content loading and the frozen scale used by expensive gesture styles.
-      workspace.style.setProperty('--selection-scale', latestScale.toString());
-      if (workspace.getAttribute('data-gesture') === 'true') {
-        // A single boundary switch lets the already-active Nano canvas take over,
-        // without reconciling/unmounting every editor in the middle of a wheel gesture.
-        const useNanoPreview = latestScale < getNanoLodThreshold();
-        if (useNanoPreview !== (workspace.getAttribute('data-gesture-low') === 'true')) {
-          if (useNanoPreview) workspace.setAttribute('data-gesture-low', 'true');
-          else workspace.removeAttribute('data-gesture-low');
-        }
-      } else {
-        workspace.style.setProperty('--current-scale', latestScale.toString());
-      }
+    if (overviewViewportElRef.current) {
+      overviewViewportElRef.current.style.setProperty('--selection-scale', latestScale.toString());
+    }
+    if (overviewCursorElRef.current) {
+      overviewCursorElRef.current.style.setProperty('--selection-scale', latestScale.toString());
     }
   };
   
@@ -531,6 +522,9 @@ export default function App() {
   const [overviewViewportBox, setOverviewViewportBox] = useState<{ x: number, y: number, width: number, height: number } | null>(null);
   const [overviewCursorBox, setOverviewCursorBox] = useState<{ x: number, y: number, width: number, height: number } | null>(null);
   const overviewBoxScaleRef = useRef(1.0);
+  useEffect(() => {
+    updateCurrentScale(tScale.get());
+  }, [overviewViewportBox, overviewCursorBox, isOverviewMode]);
   const lastMouseClientPosRef = useRef<{ clientX: number; clientY: number }>({
     clientX: typeof window !== 'undefined' ? window.innerWidth / 2 : 500,
     clientY: typeof window !== 'undefined' ? window.innerHeight / 2 : 500,
@@ -882,7 +876,6 @@ export default function App() {
   };
 
   const [isDragging, setIsDragging] = useState(false);
-  const [isZooming, setIsZooming] = useState(false);
   const isZoomingRef = useRef(false);
   const isZoomAnimationActiveRef = useRef(false);
   const [isZoomAnimationActive, setIsZoomAnimationActive] = useState(false);
@@ -3499,6 +3492,10 @@ export default function App() {
         if (!mounted) return;
         
         if (saved !== null) {
+          const savedById = new Map<string, CardData>();
+          for (const c of saved) {
+            if (c?.id) savedById.set(c.id, c);
+          }
           const processedSaved = saved.map(card => {
             const updates: any = {};
             if (card.generationError) {
@@ -3507,54 +3504,85 @@ export default function App() {
               if (start >= 0 && end > start) {
                 try {
                   const taskError = JSON.parse(card.generationError.slice(start, end + 1));
-                  if (typeof taskError.error_message === 'string') updates.generationError = taskError.error_message;
+                  if (typeof taskError.error_message === 'string' && taskError.error_message !== card.generationError) {
+                    updates.generationError = taskError.error_message;
+                  }
                 } catch { /* Keep the original error when it is not JSON. */ }
               }
             }
             if (card.fileData && (card.fileData as any) instanceof Blob) {
-              const url = safeCreateObjectURL(card.fileData);
-              if (url) updates.imageUrl = url;
+              if (!card.imageUrl) {
+                const url = safeCreateObjectURL(card.fileData);
+                if (url) updates.imageUrl = url;
+              }
             } else if (card.fileData) {
               updates.fileData = undefined;
             }
 
             if (card.originalFileData && (card.originalFileData as any) instanceof Blob) {
-              const url = safeCreateObjectURL(card.originalFileData);
-              if (url) updates.originalImageUrl = url;
+              if (!card.originalImageUrl) {
+                const url = safeCreateObjectURL(card.originalFileData);
+                if (url) updates.originalImageUrl = url;
+              }
             } else if (card.originalFileData) {
               updates.originalFileData = undefined;
             }
 
             if (card.trueOriginalFileData && (card.trueOriginalFileData as any) instanceof Blob) {
-              const url = safeCreateObjectURL(card.trueOriginalFileData);
-              if (url) updates.trueOriginalImageUrl = url;
+              if (!card.trueOriginalImageUrl) {
+                const url = safeCreateObjectURL(card.trueOriginalFileData);
+                if (url) updates.trueOriginalImageUrl = url;
+              }
             } else if (card.trueOriginalFileData) {
               updates.trueOriginalFileData = undefined;
             }
 
-            // Restore local reference image Blob URLs to prevent broken image references on reload
+            // Restore local reference image Blob URLs only when missing or detached
             if (card.referenceImages && Array.isArray(card.referenceImages)) {
-              updates.referenceImages = card.referenceImages.map(ref => {
+              let refChanged = false;
+              const nextRefs = card.referenceImages.map(ref => {
                 if (ref.fileData && (ref.fileData as any) instanceof Blob) {
-                  const blobUrl = safeCreateObjectURL(ref.fileData);
-                  return {
-                    ...ref,
-                    url: blobUrl || ref.url
-                  };
+                  if (!ref.url) {
+                    const blobUrl = safeCreateObjectURL(ref.fileData);
+                    if (blobUrl) {
+                      refChanged = true;
+                      return { ...ref, url: blobUrl };
+                    }
+                  }
+                  return ref;
                 } else if (ref.fileData) {
+                  refChanged = true;
                   return {
                     ...ref,
                     fileData: undefined
                   };
+                } else if (ref.sourceCardId) {
+                  const srcCard = savedById.get(ref.sourceCardId);
+                  const srcBlob = srcCard?.trueOriginalFileData || srcCard?.originalFileData || srcCard?.fileData;
+                  const srcUrl = srcCard?.imageUrl || srcCard?.originalImageUrl || (srcBlob instanceof Blob ? safeCreateObjectURL(srcBlob) : null);
+                  if (srcBlob instanceof Blob && (!ref.url || (ref.url.startsWith('blob:') && srcUrl && ref.url !== srcUrl))) {
+                    refChanged = true;
+                    return {
+                      ...ref,
+                      url: srcUrl || ref.url,
+                      fileData: srcBlob,
+                    };
+                  }
                 }
                 return ref;
               });
-              if (updates.referenceImages[0]?.url) {
-                updates.referenceImageUrl = updates.referenceImages[0].url;
+              if (refChanged) {
+                updates.referenceImages = nextRefs;
+              }
+              const firstRefUrl = (updates.referenceImages || card.referenceImages)[0]?.url;
+              if (firstRefUrl && !card.referenceImageUrl) {
+                updates.referenceImageUrl = firstRefUrl;
               }
             } else if (card.referenceImageFileData && (card.referenceImageFileData as any) instanceof Blob) {
-              const url = safeCreateObjectURL(card.referenceImageFileData);
-              if (url) updates.referenceImageUrl = url;
+              if (!card.referenceImageUrl) {
+                const url = safeCreateObjectURL(card.referenceImageFileData);
+                if (url) updates.referenceImageUrl = url;
+              }
             } else if (card.referenceImageFileData) {
               updates.referenceImageFileData = undefined;
             }
@@ -3568,7 +3596,12 @@ export default function App() {
               } catch {}
               return card.currentTime;
             })();
-            if (typeof savedPos === 'number') updates.currentTime = savedPos;
+            if (typeof savedPos === 'number' && savedPos !== card.currentTime) {
+              updates.currentTime = savedPos;
+            }
+            if (Object.keys(updates).length === 0) {
+              return card;
+            }
             return {
               ...card,
               ...updates
@@ -4292,8 +4325,23 @@ export default function App() {
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | null = null;
     const handleCardPainted = () => {
+      if (
+        !isDomCardsActiveRef.current ||
+        tScale.get() < getNanoLodThreshold() ||
+        document.getElementById('canvas-workspace')?.getAttribute('data-nano-retired') === 'true'
+      ) {
+        return;
+      }
       if (timer !== null) return;
       const flush = () => {
+        if (
+          !isDomCardsActiveRef.current ||
+          tScale.get() < getNanoLodThreshold() ||
+          document.getElementById('canvas-workspace')?.getAttribute('data-nano-retired') === 'true'
+        ) {
+          timer = null;
+          return;
+        }
         if ((isZoomingRef.current && !canLoadDuringCameraGesture()) || (window as any).isDraggingCard || (window as any).__nanoDragging) {
           timer = setTimeout(flush, CANVAS_IDLE_MS);
           return;
@@ -4308,17 +4356,23 @@ export default function App() {
       window.removeEventListener('card-painted', handleCardPainted);
       if (timer !== null) clearTimeout(timer);
     };
-  }, []);
+  }, [tScale]);
 
   // --- Viewport Spatial Culling with QuadTree (Virtualization) ---
   // Uses O(log N + K) QuadTree spatial index to rapidly query visible cards out of 25,000+ items in < 0.05ms.
   const [visibleCardIdSet, setVisibleCardIdSet] = useState<Set<string>>(() => new Set());
   const lastFrameDurationRef = useRef<number>(0);
   const quadTreeRef = useRef<QuadTree<CardData> | null>(null);
+  const cardsByIdRef = useRef<Map<string, CardData>>(new Map());
 
-  // Synchronize QuadTree spatial index on cards change
+  // Synchronize QuadTree spatial index and lookup map on cards change
   useEffect(() => {
     quadTreeRef.current = buildCardQuadTree(cards);
+    const map = new Map<string, CardData>();
+    for (let i = 0; i < cards.length; i++) {
+      map.set(cards[i].id, cards[i]);
+    }
+    cardsByIdRef.current = map;
   }, [cards]);
 
   const updateCircularCulling = useCallback((_forceImmediate = false) => {
@@ -4330,13 +4384,15 @@ export default function App() {
     }
 
     // Camera gestures refresh visible candidates in bounded intervals while moving.
-    // Individual-card dragging still defers loading.
-    const liveCameraGesture = canLoadDuringCameraGesture();
-    const liveNanoCamera = tScale.get() < getNanoLodThreshold() &&
-      !(window as any).isDraggingCard && !(window as any).__nanoDragging;
+    // Individual-card dragging, zoom-out gestures, and < 0.40 Nano LOD defer DOM candidate updates.
+    const currentScale = tScale.get() || 1;
+    const isNanoScale = currentScale < getNanoLodThreshold();
+    const liveCameraGesture = canLoadDuringCameraGesture() && !isNanoScale;
     const isGestureActive = Boolean(
       isDraggingCanvasRef.current ||
       isZoomingRef.current ||
+      isTweenZoomingRef.current ||
+      isZoomAnimationActiveRef.current ||
       (window as any).isDraggingCard ||
       (window as any).__nanoDragging ||
       (typeof document !== 'undefined' && (
@@ -4346,10 +4402,16 @@ export default function App() {
       ))
     );
 
-    if (!_forceImmediate && isGestureActive && !liveCameraGesture && !liveNanoCamera) {
+    // In Nano LOD (< 0.40), NanoLodCanvas queries its own internal QuadTree directly
+    // and DOM cards are inactive; avoid inflating visibleCardIdSet with hundreds of cards.
+    if (isNanoScale) {
       return;
     }
-    if (!_forceImmediate && (liveCameraGesture || (isGestureActive && liveNanoCamera))) {
+
+    if (!_forceImmediate && isGestureActive && !liveCameraGesture) {
+      return;
+    }
+    if (!_forceImmediate && liveCameraGesture) {
       const elapsed = Date.now() - lastVisibleSetUpdateTimeRef.current;
       if (elapsed < 80) {
         cullingThrottleTimerRef.current = setTimeout(() => updateCircularCulling(), 80 - elapsed);
@@ -4358,7 +4420,6 @@ export default function App() {
       lastVisibleSetUpdateTimeRef.current = Date.now();
     }
 
-    const currentScale = tScale.get() || 1;
     const currentTx = tx.get();
     const currentTy = ty.get();
     const vpWidth = window.innerWidth;
@@ -4427,19 +4488,23 @@ export default function App() {
   const [mountEpoch, setMountEpoch] = useState(0);
 
   // Programmatic tween zooming state (active during double-click zoom or overview mode transition)
-  const [isTweenZooming, setIsTweenZooming] = useState(false);
   const isTweenZoomingRef = useRef(false);
   const tweenTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const triggerTweenZoom = useCallback((durationMs: number = 400) => {
-    setIsTweenZooming(true);
+    setCameraTweenZooming(true);
     isTweenZoomingRef.current = true;
+    const workspace = document.getElementById('canvas-workspace');
+    if (workspace && workspace.getAttribute('data-gesture') !== 'true') {
+      workspace.setAttribute('data-gesture', 'true');
+    }
     if (tweenTimeoutRef.current) {
       clearTimeout(tweenTimeoutRef.current);
     }
     tweenTimeoutRef.current = setTimeout(() => {
+      setCameraTweenZooming(false);
+      setCameraZoomingOut(false);
       isTweenZoomingRef.current = false;
-      setIsTweenZooming(false);
       updateCircularCulling(true);
       setMountEpoch(n => (n + 1) % 1000000);
     }, durationMs);
@@ -4638,10 +4703,24 @@ export default function App() {
   const [isMicroLod, setIsMicroLod] = useState(() => tScale.get() < getNanoLodThreshold());
   // Nano-LOD state tracking (scale < dynamic threshold)
   const [isNanoLod, setIsNanoLod] = useState(() => tScale.get() < getNanoLodThreshold());
+  const isNanoLodRef = useRef(isNanoLod);
+  isNanoLodRef.current = isNanoLod;
   // Extended Nano-LOD state to act as a backend backdrop during DOM card fade-in
   const [isNanoCanvasActive, setIsNanoCanvasActive] = useState(() => tScale.get() < getNanoLodThreshold());
   // Extended DOM card state to act as a frontend backdrop while Canvas prepares to render
   const [isDomCardsActive, setIsDomCardsActive] = useState(() => tScale.get() >= getNanoLodThreshold());
+  const isDomCardsActiveRef = useRef(isDomCardsActive);
+  isDomCardsActiveRef.current = isDomCardsActive;
+
+  const unmountRafRef = useRef<number | null>(null);
+  const startProgressiveDomUnmountRef = useRef<() => void>(() => {});
+  const abortMountQueueRef = useRef<() => void>(() => {});
+  const abortProgressiveDomUnmount = useCallback(() => {
+    if (unmountRafRef.current !== null) {
+      cancelAnimationFrame(unmountRafRef.current);
+      unmountRafRef.current = null;
+    }
+  }, []);
 
   // Track LOD switch from Low -> Standard to animate text labels fade-in
   const [isLodFading, setIsLodFading] = useState(false);
@@ -4669,33 +4748,105 @@ export default function App() {
     if (ws) ws.removeAttribute('data-lod-fade');
   }, []);
 
+  const lastReadyNanoFrameRef = useRef<LodFrame | null>(null);
   const handleNanoCanvasReady = useCallback((frame: LodFrame) => {
-    if (isNanoLod && canRetireDomForNano(frame, { scale: tScale.get(), tx: tx.get(), ty: ty.get() })) {
-      setIsDomCardsActive(false);
+    lastReadyNanoFrameRef.current = frame;
+    if ((isNanoLod || tScale.get() < getNanoLodThreshold()) &&
+        canRetireDomForNano(frame, { scale: tScale.get(), tx: tx.get(), ty: ty.get() })) {
+      const workspace = document.getElementById('canvas-workspace');
+      const activeZoomOrTween = Boolean(
+        isZoomingRef.current ||
+        isTweenZoomingRef.current ||
+        isZoomAnimationActiveRef.current ||
+        workspace?.getAttribute('data-zooming') === 'true'
+      );
+      if (activeZoomOrTween) {
+        if (workspace && workspace.getAttribute('data-nano-retired') !== 'true') {
+          workspace.setAttribute('data-nano-retired', 'true');
+        }
+      } else {
+        startProgressiveDomUnmountRef.current();
+      }
     }
   }, [isNanoLod, tScale, tx, ty]);
 
   useEffect(() => {
     if (isNanoLod) {
       setIsNanoCanvasActive(true);
-      // isDomCardsActive will be disabled by the onReady callback from NanoLodCanvas once its first frame renders
+      // isDomCardsActive will be disabled progressively once NanoLodCanvas finishes rendering
+      if (
+        lastReadyNanoFrameRef.current &&
+        !isZoomingRef.current &&
+        !isTweenZoomingRef.current &&
+        !isZoomAnimationActiveRef.current &&
+        canRetireDomForNano(lastReadyNanoFrameRef.current, { scale: tScale.get(), tx: tx.get(), ty: ty.get() })
+      ) {
+        startProgressiveDomUnmountRef.current();
+      }
     } else {
+      abortProgressiveDomUnmount();
+      document.getElementById('canvas-workspace')?.removeAttribute('data-nano-retired');
       setIsDomCardsActive(true);
       // Actual per-card media/panel readiness below keeps the backdrop alive.
       setIsNanoCanvasActive(false);
     }
-  }, [isNanoLod]);
+  }, [isNanoLod, tScale, tx, ty, abortProgressiveDomUnmount]);
 
   useEffect(() => {
+    let prevScale = tScale.get();
+    let prevDomMicro: boolean | null = null;
     const unsub = tScale.on('change', (s) => {
+      if (Math.abs(s - prevScale) > 0.0001) {
+        setCameraZoomingOut(s < prevScale);
+        prevScale = s;
+      }
       // Track Nano LOD independently of the DOM admission policy.
       const threshold = getNanoLodThreshold();
       const isMicro = s < threshold;
       const isNano = s < threshold;
+      const workspace = document.getElementById('canvas-workspace');
+      const isActiveGesture = Boolean(
+        isZoomingRef.current ||
+        isDraggingCanvasRef.current ||
+        isTweenZoomingRef.current ||
+        isZoomAnimationActiveRef.current ||
+        workspace?.getAttribute('data-gesture') === 'true' ||
+        workspace?.getAttribute('data-zooming') === 'true' ||
+        workspace?.getAttribute('data-panning') === 'true'
+      );
+      const isLazyGesture = getCanvasLoadingMode() === 'lazy' && isActiveGesture;
+      const deferLodTransition = isTweenZoomingRef.current || isZoomAnimationActiveRef.current || isLazyGesture || (isActiveGesture && isMicro);
+
+      if (workspace && prevDomMicro !== isMicro) {
+        if (isMicro) {
+          prevDomMicro = true;
+          workspace.setAttribute('data-scale-micro', 'true');
+          workspace.setAttribute('data-scale-nano', 'true');
+        } else if (!deferLodTransition) {
+          prevDomMicro = false;
+          abortProgressiveDomUnmount();
+          workspace.removeAttribute('data-scale-micro');
+          workspace.removeAttribute('data-scale-nano');
+          workspace.removeAttribute('data-nano-retired');
+        }
+      }
+
+      // During any active zoom-out into < 0.40, programmatic tween, or lazy gesture,
+      // defer React LOD state transitions until restoreCanvasStyles runs upon idle or explicit click intent.
+      if (deferLodTransition) {
+        return;
+      }
       
       if (wasMicroLodRef.current && !isMicro) {
-        // Switched from Micro/Nano to Standard LOD: trigger smooth fade-in
+        // Switched from Micro/Nano to Standard LOD: immediately activate DOM layer & wake mount queue
+        abortProgressiveDomUnmount();
+        isNanoLodRef.current = false;
+        isDomCardsActiveRef.current = true;
+        setIsDomCardsActive(true);
+        setIsNanoCanvasActive(false);
         triggerLodFadeIn();
+        updateCircularCulling(true);
+        setMountEpoch(n => (n + 1) % 1000000);
       } else if (!wasMicroLodRef.current && isMicro) {
         // Switched from Standard to Micro/Nano LOD: immediately cancel fade and hide tags
         cancelLodFade();
@@ -4706,7 +4857,7 @@ export default function App() {
       setIsNanoLod(isNano);
     });
     return unsub;
-  }, [tScale, triggerLodFadeIn, cancelLodFade]);
+  }, [tScale, triggerLodFadeIn, cancelLodFade, updateCircularCulling, abortProgressiveDomUnmount]);
 
   // Set of DOM-mounted card IDs (Center-Out Sequential Queue)
   const cardMountStore = useMemo(createCardMountStore, []);
@@ -4716,6 +4867,82 @@ export default function App() {
   }, [cardMountStore]);
   const renderedCardIdsRef = useRef<Set<string>>(renderedCardIds);
   renderedCardIdsRef.current = renderedCardIds;
+
+  const startProgressiveDomUnmount = useCallback(() => {
+    const workspace = document.getElementById('canvas-workspace');
+    if (tScale.get() >= getNanoLodThreshold()) {
+      abortProgressiveDomUnmount();
+      if (workspace?.hasAttribute('data-nano-retired')) workspace.removeAttribute('data-nano-retired');
+      return;
+    }
+    if (!isDomCardsActiveRef.current) {
+      if (workspace?.hasAttribute('data-nano-retired')) workspace.removeAttribute('data-nano-retired');
+      return;
+    }
+    abortMountQueueRef.current();
+    if (workspace && workspace.getAttribute('data-nano-retired') !== 'true') {
+      workspace.setAttribute('data-nano-retired', 'true');
+    }
+    if (renderedCardIdsRef.current.size === 0) {
+      abortProgressiveDomUnmount();
+      if (workspace?.hasAttribute('data-nano-retired')) workspace.removeAttribute('data-nano-retired');
+      setIsDomCardsActive(false);
+      return;
+    }
+    if (unmountRafRef.current !== null) return;
+
+    const startTime = performance.now();
+    const stepUnmount = () => {
+      unmountRafRef.current = null;
+      const curScale = tScale.get();
+      if (curScale >= getNanoLodThreshold()) {
+        const ws = document.getElementById('canvas-workspace');
+        if (ws?.hasAttribute('data-nano-retired')) ws.removeAttribute('data-nano-retired');
+        return;
+      }
+      // Pause DOM teardown while a new zoom/pan gesture is active; restoreCanvasStyles resumes it on idle.
+      if (
+        isZoomingRef.current ||
+        isDraggingCanvasRef.current ||
+        isTweenZoomingRef.current ||
+        isZoomAnimationActiveRef.current
+      ) {
+        return;
+      }
+      const remainingIds = Array.from(renderedCardIdsRef.current as Set<string>);
+      if (remainingIds.length === 0) {
+        const ws = document.getElementById('canvas-workspace');
+        if (ws?.hasAttribute('data-nano-retired')) ws.removeAttribute('data-nano-retired');
+        setIsDomCardsActive(false);
+        return;
+      }
+      const quota = getLodUnmountQuota(
+        remainingIds.length,
+        performance.now() - startTime,
+        UNMOUNT_TARGET_DURATION_MS
+      );
+      const viewportCenter = {
+        x: (window.innerWidth / 2 - tx.get()) / (curScale || 1),
+        y: (window.innerHeight / 2 - ty.get()) / (curScale || 1),
+      };
+      const batch = pickZoomOutUnmountBatch(remainingIds, cardsByIdRef.current, viewportCenter, quota);
+      if (batch.length > 0) {
+        const batchSet = new Set(batch);
+        setRenderedCardIds(prev => {
+          const next = new Set<string>();
+          for (const id of prev) {
+            if (!batchSet.has(id)) next.add(id);
+          }
+          return next;
+        });
+      }
+      unmountRafRef.current = requestAnimationFrame(stepUnmount);
+    };
+    unmountRafRef.current = requestAnimationFrame(stepUnmount);
+  }, [abortProgressiveDomUnmount, setRenderedCardIds, tScale, tx, ty]);
+
+  startProgressiveDomUnmountRef.current = startProgressiveDomUnmount;
+  useEffect(() => abortProgressiveDomUnmount, [abortProgressiveDomUnmount]);
 
   const handleCardDrag = useCallback((id: string, dx: number, dy: number) => {
     // No-op. Real-time dragging is now fully handled in DOM by GenerationCard.tsx (Master-Slave architecture).
@@ -8137,12 +8364,12 @@ export default function App() {
       }
     }
     clearTimeout(zoomTimeoutRef.current);
+    setCameraZoomingOut(false);
+    setCameraTweenZooming(false);
     workspace?.removeAttribute('data-middle-pan');
     workspace?.removeAttribute('data-zooming');
     workspace?.removeAttribute('data-panning');
     workspace?.removeAttribute('data-gesture');
-    workspace?.removeAttribute('data-gesture-low');
-    workspace?.style.setProperty('--current-scale', tScale.get().toString());
     isZoomingRef.current = false;
     
     (window as any).isDraggingCard = false;
@@ -8177,13 +8404,20 @@ export default function App() {
       console.warn('Failed to cleanup performance classes:', err);
     }
     
-    // Garbage Collection / Mount Trigger: Update circular culling bounds
-    updateCircularCulling(true);
-    
     // Restore accurate LOD states now that the user has stopped zooming or dragging
     const currentScale = tScale.get();
     const threshold = getNanoLodThreshold();
     const isMicro = currentScale < threshold;
+    if (workspace) {
+      if (isMicro) {
+        workspace.setAttribute('data-scale-micro', 'true');
+        workspace.setAttribute('data-scale-nano', 'true');
+      } else {
+        workspace.removeAttribute('data-scale-micro');
+        workspace.removeAttribute('data-scale-nano');
+        workspace.removeAttribute('data-nano-retired');
+      }
+    }
     if (wasMicroLodRef.current && !isMicro) {
       triggerLodFadeIn();
     } else if (!wasMicroLodRef.current && isMicro) {
@@ -8193,13 +8427,27 @@ export default function App() {
 
     setIsMicroLod(isMicro);
     setIsNanoLod(isMicro);
-    setMountEpoch(n => (n + 1) % 1000000);
+    if (isMicro) {
+      setIsNanoCanvasActive(true);
+      if (
+        lastReadyNanoFrameRef.current &&
+        canRetireDomForNano(lastReadyNanoFrameRef.current, { scale: currentScale, tx: tx.get(), ty: ty.get() })
+      ) {
+        startProgressiveDomUnmount();
+      }
+    } else {
+      abortProgressiveDomUnmount();
+      setIsDomCardsActive(true);
+      setIsNanoCanvasActive(false);
+      // Garbage Collection / Mount Trigger: Update circular culling bounds when settling in >= 0.40
+      updateCircularCulling(true);
+      setMountEpoch(n => (n + 1) % 1000000);
+    }
     
     if (workspace) {
-      setIsZooming(false); // MUST sync React state so it doesn't revert on next render
       window.dispatchEvent(new CustomEvent('canvas-styles-restored'));
     }
-  }, [updateCircularCulling, tScale, triggerLodFadeIn, cancelLodFade]);
+  }, [updateCircularCulling, tScale, tx, ty, triggerLodFadeIn, cancelLodFade, startProgressiveDomUnmount, abortProgressiveDomUnmount]);
 
   useEffect(() => {
     (window as any).resetGlobalZoomTimer = () => {
@@ -8317,7 +8565,6 @@ export default function App() {
       workspace.setAttribute('data-zooming', 'true');
       workspace.setAttribute('data-gesture', 'true');
       isZoomingRef.current = true;
-      setIsZooming(true);
     }
     clearTimeout(zoomTimeoutRef.current);
     zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, CANVAS_IDLE_MS);
@@ -8352,7 +8599,6 @@ export default function App() {
         workspace.setAttribute('data-zooming', 'true');
         workspace.setAttribute('data-gesture', 'true');
         isZoomingRef.current = true;
-        setIsZooming(true);
         window.dispatchEvent(new CustomEvent('canvas-gesture-start'));
       }
 
@@ -8386,12 +8632,22 @@ export default function App() {
     if (Math.abs(prevScale - newScale) < 0.001) return;
     
     // 1. Degrade styles during active animation to keep frames buttery smooth (Intent-Driven Lazy Restoration)
+    // Zoom-out always uses lazy deferral; zoom-in respects immediate/hybrid modes.
+    const isZoomOut = newScale < prevScale;
+    setCameraZoomingOut(isZoomOut);
+    if (isZoomOut || getCanvasLoadingMode() === 'lazy') {
+      setCameraTweenZooming(true);
+      triggerTweenZoom(240);
+      window.dispatchEvent(new CustomEvent('abort-mount-queue'));
+    } else {
+      setCameraTweenZooming(false);
+    }
     const workspace = document.getElementById('canvas-workspace');
     if (workspace && workspace.getAttribute('data-zooming') !== 'true') {
       workspace.setAttribute('data-zooming', 'true');
       workspace.setAttribute('data-gesture', 'true');
       isZoomingRef.current = true;
-      setIsZooming(true);
+      window.dispatchEvent(new CustomEvent('canvas-gesture-start'));
     }
     
     // 2. Clear previous restoration timers
@@ -8415,7 +8671,7 @@ export default function App() {
     animate(tScale, newScale, { type: 'tween', duration: 0.22, ease: 'easeOut' });
     animate(tx, newX, { type: 'tween', duration: 0.22, ease: 'easeOut' });
     animate(ty, newY, { type: 'tween', duration: 0.22, ease: 'easeOut' });
-  }, [tScale, tx, ty, restoreCanvasStyles, resetOverviewPrompt, releaseScreenCursorsIfOutsideDock]);
+  }, [tScale, tx, ty, restoreCanvasStyles, resetOverviewPrompt, releaseScreenCursorsIfOutsideDock, triggerTweenZoom]);
 
   const handleFocusCanvasCard = useCallback((cardId: string, occupiedLeftWidth?: number) => {
     const liveCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
@@ -8457,7 +8713,6 @@ export default function App() {
       workspace.setAttribute('data-zooming', 'true');
       workspace.setAttribute('data-gesture', 'true');
       isZoomingRef.current = true;
-      setIsZooming(true);
     }
     clearTimeout(zoomTimeoutRef.current);
     zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, CANVAS_IDLE_MS);
@@ -8555,13 +8810,20 @@ export default function App() {
     const worldX = (cursorX - currentTx) / currentScale;
     const worldY = (cursorY - currentTy) / currentScale;
 
-    // Intent-Driven Lazy Restoration: degrade heavy effects during rapid tween
+    // Intent-Driven Lazy Restoration: degrade heavy effects and pause mount queue during rapid tween
+    window.dispatchEvent(new CustomEvent('abort-mount-queue'));
+    window.dispatchEvent(new CustomEvent('canvas-gesture-start'));
+    setCameraTweenZooming(true);
+    isTweenZoomingRef.current = true;
+    if (tweenTimeoutRef.current) {
+      clearTimeout(tweenTimeoutRef.current);
+      tweenTimeoutRef.current = null;
+    }
     const workspace = document.getElementById('canvas-workspace');
     if (workspace && workspace.getAttribute('data-zooming') !== 'true') {
       workspace.setAttribute('data-zooming', 'true');
       workspace.setAttribute('data-gesture', 'true');
       isZoomingRef.current = true;
-      setIsZooming(true);
     }
 
     // Direct Double Click Zoom Toggle:
@@ -8571,18 +8833,19 @@ export default function App() {
     const returnToFullScale = (targetTx: number, targetTy: number) => {
       const destination = { x: targetTx, y: targetTy, scale: 1 };
       targetTransform.current = destination;
+      setCameraZoomingOut(1 < currentScale);
       clearTimeout(zoomTimeoutRef.current);
-      // isZooming already pauses the mount queue; avoid an extra latch that
-      // could remain set if this tween is interrupted by another gesture.
       const transition = { type: 'tween' as const, duration: 0.36, ease: [0.16, 1, 0.3, 1] as [number, number, number, number] };
-      // Immediate mode resumes at the end; lazy mode waits for camera idle.
+      // Immediate/hybrid modes resume at the end; lazy mode waits for camera idle.
       void Promise.all([
         animate(tScale, 1, transition),
         animate(tx, targetTx, transition),
         animate(ty, targetTy, transition),
       ]).then(() => {
-        // A wheel gesture or a newer zoom owns restoration if this one was superseded.
         if (targetTransform.current !== destination) return;
+        isTweenZoomingRef.current = false;
+        setCameraTweenZooming(false);
+        setCameraZoomingOut(false);
         clearTimeout(zoomTimeoutRef.current);
         if (getCanvasLoadingMode() === 'lazy') {
           lastCameraChangeRef.current = performance.now();
@@ -8604,6 +8867,7 @@ export default function App() {
       const targetTy = cursorY - worldY * targetScale;
       const destination = { x: targetTx, y: targetTy, scale: targetScale };
       targetTransform.current = destination;
+      setCameraZoomingOut(true);
       clearTimeout(zoomTimeoutRef.current);
       const transition = { type: 'tween' as const, duration: 0.40, ease: [0.16, 1, 0.3, 1] as [number, number, number, number] };
       void Promise.all([
@@ -8612,6 +8876,10 @@ export default function App() {
         animate(ty, targetTy, transition),
       ]).then(() => {
         if (targetTransform.current !== destination) return;
+        isTweenZoomingRef.current = false;
+        setCameraTweenZooming(false);
+        setCameraZoomingOut(false);
+        clearTimeout(zoomTimeoutRef.current);
         if (getCanvasLoadingMode() === 'lazy') {
           lastCameraChangeRef.current = performance.now();
           zoomTimeoutRef.current = setTimeout(restoreCanvasStyles, CANVAS_IDLE_MS);
@@ -8716,7 +8984,6 @@ export default function App() {
         workspace.setAttribute('data-zooming', 'true');
         workspace.setAttribute('data-gesture', 'true');
         isZoomingRef.current = true;
-        setIsZooming(true);
 
         // Offload background video pauses to next animation frame to prevent wheel tick jank
         window.dispatchEvent(new CustomEvent('canvas-gesture-start'));
@@ -8752,6 +9019,19 @@ export default function App() {
       // Continuous pinch on touchpad produces smaller deltaY, discrete mouse wheel produces larger deltaY
       const zoomSensitivity = isDiscrete ? 0.002 : 0.004;
       const delta = -e.deltaY * zoomSensitivity;
+      const isWheelZoomOut = e.deltaY > 0;
+      if (isWheelZoomOut) {
+        if (!isCameraZoomingOut()) {
+          setCameraZoomingOut(true);
+          window.dispatchEvent(new CustomEvent('abort-mount-queue'));
+        }
+      } else {
+        const wasZoomingOut = isCameraZoomingOut();
+        setCameraZoomingOut(false);
+        if (getCanvasLoadingMode() !== 'lazy' && (wasZoomingOut || !isQueueProcessingRef.current)) {
+          window.dispatchEvent(new CustomEvent('resume-mount-queue'));
+        }
+      }
       
       const newScale = Math.min(Math.max(0.1, prevTarget.scale * Math.exp(delta)), 5);
       
@@ -8799,11 +9079,14 @@ export default function App() {
 
   const startCanvasMiddlePan = useCallback((e: React.PointerEvent) => {
     releaseScreenCursorsIfOutsideDock();
+    setCameraZoomingOut(false);
     // Bypass React state to eliminate start-of-drag stutter and immediately make canvas cards pointer-transparent
     document.getElementById('canvas-workspace')?.setAttribute('data-middle-pan', 'true');
     isDraggingCanvasRef.current = true;
     hasActivatedPanRef.current = false;
-    window.dispatchEvent(new CustomEvent('abort-mount-queue'));
+    if (getCanvasLoadingMode() === 'lazy') {
+      window.dispatchEvent(new CustomEvent('abort-mount-queue'));
+    }
 
     document.body.style.cursor = 'grabbing';
     lastPointer.current = { x: e.clientX, y: e.clientY };
@@ -9154,6 +9437,9 @@ export default function App() {
     // If visibleCardIdSet has not yet initialized, calculate directly for first frame
     if (visibleCardIdSet.size === 0 && cards.length > 0) {
       if (typeof window === 'undefined') return cards;
+      if (tScale.get() < getNanoLodThreshold()) {
+        return cards.filter(card => selectedIds.has(card.id));
+      }
       const vp = {
         viewportWidth: window.innerWidth,
         viewportHeight: window.innerHeight,
@@ -9177,7 +9463,7 @@ export default function App() {
       if (added) entryBlurBatchRef.current++;
     }
     return entryBlurBatchRef.current;
-  }, [cards, currentProjectId, isLoading, visibleCards]);
+  }, [cards, currentProjectId, isLoading]);
   // --- Center-Out Event-Driven Interruptible Mount Queue ---
   // Replaces fixed timers and arbitrary batch quotas with a human-centric priority queue:
   // 1. Sorts unmounted visible cards by Euclidean distance to viewport center (Center -> Perimeter).
@@ -9185,17 +9471,22 @@ export default function App() {
     // 3. Zoom/card drag pauses admission; camera panning reprioritizes visible work live.
   const mountQueueAbortRef = useRef<{ aborted: boolean; cancel?: () => void }>({ aborted: false });
   const isQueueProcessingRef = useRef(false);
+  const hybridWaitWakeRef = useRef<(() => void) | null>(null);
   const visibleCardsRef = useRef<CardData[]>([]);
+  const agentFocusRef = useRef(agentFocus);
+  agentFocusRef.current = agentFocus;
 
   const abortMountQueue = useCallback(() => {
     mountQueueAbortRef.current.aborted = true;
     mountQueueAbortRef.current.cancel?.();
+    hybridWaitWakeRef.current = null;
     mountQueueAbortRef.current = { aborted: true };
     isQueueProcessingRef.current = false;
   }, []);
+  abortMountQueueRef.current = abortMountQueue;
 
   const runCenterOutMountQueue = useCallback(() => {
-    if (!isDomCardsActive) {
+    if (!isDomCardsActive || isNanoLodRef.current || tScale.get() < getNanoLodThreshold()) {
       abortMountQueue();
       if (!isDomCardsActive) {
         setRenderedCardIds(prev => {
@@ -9243,100 +9534,134 @@ export default function App() {
       });
     }
 
-    // 2. Identify unmounted visible cards
-    const pending = currentVisible.filter(c => !currentMounted.has(c.id));
-    if (pending.length === 0) return;
+    // 2. Check if there are any unmounted visible cards
+    const hasPending = currentVisible.some(c => !renderedCardIdsRef.current.has(c.id));
+    if (!hasPending) return;
 
-    // 3. Cancel any previous queue session and create fresh cancellation token
-    mountQueueAbortRef.current.aborted = true;
-    mountQueueAbortRef.current.cancel?.();
+    // 3. In-Flight Task Protection: if the dynamic mount loop is already active,
+    // do NOT abort the card currently mounting/painting; simply wake up any hybrid wait.
+    if (isQueueProcessingRef.current && !mountQueueAbortRef.current.aborted) {
+      hybridWaitWakeRef.current?.();
+      return;
+    }
+
     const abortToken: { aborted: boolean; cancel?: () => void } = { aborted: false };
     mountQueueAbortRef.current = abortToken;
 
-    // 4. Sort strictly from viewport Center outward (Center -> Perimeter)
-    const currentScale = tScale.get() || 1;
-    const centerX = (window.innerWidth / 2 - tx.get()) / currentScale;
-    const centerY = (window.innerHeight / 2 - ty.get()) / currentScale;
-
-    const sortedQueue = [...pending].sort((a, b) => {
-      // Top priority: Agent focused cards (Primary & References)
-      const aAgent = Boolean(agentFocus.primaryCardId === a.id || agentFocus.referenceCardIds.includes(a.id));
-      const bAgent = Boolean(agentFocus.primaryCardId === b.id || agentFocus.referenceCardIds.includes(b.id));
-      if (aAgent && !bAgent) return -1;
-      if (!aAgent && bAgent) return 1;
-
-      const aSel = selectedCardIdsRef.current.includes(a.id);
-      const bSel = selectedCardIdsRef.current.includes(b.id);
-      if (aSel && !bSel) return -1;
-      if (!aSel && bSel) return 1;
-
-      const dimA = getCardSize(a);
-      const dimB = getCardSize(b);
-      const distA = Math.pow((a.x + dimA.width / 2) - centerX, 2) + Math.pow((a.y + dimA.height / 2) - centerY, 2);
-      const distB = Math.pow((b.x + dimB.width / 2) - centerX, 2) + Math.pow((b.y + dimB.height / 2) - centerY, 2);
-      return distA - distB;
-    });
-
-    // Admit one card, then wait for its image and prompt surfaces to be
-    // presented before admitting the next one.
+    // 4. Dynamically admit one highest-priority card at a time from live visibleCardsRef,
+    // waiting for its image and prompt surfaces to be presented before picking the next.
     (async () => {
       isQueueProcessingRef.current = true;
-      let currentIndex = 0;
       let previousFrameTime: number | null = null;
 
-      while (currentIndex < sortedQueue.length) {
+      while (!abortToken.aborted) {
+        const liveWorkspace = document.getElementById('canvas-workspace');
+        const liveGestureActive = Boolean(
+          isZoomingRef.current ||
+          isDraggingCanvasRef.current ||
+          (window as any).isDraggingCard ||
+          (window as any).__nanoDragging ||
+          liveWorkspace?.getAttribute('data-gesture') === 'true' ||
+          liveWorkspace?.getAttribute('data-zooming') === 'true' ||
+          liveWorkspace?.getAttribute('data-panning') === 'true'
+        );
+        if (liveGestureActive && !canLoadDuringCameraGesture()) {
+          isQueueProcessingRef.current = false;
+          return;
+        }
+
+        const liveVisible = visibleCardsRef.current;
+        const liveMounted = renderedCardIdsRef.current;
+        const unmounted = liveVisible.filter(c => !liveMounted.has(c.id));
+        if (unmounted.length === 0) {
+          break;
+        }
+
+        const isHybridGesture = getCanvasLoadingMode() === 'hybrid' && canLoadDuringCameraGesture();
+        const candidates = isHybridGesture
+          ? unmounted.filter(c => isHybridCardNear(c.id))
+          : unmounted;
+
+        if (candidates.length === 0) {
+          await new Promise<void>(resolve => {
+            const wake = () => {
+              clearTimeout(timer);
+              if (hybridWaitWakeRef.current === wake) hybridWaitWakeRef.current = null;
+              abortToken.cancel = undefined;
+              resolve();
+            };
+            const timer = setTimeout(wake, 80);
+            hybridWaitWakeRef.current = wake;
+            abortToken.cancel = wake;
+          });
+          if (abortToken.aborted) {
+            isQueueProcessingRef.current = false;
+            return;
+          }
+          continue;
+        }
+
+        const currentScale = tScale.get() || 1;
+        const pointer = getHybridPointer();
+        const usePointerFocus = getCanvasLoadingMode() === 'hybrid' && Number.isFinite(pointer.x) && Number.isFinite(pointer.y);
+        const focusWorldX = usePointerFocus
+          ? (pointer.x - tx.get()) / currentScale
+          : (window.innerWidth / 2 - tx.get()) / currentScale;
+        const focusWorldY = usePointerFocus
+          ? (pointer.y - ty.get()) / currentScale
+          : (window.innerHeight / 2 - ty.get()) / currentScale;
+        const liveFocus = agentFocusRef.current;
+
+        candidates.sort((a, b) => {
+          const aAgent = Boolean(liveFocus.primaryCardId === a.id || liveFocus.referenceCardIds.includes(a.id));
+          const bAgent = Boolean(liveFocus.primaryCardId === b.id || liveFocus.referenceCardIds.includes(b.id));
+          if (aAgent && !bAgent) return -1;
+          if (!aAgent && bAgent) return 1;
+
+          const aSel = selectedCardIdsRef.current.includes(a.id);
+          const bSel = selectedCardIdsRef.current.includes(b.id);
+          if (aSel && !bSel) return -1;
+          if (!aSel && bSel) return 1;
+
+          const dimA = getCardSize(a);
+          const dimB = getCardSize(b);
+          const distA = Math.pow((a.x + dimA.width / 2) - focusWorldX, 2) + Math.pow((a.y + dimA.height / 2) - focusWorldY, 2);
+          const distB = Math.pow((b.x + dimB.width / 2) - focusWorldX, 2) + Math.pow((b.y + dimB.height / 2) - focusWorldY, 2);
+          return distA - distB;
+        });
+
+        const card = candidates[0];
+        let didAdmit = false;
+
+        // Mounts and surface draws share ONE queue, rather than racing per frame.
+        // Latch-on-Pick: once picked, admit as long as the card remains in the visible viewport.
+        await new Promise<void>(resolve => {
+          const cancel = scheduleCanvasSurface(() => {
+            abortToken.cancel = undefined;
+            if (!abortToken.aborted) {
+              const stillVisible = visibleCardsRef.current.some(v => v.id === card.id);
+              if (stillVisible) {
+                didAdmit = true;
+                setRenderedCardIds(prev => {
+                  if (prev.has(card.id)) return prev;
+                  const next = new Set(prev);
+                  next.add(card.id);
+                  return next;
+                });
+              }
+            }
+            resolve();
+          }, { label: `mount:${card.id}` });
+          abortToken.cancel = () => { cancel(); resolve(); };
+        });
+
         if (abortToken.aborted) {
           isQueueProcessingRef.current = false;
           return;
         }
 
-        if (getCanvasLoadingMode() === 'hybrid' && canLoadDuringCameraGesture()) {
-          const nextIndex = sortedQueue.findIndex((card, index) => index >= currentIndex && isHybridCardNear(card.id));
-          if (nextIndex < 0) { await new Promise<void>(resolve => {
-            const timer = setTimeout(resolve, 100);
-            abortToken.cancel = () => { clearTimeout(timer); resolve(); };
-          });
-          abortToken.cancel = undefined;
-          continue; }
-          [sortedQueue[currentIndex], sortedQueue[nextIndex]] = [sortedQueue[nextIndex], sortedQueue[currentIndex]];
-        }
-        const batchToMount: CardData[] = [];
-        const batchLimit = 1;
-
-        while (currentIndex < sortedQueue.length && batchToMount.length < batchLimit) {
-          batchToMount.push(sortedQueue[currentIndex]);
-          currentIndex++;
-        }
-
-        if (batchToMount.length > 0) {
-          const batchIds = new Set(batchToMount.map(c => c.id));
-
-          // Mounts and surface draws share ONE queue, rather than racing per frame.
-          await new Promise<void>(resolve => {
-            const cancel = scheduleCanvasSurface(() => {
-              abortToken.cancel = undefined;
-              if (!abortToken.aborted && getCanvasLoadingMode() === 'hybrid' && canLoadDuringCameraGesture() && !isHybridCardNear(batchToMount[0].id)) {
-                currentIndex--;
-                batchToMount.length = 0;
-                resolve();
-                return;
-              }
-              if (!abortToken.aborted) {
-                setRenderedCardIds(prev => {
-                  const next = new Set(prev);
-                  let hasNew = false;
-                  const stillVisible = new Set(visibleCardsRef.current.map(card => card.id));
-                  for (const id of batchIds) {
-                    if (!stillVisible.has(id)) continue;
-                    if (!next.has(id)) { next.add(id); hasNew = true; }
-                  }
-                  return hasNew ? next : prev;
-                });
-              }
-              resolve();
-            }, { label: `mount:${batchToMount[0].id}` });
-            abortToken.cancel = () => { cancel(); resolve(); };
-          });
+        if (!didAdmit) {
+          continue;
         }
 
         // Allow the commit to enqueue its surfaces; the shared pacer controls speed.
@@ -9350,8 +9675,7 @@ export default function App() {
           });
         });
 
-        if (batchToMount.length > 0 && !abortToken.aborted) {
-          const card = batchToMount[0];
+        if (!abortToken.aborted) {
           await new Promise<void>(resolve => {
             let finished = false;
             let firstFrame: number | null = null;
@@ -9390,15 +9714,10 @@ export default function App() {
             });
           });
         }
-
-        if (abortToken.aborted) {
-          isQueueProcessingRef.current = false;
-          return;
-        }
       }
       isQueueProcessingRef.current = false;
     })();
-  }, [isDomCardsActive, tx, ty, tScale, agentFocus, abortMountQueue]);
+  }, [isDomCardsActive, tx, ty, tScale, abortMountQueue]);
 
   useEffect(() => {
     visibleCardsRef.current = visibleCards;
@@ -9429,8 +9748,8 @@ export default function App() {
             shortSide = Math.min(size.width, size.height) * scale;
           }
         }
-        // Diameter spans about 1.2 short card sides, bounded in screen pixels.
-        cache = { cards, x: pointer.x, y: pointer.y, scale, tx: cameraX, ty: cameraY, radius: Math.max(80, Math.min(180, shortSide * 0.6)) };
+        // Adaptive focal radius (160px~320px in screen space) for reliable hybrid foveated loading during pan/zoom.
+        cache = { cards, x: pointer.x, y: pointer.y, scale, tx: cameraX, ty: cameraY, radius: Math.max(160, Math.min(320, shortSide * 0.9)) };
       }
       const card = cards.find(card => card.id === id);
       if (!card) return false;
@@ -9452,11 +9771,17 @@ export default function App() {
   useEffect(() => {
     const handleAbort = () => abortMountQueue();
     const handleResume = () => runCenterOutMountQueue();
+    const handleHybridWake = () => {
+      hybridWaitWakeRef.current?.();
+      runCenterOutMountQueue();
+    };
     window.addEventListener('abort-mount-queue', handleAbort);
     window.addEventListener('resume-mount-queue', handleResume);
+    window.addEventListener(CANVAS_HYBRID_POINTER_WAKE_EVENT, handleHybridWake);
     return () => {
       window.removeEventListener('abort-mount-queue', handleAbort);
       window.removeEventListener('resume-mount-queue', handleResume);
+      window.removeEventListener(CANVAS_HYBRID_POINTER_WAKE_EVENT, handleHybridWake);
     };
   }, [abortMountQueue, runCenterOutMountQueue]);
 
@@ -9480,6 +9805,56 @@ export default function App() {
     }
     return list;
   }, [isOverviewMode, showOverviewPromptToast, overviewProgress]);
+
+  const handleToggleScriptDrawer = useCallback(() => {
+    setDrawerOpen(!scriptViewRef.current.drawerOpen);
+  }, [setDrawerOpen]);
+
+  const handleCloseScriptDrawer = useCallback(() => {
+    setDrawerOpen(false);
+  }, [setDrawerOpen]);
+
+  const handleBindToScriptAsset = useCallback((targetCardId: string) => {
+    setBindingCanvasCardId(targetCardId);
+  }, []);
+
+  const scriptAgentFocusedTargetIds = useMemo(() => (
+    Array.from(
+      new Set([
+        ...(agentFocus.referenceCardIds || []),
+        ...(Object.values(concurrentTaskCursors) as ConcurrentTaskCursorState[]).map(c => c.targetId),
+      ].filter((id): id is string => Boolean(id)))
+    )
+  ), [agentFocus.referenceCardIds, concurrentTaskCursors]);
+
+  const nanoAgentTargetCardIds = useMemo(() => {
+    const set = new Set<string>();
+    if (agentFocus.primaryCardId) set.add(agentFocus.primaryCardId);
+    if (agentFocus.referenceCardIds) {
+      agentFocus.referenceCardIds.forEach(id => set.add(id));
+    }
+    if (agentFocus.focusedMap) {
+      Object.keys(agentFocus.focusedMap).forEach(id => set.add(id));
+    }
+    if (agentQuickInput?.isOpen) {
+      if (agentQuickInput.targetId) set.add(agentQuickInput.targetId);
+      if (agentQuickInput.targetIds && Array.isArray(agentQuickInput.targetIds)) {
+        agentQuickInput.targetIds.forEach(id => set.add(id));
+      }
+    }
+    return set;
+  }, [agentFocus.primaryCardId, agentFocus.referenceCardIds, agentFocus.focusedMap, agentQuickInput]);
+
+  const nanoPickerSession = useMemo(() => (
+    pickerSession ||
+    (assetBindPickerSession
+      ? { targetCardId: '', selectedCardIds: assetBindPickerSession.pickedCardIds }
+      : null)
+  ), [pickerSession, assetBindPickerSession]);
+
+  const handleNanoThumbnailGenerated = useCallback((id: string, thumbnailUrl: string) => {
+    handleBatchThumbnailGenerated(id, thumbnailUrl);
+  }, [handleBatchThumbnailGenerated]);
 
   return (
     <div 
@@ -9623,8 +9998,8 @@ export default function App() {
         onDeleteProject={handleDeleteProject}
         onUpdateProject={handleUpdateCurrentProject}
         isOpen={isScriptDrawerOpen}
-        onToggleOpen={() => setDrawerOpen(!scriptViewRef.current.drawerOpen)}
-        onClose={() => setDrawerOpen(false)}
+        onToggleOpen={handleToggleScriptDrawer}
+        onClose={handleCloseScriptDrawer}
         isTocOpen={isScriptTocOpen}
         onTocOpenChange={setTocOpen}
         tocScrollRequest={tocScrollRequest}
@@ -9643,12 +10018,7 @@ export default function App() {
         verifyingAssetIds={verifyingAssetIds}
         generatingAssetIds={generatingAssetIds}
         agentFocusedTargetId={agentFocus.primaryCardId || (agentQuickInput?.isOpen ? agentQuickInput.targetId : null)}
-        agentFocusedTargetIds={Array.from(
-          new Set([
-            ...(agentFocus.referenceCardIds || []),
-            ...(Object.values(concurrentTaskCursors) as ConcurrentTaskCursorState[]).map(c => c.targetId),
-          ].filter((id): id is string => Boolean(id)))
-        )}
+        agentFocusedTargetIds={scriptAgentFocusedTargetIds}
         isAgentSleeping={Boolean(agentState.isSleeping)}
         selectedAssetIds={selectedAssetIds}
         onSelectedAssetIdsChange={setSelectedAssetIds}
@@ -9698,59 +10068,32 @@ export default function App() {
       <CanvasSnapGuidesOverlay tx={tx} ty={ty} scale={tScale} />
 
       {/* Nano-LOD High Performance Hybrid Canvas Layer (Active when scale < 0.40 or during staggered DOM loading) */}
-      {(() => {
-        const targetCardIds = new Set<string>();
-        if (agentFocus.primaryCardId) targetCardIds.add(agentFocus.primaryCardId);
-        if (agentFocus.referenceCardIds) {
-          agentFocus.referenceCardIds.forEach(id => targetCardIds.add(id));
+      <NanoLodCanvas
+        cards={cards}
+        selectedCardIds={selectedCardIds}
+        renderedCardIds={renderedCardIds}
+        domCardsActive={isDomCardsActive}
+        agentTargetCardId={
+          agentFocus.primaryCardId ||
+          (agentQuickInput?.isOpen && agentQuickInput.targetId ? agentQuickInput.targetId : null)
         }
-        if (agentFocus.focusedMap) {
-          Object.keys(agentFocus.focusedMap).forEach(id => targetCardIds.add(id));
-        }
-        if (agentQuickInput?.isOpen) {
-          if (agentQuickInput.targetId) targetCardIds.add(agentQuickInput.targetId);
-          if (agentQuickInput.targetIds && Array.isArray(agentQuickInput.targetIds)) {
-            agentQuickInput.targetIds.forEach(id => targetCardIds.add(id));
-          }
-        }
-
-        return (
-          <NanoLodCanvas
-            cards={cards}
-            selectedCardIds={selectedCardIds}
-            renderedCardIds={renderedCardIds}
-            domCardsActive={isDomCardsActive}
-            agentTargetCardId={
-              agentFocus.primaryCardId || 
-              (agentQuickInput?.isOpen && agentQuickInput.targetId ? agentQuickInput.targetId : null)
-            }
-            agentTargetCardIds={targetCardIds}
-            agentReferenceCardIds={agentFocus.referenceCardIds}
-            agentFocusMap={agentFocus.focusedMap}
-            pickerSession={
-              pickerSession ||
-              (assetBindPickerSession
-                ? { targetCardId: '', selectedCardIds: assetBindPickerSession.pickedCardIds }
-                : null)
-            }
-            scale={tScale}
-            tx={tx}
-            ty={ty}
-            isDarkMode={isDarkMode}
-            isOverviewMode={isOverviewMode}
-            onReady={handleNanoCanvasReady}
-            onThumbnailGenerated={(id, thumbnailUrl) => {
-              handleBatchThumbnailGenerated(id, thumbnailUrl);
-            }}
-          />
-        );
-      })()}
+        agentTargetCardIds={nanoAgentTargetCardIds}
+        agentReferenceCardIds={agentFocus.referenceCardIds}
+        agentFocusMap={agentFocus.focusedMap}
+        pickerSession={nanoPickerSession}
+        scale={tScale}
+        tx={tx}
+        ty={ty}
+        isDarkMode={isDarkMode}
+        isOverviewMode={isOverviewMode}
+        onReady={handleNanoCanvasReady}
+        onThumbnailGenerated={handleNanoThumbnailGenerated}
+      />
 
       {/* Canvas Workspace for Nodes/Cards */}
       <motion.div 
         id="canvas-workspace"
-        className={`absolute top-0 left-0 transform-gpu group/canvas ${isOverviewMode ? 'z-20' : 'z-0'} ${isZooming || isDraggingCanvasRef.current || isTweenZooming ? 'will-change-transform' : ''}`}
-        data-zooming={isZooming ? 'true' : undefined}
+        className={`absolute top-0 left-0 transform-gpu group/canvas ${isOverviewMode ? 'z-20' : 'z-0'}`}
         data-scale-micro={isMicroLod ? 'true' : undefined}
         data-scale-nano={isNanoLod ? 'true' : undefined}
         data-lod-fade={isLodFading ? 'true' : undefined}
@@ -9804,7 +10147,6 @@ export default function App() {
               agentFocusRole={agentFocusRole}
               agentInspectScenario={agentInspectScenario}
               isAgentThinking={isAgentThinking}
-              isZooming={isZooming}
               allCards={cards}
               currentProject={currentProject}
               onSelect={handleCardSelectWrapped}
@@ -9813,7 +10155,7 @@ export default function App() {
               onDelete={handleCardDelete}
               onUpdate={handleUpdateCard}
               onForkCard={handleForkCard}
-              onBindToScriptAsset={(targetCardId) => setBindingCanvasCardId(targetCardId)}
+              onBindToScriptAsset={handleBindToScriptAsset}
               onHover={setHoveredCardId}
             />
           );
@@ -9860,6 +10202,7 @@ export default function App() {
         <AnimatePresence>
           {overviewViewportBox && (
             <motion.div
+              ref={overviewViewportElRef}
               key="overview-viewport-indicator"
               initial={{ opacity: 1 }}
               animate={{ opacity: isOverviewMode ? 1 : 0 }}
@@ -9882,6 +10225,7 @@ export default function App() {
         {/* Overview Mode Dynamic Cursor Viewport Reticle Box */}
         {isOverviewMode && overviewCursorBox && (
           <div
+            ref={overviewCursorElRef}
             key="overview-cursor-viewport-reticle"
             className="absolute pointer-events-none z-[85] border border-solid border-blue-500/90 dark:border-blue-400/95 bg-blue-500/[0.06] dark:bg-blue-400/[0.08]"
             style={{
@@ -9964,7 +10308,6 @@ export default function App() {
             }}
             transform={transformValues}
             isIdle={!cursor.isRunning}
-            isZooming={isZooming}
             isAgentRunning={cursor.isRunning}
             isAgentThinking={cursor.isThinking}
             isAgentAsking={Boolean(cursor.isAsking)}
@@ -9988,7 +10331,6 @@ export default function App() {
         agentState={agentState}
         transform={transformValues}
         isIdle={true}
-        isZooming={isZooming}
         isAgentRunning={isAgentRunning || isProcessingInspectQueueRef.current || isAgentThinking}
         isAgentThinking={isAgentThinking}
         isAgentAsking={isAgentAsking}

@@ -186,5 +186,211 @@ export function getLodUnmountQuota(
   return Math.max(1, Math.ceil(remainingCulledCount / remainingFrames));
 }
 
+export const NANO_FULL_IMAGE_MIN_SCALE = 0.6;
 
+/**
+ * Selects up to `quota` mounted card IDs to unmount first during a High -> Low LOD transition.
+ * Picks perimeter cards furthest from the viewport center first so focal cards stay resident
+ * longest in case the user reverses zoom back into Standard LOD.
+ */
+export function pickZoomOutUnmountBatch(
+  mountedIds: Iterable<string>,
+  cardsById: ReadonlyMap<string, CardBounds>,
+  viewportCenter: { x: number; y: number },
+  quota: number
+): string[] {
+  if (quota <= 0) return [];
+  const entries: Array<{ id: string; distSq: number }> = [];
+  for (const id of mountedIds) {
+    const card = cardsById.get(id);
+    if (!card) {
+      entries.push({ id, distSq: Infinity });
+      continue;
+    }
+    const size = getCardSize(card);
+    const cx = card.x + size.width / 2;
+    const cy = card.y + size.height / 2;
+    const dx = cx - viewportCenter.x;
+    const dy = cy - viewportCenter.y;
+    entries.push({ id, distSq: dx * dx + dy * dy });
+  }
+  if (entries.length === 0) return [];
+  if (quota >= entries.length) {
+    return entries.map(entry => entry.id);
+  }
+  entries.sort((a, b) => b.distSq - a.distSq);
+  return entries.slice(0, quota).map(entry => entry.id);
+}
 
+/**
+ * Avoids expensive 2D Canvas downsampling of high-res full bitmaps during active gestures,
+ * zoom-out, or scales below 60% where lightweight proxy thumbnails already match screen size.
+ */
+export function shouldUseNanoCanvasThumbOnly(
+  scale: number,
+  isGestureActive: boolean,
+  isZoomingOut: boolean,
+  allowGestureUpgrade: boolean = false
+): boolean {
+  if (isZoomingOut || scale < NANO_FULL_IMAGE_MIN_SCALE) return true;
+  if (isGestureActive && !allowGestureUpgrade) return true;
+  return false;
+}
+
+/**
+ * Enables cheap rectangular drawing and simplified bottom panels in NanoLodCanvas during
+ * active zoom-out gestures, deferring Path2D clipping and full skeleton details until idle.
+ */
+export function shouldSimplifyNanoCanvasCard(
+  scale: number,
+  isGestureActive: boolean,
+  isZoomingOut: boolean
+): boolean {
+  return isGestureActive && (isZoomingOut || scale < NANO_FULL_IMAGE_MIN_SCALE);
+}
+
+/**
+ * Quantizes camera scale into the discrete buckets actually needed by DOM cards
+ * (image DPR steps > 1.0, ReferenceThumbItem at 1.0 / 2.0, and high-scale >= 1.8 / 2.5),
+ * eliminating redundant React state updates across 0.10..0.99 zoom ranges.
+ */
+export function quantizeCardScaleTier(scale: number): number {
+  if (!Number.isFinite(scale) || scale < 1.0) return 0.9;
+  if (scale < 1.5) return 1.25;
+  if (scale <= 1.8) return 1.75;
+  if (scale < 2.0) return 1.9;
+  if (scale <= 2.5) return 2.25;
+  if (scale <= 3.5) return 3.0;
+  return 4.0;
+}
+
+/**
+ * Doubles grid spacing cleanly by powers of two when zoomed deep out so pattern
+ * repetition stays below heavy fill-rate thresholds while keeping world alignment.
+ */
+export function computeGridDisplaySpacing(
+  scale: number,
+  baseWorldStep: number = 48,
+  minScreenSpacing: number = 16
+): number {
+  const safeScale = Number.isFinite(scale) && scale > 0.001 ? scale : 0.001;
+  const safeStep = Math.max(1, baseWorldStep);
+  let spacing = safeStep * safeScale;
+  let doublings = 0;
+  while (spacing < minScreenSpacing && doublings < 6) {
+    spacing *= 2;
+    doublings += 1;
+  }
+  return spacing;
+}
+
+/**
+ * Defers cold decoding of raw high-res imageUrl/originalImageUrl inside NanoLodCanvas
+ * during active zoom-out gestures when no thumbnail or cached bitmap is ready yet.
+ */
+export function shouldDeferNanoColdFallback(
+  hasCachedOrThumb: boolean,
+  isGestureActive: boolean,
+  isZoomingOut: boolean
+): boolean {
+  return Boolean(!hasCachedOrThumb && isGestureActive && isZoomingOut);
+}
+
+/**
+ * Enables single-texture world snapshot blitting in NanoLodCanvas below the Nano-LOD threshold
+ * during active camera gestures on multi-card canvases (when not dragging individual cards or in Overview).
+ */
+export function shouldUseNanoGestureSnapshot(
+  scale: number,
+  cardCount: number,
+  isGestureActive: boolean,
+  isZoomingOut: boolean,
+  isOverviewMode: boolean,
+  isDragging: boolean
+): boolean {
+  if (!isGestureActive || isOverviewMode || isDragging) return false;
+  if (scale >= getNanoLodThreshold()) return false;
+  return cardCount >= 12 && (isZoomingOut || scale < getNanoLodThreshold());
+}
+
+export interface ZoomHudState {
+  pct: number;
+  label: '远景' | '中景' | '近景' | '特写';
+  colorClass: string;
+  zoomInDisabled: boolean;
+}
+
+/**
+ * Computes ZoomControlGroup display metadata from raw camera scale for zero-re-render DOM updates.
+ */
+export function formatZoomHudState(scale: number): ZoomHudState {
+  const safeScale = Number.isFinite(scale) ? scale : 1;
+  const pct = Math.round(safeScale * 100);
+  let label: ZoomHudState['label'];
+  let colorClass: string;
+  if (pct < 40) {
+    label = '远景';
+    colorClass = 'text-blue-500 dark:text-blue-400';
+  } else if (pct < 100) {
+    label = '中景';
+    colorClass = 'text-emerald-500 dark:text-emerald-400';
+  } else if (pct < 200) {
+    label = '近景';
+    colorClass = 'text-amber-500 dark:text-amber-400';
+  } else {
+    label = '特写';
+    colorClass = 'text-rose-500 dark:text-rose-400';
+  }
+  return {
+    pct,
+    label,
+    colorClass,
+    zoomInDisabled: safeScale >= 4.99,
+  };
+}
+
+export interface FpsHudBadge {
+  text: string;
+  dotClassName: string;
+}
+
+/**
+ * Formats FPS indicator text and status dot classes for direct DOM updates without React re-renders.
+ */
+export function formatFpsHudBadge(fps: number): FpsHudBadge {
+  const safeFps = Number.isFinite(fps) ? Math.max(0, Math.round(fps)) : 60;
+  const colorClass =
+    safeFps >= 58
+      ? 'bg-emerald-500 animate-pulse'
+      : safeFps >= 45
+      ? 'bg-teal-500'
+      : safeFps >= 30
+      ? 'bg-amber-500'
+      : 'bg-red-500';
+  return {
+    text: String(safeFps),
+    dotClassName: `w-1.5 h-1.5 rounded-full ${colorClass} shrink-0`,
+  };
+}
+
+/**
+ * Avoids shrinking and clearing CardImageCanvas backing buffers when DPR steps down
+ * slightly on zoom-out, while allowing growth and bounds-capped shrinkage when oversampled > 2.25x.
+ */
+export function shouldPreserveCardCanvasBackingStore(
+  prevPxW: number,
+  prevPxH: number,
+  targetPxW: number,
+  targetPxH: number,
+  effectiveShowOriginal: boolean,
+  isGenerating: boolean
+): boolean {
+  if (effectiveShowOriginal || isGenerating) return false;
+  if (prevPxW <= 0 || prevPxH <= 0 || targetPxW <= 0 || targetPxH <= 0) return false;
+  return (
+    prevPxW >= targetPxW &&
+    prevPxH >= targetPxH &&
+    prevPxW <= targetPxW * 2.25 &&
+    prevPxH <= targetPxH * 2.25
+  );
+}

@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import type { MotionValue } from 'motion/react';
 import { getCappedDpr } from '../utils/devicePixelBudget';
+import { computeGridDisplaySpacing } from '../utils/viewportCulling';
 
 /** A repeating texture keeps the number of draw calls constant at every zoom. */
 export function CanvasGridBackground({ tx, ty, scale }: {
@@ -20,30 +21,38 @@ export function CanvasGridBackground({ tx, ty, scale }: {
     if (!ctx || !tileCtx) return;
     let pattern: CanvasPattern | null = null;
     let raf: number | null = null;
-    let lastSpacing = -1;
+    let lastRadius = -1;
 
     const draw = () => {
       raf = null;
       const width = window.innerWidth;
       const height = window.innerHeight;
-      // Decorative grid: cap the backing store so a large high-DPI window does not pay
-      // for millions of extra pixels on every redraw.
-      const dpr = getCappedDpr(width, height, 1.5);
+      const workspace = document.getElementById('canvas-workspace');
+      const isGestureActive = Boolean(
+        workspace &&
+        (workspace.getAttribute('data-gesture') === 'true' ||
+          workspace.getAttribute('data-zooming') === 'true' ||
+          workspace.getAttribute('data-panning') === 'true')
+      );
+      // Drop grid backing store to 1x DPR during active gestures, then restore crisp 1.5x at rest.
+      const dpr = isGestureActive ? 1 : getCappedDpr(width, height, 1.5);
       const pixelWidth = Math.round(width * dpr);
       const pixelHeight = Math.round(height * dpr);
       if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
         canvas.width = pixelWidth;
         canvas.height = pixelHeight;
       }
-      const spacing = Math.max(0.01, scale.get() * 48);
-      if (spacing !== lastSpacing) {
+      const rawScale = scale.get();
+      const spacing = computeGridDisplaySpacing(rawScale, 48, 16);
+      const tileRadius = Math.max(2, Math.min(24, Math.round(((2 * 128) / spacing) * 2) / 2));
+      if (!pattern || tileRadius !== lastRadius) {
         tileCtx.clearRect(0, 0, 128, 128);
         tileCtx.fillStyle = '#a1a1aa';
         tileCtx.beginPath();
-        tileCtx.arc(64, 64, 2 * 128 / spacing, 0, Math.PI * 2);
+        tileCtx.arc(64, 64, tileRadius, 0, Math.PI * 2);
         tileCtx.fill();
         pattern = ctx.createPattern(tile, 'repeat');
-        lastSpacing = spacing;
+        lastRadius = tileRadius;
       }
       if (!pattern) return;
       const offsetX = ((tx.get() % spacing) + spacing) % spacing;
@@ -59,10 +68,12 @@ export function CanvasGridBackground({ tx, ty, scale }: {
     };
     const unsubs = [tx, ty, scale].map(value => value.on('change', schedule));
     window.addEventListener('resize', schedule);
+    window.addEventListener('canvas-styles-restored', schedule);
     schedule();
     return () => {
       unsubs.forEach(unsub => unsub());
       window.removeEventListener('resize', schedule);
+      window.removeEventListener('canvas-styles-restored', schedule);
       if (raf !== null) cancelAnimationFrame(raf);
     };
   }, [tx, ty, scale]);

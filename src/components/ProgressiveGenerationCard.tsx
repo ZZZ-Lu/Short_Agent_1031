@@ -1,6 +1,6 @@
 import { isNewCardAwaitingLod } from '../utils/cardEntrance';
 import { getNanoLodThreshold } from '../utils/viewportCulling';
-import { getCanvasLoadingMode, isHybridCardNear } from '../utils/canvasPerformance';
+import { getCanvasLoadingMode, isHybridCardNear, subscribeCanvasLoadingMode, CANVAS_HYBRID_POINTER_WAKE_EVENT } from '../utils/canvasPerformance';
 import React, { useCallback, useRef, useState, useSyncExternalStore } from 'react';
 import { GenerationCard } from './GenerationCard';
 
@@ -38,12 +38,28 @@ export const ProgressiveGenerationCard = React.memo(function ProgressiveGenerati
   const useDomLod = useSyncExternalStore(subscribeScale, getDomLod, getDomLod);
   const admittedDom = useRef(false);
   const subscribe = useCallback((listener: () => void) => {
-    const unsubscribe = mountStore.subscribe(id, listener);
-    if (isSelected) window.addEventListener('canvas-styles-restored', listener);
-    return () => { unsubscribe(); if (isSelected) window.removeEventListener('canvas-styles-restored', listener); };
+    const unsubscribeMount = mountStore.subscribe(id, listener);
+    const unsubscribeMode = subscribeCanvasLoadingMode(listener);
+    window.addEventListener('canvas-styles-restored', listener);
+    window.addEventListener('canvas-gesture-start', listener);
+    if (isSelected) {
+      window.addEventListener(CANVAS_HYBRID_POINTER_WAKE_EVENT, listener);
+    }
+    return () => {
+      unsubscribeMount();
+      unsubscribeMode();
+      window.removeEventListener('canvas-styles-restored', listener);
+      window.removeEventListener('canvas-gesture-start', listener);
+      if (isSelected) {
+        window.removeEventListener(CANVAS_HYBRID_POINTER_WAKE_EVENT, listener);
+      }
+    };
   }, [id, isSelected, mountStore]);
   const snapshot = useCallback(() => {
     const workspace = document.getElementById('canvas-workspace');
+    if (workspace?.getAttribute('data-nano-retired') === 'true' && !mountStore.ids.has(id)) {
+      return false;
+    }
     const paused = (getCanvasLoadingMode() === 'lazy' || (getCanvasLoadingMode() === 'hybrid' && !isHybridCardNear(id))) &&
       ['data-gesture', 'data-panning', 'data-zooming'].some(name => workspace?.getAttribute(name) === 'true');
     if (paused && isSelected && !admittedDom.current) return false;

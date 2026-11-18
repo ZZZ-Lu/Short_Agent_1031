@@ -358,7 +358,7 @@ function SingleLineMarquee({
   );
 }
 
-export function AgentCursor({ 
+export const AgentCursor = React.memo(function AgentCursor({ 
   agentState, 
   transform, 
   isIdle = true, 
@@ -678,7 +678,11 @@ export function AgentCursor({
       agentPosX.set(agentState.x);
       agentPosY.set(agentState.y);
     } else {
-      const transition = isZooming && currentCoordSpace === 'canvas'
+      const zoomingNow = Boolean(
+        isZooming ||
+        (typeof document !== 'undefined' && document.getElementById('canvas-workspace')?.getAttribute('data-zooming') === 'true')
+      );
+      const transition = zoomingNow && currentCoordSpace === 'canvas'
         ? { type: 'tween', duration: 0.15, ease: 'easeOut' }
         : agentState.isMoving 
           ? { type: 'spring', damping: 28, stiffness: 450, mass: 0.35 }
@@ -1132,4 +1136,4 @@ export function AgentCursor({
       </div>
     </motion.div>
   );
-}
+});

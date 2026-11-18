@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { MotionValue } from 'motion/react';
 import { CardData, getCardSize } from './GenerationCard';
 
@@ -77,17 +77,31 @@ export const CanvasLineageOverlay: React.FC<CanvasLineageOverlayProps> = React.m
     };
   }, []);
 
-  // Scale tracking for scale-invariant visual stroke width and dot size
-  const [currentScale, setCurrentScale] = useState(() => scale ? scale.get() : 1);
+  const svgRef = useRef<SVGSVGElement | null>(null);
 
   useEffect(() => {
     if (!scale) return;
     let rafId: number | null = null;
-    const unsub = scale.on('change', (s) => {
+    const syncScaleToSvg = () => {
+      const svg = svgRef.current;
+      if (!svg) return;
+      const safeScale = Math.max(scale.get() || 1, 0.001);
+      const sw = (1.5 / safeScale).toString();
+      const r = (3.5 / safeScale).toString();
+      const lines = svg.querySelectorAll('line');
+      for (let i = 0; i < lines.length; i++) {
+        lines[i].setAttribute('stroke-width', sw);
+      }
+      const circles = svg.querySelectorAll('circle');
+      for (let i = 0; i < circles.length; i++) {
+        circles[i].setAttribute('r', r);
+      }
+    };
+    const unsub = scale.on('change', () => {
       if (rafId === null) {
         rafId = requestAnimationFrame(() => {
           rafId = null;
-          setCurrentScale(s);
+          syncScaleToSvg();
         });
       }
     });
@@ -224,12 +238,13 @@ export const CanvasLineageOverlay: React.FC<CanvasLineageOverlayProps> = React.m
   };
 
   const BLUE_COLOR = '#3b82f6';
-  const safeScale = Math.max(currentScale || 1, 0.001);
+  const safeScale = Math.max((scale ? scale.get() : 1) || 1, 0.001);
   const strokeWidth = 1.5 / safeScale;
   const dotRadius = 3.5 / safeScale;
 
   return (
     <svg
+      ref={svgRef}
       className="absolute inset-0 pointer-events-none overflow-visible z-[6]"
       style={{ width: 1, height: 1 }}
     >

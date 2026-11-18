@@ -5,8 +5,9 @@ import fs from "fs";
 import dotenv from "dotenv";
 import { AGENT_TOOL_REGISTRY } from './src/agent/toolRegistry';
 import { initialAgentContext, TOOL_CATEGORIES, resolveContext, CONTROL_TOOLS, cleanToolOutputForPrompt, mergeTaskNotes, type AgentContextSelection } from './src/agent/contextPolicy';
-import { applyThinkingPayload, resolveAgentTurnMaxTokens, resolveModelConfig, type ModelConfig } from './src/agent/modelConfig';
-import { splitPromptForPrefixCache, splitStateNodePromptForPrefixCache, normalizeTokenUsage, type PromptCacheUsageStats } from './src/agent/promptCache';
+import { resolveAgentTurnMaxTokens, resolveModelConfig, type ModelConfig } from './src/agent/modelConfig';
+import { executeChatCompletion, sanitizeImageUrlsForLlm, UpstreamHttpError } from './src/agent/llmClient';
+import { splitPromptForPrefixCache, splitStateNodePromptForPrefixCache, type PromptCacheUsageStats } from './src/agent/promptCache';
 import { RECOMMENDED_BATCH_MAX_CHARS } from './src/agent/scriptTools';
 import { formatExperiencePlaybookForPrompt, type ExperienceSearchResult } from './src/agent/experienceRegistry';
 import { mcpRouter } from './src/server/mcpRouter';
@@ -426,94 +427,6 @@ function getModelConfig(modelType: string, userKey?: string): ModelConfig {
   return resolveModelConfig(modelType, userKey, process.env);
 }
 
-async function parseChatCompletionResponse(response: Response, isStream: boolean): Promise<{ content: string; reasoning_content?: string; usage?: PromptCacheUsageStats }> {
-  const contentType = response.headers.get('content-type') || '';
-  if (!contentType.includes('text/event-stream') && !isStream) {
-    const data = await response.json();
-    const message = data.choices?.[0]?.message || {};
-    return {
-      content: message.content || '',
-      reasoning_content: message.reasoning_content || message.reasoning || '',
-      usage: normalizeTokenUsage(data.usage),
-    };
-  }
-
-  const reader = response.body?.getReader();
-  if (!reader) {
-    const text = await response.text();
-    try {
-      const data = JSON.parse(text);
-      const message = data.choices?.[0]?.message || {};
-      return {
-        content: message.content || '',
-        reasoning_content: message.reasoning_content || '',
-        usage: normalizeTokenUsage(data.usage),
-      };
-    } catch {
-      throw new Error('无法读取响应流内容');
-    }
-  }
-
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let fullContent = '';
-  let fullReasoning = '';
-  let latestUsage: PromptCacheUsageStats | undefined;
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() ?? '';
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith(':')) continue;
-      if (trimmed === 'data: [DONE]') continue;
-      if (trimmed.startsWith('data: ')) {
-        const jsonStr = trimmed.slice(6);
-        try {
-          const chunk = JSON.parse(jsonStr);
-          if (chunk.usage) {
-            const parsedUsage = normalizeTokenUsage(chunk.usage);
-            if (parsedUsage) latestUsage = parsedUsage;
-          }
-          const delta = chunk.choices?.[0]?.delta;
-          if (delta) {
-            if (delta.content) {
-              fullContent += delta.content;
-            }
-            if (delta.reasoning_content) {
-              fullReasoning += delta.reasoning_content;
-            } else if (delta.reasoning) {
-              fullReasoning += delta.reasoning;
-            }
-          }
-        } catch {
-          // ignore incomplete JSON chunks
-        }
-      }
-    }
-  }
-
-  if (buffer.trim().startsWith('data: ') && buffer.trim() !== 'data: [DONE]') {
-    try {
-      const chunk = JSON.parse(buffer.trim().slice(6));
-      if (chunk.usage) {
-        const parsedUsage = normalizeTokenUsage(chunk.usage);
-        if (parsedUsage) latestUsage = parsedUsage;
-      }
-      const delta = chunk.choices?.[0]?.delta;
-      if (delta?.content) fullContent += delta.content;
-      if (delta?.reasoning_content) fullReasoning += delta.reasoning_content;
-      else if (delta?.reasoning) fullReasoning += delta.reasoning;
-    } catch {}
-  }
-
-  return { content: fullContent, reasoning_content: fullReasoning, usage: latestUsage };
-}
-
 // Heuristic fallback for script TOC pattern recognition
 function inferPatternHeuristically(sampleText: string): { tocPattern: string; scenePattern: string; flags: string; patternDescription: string } {
   const lines = sampleText.split('\n').map(l => l.trim()).filter(Boolean);
@@ -605,30 +518,17 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
 
     try {
       if (modelType !== 'heuristic') {
-        const { endpoint, actualModel, apiKey: keyToUse, enableThinking } = getModelConfig(modelType, apiKey || deepseekKey);
-        const requestPayload: Record<string, unknown> = {
-          model: actualModel,
-          response_format: { type: 'json_object' },
+        const modelConfig = getModelConfig(modelType, apiKey || deepseekKey);
+        const data = await executeChatCompletion({
+          modelConfig,
+          jsonMode: true,
+          stream: false,
           messages: [
             { role: 'system', content: systemPrompt || '分析剧本标题格式并返回 pattern、flags、patternDescription 的 JSON。' },
             { role: 'user', content: sampleText.slice(0, 4000) }
           ]
-        };
-        if (enableThinking) {
-          requestPayload.enable_thinking = true;
-          requestPayload.extra_body = { thinking: { type: 'enabled' } };
-        } else {
-          requestPayload.thinking = { type: 'disabled' };
-          requestPayload.extra_body = { thinking: { type: 'disabled' } };
-        }
-        const response = await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${keyToUse}` },
-          body: JSON.stringify(requestPayload)
         });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const body = await response.json();
-        const parsed = robustParseJson(body.choices?.[0]?.message?.content || '{}') || {};
+        const parsed = robustParseJson(data.content || '{}') || {};
         if (parsed.scenePattern || parsed.pattern || parsed.tocPattern) {
           return res.json({ 
             ...parsed,
@@ -656,11 +556,11 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
   app.post("/api/script/assess-change", async (req, res) => {
     try {
       const { action, affected_scene_orders, char_delta, before_snippet, after_snippet, apiKey, modelType = 'auto' } = req.body;
-      const { endpoint, actualModel, apiKey: keyToUse, enableThinking } = getModelConfig(modelType, apiKey);
-
-      const requestPayload: Record<string, unknown> = {
-        model: actualModel,
-        response_format: { type: 'json_object' },
+      const modelConfig = getModelConfig(modelType, apiKey);
+      const data = await executeChatCompletion({
+        modelConfig,
+        jsonMode: true,
+        stream: false,
         messages: [
           {
             role: "system",
@@ -677,33 +577,9 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
             })
           }
         ]
-      };
+      });
 
-      if (enableThinking) {
-        requestPayload.enable_thinking = true;
-        requestPayload.extra_body = { thinking: { type: 'enabled' } };
-      } else {
-        requestPayload.thinking = { type: 'disabled' };
-        requestPayload.extra_body = { thinking: { type: 'disabled' } };
-      }
-
-      const fetchOptions: RequestInit = {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${keyToUse}`,
-        },
-        body: JSON.stringify(requestPayload),
-      };
-
-      const response = await fetch(endpoint, fetchOptions);
-      if (!response.ok) {
-        throw new Error(`Model API error: HTTP ${response.status}`);
-      }
-
-      const body = await response.json();
-      const resultText = body.choices?.[0]?.message?.content || '{}';
-      const parsed = robustParseJson(resultText) || {};
+      const parsed = robustParseJson(data.content || '{}') || {};
       
       return res.json({
         scale: parsed.scale || 'trivial',
@@ -722,10 +598,10 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
     try {
       const { prompt, apiKey, systemPrompt, modelType = 'auto' } = req.body;
       if (modelType === 'heuristic') return res.status(400).json({ error: '该节点不支持启发式模型。' });
-      const { endpoint, actualModel, apiKey: keyToUse, stream, enableThinking, reasoningEffort } = getModelConfig(modelType, apiKey);
-
-      const requestPayload: Record<string, unknown> = {
-        model: actualModel,
+      const modelConfig = getModelConfig(modelType, apiKey);
+      const data = await executeChatCompletion({
+        modelConfig,
+        stream: !!modelConfig.stream,
         messages: [
           {
             role: "system",
@@ -736,31 +612,7 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
             content: prompt
           }
         ]
-      };
-
-      if (stream) {
-        requestPayload.stream = true;
-      }
-      applyThinkingPayload(requestPayload, {
-        endpoint,
-        enableThinking,
-        reasoningEffort,
       });
-
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${keyToUse}`
-        },
-        body: JSON.stringify(requestPayload)
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error?.message || `API Error: ${response.status}`);
-      }
-      const data = await parseChatCompletionResponse(response, !!stream);
       res.json({ result: data.content });
     } catch (error: any) {
       console.error("DeepSeek API Error:", error);
@@ -826,7 +678,8 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
         jsonAdapterKey,
         jsonAdapterPrompt: customJsonAdapterPrompt,
       } = req.body;
-      const { endpoint, actualModel, apiKey: keyToUse, stream, enableThinking, reasoningEffort } = getModelConfig(modelType, apiKey);
+      const modelConfig = getModelConfig(modelType, apiKey);
+      const { endpoint, actualModel, stream, enableThinking, reasoningEffort } = modelConfig;
       if (!userMessage || typeof userMessage !== 'string') return res.status(400).json({ error: '缺少用户消息。' });
 
       const allToolIds = new Set<string>(AGENT_TOOL_REGISTRY.map((tool) => tool.id));
@@ -1424,12 +1277,12 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         }
       }
 
-      const allImages: string[] = [
+      const allImages: string[] = sanitizeImageUrlsForLlm([
         ...(Array.isArray(images) ? images : []),
         ...(Array.isArray(task?.images) ? task.images : []),
         ...(Array.isArray(effectiveCardContext?.images) ? effectiveCardContext.images : []),
         ...(effectiveCardContext?.imageUrl ? [effectiveCardContext.imageUrl] : []),
-      ].filter((img, idx, arr) => typeof img === 'string' && img.length > 0 && arr.indexOf(img) === idx);
+      ]);
 
       const { systemPrompt: cachedSystemPrefix, userPrompt: dynamicUserPrompt } = splitPromptForPrefixCache(finalPrompt);
       const effectiveUserText = cachedSystemPrefix ? dynamicUserPrompt : finalPrompt;
@@ -1457,88 +1310,42 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
             { role: 'user', content: userContent },
           ];
 
-      const requestPayload: Record<string, unknown> = {
-        model: actualModel,
-        messages,
-        max_tokens: resolveAgentTurnMaxTokens({ endpoint, enableThinking, reasoningEffort }),
-      };
+      const fallbackSystemKey =
+        modelConfig.provider === 'gemini'
+          ? process.env.GEMINI_API_KEY
+          : modelConfig.provider === 'dashscope'
+          ? process.env.DASHSCOPE_API_KEY
+          : modelConfig.provider === 'ark'
+          ? (process.env.ARK_API_KEY || process.env.VOLCENGINE_API_KEY)
+          : process.env.DEEPSEEK_API_KEY;
 
-      if (stream) {
-        requestPayload.stream = true;
-        requestPayload.stream_options = { include_usage: true };
-      }
-      applyThinkingPayload(requestPayload, {
-        endpoint,
-        enableThinking,
-        reasoningEffort,
-        includeTemperatureWhenDisabled: 0.2,
-      });
-
-      let response = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${keyToUse}` },
-        body: JSON.stringify(requestPayload),
-      });
-
-      // Fallback if an upstream OpenAI-compatible provider rejects stream_options
-      if (!response.ok && response.status === 400 && requestPayload.stream_options) {
-        const errBody = await response.clone().text().catch(() => '');
-        if (/stream_options|include_usage/i.test(errBody)) {
-          delete requestPayload.stream_options;
-          response = await fetch(endpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${keyToUse}` },
-            body: JSON.stringify(requestPayload),
-          });
-        }
-      }
-
-      // If multimodal payload was rejected (e.g. text-only model or provider error), transparently retry with text-only payload
-      if (!response.ok && Array.isArray(userContent)) {
-        console.warn(`Vision payload rejected (${response.status}), retrying with text-only payload`);
-        requestPayload.messages = cachedSystemPrefix
-          ? [
-              { role: 'system', content: cachedSystemPrefix },
-              { role: 'user', content: effectiveUserText },
-            ]
-          : [{ role: 'user', content: finalPrompt }];
-        response = await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${keyToUse}` },
-          body: JSON.stringify(requestPayload),
+      let message;
+      try {
+        message = await executeChatCompletion({
+          modelConfig,
+          messages,
+          stream: !!stream,
+          maxTokens: resolveAgentTurnMaxTokens({ endpoint, enableThinking, reasoningEffort }),
+          includeTemperatureWhenDisabled: 0.2,
+          fallbackSystemKey,
         });
-      }
-      if (!response.ok) {
-        const detail = await response.json().catch(() => ({}));
-        const rawMsg = detail?.error?.message || detail?.message || `HTTP ${response.status}`;
+      } catch (err: any) {
+        const rawMsg = err?.message || 'Unknown upstream error';
+        const status = err instanceof UpstreamHttpError ? err.status : 0;
         const isBalanceError = /insufficient\s*balance|quota|402|out\s*of\s*credit|余额不足|欠费/i.test(rawMsg);
-        const isAuthError = /authentication\s*fails|invalid\s*api\s*key|unauthorized|401|api\s*key\s*is\s*invalid/i.test(rawMsg);
-        const isUpstream500 = response.status >= 500 || /internal\s*server\s*error/i.test(rawMsg);
-        
-        const fallbackSystemKey = process.env.GEMINI_API_KEY || process.env.DEEPSEEK_API_KEY || process.env.DASHSCOPE_API_KEY || process.env.ZHIPU_API_KEY || process.env.SILICONFLOW_API_KEY;
-        if (isBalanceError && fallbackSystemKey && keyToUse !== fallbackSystemKey) {
-          console.warn(`User Key insufficient balance (${rawMsg}), retrying with system fallback API key...`);
-          const retryRes = await fetch(endpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${fallbackSystemKey}` },
-            body: JSON.stringify(requestPayload),
-          });
-          if (retryRes.ok) {
-            response = retryRes;
-          } else {
-            throw new Error('API Key 账户余额不足 (Insufficient Balance)。请在设置页面更新有效的 API Key 或切换模型。');
-          }
-        } else if (isBalanceError) {
+        const isAuthError = status === 401 || /authentication\s*fails|invalid\s*api\s*key|unauthorized|401|api\s*key\s*(?:is\s*)?invalid|API_KEY_INVALID/i.test(rawMsg);
+        const isUpstream500 = status >= 500 || /internal\s*server\s*error/i.test(rawMsg);
+
+        if (isBalanceError) {
           throw new Error('API Key 账户余额不足 (Insufficient Balance)。请在设置页面更新有效的 API Key 或切换模型。');
         } else if (isAuthError) {
           throw new Error(`模型供应商鉴权失败 (401)：${rawMsg}。请在“设置 > API 密钥”中检查填写的 Key。`);
         } else if (isUpstream500) {
-          throw new Error(`上游模型服务出现临时错误 (${response.status} Internal Server Error)：${rawMsg}。这通常是上游大模型服务商集群瞬时抖动，请重试或在设置中切换模型。`);
+          throw new Error(`上游模型服务出现临时错误 (${status || 500} Internal Server Error)：${rawMsg}。这通常是上游大模型服务商集群瞬时抖动，请重试或在设置中切换模型。`);
         } else {
           throw new Error(rawMsg);
         }
       }
-      const message = await parseChatCompletionResponse(response, !!stream);
       
       const narration: string[] = [];
       let speakText = '';
@@ -2125,7 +1932,10 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       const fastStateModel = requestedStateModel.toLowerCase().includes('deepseek-v4-pro')
         ? 'deepseek-v4-flash'
         : requestedStateModel;
-      const { endpoint, actualModel, apiKey: keyToUse } = getModelConfig(fastStateModel, apiKey);
+      const stateModelConfig = {
+        ...getModelConfig(fastStateModel, apiKey),
+        enableThinking: false,
+      };
 
       const defaultDeltaMergeStatePrompt = `你是一个认知状态增量合并与整理节点。
 你的职责是：对照【任务背景与聚焦目标】与【当前认知状态（上一轮旧状态）】，读取【本轮最新流向与主循环输出】，将主循环在“状态检查”和“思考”中产出的本轮增量变化，合并整理为最新的认知状态 JSON。
@@ -2259,32 +2069,22 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
       const { systemPrompt: stateSystemPrompt, userPrompt: stateUserPrompt } = splitStateNodePromptForPrefixCache(prompt);
       const formattedStateDebugPrompt = `=== [SYSTEM] ===\n${stateSystemPrompt}\n\n=== [USER] ===\n${stateUserPrompt}`;
 
-      const isDeepSeekStateEndpoint = endpoint.includes('deepseek.com');
-      const requestPayload: Record<string, unknown> = {
-        model: actualModel,
-        response_format: { type: 'json_object' },
-        temperature: 0.1,
-        max_tokens: 2048,
-        thinking: { type: 'disabled' },
-        ...(isDeepSeekStateEndpoint ? { reasoning_effort: 'none' } : {}),
-        extra_body: {
-          thinking: { type: 'disabled' },
-          ...(isDeepSeekStateEndpoint ? { reasoning_effort: 'none' } : {}),
-        },
-        messages: [
-          { role: 'system', content: stateSystemPrompt },
-          { role: 'user', content: stateUserPrompt }
-        ]
-      };
-
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${keyToUse}` },
-        body: JSON.stringify(requestPayload),
-      });
-
-      if (!response.ok) {
-        const errText = await response.text();
+      let data;
+      try {
+        data = await executeChatCompletion({
+          modelConfig: stateModelConfig,
+          jsonMode: true,
+          stream: false,
+          maxTokens: 2048,
+          includeTemperatureWhenDisabled: 0.1,
+          messages: [
+            { role: 'system', content: stateSystemPrompt },
+            { role: 'user', content: stateUserPrompt }
+          ]
+        });
+      } catch (stateErr: any) {
+        const errText = stateErr?.message || 'Unknown error';
+        const status = stateErr instanceof UpstreamHttpError ? stateErr.status : 500;
         const speakText = typeof lastTurnOutput === 'object' && (lastTurnOutput?.response || lastTurnOutput?.speak)
           ? String(lastTurnOutput.response || lastTurnOutput.speak)
           : '';
@@ -2299,12 +2099,10 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
           notes: speakText ? mergeTaskNotes(currentTask?.notes, speakText.slice(0, 100), 'append') : undefined,
           notesMode: 'overwrite',
           debugPrompt: formattedStateDebugPrompt,
-          fallbackNotice: `接口响应异常 (${response.status})，已启用启发式保底提炼机制`,
+          fallbackNotice: `接口响应异常 (${status})，已启用启发式保底提炼机制`,
           apiError: errText,
         });
       }
-
-      const data = await parseChatCompletionResponse(response, false);
       let parsed: any = robustParseJson(data.content || '{}');
       if (!parsed || typeof parsed !== 'object') {
         console.warn('Failed to parse json from state node output:', data.content);
@@ -2346,7 +2144,10 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
     try {
       const { sampleText, input, systemPrompt, modelType = 'deepseek-v4-flash', apiKey } = req.body;
       const rawInput = sampleText || input || '';
-      const { endpoint, actualModel, apiKey: keyToUse } = getModelConfig(modelType, apiKey);
+      const adapterModelConfig = {
+        ...getModelConfig(modelType, apiKey),
+        enableThinking: false,
+      };
 
       const allTools = AGENT_TOOL_REGISTRY;
       const adapterToolPrompt = allTools
@@ -2359,27 +2160,21 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         ? systemPromptTemplate.replace('{{adapterToolPrompt}}', adapterToolPrompt)
         : systemPromptTemplate + `\n\n可用工具的 JSON Schema：\n${adapterToolPrompt}`;
 
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${keyToUse}` },
-        body: JSON.stringify({
-          model: actualModel,
-          response_format: { type: 'json_object' },
-          thinking: { type: 'disabled' },
-          extra_body: { thinking: { type: 'disabled' } },
+      let data;
+      try {
+        data = await executeChatCompletion({
+          modelConfig: adapterModelConfig,
+          jsonMode: true,
+          stream: false,
           messages: [
             { role: 'system', content: finalPrompt },
             { role: 'user', content: rawInput }
           ]
-        })
-      });
-
-      if (!response.ok) {
-        const errText = await response.text();
-        return res.status(response.status).json({ error: `JSON 转译节点请求失败: ${errText}` });
+        });
+      } catch (adapterErr: any) {
+        const status = adapterErr instanceof UpstreamHttpError ? adapterErr.status : 500;
+        return res.status(status).json({ error: `JSON 转译节点请求失败: ${adapterErr?.message || adapterErr}` });
       }
-
-      const data = await parseChatCompletionResponse(response, false);
       const parsed = robustParseJson(data.content || '{}') || {};
       res.json(parsed);
     } catch (err: any) {
@@ -2404,7 +2199,11 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         });
       }
 
-      const { endpoint, actualModel, apiKey: keyToUse } = getModelConfig(model || 'deepseek-v4-flash', apiKey);
+      const landmarksModelConfig = {
+        ...getModelConfig(model || 'deepseek-v4-flash', apiKey),
+        enableThinking: false,
+      };
+      const { actualModel } = landmarksModelConfig;
 
       const hasSlices = Array.isArray(slices) && slices.length > 1;
 
@@ -2495,44 +2294,34 @@ ${effectiveRequirement}
         ];
       }
 
-      const requestPayload = {
-        model: actualModel,
-        response_format: { type: 'json_object' },
-        thinking: { type: 'disabled' },
-        extra_body: { thinking: { type: 'disabled' } },
-        messages: [
-          { role: 'system', content: landmarksPromptTemplate },
-          {
-            role: 'user',
-            content: userMessagesContent
-          }
-        ]
-      };
-
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${keyToUse}`
-        },
-        body: JSON.stringify(requestPayload)
-      });
-
-      if (!response.ok) {
-        const errText = await response.text();
-        console.info(`[LandmarksNode] Model API returned status ${response.status}:`, errText);
+      let data;
+      try {
+        data = await executeChatCompletion({
+          modelConfig: landmarksModelConfig,
+          jsonMode: true,
+          stream: false,
+          messages: [
+            { role: 'system', content: landmarksPromptTemplate },
+            {
+              role: 'user',
+              content: userMessagesContent
+            }
+          ]
+        });
+      } catch (lmErr: any) {
+        const status = lmErr instanceof UpstreamHttpError ? lmErr.status : 500;
+        const errText = lmErr?.message || 'Unknown error';
+        console.info(`[LandmarksNode] Model API returned status ${status}:`, errText);
         const fallback = generateFallbackLandmarks(effectiveRequirement);
         return res.json({
           ...fallback,
           requirement: effectiveRequirement,
           detectedAt: Date.now(),
           modelUsed: 'heuristic_fallback',
-          fallbackNotice: `视觉接口响应异常 (${response.status})，已启用启发式保底定位`,
+          fallbackNotice: `视觉接口响应异常 (${status})，已启用启发式保底定位`,
           apiError: errText,
         });
       }
-
-      const data = await parseChatCompletionResponse(response, false);
       let parsed: any = robustParseJson(data.content || '{}');
       if (!parsed || typeof parsed !== 'object') {
         console.warn('Failed to parse landmarks json:', data.content);
@@ -2768,7 +2557,10 @@ ${effectiveRequirement}
         return res.status(400).json({ error: 'Missing cropDataUrl or label' });
       }
 
-      const { endpoint, actualModel, apiKey: keyToUse } = getModelConfig(model || 'deepseek-v4-flash', apiKey);
+      const verifyModelConfig = {
+        ...getModelConfig(model || 'deepseek-v4-flash', apiKey),
+        enableThinking: false,
+      };
 
       const verifySystemPrompt = `你是一个严谨的多模态视觉核验专家。
 你的任务是：观察输入的目标局部裁剪图，判断画面中是否真实、明确地包含了所声明的目标主体【${label}】。
@@ -2783,44 +2575,33 @@ ${effectiveRequirement}
 }
 严格只返回合法 JSON，严禁任何额外解释。`;
 
-      const requestPayload = {
-        model: actualModel,
-        response_format: { type: 'json_object' },
-        thinking: { type: 'disabled' },
-        extra_body: { thinking: { type: 'disabled' } },
-        messages: [
-          { role: 'system', content: verifySystemPrompt },
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'image_url',
-                image_url: { url: cropDataUrl, detail: 'low' }
-              },
-              {
-                type: 'text',
-                text: `核验目标：【${label}】${description ? `（特征参考：${description}）` : ''}。该局部画面中是否真实包含该目标？`
-              }
-            ]
-          }
-        ]
-      };
-
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${keyToUse}`
-        },
-        body: JSON.stringify(requestPayload)
-      });
-
-      if (!response.ok) {
+      let data;
+      try {
+        data = await executeChatCompletion({
+          modelConfig: verifyModelConfig,
+          jsonMode: true,
+          stream: false,
+          messages: [
+            { role: 'system', content: verifySystemPrompt },
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'image_url',
+                  image_url: { url: cropDataUrl, detail: 'low' }
+                },
+                {
+                  type: 'text',
+                  text: `核验目标：【${label}】${description ? `（特征参考：${description}）` : ''}。该局部画面中是否真实包含该目标？`
+                }
+              ]
+            }
+          ]
+        });
+      } catch {
         // Fallback: if verification API fails, be permissive to avoid accidentally dropping valid items
         return res.json({ match: true, confidence: 0.8, reason: 'Verification API unavailable, defaulted to pass' });
       }
-
-      const data = await parseChatCompletionResponse(response, false);
       const parsed = robustParseJson(data.content || '{}') || {};
       const match = parsed.match !== false && (parsed.valid !== false);
       const confidence = typeof parsed.confidence === 'number' ? parsed.confidence : 0.85;
@@ -2844,7 +2625,10 @@ ${effectiveRequirement}
         return res.status(400).json({ error: 'Missing imageUrl or label' });
       }
 
-      const { endpoint, actualModel, apiKey: keyToUse } = getModelConfig(model || 'deepseek-v4-flash', apiKey);
+      const singleModelConfig = {
+        ...getModelConfig(model || 'deepseek-v4-flash', apiKey),
+        enableThinking: false,
+      };
 
       const singlePrompt = `你是一个单目标极高精度视觉定位定位专家。
 你的唯一任务是：在全图画面中，全力聚焦搜寻单个指定目标【${label}】。
@@ -2860,43 +2644,32 @@ ${effectiveRequirement}
   "description": "目标在画面中的位置与视觉特征简述"
 }`;
 
-      const requestPayload = {
-        model: actualModel,
-        response_format: { type: 'json_object' },
-        thinking: { type: 'disabled' },
-        extra_body: { thinking: { type: 'disabled' } },
-        messages: [
-          { role: 'system', content: singlePrompt },
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'image_url',
-                image_url: { url: imageUrl, detail: 'low' }
-              },
-              {
-                type: 'text',
-                text: `请在全图中精准定位单一目标：【${label}】${description ? `（特征描述：${description}）` : ''}`
-              }
-            ]
-          }
-        ]
-      };
-
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${keyToUse}`
-        },
-        body: JSON.stringify(requestPayload)
-      });
-
-      if (!response.ok) {
+      let data;
+      try {
+        data = await executeChatCompletion({
+          modelConfig: singleModelConfig,
+          jsonMode: true,
+          stream: false,
+          messages: [
+            { role: 'system', content: singlePrompt },
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'image_url',
+                  image_url: { url: imageUrl, detail: 'low' }
+                },
+                {
+                  type: 'text',
+                  text: `请在全图中精准定位单一目标：【${label}】${description ? `（特征描述：${description}）` : ''}`
+                }
+              ]
+            }
+          ]
+        });
+      } catch {
         return res.json({ found: false, box_2d: null, error: 'Model failed' });
       }
-
-      const data = await parseChatCompletionResponse(response, false);
       const parsed = robustParseJson(data.content || '{}') || {};
 
       let box_2d: [number, number, number, number] | null = null;

@@ -26,27 +26,27 @@ import {
   Copy,
   Link2
 } from 'lucide-react';
-import { isCardIntersectingRectangle } from '../utils/viewportCulling';
+import { isCardIntersectingRectangle, quantizeCardScaleTier } from '../utils/viewportCulling';
 import { getBottomPanelHeight, getPromptAreaHeight, getPromptSurfaceLayout, getReferencePreviewLayout } from '../utils/cardLayout';
 import { CardImageCanvas } from './CardImageCanvas';
 import { PromptCanvas } from './PromptCanvas';
-import { readyPromptPanels, getCardSurfaceRevision } from '../utils/promptSurfaceCache';
+import { readyPromptPanels, mountedDomCardIds, getCardSurfaceRevision } from '../utils/promptSurfaceCache';
 import { cardCornerStyle, CARD_PANEL_WIDTH, EMPTY_CARD_PATHS } from '../utils/cardLodAppearance';
 import { capDprToBudget } from '../utils/devicePixelBudget';
 import { getStandardReferencePreview, resolveReferencePreviewSource } from '../utils/referencePreview';
 import { referenceDisplayName, shortenReferenceMentions } from '../utils/referenceName';
 import { PromptPanelCanvas, type PanelControl } from './PromptPanelCanvas';
-import { CANVAS_IDLE_MS, scheduleCanvasSurface, scheduleOriginalImageRestore } from '../utils/canvasPerformance';
+import { CANVAS_IDLE_MS, scheduleCanvasSurface, scheduleOriginalImageRestore, canUpgradeCardDuringGesture, isCameraZoomingOut, CANVAS_HYBRID_POINTER_WAKE_EVENT } from '../utils/canvasPerformance';
 import { fullImageCache, originalImageCache, preloadAndDecodeImage } from '../utils/imageTextureCache';
 import { ScriptProject } from '../types/script';
-import { generateImageThumbnail, generateVideoThumbnail, generateNativeVideoPoster, thumbCache, MAX_THUMBNAIL_EDGE } from '../utils/thumbnail';
+import { generateImageThumbnail, generateVideoThumbnail, generateNativeVideoPoster, getOrLoadThumbImage, thumbCache, MAX_THUMBNAIL_EDGE } from '../utils/thumbnail';
 import { captureLiveVideoFrame } from '../utils/videoFrameBus';
 import { getActiveMcpKey, getActiveMcpKeySync, getActiveMcpTokenSync } from '../utils/mcpStorage';
 import { useMcpKey } from '../hooks/useMcpKey';
 import { useWorkrallyModels } from '../hooks/useWorkrallyModels';
 import { WORKRALLY_IMAGE_MODELS, WORKRALLY_IMAGE_RATIOS, WORKRALLY_IMAGE_TOOL, WorkRallyImageModel } from '../config/workrallyImageModels';
 import { WORKRALLY_VIDEO_MODELS, WORKRALLY_VIDEO_RATIOS, WORKRALLY_VIDEO_TOOL, WorkRallyVideoModel } from '../config/workrallyVideoModels';
-import { resolveMediaResolutionTag, stripMediaFileExtension } from '../utils/assetImages';
+import { buildCardSnapshotMap, getPrimaryAssetImageEntry, resolveMediaResolutionTag, stripMediaFileExtension } from '../utils/assetImages';
 
 export type CardState = 'draft' | 'generating' | 'completed' | 'idle' | 'error';
 export type AspectRatio = string;
@@ -2447,23 +2447,73 @@ export const GenerationCard = React.memo(function GenerationCard({
     refresh: refreshMcpModels,
   } = useWorkrallyModels(Boolean(data.isVideo));
 
-  const [currentScale, setCurrentScale] = useState(() => scale.get());
-  useEffect(() => {
-    return scale.on('change', (v) => {
-      // Keep card resolution and reference thumbnails stable during camera motion.
-      const workspace = document.getElementById('canvas-workspace');
-      if (!isZooming && workspace?.getAttribute('data-gesture') !== 'true') {
-        setCurrentScale(v);
-      }
-    });
-  }, [scale, isZooming]);
+  const [currentScale, setCurrentScale] = useState(() => quantizeCardScaleTier(scale.get()));
+  const cardBodyRef = useRef<HTMLDivElement | null>(null);
+  const floatingToolbarRef = useRef<HTMLDivElement | null>(null);
+  const dualSelectionBorderRef = useRef<HTMLDivElement | null>(null);
 
-  // Synchronize the scale immediately once zooming ends (Instant Restoration)
   useEffect(() => {
-    if (!isZooming) {
-      setCurrentScale(scale.get());
+    const syncScaleTier = () => {
+      if ((isZooming || isCameraGestureActive()) && !canUpgradeCardDuringGesture(id)) return;
+      const nextTier = quantizeCardScaleTier(scale.get());
+      setCurrentScale(prev => (prev === nextTier ? prev : nextTier));
+    };
+    const unsubScale = scale.on('change', syncScaleTier);
+    window.addEventListener('canvas-styles-restored', syncScaleTier);
+    window.addEventListener(CANVAS_HYBRID_POINTER_WAKE_EVENT, syncScaleTier);
+    syncScaleTier();
+    return () => {
+      unsubScale();
+      window.removeEventListener('canvas-styles-restored', syncScaleTier);
+      window.removeEventListener(CANVAS_HYBRID_POINTER_WAKE_EVENT, syncScaleTier);
+    };
+  }, [scale, isZooming, id]);
+
+  const needsSelectionOutline = Boolean(
+    isSelected || isAgentTarget || isPickerTarget || (pickerSelectionIndex && pickerSelectionIndex > 0)
+  );
+  useEffect(() => {
+    if (!needsSelectionOutline) {
+      if (cardBodyRef.current) cardBodyRef.current.style.outlineWidth = '0px';
+      return;
     }
-  }, [isZooming, scale]);
+    const syncOutlineWidth = (rawScale: number) => {
+      const safeScale = Math.max(rawScale || 1, 0.001);
+      if (cardBodyRef.current) {
+        if (pickerSelectionIndex && pickerSelectionIndex > 0) {
+          cardBodyRef.current.style.outlineWidth = `${4 / safeScale}px`;
+        } else if (isAgentTarget && isSelected) {
+          cardBodyRef.current.style.outlineWidth = '0px';
+        } else {
+          cardBodyRef.current.style.outlineWidth = `${2 / safeScale}px`;
+        }
+      }
+      if (dualSelectionBorderRef.current && isAgentTarget && isSelected) {
+        dualSelectionBorderRef.current.style.padding = `${2 / safeScale}px`;
+      }
+    };
+    syncOutlineWidth(scale.get());
+    return scale.on('change', syncOutlineWidth);
+  }, [scale, needsSelectionOutline, pickerSelectionIndex, isAgentTarget, isSelected]);
+
+  useEffect(() => {
+    if (!isSelected) return;
+    const syncToolbarScale = () => {
+      if (!floatingToolbarRef.current) return;
+      if ((isZooming || isCameraGestureActive()) && !canUpgradeCardDuringGesture(id)) return;
+      const safeScale = Math.max(scale.get() || 1, 0.001);
+      floatingToolbarRef.current.style.setProperty('--current-scale', safeScale.toString());
+    };
+    syncToolbarScale();
+    const unsubScale = scale.on('change', syncToolbarScale);
+    window.addEventListener('canvas-styles-restored', syncToolbarScale);
+    window.addEventListener(CANVAS_HYBRID_POINTER_WAKE_EVENT, syncToolbarScale);
+    return () => {
+      unsubScale();
+      window.removeEventListener('canvas-styles-restored', syncToolbarScale);
+      window.removeEventListener(CANVAS_HYBRID_POINTER_WAKE_EVENT, syncToolbarScale);
+    };
+  }, [scale, isSelected, isZooming, id]);
 
   // Track whether the card itself has finished loading & painting
   const [isCardLoaded, setIsCardLoaded] = useState(() => {
@@ -2558,36 +2608,9 @@ export const GenerationCard = React.memo(function GenerationCard({
     }
   }, [id]);
 
-  useEffect(() => {
-    const hasImageCanvas = Boolean(imageUrl && !isVideo);
-    let raf1: number | null = null;
-    let raf2: number | null = null;
-    if (!hasImageCanvas && typeof window !== "undefined") {
-      if (isVideo) {
-        // Video cards must ONLY declare painted when the video element has decoded frame data (readyState >= 2)
-        if (videoRef.current && videoRef.current.readyState >= 2) {
-          markVideoPainted();
-        }
-      } else {
-        raf1 = requestAnimationFrame(() => {
-          raf2 = requestAnimationFrame(() => {
-            markVideoPainted();
-          });
-        });
-      }
-    }
-    return () => {
-      if (raf1 !== null) cancelAnimationFrame(raf1);
-      if (raf2 !== null) cancelAnimationFrame(raf2);
-      if (!hasImageCanvas && typeof window !== "undefined") {
-        if ((window as any).__paintedCardIds) {
-          (window as any).__paintedCardIds.delete(id);
-          window.dispatchEvent(new CustomEvent("card-painted", { detail: { cardId: id } }));
-        }
-      }
-    };
-  }, [id, imageUrl, isVideo, markVideoPainted]);
+  // See paint-readiness effect after effectiveVideoSrc/localThumbnailUrl declarations.
 
+  const [isVideoFrameReady, setIsVideoFrameReady] = useState(false);
   const [openMenu, setOpenMenu] = useState<{ type: 'ratio' | 'res' | 'ref' | 'model' | 'param', ownerId: string } | null>(null);
   const [isPlaying, setPlayingState] = useState(() => Boolean(imageUrl && playingVideoSources.get(id) === imageUrl));
   const setIsPlaying = (playing: boolean) => {
@@ -2752,6 +2775,81 @@ export const GenerationCard = React.memo(function GenerationCard({
     }
     return activeVideoSrc;
   }, [activeVideoSrc]);
+
+  useEffect(() => {
+    setIsVideoFrameReady(Boolean(videoRef.current && videoRef.current.readyState >= 2));
+  }, [effectiveVideoSrc]);
+
+  // Clear __paintedCardIds only when identity/media type changes or on unmount
+  useEffect(() => {
+    const hasImageCanvas = Boolean(imageUrl && !isVideo);
+    return () => {
+      if (!hasImageCanvas && typeof window !== "undefined") {
+        if ((window as any).__paintedCardIds) {
+          (window as any).__paintedCardIds.delete(id);
+          window.dispatchEvent(new CustomEvent("card-painted", { detail: { cardId: id } }));
+        }
+      }
+    };
+  }, [id, imageUrl, isVideo]);
+
+  // For video cards and non-image cards, announce paint readiness when empty/errored,
+  // when a poster/thumbnail has loaded, or when the video element has decoded a frame.
+  useEffect(() => {
+    const hasImageCanvas = Boolean(imageUrl && !isVideo);
+    if (hasImageCanvas || typeof window === "undefined") return;
+
+    let cancelled = false;
+    let raf1: number | null = null;
+    let raf2: number | null = null;
+    const schedulePainted = () => {
+      if (cancelled || raf1 !== null) return;
+      raf1 = requestAnimationFrame(() => {
+        raf1 = null;
+        if (cancelled) return;
+        raf2 = requestAnimationFrame(() => {
+          raf2 = null;
+          if (!cancelled) markVideoPainted();
+        });
+      });
+    };
+
+    if (!isVideo || !imageUrl || !effectiveVideoSrc || videoHasError) {
+      schedulePainted();
+    } else if (videoRef.current && videoRef.current.readyState >= 2) {
+      setIsVideoFrameReady(true);
+      schedulePainted();
+    } else {
+      const posterUrl =
+        data.videoPosterUrl ||
+        data.thumbnailUrl ||
+        localThumbnailUrl ||
+        thumbCache.get(imageUrl) ||
+        thumbCache.get(id);
+      if (posterUrl) {
+        const thumbImg = getOrLoadThumbImage(posterUrl, schedulePainted);
+        if (thumbImg && thumbImg.complete && thumbImg.naturalWidth > 0) {
+          schedulePainted();
+        }
+      }
+    }
+
+    return () => {
+      cancelled = true;
+      if (raf1 !== null) cancelAnimationFrame(raf1);
+      if (raf2 !== null) cancelAnimationFrame(raf2);
+    };
+  }, [
+    id,
+    imageUrl,
+    isVideo,
+    effectiveVideoSrc,
+    videoHasError,
+    data.videoPosterUrl,
+    data.thumbnailUrl,
+    localThumbnailUrl,
+    markVideoPainted,
+  ]);
 
   // Synchronize playback with isPlaying state
   useEffect(() => {
@@ -2979,7 +3077,6 @@ export const GenerationCard = React.memo(function GenerationCard({
   const [isPromptEditing, setIsPromptEditing] = useState(false);
   const [isPromptPanelHovered, setIsPromptPanelHovered] = useState(false);
   const [nativePanelMounted, setNativePanelMounted] = useState(false);
-  const [hasPresentedPanel, setHasPresentedPanel] = useState(false);
   const [promptBitmapReady, setPromptBitmapReady] = useState('');
   const [panelBitmapReady, setPanelBitmapReady] = useState('');
   const [isReferenceFilePickerOpen, setIsReferenceFilePickerOpen] = useState(false);
@@ -3051,7 +3148,7 @@ export const GenerationCard = React.memo(function GenerationCard({
   }, [isVideo, isPlaying]);
 
   useEffect(() => {
-    if (!isVideo || isZooming) return;
+    if (!isVideo || isZooming || isCameraGestureActive()) return;
     const el = videoContainerRef.current;
     if (!el) return;
     const mouse = (window as any).__lastMousePos;
@@ -3199,7 +3296,7 @@ export const GenerationCard = React.memo(function GenerationCard({
 
     const evaluateOriginalImage = () => {
       const workspace = document.getElementById('canvas-workspace');
-      if ((window as any).isDraggingCard || workspace?.getAttribute('data-gesture') === 'true') return;
+      if ((window as any).isDraggingCard || (workspace?.getAttribute('data-gesture') === 'true' && !canUpgradeCardDuringGesture(id))) return;
       const currentData = dataRef.current;
       const hasImage = Boolean(currentData.originalImageUrl || currentData.imageUrl);
       if (!hasImage) return;
@@ -3238,7 +3335,7 @@ export const GenerationCard = React.memo(function GenerationCard({
             ty: ty.get(),
           };
           if (latestScale > 2 && isCardIntersectingRectangle(latest, latestViewport) &&
-              document.getElementById('canvas-workspace')?.getAttribute('data-gesture') !== 'true') {
+              (document.getElementById('canvas-workspace')?.getAttribute('data-gesture') !== 'true' || canUpgradeCardDuringGesture(id))) {
             showOriginalRef.current = true;
             setShowOriginal(true);
           }
@@ -3255,15 +3352,22 @@ export const GenerationCard = React.memo(function GenerationCard({
       const hasImage = Boolean(currentData.originalImageUrl || currentData.imageUrl);
       if (!hasImage) return;
 
-      // Intent-driven lazy degradation on ZOOM (scaling):
-      // Drop back to proxy immediately to save heavy rasterization
-      if (showOriginalRef.current) {
-        showOriginalRef.current = false;
-        setShowOriginal(false);
+      const allowLiveUpgrade = !isCameraZoomingOut() && canUpgradeCardDuringGesture(id);
+      if (!allowLiveUpgrade || scale.get() <= 2.0) {
+        // Intent-driven lazy degradation on zoom-out or lazy/non-focal gesture:
+        // Drop back to proxy immediately to save heavy rasterization
+        if (showOriginalRef.current) {
+          showOriginalRef.current = false;
+          setShowOriginal(false);
+        }
+        cancelPendingRestore();
       }
-      cancelPendingRestore();
 
       clearTimeout(timeout);
+      if (allowLiveUpgrade) {
+        evaluateOriginalImage();
+        return;
+      }
       // The shared restoration event handles camera gestures; avoid one timer per card per frame.
       if (document.getElementById('canvas-workspace')?.getAttribute('data-gesture') === 'true') return;
       timeout = setTimeout(() => {
@@ -3970,16 +4074,16 @@ export const GenerationCard = React.memo(function GenerationCard({
     setOpenMenu(null);
   };
 
-  const handleSelectAsset = (asset: { name: string; referenceImage?: string; description?: string }) => {
+  const handleSelectAsset = (asset: { name: string; referenceImage?: string; description?: string; fileData?: Blob; sourceCardId?: string }) => {
     const prevRefs = data.referenceImages && data.referenceImages.length > 0
       ? [...data.referenceImages]
       : data.referenceImageUrl ? [{ url: data.referenceImageUrl, name: data.referenceImageName, fileData: data.referenceImageFileData }] : [];
     const url = asset.referenceImage || '';
     if (url) {
       Promise.all([
-        generateImageThumbnail(url, 32, 0.90).catch(() => ''),
-        generateImageThumbnail(url, 64, 0.90).catch(() => ''),
-        generateImageThumbnail(url, 128, 0.90).catch(() => '')
+        generateImageThumbnail(asset.fileData || url, 32, 0.90).catch(() => ''),
+        generateImageThumbnail(asset.fileData || url, 64, 0.90).catch(() => ''),
+        generateImageThumbnail(asset.fileData || url, 128, 0.90).catch(() => '')
       ]).then(([micro, full, closeup]) => {
         const newRef = {
           url,
@@ -3987,13 +4091,16 @@ export const GenerationCard = React.memo(function GenerationCard({
           microLodThumbnailUrl: micro || undefined,
           fullDetailThumbnailUrl: full || undefined,
           closeupThumbnailUrl: closeup || undefined,
-          name: asset.name
+          name: asset.name,
+          ...(asset.fileData instanceof Blob ? { fileData: asset.fileData } : {}),
+          ...(asset.sourceCardId ? { sourceCardId: asset.sourceCardId } : {}),
         };
+        const nextRefs = [...prevRefs, newRef];
         const updates: Partial<CardData> = {
-          referenceImages: [...prevRefs, newRef],
-          referenceImageUrl: url,
+          referenceImages: nextRefs,
+          referenceImageUrl: nextRefs[0]?.url || url,
           referenceImageName: prevRefs.length > 0 ? `参考图 (${prevRefs.length + 1})` : asset.name,
-          referenceImageFileData: undefined
+          referenceImageFileData: nextRefs[0]?.fileData
         };
         if (!localPrompt.trim() && asset.description) {
           setLocalPrompt(asset.description);
@@ -4132,44 +4239,95 @@ export const GenerationCard = React.memo(function GenerationCard({
     }
   };
 
+  const resolveAssetReferenceMedia = useCallback((
+    assetItem: { id: string; images?: any[]; referenceImage?: string } | null | undefined,
+    cardsMap: Map<string, CardData>
+  ): { url?: string; thumbnailUrl?: string; fileData?: Blob; sourceCardId?: string } => {
+    if (!assetItem) return {};
+    const primary = getPrimaryAssetImageEntry(assetItem as any, cardsMap as any);
+    const linkedCard = primary?.cardId ? cardsMap.get(primary.cardId) : undefined;
+    const rawUrl = primary?.imageUrl || primary?.thumbnailUrl;
+    if (rawUrl && rawUrl.startsWith('blob:') && !linkedCard) {
+      let matchedCard: CardData | undefined;
+      for (const c of cardsMap.values()) {
+        if (c.imageUrl === rawUrl || c.originalImageUrl === rawUrl || c.trueOriginalImageUrl === rawUrl) {
+          matchedCard = c;
+          break;
+        }
+      }
+      if (!matchedCard) {
+        const safeThumb = primary?.thumbnailUrl && !primary.thumbnailUrl.startsWith('blob:') ? primary.thumbnailUrl : undefined;
+        return { url: safeThumb, thumbnailUrl: safeThumb };
+      }
+      return {
+        url: matchedCard.imageUrl || matchedCard.originalImageUrl || rawUrl,
+        thumbnailUrl: matchedCard.thumbnailUrl || matchedCard.closeupThumbnailUrl || rawUrl,
+        fileData: matchedCard.trueOriginalFileData || matchedCard.originalFileData || matchedCard.fileData,
+        sourceCardId: matchedCard.id,
+      };
+    }
+    return {
+      url: rawUrl,
+      thumbnailUrl: primary?.thumbnailUrl || rawUrl,
+      fileData: linkedCard ? (linkedCard.trueOriginalFileData || linkedCard.originalFileData || linkedCard.fileData) : undefined,
+      sourceCardId: linkedCard?.id || primary?.cardId,
+    };
+  }, []);
+
   // Asset list items (Only computed when Asset Picker modal is opened)
   const { characterItems, locationItems, propItems, allAssetItems, filteredAssets } = useMemo(() => {
     if (!showAssetPicker) {
       return {
-        characterItems: [] as Array<{ id: string; category: 'characters'; categoryLabel: string; name: string; tag: string; description: string; referenceImage?: string }>,
-        locationItems: [] as Array<{ id: string; category: 'locations'; categoryLabel: string; name: string; tag: string; description: string; referenceImage?: string }>,
-        propItems: [] as Array<{ id: string; category: 'props'; categoryLabel: string; name: string; tag: string; description: string; referenceImage?: string }>,
-        allAssetItems: [] as Array<{ id: string; category: 'characters' | 'locations' | 'props'; categoryLabel: string; name: string; tag: string; description: string; referenceImage?: string }>,
-        filteredAssets: [] as Array<{ id: string; category: 'characters' | 'locations' | 'props'; categoryLabel: string; name: string; tag: string; description: string; referenceImage?: string }>
+        characterItems: [] as Array<{ id: string; category: 'characters'; categoryLabel: string; name: string; tag: string; description: string; referenceImage?: string; fileData?: Blob; sourceCardId?: string }>,
+        locationItems: [] as Array<{ id: string; category: 'locations'; categoryLabel: string; name: string; tag: string; description: string; referenceImage?: string; fileData?: Blob; sourceCardId?: string }>,
+        propItems: [] as Array<{ id: string; category: 'props'; categoryLabel: string; name: string; tag: string; description: string; referenceImage?: string; fileData?: Blob; sourceCardId?: string }>,
+        allAssetItems: [] as Array<{ id: string; category: 'characters' | 'locations' | 'props'; categoryLabel: string; name: string; tag: string; description: string; referenceImage?: string; fileData?: Blob; sourceCardId?: string }>,
+        filteredAssets: [] as Array<{ id: string; category: 'characters' | 'locations' | 'props'; categoryLabel: string; name: string; tag: string; description: string; referenceImage?: string; fileData?: Blob; sourceCardId?: string }>
       };
     }
-    const chars = (currentProject?.characters || []).map(c => ({
-      id: `char-${c.id}`,
-      category: 'characters' as const,
-      categoryLabel: '角色',
-      name: c.name,
-      tag: c.role || '角色设定',
-      description: c.appearance || c.performanceNotes || '',
-      referenceImage: c.referenceImage
-    }));
-    const locs = (currentProject?.locations || []).map(l => ({
-      id: `loc-${l.id}`,
-      category: 'locations' as const,
-      categoryLabel: '场景',
-      name: l.name,
-      tag: `${l.type === 'INT' ? '内景' : '外景'}${l.timeOfDay ? ` · ${l.timeOfDay}` : ''}`,
-      description: l.atmosphere || l.visualDetails || '',
-      referenceImage: l.referenceImage
-    }));
-    const props = (currentProject?.props || []).map(p => ({
-      id: `prop-${p.id}`,
-      category: 'props' as const,
-      categoryLabel: '道具',
-      name: p.name,
-      tag: p.owner ? `归属: ${p.owner}` : '道具',
-      description: p.materialAndState || p.storySignificance || '',
-      referenceImage: p.referenceImage
-    }));
+    const cardsMap = buildCardSnapshotMap(allCards || []) as Map<string, CardData>;
+    const chars = (currentProject?.characters || []).map(c => {
+      const media = resolveAssetReferenceMedia(c, cardsMap);
+      return {
+        id: `char-${c.id}`,
+        category: 'characters' as const,
+        categoryLabel: '角色',
+        name: c.name,
+        tag: c.role || '角色设定',
+        description: c.appearance || c.performanceNotes || '',
+        referenceImage: media.url,
+        fileData: media.fileData,
+        sourceCardId: media.sourceCardId,
+      };
+    });
+    const locs = (currentProject?.locations || []).map(l => {
+      const media = resolveAssetReferenceMedia(l, cardsMap);
+      return {
+        id: `loc-${l.id}`,
+        category: 'locations' as const,
+        categoryLabel: '场景',
+        name: l.name,
+        tag: `${l.type === 'INT' ? '内景' : '外景'}${l.timeOfDay ? ` · ${l.timeOfDay}` : ''}`,
+        description: l.atmosphere || l.visualDetails || '',
+        referenceImage: media.url,
+        fileData: media.fileData,
+        sourceCardId: media.sourceCardId,
+      };
+    });
+    const props = (currentProject?.props || []).map(p => {
+      const media = resolveAssetReferenceMedia(p, cardsMap);
+      return {
+        id: `prop-${p.id}`,
+        category: 'props' as const,
+        categoryLabel: '道具',
+        name: p.name,
+        tag: p.owner ? `归属: ${p.owner}` : '道具',
+        description: p.materialAndState || p.storySignificance || '',
+        referenceImage: media.url,
+        fileData: media.fileData,
+        sourceCardId: media.sourceCardId,
+      };
+    });
     const all = [...chars, ...locs, ...props];
     const q = assetSearch.trim().toLowerCase();
     const filtered = all.filter(item => {
@@ -4184,7 +4342,7 @@ export const GenerationCard = React.memo(function GenerationCard({
       allAssetItems: all,
       filteredAssets: filtered
     };
-  }, [showAssetPicker, currentProject, assetFilter, assetSearch]);
+  }, [showAssetPicker, currentProject, assetFilter, assetSearch, allCards, resolveAssetReferenceMedia]);
 
   const canvasCandidates = useMemo(() => (allCards || []).filter(c =>
     c.id !== id && Boolean(c.imageUrl || c.originalImageUrl || c.thumbnailUrl)
@@ -4222,9 +4380,11 @@ export const GenerationCard = React.memo(function GenerationCard({
       thumbnailUrl?: string;
       fullDetailThumbnailUrl?: string;
       fileData?: Blob;
+      sourceCardId?: string;
       source: 'current' | 'character' | 'location' | 'prop';
       subtitle?: string;
     }> = [];
+    const cardsMap = buildCardSnapshotMap(allCards || []) as Map<string, CardData>;
 
     // 1. Current card reference images
     refList.forEach((r, idx) => {
@@ -4237,6 +4397,7 @@ export const GenerationCard = React.memo(function GenerationCard({
           thumbnailUrl: r.fullDetailThumbnailUrl || r.thumbnailUrl,
           fullDetailThumbnailUrl: r.fullDetailThumbnailUrl,
           fileData: r.fileData,
+          sourceCardId: (r as any).sourceCardId,
           source: 'current',
           subtitle: '当前卡片参考图',
         });
@@ -4246,11 +4407,14 @@ export const GenerationCard = React.memo(function GenerationCard({
     // 2. Project Characters
     (currentProject?.characters || []).forEach(c => {
       if (!items.some(it => it.name === c.name)) {
+        const media = resolveAssetReferenceMedia(c, cardsMap);
         items.push({
           id: `char-${c.id}`,
           name: c.name,
-          url: c.referenceImage,
-          thumbnailUrl: c.referenceImage,
+          url: media.url,
+          thumbnailUrl: media.thumbnailUrl,
+          fileData: media.fileData,
+          sourceCardId: media.sourceCardId,
           source: 'character',
           subtitle: c.role || '角色',
         });
@@ -4260,11 +4424,14 @@ export const GenerationCard = React.memo(function GenerationCard({
     // 3. Project Locations
     (currentProject?.locations || []).forEach(l => {
       if (!items.some(it => it.name === l.name)) {
+        const media = resolveAssetReferenceMedia(l, cardsMap);
         items.push({
           id: `loc-${l.id}`,
           name: l.name,
-          url: l.referenceImage,
-          thumbnailUrl: l.referenceImage,
+          url: media.url,
+          thumbnailUrl: media.thumbnailUrl,
+          fileData: media.fileData,
+          sourceCardId: media.sourceCardId,
           source: 'location',
           subtitle: '场景',
         });
@@ -4274,11 +4441,14 @@ export const GenerationCard = React.memo(function GenerationCard({
     // 4. Project Props
     (currentProject?.props || []).forEach(p => {
       if (!items.some(it => it.name === p.name)) {
+        const media = resolveAssetReferenceMedia(p, cardsMap);
         items.push({
           id: `prop-${p.id}`,
           name: p.name,
-          url: p.referenceImage,
-          thumbnailUrl: p.referenceImage,
+          url: media.url,
+          thumbnailUrl: media.thumbnailUrl,
+          fileData: media.fileData,
+          sourceCardId: media.sourceCardId,
           source: 'prop',
           subtitle: '道具',
         });
@@ -4286,7 +4456,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     });
 
     return items;
-  }, [refList, currentProject]);
+  }, [refList, currentProject, allCards, resolveAssetReferenceMedia]);
 
   // Filtered mention candidates strictly for the suggestion popup menu
   const filteredMentionCandidates = useMemo(() => {
@@ -4308,7 +4478,7 @@ export const GenerationCard = React.memo(function GenerationCard({
   }, [mentionMenuOpen, selectedMentionIndex, filteredMentionCandidates]);
 
   // Insert mention into prompt with exact spacing: "前后分别空一格"
-  const insertMention = (refItem: { name: string; url?: string; fileData?: Blob }) => {
+  const insertMention = (refItem: { name: string; url?: string; fileData?: Blob; sourceCardId?: string }) => {
     setIsPromptEditing(true);
     const refName = referenceDisplayName(refItem.name);
     const textarea = textareaRef.current;
@@ -4352,9 +4522,9 @@ export const GenerationCard = React.memo(function GenerationCard({
           : [];
       const url = refItem.url;
       Promise.all([
-        generateImageThumbnail(url, 32, 0.90).catch(() => ''),
-        generateImageThumbnail(url, 64, 0.90).catch(() => ''),
-        generateImageThumbnail(url, 128, 0.90).catch(() => '')
+        generateImageThumbnail(refItem.fileData || url, 32, 0.90).catch(() => ''),
+        generateImageThumbnail(refItem.fileData || url, 64, 0.90).catch(() => ''),
+        generateImageThumbnail(refItem.fileData || url, 128, 0.90).catch(() => '')
       ]).then(([micro, full, closeup]) => {
         const newRef = {
           url,
@@ -4363,13 +4533,15 @@ export const GenerationCard = React.memo(function GenerationCard({
           fullDetailThumbnailUrl: full || undefined,
           closeupThumbnailUrl: closeup || undefined,
           name: refItem.name,
-          fileData: refItem.fileData
+          fileData: refItem.fileData,
+          ...(refItem.sourceCardId ? { sourceCardId: refItem.sourceCardId } : {}),
         };
         const upd: Partial<CardData> = {
           ...updates,
           referenceImages: [...prevRefs, newRef],
           referenceImageUrl: prevRefs.length === 0 ? url : data.referenceImageUrl,
-          referenceImageName: prevRefs.length === 0 ? refItem.name : data.referenceImageName
+          referenceImageName: prevRefs.length === 0 ? refItem.name : data.referenceImageName,
+          ...(prevRefs.length === 0 && refItem.fileData instanceof Blob ? { referenceImageFileData: refItem.fileData } : {}),
         };
         onUpdate(id, upd);
       });
@@ -4693,13 +4865,15 @@ export const GenerationCard = React.memo(function GenerationCard({
     typeof document !== 'undefined' && document.documentElement.classList.contains('dark'),
   );
   useLayoutEffect(() => {
-    if (!hasPresentedPanel && (useNativePromptPanel ||
-        (promptBitmapReady === panelRenderKey && panelBitmapReady === panelRenderKey))) {
-      setHasPresentedPanel(true);
-    }
-  }, [hasPresentedPanel, useNativePromptPanel, promptBitmapReady, panelBitmapReady, panelRenderKey]);
+    mountedDomCardIds.add(id);
+    window.dispatchEvent(new CustomEvent('card-painted', { detail: { cardId: id } }));
+    return () => {
+      mountedDomCardIds.delete(id);
+      window.dispatchEvent(new CustomEvent('card-painted', { detail: { cardId: id } }));
+    };
+  }, [id]);
   useLayoutEffect(() => {
-    if (!shouldRenderBottomPanel || !hasPresentedPanel) return;
+    if (!shouldRenderBottomPanel) return;
     // Layout readiness is not presentation readiness. Keep the fallback until
     // the browser has had a frame to present the newly visible panel.
     let secondFrame: number | undefined;
@@ -4715,7 +4889,7 @@ export const GenerationCard = React.memo(function GenerationCard({
       readyPromptPanels.delete(id);
       window.dispatchEvent(new CustomEvent('card-painted', { detail: { cardId: id } }));
     };
-  }, [id, shouldRenderBottomPanel, hasPresentedPanel]);
+  }, [id, shouldRenderBottomPanel]);
   useEffect(() => {
     if (useNativePromptPanel) setNativePanelMounted(true);
     else if (promptBitmapReady === panelRenderKey && panelBitmapReady === panelRenderKey) {
@@ -4890,8 +5064,16 @@ export const GenerationCard = React.memo(function GenerationCard({
 
         {/* Floating Top Toolbar Card (Only visible when card is selected, horizontally centered with squircle corners) */}
         <div 
-          className="absolute bottom-full mb-2.5 left-0 flex justify-center pointer-events-none z-[70]"
-          style={{ width: `${w}px` }}
+          ref={floatingToolbarRef}
+          className="absolute bottom-full left-0 flex justify-center pointer-events-none z-[70]"
+          style={{
+            width: `${w}px`,
+            marginBottom: 'calc(10px / (var(--current-scale, 1) * 1.05))',
+            transform: isSelected
+              ? 'scale(calc(1 / (var(--current-scale, 1) * 1.05)))'
+              : 'scale(calc(1 / var(--current-scale, 1)))',
+            transformOrigin: 'bottom center',
+          }}
         >
           <AnimatePresence>
             {isSelected && (
@@ -4900,11 +5082,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                 animate={{ opacity: 1, y: 0, scale: 1 }}
                 exit={{ opacity: 0, y: 6, scale: 0.95 }}
                 transition={{ duration: 0.15, ease: 'easeOut' }}
-                className="pointer-events-auto flex items-center gap-1.5 bg-white/95 dark:bg-[#222222]/95 backdrop-blur-md border border-gray-200/90 dark:border-neutral-700/80 shadow-xl rounded-[14px] corner-squircle px-2 py-1.5 group-data-[zooming=true]/canvas:!opacity-0 group-data-[gesture=true]/canvas:!opacity-0"
-                style={{
-                  transform: 'scale(calc(1 / var(--current-scale, 1)))',
-                  transformOrigin: 'bottom center',
-                }}
+                className="pointer-events-auto shrink-0 whitespace-nowrap flex items-center gap-1.5 bg-white/95 dark:bg-[#222222]/95 backdrop-blur-md border border-gray-200/90 dark:border-neutral-700/80 shadow-xl rounded-[14px] corner-squircle px-2 py-1.5 group-data-[zooming=true]/canvas:!opacity-0 group-data-[gesture=true]/canvas:!opacity-0"
                 onPointerDown={(e) => {
                   if (e.button === 0) e.stopPropagation();
                 }}
@@ -5012,11 +5190,8 @@ export const GenerationCard = React.memo(function GenerationCard({
 
         {/* Top Layer: Image Placeholder & Drag Handle */}
         <div 
-          className={`generation-card-body pointer-events-auto relative shrink-0 overflow-hidden cursor-grab active:cursor-grabbing ${
-            (imageUrl || data.fileData || data.thumbnailUrl)
-              ? 'bg-transparent'
-              : 'bg-gray-100 dark:bg-neutral-800'
-          } squircle self-start ease-out [&.drag-degraded]:!shadow-none [&.drag-degraded]:!backdrop-filter-none ${
+          ref={cardBodyRef}
+          className={`generation-card-body pointer-events-auto relative shrink-0 overflow-hidden cursor-grab active:cursor-grabbing bg-gray-100 dark:bg-neutral-800 squircle self-start ease-out [&.drag-degraded]:!shadow-none [&.drag-degraded]:!backdrop-filter-none ${
             pickerSelectionIndex && pickerSelectionIndex > 0
               ? 'outline outline-[4px] outline-[#2563eb] shadow-[0_0_25px_rgba(37,99,235,0.7)] scale-[1.015]'
               : isAgentTarget && isSelected
@@ -5052,16 +5227,12 @@ export const GenerationCard = React.memo(function GenerationCard({
             width: w, 
             height: h,
             outlineWidth: pickerSelectionIndex && pickerSelectionIndex > 0 
-              ? 'calc(4px / var(--selection-scale, 1))'
+              ? `${4 / Math.max(scale.get() || 1, 0.001)}px`
               : isAgentTarget && isSelected
                 ? '0px'
-              : isAgentTarget
-                ? 'calc(2px / var(--selection-scale, 1))'
-                : isPickerTarget
-                  ? 'calc(2px / var(--selection-scale, 1))'
-                  : isSelected 
-                    ? 'calc(2px / var(--selection-scale, 1))'
-                    : '0px',
+              : (isAgentTarget || isPickerTarget || isSelected)
+                ? `${2 / Math.max(scale.get() || 1, 0.001)}px`
+                : '0px',
             boxShadow: pickerSelectionIndex && pickerSelectionIndex > 0
               ? '0 12px 30px rgba(37, 99, 235, 0.45)'
                 : isAgentTarget
@@ -5139,13 +5310,11 @@ export const GenerationCard = React.memo(function GenerationCard({
         )}
 
         {/* Empty State Placeholder (SVG matching user request) */}
-        {!imageUrl && !data.fileData && (
-          <div className="absolute inset-0 flex items-center justify-center bg-gray-100 dark:bg-neutral-800 group-data-[scale-micro=true]/canvas:!opacity-0 pointer-events-none">
-            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-gray-300 dark:text-neutral-600">
-              {EMPTY_CARD_PATHS.map(path => <path key={path} d={path} fill="currentColor" />)}
-            </svg>
-          </div>
-        )}
+        <div className={`absolute inset-0 flex items-center justify-center bg-gray-100 dark:bg-neutral-800 transition-opacity duration-500 ${!imageUrl ? 'opacity-100' : 'opacity-0'} group-data-[scale-micro=true]/canvas:!opacity-0`}>
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className="text-gray-300 dark:text-neutral-600">
+            {EMPTY_CARD_PATHS.map(path => <path key={path} d={path} fill="currentColor" />)}
+          </svg>
+        </div>
 
         {/* Generated Image or Video */}
         {imageUrl && (
@@ -5204,7 +5373,7 @@ export const GenerationCard = React.memo(function GenerationCard({
               style={{
                 width: w,
                 height: h,
-                backgroundImage: (!effectiveVideoSrc || videoHasError || !isCardLoaded)
+                backgroundImage: (!effectiveVideoSrc || videoHasError || !isVideoFrameReady)
                   ? (data.videoPosterUrl || data.thumbnailUrl || localThumbnailUrl || (imageUrl ? thumbCache.get(imageUrl) || thumbCache.get(id) : undefined))
                     ? `url(${data.videoPosterUrl || data.thumbnailUrl || localThumbnailUrl || (imageUrl ? thumbCache.get(imageUrl) || thumbCache.get(id) : undefined)})`
                     : undefined
@@ -5230,6 +5399,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                   className="absolute inset-0 w-full h-full object-cover pointer-events-none group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform"
                   onLoadedData={(e) => {
                     setIsCardLoaded(true);
+                    setIsVideoFrameReady(true);
                     markVideoPainted();
                     const video = e.currentTarget;
                     if (video.duration) {
@@ -5258,6 +5428,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                     const video = e.currentTarget;
                     if (video.readyState >= 2) {
                       setIsCardLoaded(true);
+                      setIsVideoFrameReady(true);
                       markVideoPainted();
                     }
                     if (video.duration) setDuration(video.duration);
@@ -5530,7 +5701,7 @@ export const GenerationCard = React.memo(function GenerationCard({
             <motion.div 
               initial={isStagedMediaEntry(id) ? { opacity: 0 } : false}
               animate={{ opacity: 1 }}
-              transition={{ duration: isStagedMediaEntry(id) ? MEDIA_REVEAL_MS / 1000 : 0 }}
+              transition={{ duration: MEDIA_REVEAL_MS / 1000 }}
               className="absolute inset-0 overflow-hidden squircle pointer-events-auto"
               style={{
                 width: w,
@@ -5674,9 +5845,10 @@ export const GenerationCard = React.memo(function GenerationCard({
         {/* Dual Co-Presence Border Overlay (Half User Blue #3b82f6 + Half Agent Purple #a45cf8) */}
         {isAgentTarget && isSelected && (
           <div 
+            ref={dualSelectionBorderRef}
             className="dual-selection-border absolute inset-0 pointer-events-none rounded-[20px] corner-squircle z-[90] select-none transition-opacity duration-150"
             style={{
-              padding: 'calc(2px / var(--selection-scale, 1))',
+              padding: `${2 / Math.max(scale.get() || 1, 0.001)}px`,
               background: 'linear-gradient(135deg, #3b82f6 0%, #3b82f6 44%, #a45cf8 56%, #a45cf8 100%)',
               WebkitMask: 'linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0)',
               WebkitMaskComposite: 'xor',
@@ -6418,7 +6590,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                   <button
                     key={item.id}
                     type="button"
-                    onClick={() => handleSelectAsset({ name: item.name, referenceImage: item.referenceImage, description: item.description })}
+                    onClick={() => handleSelectAsset({ name: item.name, referenceImage: item.referenceImage, description: item.description, fileData: item.fileData, sourceCardId: item.sourceCardId })}
                     className="flex items-start gap-3 p-3 rounded-xl border border-neutral-200/80 dark:border-neutral-800 hover:border-amber-500/60 dark:hover:border-amber-500/60 hover:bg-amber-50/30 dark:hover:bg-amber-950/20 text-left transition-all group cursor-pointer"
                   >
                     <div className="w-14 h-14 rounded-lg overflow-hidden bg-neutral-100 dark:bg-neutral-800 flex-shrink-0 flex items-center justify-center border border-neutral-200 dark:border-neutral-700">

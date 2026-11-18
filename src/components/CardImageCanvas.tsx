@@ -6,6 +6,8 @@ import {
 import { getOrLoadThumbImage, thumbCache, thumbImageCache } from '../utils/thumbnail';
 import { capDprToBudget } from '../utils/devicePixelBudget';
 import { cardOutline } from '../utils/cardLodAppearance';
+import { shouldPreserveCardCanvasBackingStore } from '../utils/viewportCulling';
+import { canUpgradeCardDuringGesture, CANVAS_HYBRID_POINTER_WAKE_EVENT } from '../utils/canvasPerformance';
 
 export interface CardImageCanvasProps {
   cardId?: string;
@@ -59,6 +61,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
   const lastLoadedUrlRef = useRef<string | null>(null);
   const fadeStartTimeRef = useRef<number | null>(null);
   const isFadingOriginalRef = useRef<boolean>(false);
+  const needsRestoreRedrawRef = useRef<boolean>(false);
 
   // Keep latest props in refs to avoid re-binding callbacks
   const propsRef = useRef({
@@ -141,7 +144,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     if (w <= 0 || h <= 0) return;
 
     // Determine target canvas pixel resolution
-    const isGestureActive = typeof window !== 'undefined' && (
+    const rawGestureActive = typeof window !== 'undefined' && (
       Boolean((window as any).isDraggingCard) || 
       Boolean((window as any).isDraggingCanvas) ||
       Boolean((window as any).isZoomingCanvas) ||
@@ -149,6 +152,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
       document.getElementById('canvas-workspace')?.getAttribute('data-zooming') === 'true' ||
       document.getElementById('canvas-workspace')?.getAttribute('data-panning') === 'true'
     );
+    const isGestureActive = rawGestureActive && !canUpgradeCardDuringGesture(cardId);
     const effectiveShowOriginal = showOriginal && !isGestureActive;
 
     const screenDpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
@@ -165,17 +169,31 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
 
     const targetPxW = Math.round(w * actualDpr);
     const targetPxH = Math.round(h * actualDpr);
+    const isGenerating = cardState === 'generating';
 
-    if (canvas.width !== targetPxW || canvas.height !== targetPxH) {
+    if (
+      !shouldPreserveCardCanvasBackingStore(
+        canvas.width,
+        canvas.height,
+        targetPxW,
+        targetPxH,
+        effectiveShowOriginal,
+        isGenerating
+      ) &&
+      (canvas.width !== targetPxW || canvas.height !== targetPxH)
+    ) {
       canvas.width = targetPxW;
       canvas.height = targetPxH;
     }
+
+    const backingScaleX = canvas.width / w;
+    const backingScaleY = canvas.height / h;
 
     ctx.save();
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     // Coordinate space normalization (from physical pixels to CSS pixels)
-    ctx.scale(actualDpr, actualDpr);
+    ctx.scale(backingScaleX, backingScaleY);
 
     // Clip strictly to card squircle path to prevent any image corner bleeding/leakage
     ctx.save();
@@ -208,8 +226,6 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     const origImg = (effectiveShowOriginal && originalImageUrl)
       ? getOrLoadCanvasImage(originalImageUrl, scheduleDraw, 'original')
       : null;
-
-    const isGenerating = cardState === 'generating';
 
     // Helper to draw an image with object-cover calculation
     const drawCover = (img: HTMLImageElement, alpha: number = 1) => {
@@ -323,6 +339,14 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
       propsRef.current.onLoaded?.();
     }
 
+    needsRestoreRedrawRef.current = Boolean(
+      isGestureActive ||
+      !isPainted ||
+      transitionRef.current !== null ||
+      (showOriginal && !effectiveShowOriginal) ||
+      isFadingOriginalRef.current
+    );
+
     if (isPainted && cardId && typeof window !== 'undefined') {
       if (!(window as any).__paintedCardIds) {
         (window as any).__paintedCardIds = new Set<string>();
@@ -367,7 +391,6 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     height,
     dpr,
     state,
-    isZooming,
   ]);
 
   // Clean up painted registration on unmount
@@ -390,11 +413,28 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
   // Listen for idle canvas styles restoration
   useEffect(() => {
     const handleStylesRestored = () => {
+      const workspace = document.getElementById('canvas-workspace');
+      if (
+        workspace?.getAttribute('data-scale-micro') === 'true' ||
+        workspace?.getAttribute('data-nano-retired') === 'true'
+      ) {
+        return;
+      }
+      if (!needsRestoreRedrawRef.current && !propsRef.current.showOriginal) {
+        return;
+      }
       scheduleDraw();
     };
+    const handleHybridWake = () => {
+      if (needsRestoreRedrawRef.current && canUpgradeCardDuringGesture(propsRef.current.cardId)) {
+        scheduleDraw();
+      }
+    };
     window.addEventListener('canvas-styles-restored', handleStylesRestored);
+    window.addEventListener(CANVAS_HYBRID_POINTER_WAKE_EVENT, handleHybridWake);
     return () => {
       window.removeEventListener('canvas-styles-restored', handleStylesRestored);
+      window.removeEventListener(CANVAS_HYBRID_POINTER_WAKE_EVENT, handleHybridWake);
       if (rafIdRef.current !== null) {
         cancelAnimationFrame(rafIdRef.current);
         rafIdRef.current = null;

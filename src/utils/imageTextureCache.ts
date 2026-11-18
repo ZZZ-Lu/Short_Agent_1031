@@ -84,7 +84,17 @@ export function getOrLoadCanvasImage(
       img.src = url;
     } else {
       console.warn(`[imageTextureCache] Hard load failure for ${tier} image: ${url}`);
-      pendingCallbacks.delete(url);
+      const callbacks = pendingCallbacks.get(url);
+      if (callbacks) {
+        callbacks.forEach(cb => {
+          try {
+            cb();
+          } catch (err) {
+            console.error('[imageTextureCache] Error callback execution error:', err);
+          }
+        });
+        pendingCallbacks.delete(url);
+      }
     }
   };
 

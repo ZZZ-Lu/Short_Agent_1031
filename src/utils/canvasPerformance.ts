@@ -30,17 +30,46 @@ if (typeof window !== 'undefined') {
   });
 }
 
-// Rendering policy only: camera pan and zoom may load proxies progressively.
+let cameraZoomingOut = false;
+let cameraTweenZooming = false;
+export function setCameraZoomingOut(active: boolean) {
+  if (cameraZoomingOut === active) return;
+  cameraZoomingOut = active;
+}
+export function isCameraZoomingOut() { return cameraZoomingOut; }
+export function setCameraTweenZooming(active: boolean) {
+  if (cameraTweenZooming === active) return;
+  cameraTweenZooming = active;
+}
+export function isCameraTweenZooming() { return cameraTweenZooming; }
+
+// Rendering policy only: camera pan and zoom-in may load proxies progressively;
+// active zoom-out gestures and programmatic tweens defer new DOM admission.
 export function canLoadDuringCameraGesture() {
-  if (loadingMode === 'lazy' || typeof document === 'undefined') return false;
+  if (loadingMode === 'lazy' || cameraTweenZooming || cameraZoomingOut || typeof document === 'undefined') return false;
   const workspace = document.getElementById('canvas-workspace');
   return (workspace?.getAttribute('data-panning') === 'true' ||
-    workspace?.getAttribute('data-zooming') === 'true') &&
+    workspace?.getAttribute('data-zooming') === 'true' ||
+    workspace?.getAttribute('data-middle-pan') === 'true') &&
     !(window as any).isDraggingCard && !(window as any).__nanoDragging;
 }
 
+// Determines whether a card may upgrade its visual fidelity (DPR, scale tier,
+// preview texture) during an active camera gesture.
+// - Zoom-out: always false (all 3 modes use lazy degradation/restoration).
+// - Zoom-in / Pan: 'immediate' upgrades all visible cards; 'hybrid' upgrades only
+//   cards within the pointer focal radius; 'lazy' defers until idle.
+export function canUpgradeCardDuringGesture(cardId?: string): boolean {
+  if (!canLoadDuringCameraGesture()) return false;
+  if (loadingMode === 'immediate') return true;
+  if (loadingMode === 'hybrid') return Boolean(cardId && isHybridCardNear(cardId));
+  return false;
+}
+
 // Renderer-local policy: only plain coordinates and a live camera adapter.
+export const CANVAS_HYBRID_POINTER_WAKE_EVENT = 'canvas-hybrid-pointer-wake';
 let pointer = { x: -Infinity, y: -Infinity };
+let lastPointerWakeMs = 0;
 let proximity: (id: string, radius: number) => boolean = () => false;
 const nearby = new Set<string>();
 export function setHybridProximityProvider(provider: typeof proximity) {
@@ -50,7 +79,23 @@ export function setHybridProximityProvider(provider: typeof proximity) {
 }
 export function getHybridPointer() { return pointer; }
 if (typeof window !== 'undefined') {
-  window.addEventListener('pointermove', event => { pointer = { x: event.clientX, y: event.clientY }; });
+  const updateHybridPointer = (clientX: number, clientY: number) => {
+    pointer = { x: clientX, y: clientY };
+    if (loadingMode === 'hybrid') {
+      if (deferredSurfaceTimer !== null) {
+        clearTimeout(deferredSurfaceTimer);
+        deferredSurfaceTimer = null;
+        scheduleSurfaceFrame();
+      }
+      const now = performance.now();
+      if (now - lastPointerWakeMs >= 48) {
+        lastPointerWakeMs = now;
+        window.dispatchEvent(new Event(CANVAS_HYBRID_POINTER_WAKE_EVENT));
+      }
+    }
+  };
+  window.addEventListener('pointermove', event => updateHybridPointer(event.clientX, event.clientY), { passive: true });
+  window.addEventListener('wheel', event => updateHybridPointer(event.clientX, event.clientY), { passive: true });
   window.addEventListener('blur', () => { pointer = { x: -Infinity, y: -Infinity }; nearby.clear(); });
 }
 export function isHybridCardNear(id: string) {
@@ -60,8 +105,8 @@ export function isHybridCardNear(id: string) {
 }
 export function canRunHybridSurface(label?: string) {
   if (loadingMode !== 'hybrid') return true;
-  // High-resolution originals retain the existing idle-only restoration policy.
-  if (!label || label.startsWith('original:')) return false;
+  if (!label) return false;
+  if (label.startsWith('original:') && cameraZoomingOut) return false;
   // Admission jobs recheck live distance in their callback so they cannot block nearer mounts.
   if (label.startsWith('mount:')) return true;
   const id = label.slice(label.indexOf(':') + 1);
@@ -113,7 +158,8 @@ function pumpSurfaces(frameTime: number) {
     // the synchronous time spent admitting a card to the mount store.
     if (previousFrame !== null) pacer.observeFrame(frameTime - previousFrame);
     previousFrame = frameTime;
-    if (++framesSinceJob > Math.max(cameraMoving ? 1 : 0, pacer.idleFrames)) {
+    const requiredIdleFrames = cameraMoving ? Math.min(1, pacer.idleFrames) : pacer.idleFrames;
+    if (++framesSinceJob > requiredIdleFrames) {
       framesSinceJob = 0;
       // Finish already-mounted prompt surfaces before admitting another card.
       // Still execute just one job at the existing adaptive frame cadence.

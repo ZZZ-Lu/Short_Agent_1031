@@ -511,7 +511,7 @@ const CandidateMatchesOverlay = React.memo(function CandidateMatchesOverlay({
   );
 });
 
-export function ProjectScriptBible({
+export const ProjectScriptBible = React.memo(function ProjectScriptBible({
   currentProject,
   projects,
   cards = [],
@@ -6200,4 +6200,4 @@ export function ProjectScriptBible({
       />
     </>
   );
-}
+});

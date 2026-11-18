@@ -1,10 +1,10 @@
 import { cardEntryFrame, waitForEntryDom, mediaRevealProgress } from '../utils/cardEntrance';
 import { calculateVideoPlayButtonDimensions, getPlayIconPath2D } from "../utils/videoPlayButton";
 import { getLiveVideoFrame } from '../utils/videoFrameBus';
-import { getCanvasLoadingMode, isHybridCardNear } from '../utils/canvasPerformance';
+import { getCanvasLoadingMode, isCameraZoomingOut, isHybridCardNear } from '../utils/canvasPerformance';
 import { getCappedDpr } from '../utils/devicePixelBudget';
 import React, { useEffect, useRef } from 'react';
-import { readyPromptPanels } from '../utils/promptSurfaceCache';
+import { readyPromptPanels, mountedDomCardIds } from '../utils/promptSurfaceCache';
 import { cardOutline, strokeCardOutline, drawEmptyCardIcon, isStandardCardLod } from '../utils/cardLodAppearance';
 import type { LodFrame } from '../utils/lodHandoff';
 import { MotionValue } from 'motion/react';
@@ -16,7 +16,15 @@ import {
   thumbImageCache,
 } from '../utils/thumbnail';
 import { calculateObjectCover, fullImageCache } from '../utils/imageTextureCache';
-import { getNanoLodThreshold, NANO_LOD_EXIT_HIGH_THRESHOLD, getCardWorldBounds } from '../utils/viewportCulling';
+import {
+  getNanoLodThreshold,
+  NANO_LOD_EXIT_HIGH_THRESHOLD,
+  getCardWorldBounds,
+  shouldUseNanoCanvasThumbOnly,
+  shouldSimplifyNanoCanvasCard,
+  shouldDeferNanoColdFallback,
+  shouldUseNanoGestureSnapshot,
+} from '../utils/viewportCulling';
 import { getBottomPanelHeight, getPromptAreaHeight, calculatePromptLines } from '../utils/cardLayout';
 import { buildCardQuadTree, QuadTree, BoundingBox } from '../utils/quadTree';
 
@@ -55,9 +63,11 @@ export const DEFAULT_OVERVIEW_DOT_THRESHOLD = 0;
 interface BakedSnapshot {
   canvas: HTMLCanvasElement;
   bounds: { minX: number; minY: number; width: number; height: number };
+  scaleRatio: number;
   dark: boolean;
   cardsCount: number;
   selectedKey: string;
+  cardsRefSnapshot?: CardData[];
 }
 
 function drawCardBottomPanel(
@@ -74,7 +84,8 @@ function drawCardBottomPanel(
   selectedLineWidth: number,
   normalLineWidth: number,
   alpha: number = 1.0,
-  screenW: number = 480
+  screenW: number = 480,
+  simplified: boolean = false
 ) {
   if (alpha <= 0.001) return;
   const basePanelW = 480;
@@ -97,9 +108,7 @@ function drawCardBottomPanel(
 
   // Background fill matching DOM border-box
   ctx.fillStyle = dark ? '#262626' : '#f3f4f6';
-  ctx.beginPath();
-  ctx.rect(panelX, panelY, panelW, panelH);
-  ctx.fill();
+  ctx.fillRect(panelX, panelY, panelW, panelH);
 
   // Border matching CSS border-box (inset by half stroke width to align outer edge with bounds)
   ctx.strokeStyle = isSelected ? borderSelected : borderNormal;
@@ -110,6 +119,19 @@ function drawCardBottomPanel(
     Math.max(0, panelW - currentLw),
     Math.max(0, panelH - currentLw)
   );
+
+  if (simplified) {
+    ctx.fillStyle = dark ? 'rgba(255, 255, 255, 0.045)' : 'rgba(0, 0, 0, 0.035)';
+    const insetX = 17 * scaleFactor;
+    const insetY = 17 * scaleFactor;
+    const innerW = Math.max(0, panelW - insetX * 2);
+    const innerH = Math.max(0, Math.min(28 * scaleFactor, panelH - insetY * 2));
+    if (innerW > 0 && innerH > 0) {
+      ctx.fillRect(panelX + insetX, panelY + insetY, innerW, innerH);
+    }
+    ctx.restore();
+    return;
+  }
 
   // Internal skeleton color blocks (scaled smoothly from panel origin)
   ctx.save();
@@ -182,7 +204,9 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
   const lodTransitionMap = useRef<Map<string, { alpha: number; startTime: number; startAlpha: number; targetAlpha: number }>>(new Map());
   const pendingThumbGenRef = useRef<Set<string>>(new Set());
   const bakedSnapshotRef = useRef<BakedSnapshot | null>(null);
+  const gestureSnapshotRef = useRef<BakedSnapshot | null>(null);
   const quadTreeRef = useRef<QuadTree<CardData> | null>(null);
+  const hasDrawnContentRef = useRef(false);
 
   // Synchronize QuadTree spatial index on cards change
   useEffect(() => {
@@ -234,21 +258,27 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
   const onThumbGenRef = useRef(onThumbnailGenerated);
   onThumbGenRef.current = onThumbnailGenerated;
 
-  // Builds or retrieves cached static snapshot texture for Overview Mode
-  const getOrBuildOverviewSnapshot = (
+  // Builds or retrieves cached static snapshot texture for Overview Mode or < 0.40 Gesture Highway
+  const buildWorldSnapshot = (
+    targetRef: React.MutableRefObject<BakedSnapshot | null>,
     currentCards: CardData[],
     dark: boolean,
     selectedSet: Set<string>,
-    pickerSession: NanoLodCanvasProps['pickerSession']
+    pickerSession: NanoLodCanvasProps['pickerSession'],
+    maxEdge: number,
+    maxScaleRatio: number,
+    simplifiedPanels: boolean,
+    onAsyncImageLoad: () => void
   ): BakedSnapshot | null => {
     if (currentCards.length === 0) return null;
 
     const selectedKey = Array.from(selectedSet).sort().join(',') + (pickerSession ? `_picker_${pickerSession.targetCardId}` : '');
-    const cached = bakedSnapshotRef.current;
+    const cached = targetRef.current;
     if (
       cached &&
       cached.dark === dark &&
       cached.cardsCount === currentCards.length &&
+      cached.cardsRefSnapshot === currentCards &&
       cached.selectedKey === selectedKey
     ) {
       return cached;
@@ -280,11 +310,10 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     const worldW = maxX - minX;
     const worldH = maxY - minY;
 
-    // 2. Determine texture size (bounded to max 2560px)
-    const maxTextureEdge = 2560;
-    const scaleRatio = Math.min(1.0, maxTextureEdge / Math.max(worldW, worldH));
-    const textureW = Math.max(128, Math.min(maxTextureEdge, Math.round(worldW * scaleRatio)));
-    const textureH = Math.max(128, Math.min(maxTextureEdge, Math.round(worldH * scaleRatio)));
+    // 2. Determine texture size (bounded to maxEdge)
+    const scaleRatio = Math.min(maxScaleRatio, maxEdge / Math.max(worldW, worldH));
+    const textureW = Math.max(128, Math.min(maxEdge, Math.round(worldW * scaleRatio)));
+    const textureH = Math.max(128, Math.min(maxEdge, Math.round(worldH * scaleRatio)));
 
     let offscreen: HTMLCanvasElement;
     if (cached && cached.canvas) {
@@ -307,7 +336,6 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     offCtx.scale(scaleRatio, scaleRatio);
     offCtx.translate(-minX, -minY);
 
-    // Sharp rectangle rendering strictly adhering to card ratio and dimensions
     const colorGenerating = dark ? '#262626' : '#f3f4f6';
     const colorMedia = dark ? '#262626' : '#f3f4f6';
     const colorDraft = dark ? '#262626' : '#f3f4f6';
@@ -334,26 +362,29 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         card.thumbnailUrl || card.imageUrl || card.originalImageUrl || card.trueOriginalImageUrl || card.fileData || card.originalFileData || card.trueOriginalFileData
       );
 
-      // Fill proportional rectangle
       offCtx.fillStyle = card.state === 'generating' ? colorGenerating : hasMedia ? colorMedia : colorDraft;
       offCtx.fillRect(card.x, card.y, dim.width, dim.height);
 
-      // Thumbnail cover if available in cache
       const thumbUrl =
         card.thumbnailUrl ||
         thumbCache.get(card.id) ||
-        (card.imageUrl ? thumbCache.get(card.imageUrl) : undefined) ||
-        card.imageUrl ||
-        card.originalImageUrl;
+        (card.imageUrl ? thumbCache.get(card.imageUrl) : undefined);
 
       let drawSourceImg: HTMLImageElement | null = null;
       if (thumbUrl) {
-        drawSourceImg = getOrLoadThumbImage(thumbUrl, scheduleDraw);
+        drawSourceImg = getOrLoadThumbImage(thumbUrl, onAsyncImageLoad);
       } else if (card.imageUrl && fullImageCache.has(card.imageUrl)) {
         const cachedImg = fullImageCache.get(card.imageUrl);
         if (cachedImg && cachedImg.complete && cachedImg.naturalWidth > 0) {
           drawSourceImg = cachedImg;
         }
+      } else if (card.imageUrl && thumbImageCache.has(card.imageUrl)) {
+        const cachedThumb = thumbImageCache.get(card.imageUrl);
+        if (cachedThumb && cachedThumb.complete && cachedThumb.naturalWidth > 0) {
+          drawSourceImg = cachedThumb;
+        }
+      } else if (!simplifiedPanels && (card.imageUrl || card.originalImageUrl)) {
+        drawSourceImg = getOrLoadThumbImage((card.imageUrl || card.originalImageUrl)!, onAsyncImageLoad);
       }
 
       if (drawSourceImg && drawSourceImg.complete && drawSourceImg.naturalWidth > 0) {
@@ -366,19 +397,16 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         offCtx.drawImage(drawSourceImg, sx, sy, sw, sh, card.x, card.y, dim.width, dim.height);
       }
 
-      // Proportional rectangle stroke border
       if (isAgentFocused) {
         offCtx.strokeStyle = borderAgentTarget;
         offCtx.lineWidth = selectedLineWidth * 1.25;
         offCtx.strokeRect(card.x, card.y, dim.width, dim.height);
       } else {
         offCtx.strokeStyle = isSelected ? borderSelected : borderNormal;
-        const currentLw = isSelected ? selectedLineWidth : normalLineWidth;
-        offCtx.lineWidth = currentLw;
+        offCtx.lineWidth = isSelected ? selectedLineWidth : normalLineWidth;
         offCtx.strokeRect(card.x, card.y, dim.width, dim.height);
       }
 
-      // Bottom Panel Skeleton Color Block for Generation Cards in Overview Mode
       const isGenerationCard = !card.fileName && !card.isAsset;
       if (isGenerationCard) {
         drawCardBottomPanel(
@@ -395,7 +423,8 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
           selectedLineWidth,
           normalLineWidth,
           1.0,
-          dim.width * scaleRatio
+          dim.width * scaleRatio,
+          simplifiedPanels
         );
       }
     }
@@ -405,13 +434,23 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     const result: BakedSnapshot = {
       canvas: offscreen,
       bounds: { minX, minY, width: worldW, height: worldH },
+      scaleRatio,
       dark,
       cardsCount: currentCards.length,
       selectedKey,
+      cardsRefSnapshot: currentCards,
     };
-    bakedSnapshotRef.current = result;
+    targetRef.current = result;
     return result;
   };
+
+  const getOrBuildOverviewSnapshot = (
+    currentCards: CardData[],
+    dark: boolean,
+    selectedSet: Set<string>,
+    pickerSession: NanoLodCanvasProps['pickerSession']
+  ): BakedSnapshot | null =>
+    buildWorldSnapshot(bakedSnapshotRef, currentCards, dark, selectedSet, pickerSession, 2560, 1.0, false, scheduleDraw);
 
   // Single-frame draw call
   const draw = () => {
@@ -429,23 +468,18 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       (workspace && ['data-gesture', 'data-panning', 'data-zooming'].some(name => workspace.getAttribute(name) === 'true')) ||
       (typeof window !== 'undefined' && (window as any).isDraggingCard)
     );
-    const useSquircle = squircleSupported && !isGestureActive;
-    const lazyGesture = getCanvasLoadingMode() === 'lazy' && isGestureActive;
+    const zoomingOut = isCameraZoomingOut();
+    const canUpgradeGesture = !zoomingOut && getCanvasLoadingMode() !== 'lazy';
+    const useSquircle = squircleSupported && (!isGestureActive || canUpgradeGesture);
+    const thumbOnly = shouldUseNanoCanvasThumbOnly(currentScale, isGestureActive, zoomingOut);
+    const simplifyCard = shouldSimplifyNanoCanvasCard(currentScale, isGestureActive, zoomingOut);
     const currentTx = tx.get();
     const currentTy = ty.get();
     const width = window.innerWidth;
     const height = window.innerHeight;
-    const dpr = getCappedDpr(width, height, 1.5);
-
-    // Adjust canvas resolution if viewport size changed
+    const dpr = (isGestureActive && !canUpgradeGesture) ? 1 : getCappedDpr(width, height, 1.5);
     const targetW = Math.round(width * dpr);
     const targetH = Math.round(height * dpr);
-    if (canvas.width !== targetW || canvas.height !== targetH) {
-      canvas.width = targetW;
-      canvas.height = targetH;
-    }
-
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     const dark = isDarkRef.current;
     const currentCards = cardsRef.current;
@@ -456,17 +490,19 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     // Check if dragging locally in Nano LOD
     const dragging = (window as any).__nanoDragging;
 
-    ctx.save();
-    // Normalize to CSS pixel coordinates
-    ctx.scale(dpr, dpr);
-    // Apply camera world transform
-    ctx.translate(currentTx, currentTy);
-    ctx.scale(currentScale, currentScale);
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = 'high';
-
     // PERFORMANCE HIGHWAY: In Overview Mode, draw the single baked snapshot texture in O(1) time
     if (isOverviewModeRef.current && !dragging) {
+      if (canvas.width !== targetW || canvas.height !== targetH) {
+        canvas.width = targetW;
+        canvas.height = targetH;
+      }
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.save();
+      ctx.scale(dpr, dpr);
+      ctx.translate(currentTx, currentTy);
+      ctx.scale(currentScale, currentScale);
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = isGestureActive ? 'low' : 'high';
       const selectedSet = new Set<string>(selectedIds);
       const snapshot = getOrBuildOverviewSnapshot(currentCards, dark, selectedSet, pickerSession);
       if (snapshot) {
@@ -483,6 +519,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         );
       }
       ctx.restore();
+      hasDrawnContentRef.current = Boolean(snapshot);
       if (onReadyRef.current) {
         onReadyRef.current({ scale: currentScale, tx: currentTx, ty: currentTy });
       }
@@ -494,6 +531,56 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       bakedSnapshotRef.current = null;
     }
 
+    if (!isGestureActive || currentScale >= getNanoLodThreshold()) {
+      gestureSnapshotRef.current = null;
+    } else if (shouldUseNanoGestureSnapshot(currentScale, currentCards.length, isGestureActive, zoomingOut, isOverviewModeRef.current, Boolean(dragging))) {
+      const selectedSet = new Set<string>(selectedIds);
+      const snapshot = buildWorldSnapshot(
+        gestureSnapshotRef,
+        currentCards,
+        dark,
+        selectedSet,
+        pickerSession,
+        2560,
+        0.42,
+        true,
+        () => {
+          gestureSnapshotRef.current = null;
+          scheduleDraw();
+        }
+      );
+      if (snapshot && snapshot.scaleRatio >= currentScale * 0.6) {
+        if (canvas.width !== targetW || canvas.height !== targetH) {
+          canvas.width = targetW;
+          canvas.height = targetH;
+        }
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.save();
+        ctx.scale(dpr, dpr);
+        ctx.translate(currentTx, currentTy);
+        ctx.scale(currentScale, currentScale);
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'low';
+        ctx.drawImage(
+          snapshot.canvas,
+          0,
+          0,
+          snapshot.canvas.width,
+          snapshot.canvas.height,
+          snapshot.bounds.minX,
+          snapshot.bounds.minY,
+          snapshot.bounds.width,
+          snapshot.bounds.height
+        );
+        ctx.restore();
+        hasDrawnContentRef.current = true;
+        if (onReadyRef.current) {
+          onReadyRef.current({ scale: currentScale, tx: currentTx, ty: currentTy });
+        }
+        return;
+      }
+    }
+
     // Compute visible viewport bounds in world coordinates for instant AABB culling
     const vpLeft = -currentTx / currentScale;
     const vpTop = -currentTy / currentScale;
@@ -501,9 +588,10 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     const vpBottom = (height - currentTy) / currentScale;
 
     // Color constants matching Nano-LOD design (sharp straight edges / no border radius)
-    const colorGenerating = dark ? '#262626' : '#e5e7eb';
-    const colorMedia = dark ? '#262626' : '#d4d4d8';
-    const colorDraft = dark ? '#262626' : '#e5e7eb';
+    // Matches DOM bg-gray-100 (#f3f4f6) and dark:bg-neutral-800 (#262626)
+    const colorGenerating = dark ? '#262626' : '#f3f4f6';
+    const colorMedia = dark ? '#262626' : '#f3f4f6';
+    const colorDraft = dark ? '#262626' : '#f3f4f6';
 
     const borderNormal = dark ? 'rgba(64, 64, 64, 0.85)' : 'rgba(212, 212, 216, 0.85)';
     const borderSelected = '#3b82f6';
@@ -586,6 +674,46 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       }
     }
 
+    // Fast-path skip when >= threshold and every visible card is already mounted & painted in DOM
+    const renderedSetForFastPath = renderedIdsRef.current;
+    const paintedSetForFastPath = typeof window !== 'undefined' ? (window as any).__paintedCardIds : null;
+    const needsCanvasCard = (card: CardData) => {
+      if (currentScale < threshold) return true;
+      const isDomMounted = Boolean(
+        domCardsActiveRef.current &&
+        (renderedSetForFastPath?.has(card.id) || mountedDomCardIds.has(card.id))
+      );
+      const isPainted = Boolean(paintedSetForFastPath?.has(card.id));
+      const panelReady = Boolean(card.fileName || card.isAsset) || readyPromptPanels.has(card.id);
+      return !(isDomMounted && isPainted && panelReady);
+    };
+    const anyCardToDraw = unselectedCards.some(needsCanvasCard) || selectedCards.some(needsCanvasCard);
+    if (!anyCardToDraw) {
+      if (hasDrawnContentRef.current) {
+        if (canvas.width !== targetW || canvas.height !== targetH) {
+          canvas.width = targetW;
+          canvas.height = targetH;
+        }
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        hasDrawnContentRef.current = false;
+      }
+      return;
+    }
+
+    if (canvas.width !== targetW || canvas.height !== targetH) {
+      canvas.width = targetW;
+      canvas.height = targetH;
+    }
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    hasDrawnContentRef.current = true;
+
+    ctx.save();
+    ctx.scale(dpr, dpr);
+    ctx.translate(currentTx, currentTy);
+    ctx.scale(currentScale, currentScale);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = isGestureActive ? 'low' : 'high';
+
     const renderCard = (card: CardData) => {
       let dim = getCardSize(card);
       const origW = dim.width;
@@ -618,51 +746,20 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         dim = { width: dim.width * scaleFactor, height: dim.height * scaleFactor };
       }
       const renderedSet = renderedIdsRef.current;
+      const isDomMounted = Boolean(
+        domCardsActiveRef.current &&
+        (renderedSet?.has(card.id) || mountedDomCardIds.has(card.id))
+      );
       const paintedSet = typeof window !== 'undefined' ? (window as any).__paintedCardIds : null;
       const isPainted = Boolean(paintedSet?.has(card.id));
       const panelReady = Boolean(card.fileName || card.isAsset) || readyPromptPanels.has(card.id);
-      const isCardReadyInDom = currentScale >= getNanoLodThreshold() && Boolean(renderedSet?.has(card.id) && isPainted && panelReady);
+      const isCardReadyInDom = currentScale >= getNanoLodThreshold() && Boolean(isDomMounted && isPainted && panelReady);
 
-      const targetAlpha = isCardReadyInDom ? 0 : 1;
-      let transitionState = lodTransitionMap.current.get(card.id);
-      const now = performance.now();
-
-      if (!transitionState) {
-        transitionState = { alpha: targetAlpha, startTime: now, startAlpha: targetAlpha, targetAlpha };
-        lodTransitionMap.current.set(card.id, transitionState);
-      } else if (transitionState.targetAlpha !== targetAlpha) {
-        transitionState.startAlpha = transitionState.alpha;
-        transitionState.targetAlpha = targetAlpha;
-        transitionState.startTime = now;
-      }
-
-      if (transitionState.alpha !== targetAlpha) {
-        if (currentScale < getNanoLodThreshold()) {
-          // When zooming out to Nano LOD, immediately snap alpha to 1 so there is no transparent flash when DOM cards retire!
-          transitionState.alpha = 1;
-        } else {
-          const elapsed = now - transitionState.startTime;
-          const duration = 250;
-          const progress = Math.min(1, elapsed / duration);
-          // Smooth quadratic ease-out curve
-          const eased = 1 - Math.pow(1 - progress, 2);
-          transitionState.alpha = transitionState.startAlpha + (targetAlpha - transitionState.startAlpha) * eased;
-          if (progress < 1) {
-            scheduleDraw();
-          } else {
-            transitionState.alpha = targetAlpha;
-          }
-        }
-      }
-
-      const alpha = transitionState.alpha;
-
-      if (alpha <= 0.001 && isCardReadyInDom) {
+      if (isCardReadyInDom) {
         return;
       }
 
       ctx.save();
-      ctx.globalAlpha *= alpha;
 
 
       // If we are in High LOD (scale >= threshold), and the card is currently being dragged in DOM,
@@ -713,29 +810,26 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         card.trueOriginalFileData
       );
       const isGenerating = card.state === 'generating';
-      // Keep the lightweight preview throughout a lazy camera gesture; otherwise
-      // crossing 34% would upgrade every visible canvas card in the same frame.
-      const deferForGesture = isGestureActive && (getCanvasLoadingMode() === 'lazy' || (getCanvasLoadingMode() === 'hybrid' && !isHybridCardNear(card.id)));
+      // Keep the lightweight preview throughout a lazy or zoom-out camera gesture;
+      // on zoom-in, immediate mode upgrades all visible cards and hybrid mode upgrades focal cards.
+      const deferForGesture = isGestureActive && (
+        zoomingOut ||
+        getCanvasLoadingMode() === 'lazy' ||
+        (getCanvasLoadingMode() === 'hybrid' && !isHybridCardNear(card.id))
+      );
       const standard = isStandardCardLod(currentScale) && !deferForGesture;
-      if (standard) {
+      const cardThumbOnly = deferForGesture
+        ? thumbOnly
+        : shouldUseNanoCanvasThumbOnly(currentScale, isGestureActive, zoomingOut, true);
+      const useRoundedOutline = standard && !simplifyCard;
+      if (useRoundedOutline) {
         ctx.save();
         ctx.translate(cardX, cardY);
         ctx.clip(cardOutline(dim.width, dim.height, true, useSquircle));
         ctx.translate(-cardX, -cardY);
       }
-      // 1. Solid Base Fill or Nano LOD Skeleton Screen
-      if (isGenerating) {
-        ctx.fillStyle = colorGenerating;
-        ctx.fillRect(cardX, cardY, dim.width, dim.height);
-      } else if (hasMedia) {
-        ctx.fillStyle = colorMedia;
-        ctx.fillRect(cardX, cardY, dim.width, dim.height);
-      } else {
-        ctx.fillStyle = colorDraft;
-        ctx.fillRect(cardX, cardY, dim.width, dim.height);
-      }
 
-      // 2. Draw Live Memory Frame (for video cards) or Ultra-Low-Resolution Thumbnail (with Object-Cover preservation)
+      // 1. Resolve Live Memory Frame (for video cards) or Thumbnail / Full Image
       let hasDrawnThumbnail = false;
       const liveFrame = card.isVideo ? getLiveVideoFrame(card.id) : null;
       let drawSourceImg: CanvasImageSource | null = liveFrame;
@@ -743,16 +837,22 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       let imgHeight = liveFrame ? liveFrame.height : 0;
 
       if (!drawSourceImg) {
-        const thumbUrl =
+        const cachedRawThumb = card.imageUrl
+          ? Boolean(fullImageCache.get(card.imageUrl)?.complete || thumbImageCache.get(card.imageUrl)?.complete)
+          : false;
+        const primaryThumb =
           (standard && card.isVideo ? card.videoPosterUrl : undefined) ||
           card.thumbnailUrl ||
           thumbCache.get(card.id) ||
           (card.imageUrl ? thumbCache.get(card.imageUrl) : undefined) ||
-          (card.isVideo ? card.videoPosterUrl : undefined) ||
-          (!card.isVideo ? (card.imageUrl || card.originalImageUrl) : undefined);
+          (card.isVideo ? card.videoPosterUrl : undefined);
+        const deferColdRaw = shouldDeferNanoColdFallback(Boolean(primaryThumb || cachedRawThumb), isGestureActive, zoomingOut);
+        const thumbUrl =
+          primaryThumb ||
+          (!card.isVideo && !deferColdRaw ? (card.imageUrl || card.originalImageUrl) : undefined);
 
         const full = card.imageUrl ? fullImageCache.get(card.imageUrl) : undefined;
-        if (standard && full?.complete && full.naturalWidth > 0) {
+        if (!cardThumbOnly && standard && full?.complete && full.naturalWidth > 0) {
           drawSourceImg = full;
           imgWidth = full.naturalWidth;
           imgHeight = full.naturalHeight;
@@ -771,7 +871,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
             if (pending && !pending.complete) {
               // Leave the old DOM image visible until this replacement is ready.
               nanoHandoffReady = false;
-              if (standard) ctx.restore();
+              if (useRoundedOutline) ctx.restore();
               ctx.restore();
               return;
             }
@@ -786,16 +886,30 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         }
       }
 
+      const hasValidSourceImg = Boolean(drawSourceImg && imgWidth > 0 && imgHeight > 0);
+      const reveal = hasValidSourceImg ? mediaRevealProgress(card.id) : 0;
 
+      // 2. Solid Base Fill or Nano LOD Skeleton Screen (only when image does not yet fully cover the card)
+      if (!hasValidSourceImg || reveal < 1) {
+        if (isGenerating) {
+          ctx.fillStyle = colorGenerating;
+          ctx.fillRect(cardX, cardY, dim.width, dim.height);
+        } else if (hasMedia) {
+          ctx.fillStyle = colorMedia;
+          ctx.fillRect(cardX, cardY, dim.width, dim.height);
+        } else {
+          ctx.fillStyle = colorDraft;
+          ctx.fillRect(cardX, cardY, dim.width, dim.height);
+        }
+      }
 
-      if (drawSourceImg && imgWidth > 0 && imgHeight > 0) {
+      if (hasValidSourceImg && drawSourceImg) {
         const { sx, sy, sw, sh } = calculateObjectCover(
           imgWidth,
           imgHeight,
           dim.width,
           dim.height
         );
-        const reveal = mediaRevealProgress(card.id);
         ctx.save();
         ctx.globalAlpha *= reveal;
         ctx.drawImage(drawSourceImg, sx, sy, sw, sh, cardX, cardY, dim.width, dim.height);
@@ -830,9 +944,9 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         }
       }
 
-      if (standard) ctx.restore();
+      if (useRoundedOutline) ctx.restore();
       const strokeOutline = (x = cardX, y = cardY, width = dim.width, height = dim.height) =>
-        strokeCardOutline(ctx, x, y, width, height, standard, useSquircle);
+        strokeCardOutline(ctx, x, y, width, height, useRoundedOutline, useSquircle);
       const focusItem = agentFocusMapRef.current?.[card.id];
       const targetIds = agentTargetCardIdsRef.current;
       const isAgentTargetInSet = Boolean(
@@ -890,7 +1004,8 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
 
       // 3b. Bottom Panel Skeleton Color Block for Generation Cards in 2D Canvas Mode
       const isGenerationCard = !card.fileName && !card.isAsset;
-      if (isGenerationCard) {
+      const isBottomPanelReadyInDom = currentScale >= getNanoLodThreshold() && Boolean(isDomMounted && panelReady);
+      if (isGenerationCard && !isBottomPanelReadyInDom) {
         drawCardBottomPanel(
           ctx,
           card,
@@ -905,7 +1020,8 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
           selectedLineWidth,
           normalLineWidth,
           1.0,
-          screenW
+          screenW,
+          simplifyCard
         );
       }
 
@@ -1022,7 +1138,11 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     let animating = false;
     const renderWithEntry = (card: CardData) => {
       if (currentScale >= threshold) {
-        const domReady = Boolean(renderedIdsRef.current?.has(card.id) &&
+        const isDomMounted = Boolean(
+          domCardsActiveRef.current &&
+          (renderedIdsRef.current?.has(card.id) || mountedDomCardIds.has(card.id))
+        );
+        const domReady = Boolean(isDomMounted &&
           (window as any).__paintedCardIds?.has(card.id) &&
           (card.fileName || card.isAsset || readyPromptPanels.has(card.id)));
         if (waitForEntryDom(card.id, domReady)) return;
@@ -1082,20 +1202,25 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
 
   // Re-draw when data changes (renderedCardIds excluded to prevent canvas redraw thrashing on DOM card mount)
   useEffect(() => {
+    gestureSnapshotRef.current = null;
     scheduleDraw();
   }, [cards, selectedCardIds, agentTargetCardId, agentTargetCardIds, agentReferenceCardIds, agentFocusMap, pickerSession, isDarkMode, isOverviewMode, dotModeThreshold]);
 
   // Listen to custom card painted and surface ready events for seamless DOM handoff
   useEffect(() => {
-    window.addEventListener('card-painted', scheduleDraw);
-    window.addEventListener('card-surface-ready', scheduleDraw);
+    const handleDomSurfaceEvent = () => {
+      if (scale.get() < getNanoLodThreshold() || !domCardsActiveRef.current) return;
+      scheduleDraw();
+    };
+    window.addEventListener('card-painted', handleDomSurfaceEvent);
+    window.addEventListener('card-surface-ready', handleDomSurfaceEvent);
     window.addEventListener('canvas-styles-restored', scheduleDraw);
     return () => {
-      window.removeEventListener('card-painted', scheduleDraw);
-      window.removeEventListener('card-surface-ready', scheduleDraw);
+      window.removeEventListener('card-painted', handleDomSurfaceEvent);
+      window.removeEventListener('card-surface-ready', handleDomSurfaceEvent);
       window.removeEventListener('canvas-styles-restored', scheduleDraw);
     };
-  }, []);
+  }, [scale]);
 
   useEffect(() => {
     const handleRepaint = () => {
