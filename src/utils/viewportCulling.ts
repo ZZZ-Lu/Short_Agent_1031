@@ -1,5 +1,5 @@
 import { AspectRatio, CARD_DIMENSIONS, getCardSize } from '../components/GenerationCard';
-import { getBottomPanelHeight } from './cardLayout';
+import { getBottomPanelHeight, hasCardMedia, shouldShowGenerationPromptPanel } from './cardLayout';
 import { NANO_LOD_THRESHOLD, NANO_LOD_ENTER_HIGH_THRESHOLD, NANO_LOD_EXIT_HIGH_THRESHOLD } from './cardLodAppearance';
 
 export interface CardBounds {
@@ -14,6 +14,16 @@ export interface CardBounds {
   referenceImageUrl?: string | null;
   fileName?: string;
   isAsset?: boolean;
+  imageUrl?: string | null;
+  originalImageUrl?: string | null;
+  trueOriginalImageUrl?: string | null;
+  thumbnailUrl?: string | null;
+  fileData?: unknown;
+  originalFileData?: unknown;
+  trueOriginalFileData?: unknown;
+  isVideo?: boolean;
+  state?: string;
+  generationError?: string | null;
 }
 
 export interface CanvasViewport {
@@ -26,15 +36,22 @@ export interface CanvasViewport {
 
 /**
  * Calculates visual dimensions of a card in canvas world coordinates.
- * Includes the image area, gap, and dynamic bottom prompt/action panel height for generation cards.
+ * Includes the bottom prompt/action panel height only when the card defaults to
+ * displaying it (blank drafts, generating cards, or errored generation cards).
  */
 export function getCardDimensions(card: CardBounds): { width: number; height: number } {
   const dim = getCardSize(card);
   const isGenerationCard = !card.fileName && !card.isAsset;
-  const visualWidth = isGenerationCard ? Math.max(dim.width, 480) : dim.width;
-  if (!isGenerationCard) {
-    return { width: visualWidth, height: dim.height };
+  const includePanelBounds = isGenerationCard && shouldShowGenerationPromptPanel({
+    isAssetCard: false,
+    hasMedia: hasCardMedia(card),
+    state: card.state,
+    hasError: Boolean(card.generationError),
+  });
+  if (!includePanelBounds) {
+    return { width: dim.width, height: dim.height };
   }
+  const visualWidth = Math.max(dim.width, 480);
   const panelHeight = getBottomPanelHeight(card.prompt, card.referenceImages?.length || (card.referenceImageUrl ? 1 : 0));
   const visualHeight = dim.height + 12 + panelHeight;
   return { width: visualWidth, height: visualHeight };
@@ -264,24 +281,64 @@ export function quantizeCardScaleTier(scale: number): number {
   return 4.0;
 }
 
+export interface GridPatternSpec {
+  spacing: number;
+  tileSize: number;
+  dotRadiusTile: number;
+  dotRadiusCss: number;
+}
+
+export const DEFAULT_GRID_DOT_RADIUS_CSS = 1.76;
+
 /**
- * Doubles grid spacing cleanly by powers of two when zoomed deep out so pattern
- * repetition stays below heavy fill-rate thresholds while keeping world alignment.
+ * Computes screen-space grid spacing proportional to the canvas scale so dot spacing
+ * shrinks smoothly as the canvas zooms out (no discontinuous 2x jumps), clamped only
+ * above the minimum physical dot diameter.
  */
 export function computeGridDisplaySpacing(
   scale: number,
   baseWorldStep: number = 48,
-  minScreenSpacing: number = 16
+  minScreenSpacing: number = DEFAULT_GRID_DOT_RADIUS_CSS * 2.1
 ): number {
   const safeScale = Number.isFinite(scale) && scale > 0.001 ? scale : 0.001;
   const safeStep = Math.max(1, baseWorldStep);
-  let spacing = safeStep * safeScale;
-  let doublings = 0;
-  while (spacing < minScreenSpacing && doublings < 6) {
-    spacing *= 2;
-    doublings += 1;
-  }
-  return spacing;
+  return Math.max(minScreenSpacing, safeStep * safeScale);
+}
+
+/**
+ * Computes tile dimensions and tile-space dot radius so every dot maintains a constant
+ * screen-space size across the entire zoom range (10%..500%) while spacing scales with zoom.
+ */
+export function computeGridPatternSpec(
+  scale: number,
+  dpr: number,
+  baseWorldStep: number = 48,
+  dotRadiusCss: number = DEFAULT_GRID_DOT_RADIUS_CSS,
+  isGestureActive: boolean = false
+): GridPatternSpec {
+  const safeDotRadius =
+    Number.isFinite(dotRadiusCss) && dotRadiusCss > 0.25 ? dotRadiusCss : DEFAULT_GRID_DOT_RADIUS_CSS;
+  const safeDpr = Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
+  const spacing = computeGridDisplaySpacing(scale, baseWorldStep, safeDotRadius * 2.1);
+  const deviceSpacing = spacing * safeDpr;
+  // Use a single fixed 128px tile during active gestures to prevent per-frame offscreen canvas
+  // reallocations and createPattern rebuilds, and discrete power-of-two buckets at rest.
+  const tileSize = isGestureActive
+    ? 128
+    : deviceSpacing >= 384
+    ? 512
+    : deviceSpacing >= 192
+    ? 256
+    : deviceSpacing >= 96
+    ? 128
+    : 64;
+  const dotRadiusTile = safeDotRadius * (tileSize / spacing);
+  return {
+    spacing,
+    tileSize,
+    dotRadiusTile,
+    dotRadiusCss: safeDotRadius,
+  };
 }
 
 /**
@@ -297,20 +354,18 @@ export function shouldDeferNanoColdFallback(
 }
 
 /**
- * Enables single-texture world snapshot blitting in NanoLodCanvas below the Nano-LOD threshold
- * during active camera gestures on multi-card canvases (when not dragging individual cards or in Overview).
+ * Previously enabled single-texture world snapshot blitting in NanoLodCanvas below the Nano-LOD threshold
+ * during active camera gestures. Disabled so 10% zoom panning/dragging keeps crisp per-card rendering.
  */
 export function shouldUseNanoGestureSnapshot(
-  scale: number,
-  cardCount: number,
-  isGestureActive: boolean,
-  isZoomingOut: boolean,
-  isOverviewMode: boolean,
-  isDragging: boolean
+  _scale: number,
+  _cardCount: number,
+  _isGestureActive: boolean,
+  _isZoomingOut: boolean,
+  _isOverviewMode: boolean,
+  _isDragging: boolean
 ): boolean {
-  if (!isGestureActive || isOverviewMode || isDragging) return false;
-  if (scale >= getNanoLodThreshold()) return false;
-  return cardCount >= 12 && (isZoomingOut || scale < getNanoLodThreshold());
+  return false;
 }
 
 export interface ZoomHudState {
@@ -383,10 +438,17 @@ export function shouldPreserveCardCanvasBackingStore(
   targetPxW: number,
   targetPxH: number,
   effectiveShowOriginal: boolean,
-  isGenerating: boolean
+  isGenerating: boolean,
+  isGestureActive: boolean = false
 ): boolean {
-  if (effectiveShowOriginal || isGenerating) return false;
+  if (isGenerating) return false;
   if (prevPxW <= 0 || prevPxH <= 0 || targetPxW <= 0 || targetPxH <= 0) return false;
+  // During an active zoom/pan gesture or tween, never downsize and wipe an already-rasterized
+  // backing buffer; let the GPU compositor scale it smoothly and resize once at idle.
+  if (isGestureActive && prevPxW >= targetPxW && prevPxH >= targetPxH) {
+    return true;
+  }
+  if (effectiveShowOriginal) return false;
   return (
     prevPxW >= targetPxW &&
     prevPxH >= targetPxH &&
@@ -394,3 +456,87 @@ export function shouldPreserveCardCanvasBackingStore(
     prevPxH <= targetPxH * 2.25
   );
 }
+
+/**
+ * Defers tearing down 4K original textures while actively zooming out or animating,
+ * keeping GPU-cached high-res bitmaps intact until the camera settles.
+ */
+export function shouldDeferOriginalTierDowngrade(
+  scale: number,
+  isGestureActive: boolean,
+  isZoomingOut: boolean,
+  isTweenZooming: boolean
+): boolean {
+  if (scale >= 2.0) return false;
+  return Boolean(isGestureActive || isZoomingOut || isTweenZooming);
+}
+
+export interface NanoCanvasRenderQuality {
+  dprCap: number;
+  imageSmoothingQuality: 'low' | 'high';
+}
+
+/**
+ * Drops NanoLodCanvas backing resolution and resampling quality during active gestures or
+ * fast zoom-outs, restoring 1.5x DPR and high-quality smoothing once settled.
+ */
+export function computeNanoCanvasRenderQuality(
+  isGestureActive: boolean,
+  isZoomingOut: boolean,
+  simplifyCard: boolean
+): NanoCanvasRenderQuality {
+  if (isGestureActive || isZoomingOut || simplifyCard) {
+    return { dprCap: 1, imageSmoothingQuality: 'low' };
+  }
+  return { dprCap: 1.5, imageSmoothingQuality: 'high' };
+}
+
+/**
+ * Compares two ID lists to avoid allocating fresh selection arrays or triggering full-tree renders.
+ */
+export function areStringArraysEqual(a: readonly string[], b: readonly string[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+/**
+ * Computes the target DPR for CardImageCanvas:
+ * - When `effectiveShowOriginal` is false (< 200% or deferred gesture), caps buffer to the 1200px proxy edge.
+ * - When `effectiveShowOriginal` is true and the original image is loaded, matches the original image's
+ *   native pixel resolution directly, capped at 4K (4096px max edge / 4096x4096 pixel budget).
+ */
+export function computeCardCanvasTargetDpr(
+  cardWidth: number,
+  cardHeight: number,
+  screenDpr: number,
+  requestedDpr: number,
+  effectiveShowOriginal: boolean,
+  originalNaturalWidth: number = 0,
+  originalNaturalHeight: number = 0
+): number {
+  const safeW = Math.max(1, cardWidth);
+  const safeH = Math.max(1, cardHeight);
+  const maxCardEdge = Math.max(safeW, safeH);
+  const safeScreenDpr = Math.max(1, screenDpr || 1);
+  const baseDpr = Math.max(safeScreenDpr, requestedDpr || safeScreenDpr);
+  const maxFullDpr = Math.max(safeScreenDpr, 1200 / maxCardEdge);
+
+  if (effectiveShowOriginal && originalNaturalWidth > 0 && originalNaturalHeight > 0) {
+    const max4kDpr = Math.max(safeScreenDpr, 4096 / maxCardEdge);
+    const nativeOrigDpr = Math.max(
+      originalNaturalWidth / safeW,
+      originalNaturalHeight / safeH
+    );
+    const targetOrigDpr = Math.min(Math.max(safeScreenDpr, nativeOrigDpr), max4kDpr);
+    const max4kBudget = 4096 * 4096;
+    const byArea = Math.sqrt(max4kBudget / Math.max(1, Math.round(safeW) * Math.round(safeH)));
+    return Math.max(1, Math.min(targetOrigDpr, byArea));
+  }
+
+  return Math.min(baseDpr, maxFullDpr);
+}
+

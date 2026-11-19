@@ -7,13 +7,23 @@ import {
   shouldSimplifyNanoCanvasCard,
   quantizeCardScaleTier,
   computeGridDisplaySpacing,
+  computeGridPatternSpec,
   shouldDeferNanoColdFallback,
   shouldUseNanoGestureSnapshot,
   formatZoomHudState,
   formatFpsHudBadge,
   shouldPreserveCardCanvasBackingStore,
+  shouldDeferOriginalTierDowngrade,
+  computeNanoCanvasRenderQuality,
+  areStringArraysEqual,
+  computeCardCanvasTargetDpr,
+  getCardDimensions,
   type CardBounds,
 } from '../../src/utils/viewportCulling';
+import {
+  hasCardMedia,
+  shouldShowGenerationPromptPanel,
+} from '../../src/utils/cardLayout';
 import {
   setCameraZoomingOut,
   isCameraZoomingOut,
@@ -21,6 +31,7 @@ import {
   isCameraTweenZooming,
   setCanvasLoadingMode,
   canUpgradeCardDuringGesture,
+  canRunHybridSurface,
   setHybridProximityProvider,
 } from '../../src/utils/canvasPerformance';
 
@@ -91,11 +102,23 @@ test('quantizeCardScaleTier keeps < 1.0 constant while preserving high-scale bre
   assert.equal(quantizeCardScaleTier(4.2), 4.0);
 });
 
-test('computeGridDisplaySpacing keeps normal zooms exact and doubles sparse spacing when zoomed out', () => {
+test('computeGridDisplaySpacing scales dot spacing monotonically with canvas zoom', () => {
+  assert.equal(computeGridDisplaySpacing(5.0), 240);
   assert.equal(computeGridDisplaySpacing(1.0), 48);
   assert.equal(computeGridDisplaySpacing(0.5), 24);
-  assert.equal(computeGridDisplaySpacing(0.15), 48 * 0.15 * 4);
-  assert.ok(computeGridDisplaySpacing(0.1) >= 16);
+  assert.ok(Math.abs(computeGridDisplaySpacing(0.15) - 7.2) < 1e-6);
+  assert.ok(Math.abs(computeGridDisplaySpacing(0.1) - 4.8) < 1e-6);
+});
+
+test('computeGridPatternSpec keeps rendered screen dot radius invariant at 1.76px from 10% to 500% zoom', () => {
+  for (const s of [0.1, 0.25, 0.5, 1.0, 2.0, 5.0]) {
+    for (const dpr of [1, 1.5]) {
+      const spec = computeGridPatternSpec(s, dpr, 48);
+      const renderedRadiusCss = spec.dotRadiusTile * (spec.spacing / spec.tileSize);
+      assert.ok(Math.abs(renderedRadiusCss - 1.76) < 1e-6, `Expected 1.76px radius at scale=${s}, dpr=${dpr}, got ${renderedRadiusCss}`);
+      assert.ok(spec.dotRadiusTile < spec.tileSize * 0.49, `Dot must stay inside tile bounds at scale=${s}`);
+    }
+  }
 });
 
 test('shouldDeferNanoColdFallback skips uncached raw images only during active zoom-out', () => {
@@ -105,8 +128,9 @@ test('shouldDeferNanoColdFallback skips uncached raw images only during active z
   assert.equal(shouldDeferNanoColdFallback(false, true, false), false);
 });
 
-test('shouldUseNanoGestureSnapshot activates during multi-card < 0.40 active gestures only', () => {
-  assert.equal(shouldUseNanoGestureSnapshot(0.25, 80, true, true, false, false), true);
+test('shouldUseNanoGestureSnapshot remains disabled so 10% canvas dragging keeps crisp card images', () => {
+  assert.equal(shouldUseNanoGestureSnapshot(0.10, 80, true, false, false, false), false);
+  assert.equal(shouldUseNanoGestureSnapshot(0.25, 80, true, true, false, false), false);
   assert.equal(shouldUseNanoGestureSnapshot(0.45, 80, true, true, false, false), false);
   assert.equal(shouldUseNanoGestureSnapshot(0.25, 4, true, true, false, false), false);
   assert.equal(shouldUseNanoGestureSnapshot(0.25, 80, false, true, false, false), false);
@@ -220,4 +244,155 @@ test('canUpgradeCardDuringGesture differentiates immediate, hybrid, and lazy dur
     (globalThis as any).window = prevWin;
   }
 });
+
+test('computeCardCanvasTargetDpr uses 1200px proxy below 200%, native original resolution for <4K originals, and 4K (4096px) for >=4K originals', () => {
+  // 1. Below 200% (effectiveShowOriginal = false): 480x480 card capped to 1200px proxy (dpr = 2.5)
+  const proxyDpr = computeCardCanvasTargetDpr(480, 480, 1, 2.25, false, 4096, 4096);
+  assert.equal(Math.round(480 * proxyDpr), 1080);
+  const maxProxyDpr = computeCardCanvasTargetDpr(480, 480, 1, 4.0, false, 4096, 4096);
+  assert.equal(Math.round(480 * maxProxyDpr), 1200);
+
+  // 2. >= 200% (effectiveShowOriginal = true) with < 4K original (2048x2048): renders exact native 2048x2048
+  const native2kDpr = computeCardCanvasTargetDpr(480, 480, 1, 2.25, true, 2048, 2048);
+  assert.equal(Math.round(480 * native2kDpr), 2048);
+
+  // 3. >= 200% (effectiveShowOriginal = true) with = 4K original (3840x2160 on 640x360 card): renders exact 4K 3840x2160
+  const uhd4kDpr = computeCardCanvasTargetDpr(640, 360, 1, 2.25, true, 3840, 2160);
+  assert.equal(Math.round(640 * uhd4kDpr), 3840);
+  assert.equal(Math.round(360 * uhd4kDpr), 2160);
+
+  // 4. >= 200% (effectiveShowOriginal = true) with > 4K original (6000x6000 on 480x480 card): capped at 4K 4096x4096
+  const capped4kDpr = computeCardCanvasTargetDpr(480, 480, 1, 2.25, true, 6000, 6000);
+  assert.equal(Math.round(480 * capped4kDpr), 4096);
+});
+
+test('hasCardMedia detects completed media fields while treating blank drafts as empty', () => {
+  assert.equal(hasCardMedia({}), false);
+  assert.equal(hasCardMedia({ imageUrl: 'blob:http://localhost/1' }), true);
+  assert.equal(hasCardMedia({ originalImageUrl: 'blob:http://localhost/2' }), true);
+  assert.equal(hasCardMedia({ trueOriginalImageUrl: 'blob:http://localhost/3' }), true);
+  assert.equal(hasCardMedia({ thumbnailUrl: 'data:image/jpeg;base64,abc' }), true);
+  assert.equal(hasCardMedia({ isVideo: true }), true);
+});
+
+test('shouldShowGenerationPromptPanel enforces default-hidden completed cards with explicit whitelist', () => {
+  // Asset cards never show prompt panel even if selected or blank
+  assert.equal(
+    shouldShowGenerationPromptPanel({ isAssetCard: true, isSelected: true, selectedCount: 1, hasMedia: false }),
+    false
+  );
+
+  // Completed unselected generation card stays hidden
+  assert.equal(
+    shouldShowGenerationPromptPanel({ isAssetCard: false, isSelected: false, hasMedia: true, state: 'completed' }),
+    false
+  );
+
+  // Single-selected completed card shows prompt panel
+  assert.equal(
+    shouldShowGenerationPromptPanel({ isAssetCard: false, isSelected: true, selectedCount: 1, hasMedia: true, state: 'completed' }),
+    true
+  );
+
+  // Multi-select hides prompt panels to avoid clutter
+  assert.equal(
+    shouldShowGenerationPromptPanel({ isAssetCard: false, isSelected: true, selectedCount: 2, hasMedia: true, state: 'completed' }),
+    false
+  );
+
+  // Blank draft, generating, error, agent target, picker target, and active edit stay visible
+  assert.equal(shouldShowGenerationPromptPanel({ isAssetCard: false, hasMedia: false }), true);
+  assert.equal(shouldShowGenerationPromptPanel({ isAssetCard: false, hasMedia: true, state: 'generating' }), true);
+  assert.equal(shouldShowGenerationPromptPanel({ isAssetCard: false, hasMedia: true, hasError: true }), true);
+  assert.equal(shouldShowGenerationPromptPanel({ isAssetCard: false, hasMedia: true, isAgentTarget: true }), true);
+  assert.equal(shouldShowGenerationPromptPanel({ isAssetCard: false, hasMedia: true, isPickerTarget: true }), true);
+  assert.equal(shouldShowGenerationPromptPanel({ isAssetCard: false, hasMedia: true, isEditingOrInteractive: true }), true);
+});
+
+test('getCardDimensions omits bottom panel height for completed cards while preserving panel height for blank drafts', () => {
+  const blankCard: CardBounds = { id: 'blank', x: 0, y: 0, ratio: '1:1' };
+  const blankDims = getCardDimensions(blankCard);
+  assert.equal(blankDims.width, 480);
+  assert.ok(blankDims.height > 480);
+
+  const completedCard: CardBounds = {
+    id: 'done',
+    x: 0,
+    y: 0,
+    ratio: '16:9',
+    imageUrl: 'blob:http://localhost/done',
+    state: 'completed',
+  };
+  const completedDims = getCardDimensions(completedCard);
+  assert.deepEqual(completedDims, { width: 640, height: 360 });
+});
+
+test('shouldDeferOriginalTierDowngrade preserves 4K textures during active gesture/zoom-out/tween below 200%', () => {
+  assert.equal(shouldDeferOriginalTierDowngrade(2.5, true, true, true), false);
+  assert.equal(shouldDeferOriginalTierDowngrade(1.5, true, false, false), true);
+  assert.equal(shouldDeferOriginalTierDowngrade(1.0, false, true, false), true);
+  assert.equal(shouldDeferOriginalTierDowngrade(1.0, false, false, true), true);
+  assert.equal(shouldDeferOriginalTierDowngrade(1.0, false, false, false), false);
+});
+
+test('computeNanoCanvasRenderQuality lowers DPR and smoothing during gesture/zoom-out and restores at rest', () => {
+  assert.deepEqual(computeNanoCanvasRenderQuality(true, false, false), {
+    dprCap: 1,
+    imageSmoothingQuality: 'low',
+  });
+  assert.deepEqual(computeNanoCanvasRenderQuality(false, true, false), {
+    dprCap: 1,
+    imageSmoothingQuality: 'low',
+  });
+  assert.deepEqual(computeNanoCanvasRenderQuality(false, false, true), {
+    dprCap: 1,
+    imageSmoothingQuality: 'low',
+  });
+  assert.deepEqual(computeNanoCanvasRenderQuality(false, false, false), {
+    dprCap: 1.5,
+    imageSmoothingQuality: 'high',
+  });
+});
+
+test('shouldPreserveCardCanvasBackingStore keeps oversized 4K buffer intact during active camera gestures', () => {
+  // Without gesture, 4K (3840x2160) shrinks to 1200x675 when effectiveShowOriginal is false (> 2.25x larger)
+  assert.equal(shouldPreserveCardCanvasBackingStore(3840, 2160, 1200, 675, false, false, false), false);
+  // During gesture, never wipe and shrink mid-animation
+  assert.equal(shouldPreserveCardCanvasBackingStore(3840, 2160, 1200, 675, false, false, true), true);
+  // Upward resize or generating still resets cleanly
+  assert.equal(shouldPreserveCardCanvasBackingStore(800, 450, 1200, 675, false, false, true), false);
+  assert.equal(shouldPreserveCardCanvasBackingStore(3840, 2160, 1200, 675, false, true, true), false);
+});
+
+test('computeGridPatternSpec locks tileSize to 128px during gestures while preserving 1.76px dot radius across 10%-500%', () => {
+  for (const s of [0.1, 0.5, 1.0, 2.0, 5.0]) {
+    const gestureSpec = computeGridPatternSpec(s, 1, 48, undefined, true);
+    assert.equal(gestureSpec.tileSize, 128);
+    const renderedRadiusCss = gestureSpec.dotRadiusTile * (gestureSpec.spacing / gestureSpec.tileSize);
+    assert.ok(Math.abs(renderedRadiusCss - 1.76) < 1e-6);
+  }
+});
+
+test('areStringArraysEqual compares selection ID arrays without false positives', () => {
+  const sameRef = ['a', 'b'];
+  assert.equal(areStringArraysEqual(sameRef, sameRef), true);
+  assert.equal(areStringArraysEqual(['a', 'b'], ['a', 'b']), true);
+  assert.equal(areStringArraysEqual(['a', 'b'], ['b', 'a']), false);
+  assert.equal(areStringArraysEqual(['a'], ['a', 'b']), false);
+});
+
+test('canRunHybridSurface always permits downgrade cleanup jobs regardless of pointer proximity', () => {
+  const prevWin = (globalThis as any).window;
+  (globalThis as any).window = { dispatchEvent: () => true };
+  try {
+    setCanvasLoadingMode('hybrid');
+    assert.equal(canRunHybridSurface('downgrade:card_123'), true);
+  } finally {
+    setCanvasLoadingMode('immediate');
+    (globalThis as any).window = prevWin;
+  }
+});
+
+
+
 

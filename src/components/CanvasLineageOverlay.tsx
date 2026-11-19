@@ -119,7 +119,22 @@ export const CanvasLineageOverlay: React.FC<CanvasLineageOverlayProps> = React.m
     if (activeSelectedSet.size === 0 || cards.length === 0) return [];
 
     const cardMap = new Map<string, CardData>();
-    cards.forEach(c => cardMap.set(c.id, c));
+    const urlToCardIds = new Map<string, string[]>();
+    const indexUrl = (url: string | null | undefined, cardId: string) => {
+      if (!url) return;
+      let list = urlToCardIds.get(url);
+      if (!list) {
+        list = [];
+        urlToCardIds.set(url, list);
+      }
+      list.push(cardId);
+    };
+    cards.forEach(c => {
+      cardMap.set(c.id, c);
+      indexUrl(c.imageUrl, c.id);
+      indexUrl(c.originalImageUrl, c.id);
+      indexUrl(c.thumbnailUrl, c.id);
+    });
 
     const connMap = new Map<string, LineageConnection>();
     const visited = new Set<string>();
@@ -155,11 +170,12 @@ export const CanvasLineageOverlay: React.FC<CanvasLineageOverlayProps> = React.m
             parent.referenceImages.forEach(r => {
               if (r.sourceCardId) parentRefIds.add(r.sourceCardId);
               if (r.url) {
-                cards.forEach(c => {
-                  if (c.id !== parent.id && (c.imageUrl === r.url || c.originalImageUrl === r.url || c.thumbnailUrl === r.url)) {
-                    parentRefIds.add(c.id);
+                const matchedIds = urlToCardIds.get(r.url);
+                if (matchedIds) {
+                  for (let i = 0; i < matchedIds.length; i++) {
+                    if (matchedIds[i] !== parent.id) parentRefIds.add(matchedIds[i]);
                   }
-                });
+                }
               }
             });
           }
@@ -175,9 +191,10 @@ export const CanvasLineageOverlay: React.FC<CanvasLineageOverlayProps> = React.m
           if (r.sourceCardId) {
             refIds.add(r.sourceCardId);
           } else if (r.url) {
-            const matched = cards.find(c => c.id !== currCard.id && (c.imageUrl === r.url || c.originalImageUrl === r.url || c.thumbnailUrl === r.url));
-            if (matched) {
-              refIds.add(matched.id);
+            const matchedIds = urlToCardIds.get(r.url);
+            const matchedId = matchedIds?.find(id => id !== currCard.id);
+            if (matchedId) {
+              refIds.add(matchedId);
             }
           }
         });

@@ -1,7 +1,7 @@
 import { cardEntryFrame, waitForEntryDom, mediaRevealProgress } from '../utils/cardEntrance';
 import { calculateVideoPlayButtonDimensions, getPlayIconPath2D } from "../utils/videoPlayButton";
 import { getLiveVideoFrame } from '../utils/videoFrameBus';
-import { getCanvasLoadingMode, isCameraZoomingOut, isHybridCardNear } from '../utils/canvasPerformance';
+import { getCanvasLoadingMode, isCameraTweenZooming, isCameraZoomingOut, isHybridCardNear } from '../utils/canvasPerformance';
 import { getCappedDpr } from '../utils/devicePixelBudget';
 import React, { useEffect, useRef } from 'react';
 import { readyPromptPanels, mountedDomCardIds } from '../utils/promptSurfaceCache';
@@ -23,9 +23,15 @@ import {
   shouldUseNanoCanvasThumbOnly,
   shouldSimplifyNanoCanvasCard,
   shouldDeferNanoColdFallback,
-  shouldUseNanoGestureSnapshot,
+  computeNanoCanvasRenderQuality,
 } from '../utils/viewportCulling';
-import { getBottomPanelHeight, getPromptAreaHeight, calculatePromptLines } from '../utils/cardLayout';
+import {
+  getBottomPanelHeight,
+  getPromptAreaHeight,
+  calculatePromptLines,
+  hasCardMedia,
+  shouldShowGenerationPromptPanel,
+} from '../utils/cardLayout';
 import { buildCardQuadTree, QuadTree, BoundingBox } from '../utils/quadTree';
 
 export interface NanoLodCanvasProps {
@@ -204,7 +210,6 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
   const lodTransitionMap = useRef<Map<string, { alpha: number; startTime: number; startAlpha: number; targetAlpha: number }>>(new Map());
   const pendingThumbGenRef = useRef<Set<string>>(new Set());
   const bakedSnapshotRef = useRef<BakedSnapshot | null>(null);
-  const gestureSnapshotRef = useRef<BakedSnapshot | null>(null);
   const quadTreeRef = useRef<QuadTree<CardData> | null>(null);
   const hasDrawnContentRef = useRef(false);
 
@@ -284,16 +289,38 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       return cached;
     }
 
+    const expectsSnapshotPanel = (card: CardData) => {
+      const isAgentFocused = Boolean(
+        (agentTargetCardIdRef.current && agentTargetCardIdRef.current === card.id) ||
+        (agentTargetCardIdsRef.current && (
+          agentTargetCardIdsRef.current instanceof Set
+            ? agentTargetCardIdsRef.current.has(card.id)
+            : agentTargetCardIdsRef.current.includes(card.id)
+        )) ||
+        agentFocusMapRef.current?.[card.id]
+      );
+      return shouldShowGenerationPromptPanel({
+        isAssetCard: Boolean(card.fileName || card.isAsset),
+        isSelected: selectedSet.size === 1 && selectedSet.has(card.id),
+        selectedCount: selectedSet.size,
+        hasMedia: hasCardMedia(card),
+        state: card.state,
+        hasError: Boolean(card.generationError),
+        isAgentTarget: isAgentFocused,
+        isPickerTarget: pickerSession?.targetCardId === card.id,
+      });
+    };
+
     // 1. Calculate overall world bounding box including bottom panels
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (let i = 0; i < currentCards.length; i++) {
       const card = currentCards[i];
       const dim = getCardSize(card);
-      const isGenerationCard = !card.fileName && !card.isAsset;
-      const panelH = isGenerationCard ? getBottomPanelHeight(card.prompt, card.referenceImages?.length) + 12 : 0;
+      const hasPanel = expectsSnapshotPanel(card);
+      const panelH = hasPanel ? getBottomPanelHeight(card.prompt, card.referenceImages?.length) + 12 : 0;
       const panelW = 480;
-      const effectiveLeft = Math.min(card.x, isGenerationCard ? card.x + (dim.width - panelW) / 2 : card.x);
-      const effectiveRight = Math.max(card.x + dim.width, isGenerationCard ? card.x + (dim.width + panelW) / 2 : card.x + dim.width);
+      const effectiveLeft = Math.min(card.x, hasPanel ? card.x + (dim.width - panelW) / 2 : card.x);
+      const effectiveRight = Math.max(card.x + dim.width, hasPanel ? card.x + (dim.width + panelW) / 2 : card.x + dim.width);
 
       if (effectiveLeft < minX) minX = effectiveLeft;
       if (card.y < minY) minY = card.y;
@@ -333,6 +360,8 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
 
     offCtx.clearRect(0, 0, textureW, textureH);
     offCtx.save();
+    offCtx.imageSmoothingEnabled = true;
+    offCtx.imageSmoothingQuality = 'high';
     offCtx.scale(scaleRatio, scaleRatio);
     offCtx.translate(-minX, -minY);
 
@@ -407,8 +436,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         offCtx.strokeRect(card.x, card.y, dim.width, dim.height);
       }
 
-      const isGenerationCard = !card.fileName && !card.isAsset;
-      if (isGenerationCard) {
+      if (expectsSnapshotPanel(card)) {
         drawCardBottomPanel(
           offCtx,
           card,
@@ -465,6 +493,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     const workspace = typeof document !== 'undefined' ? document.getElementById('canvas-workspace') : null;
     const isGestureActive = Boolean(
       (window as any).__nanoDragging ||
+      isCameraTweenZooming() ||
       (workspace && ['data-gesture', 'data-panning', 'data-zooming'].some(name => workspace.getAttribute(name) === 'true')) ||
       (typeof window !== 'undefined' && (window as any).isDraggingCard)
     );
@@ -473,11 +502,12 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     const useSquircle = squircleSupported && (!isGestureActive || canUpgradeGesture);
     const thumbOnly = shouldUseNanoCanvasThumbOnly(currentScale, isGestureActive, zoomingOut);
     const simplifyCard = shouldSimplifyNanoCanvasCard(currentScale, isGestureActive, zoomingOut);
+    const renderQuality = computeNanoCanvasRenderQuality(isGestureActive, zoomingOut, simplifyCard);
     const currentTx = tx.get();
     const currentTy = ty.get();
     const width = window.innerWidth;
     const height = window.innerHeight;
-    const dpr = (isGestureActive && !canUpgradeGesture) ? 1 : getCappedDpr(width, height, 1.5);
+    const dpr = getCappedDpr(width, height, renderQuality.dprCap);
     const targetW = Math.round(width * dpr);
     const targetH = Math.round(height * dpr);
 
@@ -502,7 +532,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       ctx.translate(currentTx, currentTy);
       ctx.scale(currentScale, currentScale);
       ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = isGestureActive ? 'low' : 'high';
+      ctx.imageSmoothingQuality = 'high';
       const selectedSet = new Set<string>(selectedIds);
       const snapshot = getOrBuildOverviewSnapshot(currentCards, dark, selectedSet, pickerSession);
       if (snapshot) {
@@ -529,56 +559,6 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     // Reset baked snapshot when leaving overview mode to free memory
     if (bakedSnapshotRef.current) {
       bakedSnapshotRef.current = null;
-    }
-
-    if (!isGestureActive || currentScale >= getNanoLodThreshold()) {
-      gestureSnapshotRef.current = null;
-    } else if (shouldUseNanoGestureSnapshot(currentScale, currentCards.length, isGestureActive, zoomingOut, isOverviewModeRef.current, Boolean(dragging))) {
-      const selectedSet = new Set<string>(selectedIds);
-      const snapshot = buildWorldSnapshot(
-        gestureSnapshotRef,
-        currentCards,
-        dark,
-        selectedSet,
-        pickerSession,
-        2560,
-        0.42,
-        true,
-        () => {
-          gestureSnapshotRef.current = null;
-          scheduleDraw();
-        }
-      );
-      if (snapshot && snapshot.scaleRatio >= currentScale * 0.6) {
-        if (canvas.width !== targetW || canvas.height !== targetH) {
-          canvas.width = targetW;
-          canvas.height = targetH;
-        }
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.save();
-        ctx.scale(dpr, dpr);
-        ctx.translate(currentTx, currentTy);
-        ctx.scale(currentScale, currentScale);
-        ctx.imageSmoothingEnabled = true;
-        ctx.imageSmoothingQuality = 'low';
-        ctx.drawImage(
-          snapshot.canvas,
-          0,
-          0,
-          snapshot.canvas.width,
-          snapshot.canvas.height,
-          snapshot.bounds.minX,
-          snapshot.bounds.minY,
-          snapshot.bounds.width,
-          snapshot.bounds.height
-        );
-        ctx.restore();
-        hasDrawnContentRef.current = true;
-        if (onReadyRef.current) {
-          onReadyRef.current({ scale: currentScale, tx: currentTx, ty: currentTy });
-        }
-        return;
-      }
     }
 
     // Compute visible viewport bounds in world coordinates for instant AABB culling
@@ -674,6 +654,28 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       }
     }
 
+    const expectsBottomPanel = (card: CardData) => {
+      const targetIds = agentTargetCardIdsRef.current;
+      const isAgentTargetInSet = Boolean(
+        targetIds && (targetIds instanceof Set ? targetIds.has(card.id) : targetIds.includes(card.id))
+      );
+      const isAgentPrimary = Boolean(
+        (agentTargetCardIdRef.current && agentTargetCardIdRef.current === card.id) ||
+        isAgentTargetInSet ||
+        agentFocusMapRef.current?.[card.id]
+      );
+      return shouldShowGenerationPromptPanel({
+        isAssetCard: Boolean(card.fileName || card.isAsset),
+        isSelected: !pickerSession && selectedIds.length === 1 && selectedIds[0] === card.id,
+        selectedCount: !pickerSession ? selectedIds.length : 0,
+        hasMedia: hasCardMedia(card),
+        state: card.state,
+        hasError: Boolean(card.generationError),
+        isAgentTarget: isAgentPrimary,
+        isPickerTarget: pickerSession?.targetCardId === card.id,
+      });
+    };
+
     // Fast-path skip when >= threshold and every visible card is already mounted & painted in DOM
     const renderedSetForFastPath = renderedIdsRef.current;
     const paintedSetForFastPath = typeof window !== 'undefined' ? (window as any).__paintedCardIds : null;
@@ -684,7 +686,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         (renderedSetForFastPath?.has(card.id) || mountedDomCardIds.has(card.id))
       );
       const isPainted = Boolean(paintedSetForFastPath?.has(card.id));
-      const panelReady = Boolean(card.fileName || card.isAsset) || readyPromptPanels.has(card.id);
+      const panelReady = !expectsBottomPanel(card) || readyPromptPanels.has(card.id);
       return !(isDomMounted && isPainted && panelReady);
     };
     const anyCardToDraw = unselectedCards.some(needsCanvasCard) || selectedCards.some(needsCanvasCard);
@@ -712,7 +714,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     ctx.translate(currentTx, currentTy);
     ctx.scale(currentScale, currentScale);
     ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = isGestureActive ? 'low' : 'high';
+    ctx.imageSmoothingQuality = renderQuality.imageSmoothingQuality;
 
     const renderCard = (card: CardData) => {
       let dim = getCardSize(card);
@@ -752,7 +754,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       );
       const paintedSet = typeof window !== 'undefined' ? (window as any).__paintedCardIds : null;
       const isPainted = Boolean(paintedSet?.has(card.id));
-      const panelReady = Boolean(card.fileName || card.isAsset) || readyPromptPanels.has(card.id);
+      const panelReady = !expectsBottomPanel(card) || readyPromptPanels.has(card.id);
       const isCardReadyInDom = currentScale >= getNanoLodThreshold() && Boolean(isDomMounted && isPainted && panelReady);
 
       if (isCardReadyInDom) {
@@ -1003,9 +1005,9 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       }
 
       // 3b. Bottom Panel Skeleton Color Block for Generation Cards in 2D Canvas Mode
-      const isGenerationCard = !card.fileName && !card.isAsset;
+      const showBottomPanel = expectsBottomPanel(card);
       const isBottomPanelReadyInDom = currentScale >= getNanoLodThreshold() && Boolean(isDomMounted && panelReady);
-      if (isGenerationCard && !isBottomPanelReadyInDom) {
+      if (showBottomPanel && !isBottomPanelReadyInDom) {
         drawCardBottomPanel(
           ctx,
           card,
@@ -1144,7 +1146,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         );
         const domReady = Boolean(isDomMounted &&
           (window as any).__paintedCardIds?.has(card.id) &&
-          (card.fileName || card.isAsset || readyPromptPanels.has(card.id)));
+          (!expectsBottomPanel(card) || readyPromptPanels.has(card.id)));
         if (waitForEntryDom(card.id, domReady)) return;
       }
       const entry = cardEntryFrame(card.id, performance.now(), false, selectedIds.includes(card.id));
@@ -1202,7 +1204,6 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
 
   // Re-draw when data changes (renderedCardIds excluded to prevent canvas redraw thrashing on DOM card mount)
   useEffect(() => {
-    gestureSnapshotRef.current = null;
     scheduleDraw();
   }, [cards, selectedCardIds, agentTargetCardId, agentTargetCardIds, agentReferenceCardIds, agentFocusMap, pickerSession, isDarkMode, isOverviewMode, dotModeThreshold]);
 
@@ -1261,7 +1262,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     <canvas
       ref={canvasRef}
       id="nano-lod-canvas"
-      className={`fixed inset-0 pointer-events-none ${isOverviewMode ? 'z-0' : 'z-[15]'}`}
+      className={`fixed inset-0 pointer-events-none ${isOverviewMode || domCardsActive ? 'z-0' : 'z-[15]'}`}
       style={{
         width: '100vw',
         height: '100vh',

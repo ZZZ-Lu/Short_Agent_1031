@@ -27,7 +27,14 @@ import {
   Link2
 } from 'lucide-react';
 import { isCardIntersectingRectangle, quantizeCardScaleTier } from '../utils/viewportCulling';
-import { getBottomPanelHeight, getPromptAreaHeight, getPromptSurfaceLayout, getReferencePreviewLayout } from '../utils/cardLayout';
+import {
+  getBottomPanelHeight,
+  getPromptAreaHeight,
+  getPromptSurfaceLayout,
+  getReferencePreviewLayout,
+  hasCardMedia,
+  shouldShowGenerationPromptPanel,
+} from '../utils/cardLayout';
 import { CardImageCanvas } from './CardImageCanvas';
 import { PromptCanvas } from './PromptCanvas';
 import { readyPromptPanels, mountedDomCardIds, getCardSurfaceRevision } from '../utils/promptSurfaceCache';
@@ -36,11 +43,27 @@ import { capDprToBudget } from '../utils/devicePixelBudget';
 import { getStandardReferencePreview, resolveReferencePreviewSource } from '../utils/referencePreview';
 import { referenceDisplayName, shortenReferenceMentions } from '../utils/referenceName';
 import { PromptPanelCanvas, type PanelControl } from './PromptPanelCanvas';
-import { CANVAS_IDLE_MS, scheduleCanvasSurface, scheduleOriginalImageRestore, canUpgradeCardDuringGesture, isCameraZoomingOut, CANVAS_HYBRID_POINTER_WAKE_EVENT } from '../utils/canvasPerformance';
-import { fullImageCache, originalImageCache, preloadAndDecodeImage } from '../utils/imageTextureCache';
+import { CANVAS_IDLE_MS, scheduleCanvasSurface, scheduleOriginalImageRestore, canUpgradeCardDuringGesture, isCameraZoomingOut, CANVAS_HYBRID_POINTER_WAKE_EVENT, getCanvasLoadingMode, getHybridPointer } from '../utils/canvasPerformance';
+import { fullImageCache, originalImageCache, preloadAndDecodeImage, preloadCanvasImage, evictOriginalImageCache } from '../utils/imageTextureCache';
+import { resizeImageOffThread } from '../utils/imageResize';
+import { fastGetImageDimensions } from '../utils/imageHeader';
 import { ScriptProject } from '../types/script';
-import { generateImageThumbnail, generateVideoThumbnail, generateNativeVideoPoster, getOrLoadThumbImage, thumbCache, MAX_THUMBNAIL_EDGE } from '../utils/thumbnail';
+import { generateImageThumbnail, generateVideoThumbnail, generateNativeVideoPoster, getOrLoadThumbImage, preloadThumbImage, thumbCache, MAX_THUMBNAIL_EDGE } from '../utils/thumbnail';
 import { captureLiveVideoFrame } from '../utils/videoFrameBus';
+import { executeVideoPauseTransition, type CapturedVideoPauseFrame } from '../utils/videoPauseTransition';
+import {
+  clampValidVideoDuration,
+  clampVideoSeekTargetTime,
+  clearCachedVideoProgress,
+  computeSeekTimeFromPercent,
+  getCachedVideoDuration,
+  getCachedVideoProgress,
+  resolveVideoEndResetMargin,
+  resolveVideoProgressDisplay,
+  resolveVideoScrubSeekStep,
+  setCachedVideoDuration,
+  setCachedVideoProgress,
+} from '../utils/videoProgress';
 import { getActiveMcpKey, getActiveMcpKeySync, getActiveMcpTokenSync } from '../utils/mcpStorage';
 import { useMcpKey } from '../hooks/useMcpKey';
 import { useWorkrallyModels } from '../hooks/useWorkrallyModels';
@@ -89,6 +112,7 @@ export function getCardSize(data: { ratio: AspectRatio; customWidth?: number; cu
 // Session-only playback intent survives LOD unmounts; never stored in project data.
 const playingVideoSources = new Map<string, string>();
 export function pauseVideosForNanoLod() {
+  if (playingVideoSources.size === 0) return;
   playingVideoSources.clear();
   window.dispatchEvent(new Event('canvas-nano-pause'));
 }
@@ -376,6 +400,7 @@ export interface CardData {
   originalImageUrl?: string | null;
   trueOriginalImageUrl?: string | null;
   currentTime?: number;
+  videoDuration?: number;
   videoPosterUrl?: string; // Native-resolution still; imageUrl remains the playable video.
   thumbnailUrl?: string;
   blurPlaceholderUrl?: string; // Pre-baked gaussian blurred placeholder (64px) for elegant LOD transition
@@ -2388,6 +2413,7 @@ export interface GenerationCardProps {
   tx: MotionValue<number>;
   ty: MotionValue<number>;
   isSelected?: boolean;
+  isSingleSelected?: boolean;
   isAgentTarget?: boolean;
   agentFocusRole?: 'primary' | 'reference' | 'inspect' | 'interact' | 'working' | null;
   agentInspectScenario?: 'qc' | 'quickInput' | 'compare' | 'inspect';
@@ -2416,6 +2442,7 @@ export const GenerationCard = React.memo(function GenerationCard({
   tx, 
   ty, 
   isSelected, 
+  isSingleSelected,
   isAgentTarget,
   agentFocusRole,
   agentInspectScenario = 'inspect',
@@ -2567,7 +2594,11 @@ export const GenerationCard = React.memo(function GenerationCard({
   });
 
   useEffect(() => {
-    if (data.nativeWidth && data.nativeHeight) {
+    const isSuspiciousFallback =
+      data.nativeWidth === 480 &&
+      data.nativeHeight === 480 &&
+      !data.trueOriginalFileData;
+    if (data.nativeWidth && data.nativeHeight && !isSuspiciousFallback) {
       setActualDimensions({ width: data.nativeWidth, height: data.nativeHeight });
       return;
     }
@@ -2592,7 +2623,91 @@ export const GenerationCard = React.memo(function GenerationCard({
       isMounted = false;
       img.onload = null;
     };
-  }, [imageUrl, data.originalImageUrl, data.trueOriginalImageUrl, data.nativeWidth, data.nativeHeight, data.isVideo, id, onUpdate]);
+  }, [imageUrl, data.originalImageUrl, data.trueOriginalImageUrl, data.trueOriginalFileData, data.nativeWidth, data.nativeHeight, data.isVideo, id, onUpdate]);
+
+  // Auto-migrate existing >4K cards where originalFileData is still the raw >4K blob.
+  // Uses a module-level active-migration guard (without cancelling the worker on React <StrictMode>
+  // simulated unmount) and inspects the actual blob header dimensions so even cards where
+  // trueOriginalFileData was previously set equal to originalFileData get properly downscaled to 4096px.
+  useEffect(() => {
+    if (data.isVideo) return;
+    const rawBlob =
+      data.originalFileData instanceof Blob
+        ? data.originalFileData
+        : data.fileData instanceof Blob && (data.fileData.size > 1_500_000 || !data.originalFileData)
+          ? data.fileData
+          : null;
+    if (!rawBlob) return;
+
+    // If trueOriginalFileData already exists and is a distinct (larger) blob than originalFileData,
+    // check whether originalFileData is still >4096px via header inspection.
+    const migrationKey = `${id}:${rawBlob.size}`;
+    if (!(window as any).__migrating4kKeys) {
+      (window as any).__migrating4kKeys = new Set<string>();
+    }
+    const migratingSet: Set<string> = (window as any).__migrating4kKeys;
+    if (migratingSet.has(migrationKey)) return;
+
+    let active = true;
+    (async () => {
+      const headerDims = await fastGetImageDimensions(rawBlob);
+      const w = headerDims?.width || actualDimensions?.width || data.nativeWidth || 0;
+      const h = headerDims?.height || actualDimensions?.height || data.nativeHeight || 0;
+      if (w <= 4096 && h <= 4096) return;
+      if (migratingSet.has(migrationKey)) return;
+      migratingSet.add(migrationKey);
+
+      try {
+        let blob4k: Blob;
+        try {
+          blob4k = await resizeImageOffThread(rawBlob, 4096, 0.9);
+        } catch {
+          const fallbackDataUrl = await compressImageBlob(rawBlob, 4096, 0.9);
+          blob4k = await (await fetch(fallbackDataUrl)).blob();
+        }
+        const url4k = URL.createObjectURL(blob4k);
+        const trueBlob =
+          data.trueOriginalFileData instanceof Blob ? data.trueOriginalFileData : rawBlob;
+        const trueUrl =
+          data.trueOriginalImageUrl || data.originalImageUrl || URL.createObjectURL(trueBlob);
+        if (data.originalImageUrl) {
+          evictOriginalImageCache(data.originalImageUrl);
+        }
+        onUpdate(
+          id,
+          {
+            trueOriginalFileData: trueBlob,
+            trueOriginalImageUrl: trueUrl,
+            originalFileData: blob4k,
+            originalImageUrl: url4k,
+            ...(w > 0 && h > 0 ? { nativeWidth: w, nativeHeight: h } : {}),
+          },
+          false
+        );
+      } catch (err) {
+        migratingSet.delete(migrationKey);
+        if (active) {
+          console.warn('[GenerationCard] Failed to auto-migrate >4K image to 4K tier:', err);
+        }
+      }
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, [
+    id,
+    data.isVideo,
+    data.trueOriginalFileData,
+    data.trueOriginalImageUrl,
+    data.originalFileData,
+    data.originalImageUrl,
+    data.fileData,
+    data.nativeWidth,
+    data.nativeHeight,
+    actualDimensions,
+    onUpdate,
+  ]);
 
   // For video cards and non-image cards, manage __paintedCardIds for Zero-Flicker Handoff so that
   // NanoLodCanvas knows the DOM card is fully painted before stopping the canvas layer underneath.
@@ -2613,14 +2728,60 @@ export const GenerationCard = React.memo(function GenerationCard({
   const [isVideoFrameReady, setIsVideoFrameReady] = useState(false);
   const [openMenu, setOpenMenu] = useState<{ type: 'ratio' | 'res' | 'ref' | 'model' | 'param', ownerId: string } | null>(null);
   const [isPlaying, setPlayingState] = useState(() => Boolean(imageUrl && playingVideoSources.get(id) === imageUrl));
+  const isPlayingRef = useRef(isPlaying);
+  isPlayingRef.current = isPlaying;
+  const [isPausingToThumbnail, setIsPausingToThumbnail] = useState(false);
+  const isPausingToThumbnailRef = useRef(false);
+  isPausingToThumbnailRef.current = isPausingToThumbnail;
+  const [isScrubbingVideo, setIsScrubbingVideo] = useState(false);
+  const isScrubbingVideoRef = useRef(false);
+  isScrubbingVideoRef.current = isScrubbingVideo;
+  const isScrubbingPointerDownRef = useRef(false);
+  const shouldFinalizeScrubAfterSeekRef = useRef(false);
+  const pendingScrubSeekRef = useRef<{ percent: number; time: number | null } | null>(null);
+  const queuedSeekTimeRef = useRef<number | null>(null);
+  const lastSeekIssuedAtMsRef = useRef<number>(0);
+  const scrubSettleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pauseTransitionSeqRef = useRef(0);
+  const showVideoPlayer = isPlaying || isPausingToThumbnail || isScrubbingVideo;
   const setIsPlaying = (playing: boolean) => {
-    if (playing && imageUrl) playingVideoSources.set(id, imageUrl);
-    else playingVideoSources.delete(id);
+    pauseTransitionSeqRef.current += 1;
+    isPlayingRef.current = playing;
+    if (scrubSettleTimerRef.current) {
+      clearTimeout(scrubSettleTimerRef.current);
+      scrubSettleTimerRef.current = null;
+    }
+    isScrubbingPointerDownRef.current = false;
+    shouldFinalizeScrubAfterSeekRef.current = false;
+    pendingScrubSeekRef.current = null;
+    queuedSeekTimeRef.current = null;
+    isScrubbingVideoRef.current = false;
+    setIsScrubbingVideo(false);
+    if (playing) {
+      isPausingToThumbnailRef.current = false;
+      setIsPausingToThumbnail(false);
+      if (imageUrl) playingVideoSources.set(id, imageUrl);
+    } else {
+      playingVideoSources.delete(id);
+    }
     setPlayingState(playing);
   };
   const [isHovered, setIsHovered] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [duration, setDuration] = useState(0);
+  const [duration, setDuration] = useState<number>(() =>
+    getCachedVideoDuration(id, data.videoDuration)
+  );
+  const [progress, setProgress] = useState<number>(() => {
+    const restoredDuration = getCachedVideoDuration(id, data.videoDuration);
+    const restoredTime = getCachedVideoProgress(id, currentTime);
+    return resolveVideoProgressDisplay({
+      currentTime: null,
+      storedTime: restoredTime,
+      duration: restoredDuration,
+      stateProgress: 0,
+      isPlayerMounted: false,
+      hasRestoredInitialTime: false,
+    }).progressPercent;
+  });
   const [videoHasError, setVideoHasError] = useState(false);
   const [videoLoadError, setVideoLoadError] = useState<string>('');
   const isRefreshingVideoRef = useRef(false);
@@ -2661,45 +2822,45 @@ export const GenerationCard = React.memo(function GenerationCard({
   const [localThumbnailUrl, setLocalThumbnailUrl] = useState<string | undefined>(
     data.thumbnailUrl || (imageUrl ? thumbCache.get(imageUrl) || thumbCache.get(id) : undefined)
   );
+  const [localVideoPosterUrl, setLocalVideoPosterUrl] = useState<string | undefined>(data.videoPosterUrl);
 
   const effectiveThumbnailUrl = data.thumbnailUrl || localThumbnailUrl || (imageUrl ? thumbCache.get(imageUrl) || thumbCache.get(id) : undefined);
+  const effectiveVideoPosterUrl = localVideoPosterUrl || data.videoPosterUrl;
   const cardPlaceholderUrl = effectiveThumbnailUrl || imageUrl;
 
   useEffect(() => {
-    if (isHovered || isPlaying) {
+    if (isHovered || showVideoPlayer) {
       setHasEverMountedVideo(true);
     }
-  }, [isHovered, isPlaying]);
+  }, [isHovered, showVideoPlayer]);
 
   const { activeKey } = useMcpKey();
   const activeToken = activeKey?.token || getActiveMcpTokenSync();
 
   const getStoredVideoProgress = useCallback((): number => {
-    if (typeof window === 'undefined') return currentTime || 0;
-    try {
-      const local = localStorage.getItem(`mira_vid_pos_${id}`);
-      if (local !== null) {
-        const parsed = parseFloat(local);
-        if (!isNaN(parsed) && parsed > 0) return parsed;
-      }
-    } catch {}
-    return currentTime || 0;
+    return getCachedVideoProgress(id, currentTime);
   }, [id, currentTime]);
 
-  const saveStoredVideoProgress = useCallback((time: number) => {
-    if (typeof window === 'undefined' || !id || isNaN(time) || time <= 0.1) return;
-    try {
-      const existing = localStorage.getItem(`mira_vid_pos_${id}`);
-      if (existing !== null) {
-        const parsed = parseFloat(existing);
-        // CRITICAL PROTECTION: Never let initial seek/mount timestamps (<= 0.2s) overwrite established progress (> 0.5s)
-        if (!isNaN(parsed) && parsed > 0.5 && time <= 0.2) {
-          return;
-        }
-      }
-      localStorage.setItem(`mira_vid_pos_${id}`, time.toFixed(2));
-    } catch {}
+  const saveStoredVideoProgress = useCallback((time: number, options?: { force?: boolean }) => {
+    setCachedVideoProgress(id, time, options);
   }, [id]);
+
+  const saveStoredVideoDuration = useCallback((rawDuration: number) => {
+    const valid = setCachedVideoDuration(id, rawDuration);
+    if (valid <= 0) return;
+    setDuration((prev) => (Math.abs(prev - valid) > 0.01 ? valid : prev));
+    const existingCardDuration = clampValidVideoDuration(data.videoDuration);
+    if (Math.abs(existingCardDuration - valid) > 0.05) {
+      stateRef.current.onUpdate(id, { videoDuration: valid }, false);
+    }
+  }, [id, data.videoDuration]);
+
+  useEffect(() => {
+    const restoredDuration = getCachedVideoDuration(id, data.videoDuration);
+    if (restoredDuration > 0) {
+      setDuration((prev) => (Math.abs(prev - restoredDuration) > 0.01 ? restoredDuration : prev));
+    }
+  }, [id, data.videoDuration]);
 
   const videoPlaySrc = useMemo(() => {
     if (!imageUrl) return '';
@@ -2755,30 +2916,53 @@ export const GenerationCard = React.memo(function GenerationCard({
     };
   }, [id, isVideo, data.fileData, imageUrl, videoPlaySrc, onUpdate]);
 
-  const activeVideoSrc = blobVideoUrl || videoPlaySrc;
-
+  const candidateVideoSrc = blobVideoUrl || videoPlaySrc;
+  const mountedVideoSrcRef = useRef<{ identity: string; baseSrc: string; effectiveSrc: string } | null>(null);
   const initialSeekPosRef = useRef<number | null>(null);
 
-  useEffect(() => {
-    initialSeekPosRef.current = null;
-  }, [activeVideoSrc]);
-
   const effectiveVideoSrc = useMemo(() => {
-    if (!activeVideoSrc) return '';
-    if (activeVideoSrc.includes('#t=')) return activeVideoSrc;
-    if (initialSeekPosRef.current === null) {
-      initialSeekPosRef.current = getStoredVideoProgress();
+    if (!candidateVideoSrc) {
+      mountedVideoSrcRef.current = null;
+      initialSeekPosRef.current = null;
+      return '';
     }
-    const pos = initialSeekPosRef.current;
-    if (pos > 0.1) {
-      return `${activeVideoSrc}#t=${pos.toFixed(2)}`;
+    if (!showVideoPlayer) {
+      mountedVideoSrcRef.current = null;
+      initialSeekPosRef.current = null;
+      return candidateVideoSrc;
     }
-    return activeVideoSrc;
-  }, [activeVideoSrc]);
+    const mediaIdentity = `${id}:${imageUrl || ''}`;
+    // While <video> is mounted (playing, scrubbing, or pausing transition), freeze its src
+    // so time updates or background Blob caching never reload the media element mid-playback.
+    if (mountedVideoSrcRef.current && mountedVideoSrcRef.current.identity === mediaIdentity) {
+      return mountedVideoSrcRef.current.effectiveSrc;
+    }
+    const baseSrc = candidateVideoSrc;
+    let resolvedSrc = baseSrc;
+    if (!baseSrc.includes('#t=')) {
+      const pos = pendingScrubSeekRef.current?.time ?? getCachedVideoProgress(id, currentTime);
+      initialSeekPosRef.current = pos;
+      if (typeof pos === 'number' && pos > 0.1) {
+        resolvedSrc = `${baseSrc}#t=${pos.toFixed(2)}`;
+      }
+    }
+    mountedVideoSrcRef.current = {
+      identity: mediaIdentity,
+      baseSrc,
+      effectiveSrc: resolvedSrc,
+    };
+    return resolvedSrc;
+  }, [id, imageUrl, candidateVideoSrc, showVideoPlayer]);
+
+  const activeVideoSrc = mountedVideoSrcRef.current?.baseSrc || candidateVideoSrc;
 
   useEffect(() => {
+    if (!showVideoPlayer) {
+      setIsVideoFrameReady(false);
+      return;
+    }
     setIsVideoFrameReady(Boolean(videoRef.current && videoRef.current.readyState >= 2));
-  }, [effectiveVideoSrc]);
+  }, [effectiveVideoSrc, showVideoPlayer]);
 
   // Clear __paintedCardIds only when identity/media type changes or on unmount
   useEffect(() => {
@@ -2821,7 +3005,7 @@ export const GenerationCard = React.memo(function GenerationCard({
       schedulePainted();
     } else {
       const posterUrl =
-        data.videoPosterUrl ||
+        effectiveVideoPosterUrl ||
         data.thumbnailUrl ||
         localThumbnailUrl ||
         thumbCache.get(imageUrl) ||
@@ -2845,7 +3029,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     isVideo,
     effectiveVideoSrc,
     videoHasError,
-    data.videoPosterUrl,
+    effectiveVideoPosterUrl,
     data.thumbnailUrl,
     localThumbnailUrl,
     markVideoPainted,
@@ -2892,8 +3076,23 @@ export const GenerationCard = React.memo(function GenerationCard({
     }
   }, [data.thumbnailUrl]);
 
+  useEffect(() => {
+    if (data.videoPosterUrl) {
+      setLocalVideoPosterUrl(data.videoPosterUrl);
+    }
+  }, [data.videoPosterUrl]);
+
+  useEffect(() => {
+    setLocalVideoPosterUrl(data.videoPosterUrl);
+  }, [imageUrl]);
+
   const videoPosterRevisionRef = useRef(0);
-  const lastCapturedVideoFrameRef = useRef<{ source: string; time: number } | null>(null);
+  const lastCapturedVideoFrameRef = useRef<{
+    source: string;
+    time: number;
+    thumbUrl?: string;
+    posterUrl?: string;
+  } | null>(null);
   // Upgrade existing video cards through the shared loading schedule. Persist the
   // native still separately so Nano continues to use its lightweight thumbnail.
   useEffect(() => {
@@ -3102,17 +3301,23 @@ export const GenerationCard = React.memo(function GenerationCard({
   const [miraTagWidth, setMiraTagWidth] = useState<number>(0);
 
   useLayoutEffect(() => {
-    if (rightTagRef.current) {
-      setRightTagWidth(rightTagRef.current.offsetWidth);
-    } else {
-      setRightTagWidth(0);
-    }
-    if (miraTagRef.current) {
-      setMiraTagWidth(miraTagRef.current.offsetWidth);
-    } else {
-      setMiraTagWidth(0);
-    }
-  });
+    const nextRight = rightTagRef.current ? rightTagRef.current.offsetWidth : 0;
+    setRightTagWidth((prev) => (prev !== nextRight ? nextRight : prev));
+    const nextMira = miraTagRef.current ? miraTagRef.current.offsetWidth : 0;
+    setMiraTagWidth((prev) => (prev !== nextMira ? nextMira : prev));
+  }, [
+    actualDimensions?.width,
+    actualDimensions?.height,
+    data.nativeWidth,
+    data.nativeHeight,
+    data.isVideo,
+    Boolean(imageUrl || data.originalImageUrl || data.fileData || data.thumbnailUrl),
+    isTagsReady,
+    isAgentTarget,
+    agentFocusRole,
+    isAgentThinking,
+    data.state,
+  ]);
 
   // Intent-driven lazy restoration for Video Mounting:
   // When canvas zoom/pan/gesture ends and styles/tags restore, if mouse is inside the video card,
@@ -3174,67 +3379,382 @@ export const GenerationCard = React.memo(function GenerationCard({
   const hasRestoredInitialTimeRef = useRef(false);
 
   useEffect(() => {
-    hasRestoredInitialTimeRef.current = false;
-  }, [activeVideoSrc]);
-
-  const captureAndSaveVideoState = (video: HTMLVideoElement) => {
-    if (!video || video.readyState < 2 || video.seeking) return;
-    const currTime = video.currentTime;
-    const lastFrame = lastCapturedVideoFrameRef.current;
-    if (lastFrame?.source === video.currentSrc && Math.abs(lastFrame.time - currTime) < 0.05) return;
-    const prevPos = getStoredVideoProgress();
-    // CRITICAL: Never let 0s or uninitialized mount state overwrite an established valid progress
-    if (currTime <= 0.1 && prevPos > 0.5) {
-      return;
+    if (!showVideoPlayer) {
+      hasRestoredInitialTimeRef.current = false;
     }
-    if (currTime > 0.1) {
-      saveStoredVideoProgress(currTime);
+  }, [activeVideoSrc, showVideoPlayer]);
+
+  const commitCapturedVideoFrame = useCallback((captured: CapturedVideoPauseFrame) => {
+    const updates: Partial<CardData> = {};
+    if (typeof captured.currentTime === 'number' && !isNaN(captured.currentTime)) {
+      updates.currentTime = captured.currentTime;
+    }
+    const validDur = clampValidVideoDuration(captured.duration);
+    if (validDur > 0 && Math.abs(clampValidVideoDuration(data.videoDuration) - validDur) > 0.05) {
+      updates.videoDuration = validDur;
+    }
+    if (captured.thumbUrl) {
+      updates.thumbnailUrl = captured.thumbUrl;
+      thumbCache.set(id, captured.thumbUrl);
+      if (imageUrl) thumbCache.set(imageUrl, captured.thumbUrl);
+      setLocalThumbnailUrl(captured.thumbUrl);
+    }
+    if (captured.posterUrl) {
+      updates.videoPosterUrl = captured.posterUrl;
+      setLocalVideoPosterUrl(captured.posterUrl);
+    }
+    if (Object.keys(updates).length > 0) {
+      stateRef.current.onUpdate(stateRef.current.id, updates, false);
+    }
+  }, [id, imageUrl, data.videoDuration]);
+
+  const captureAndSaveVideoState = (
+    video: HTMLVideoElement,
+    options?: { deferCommit?: boolean }
+  ): CapturedVideoPauseFrame | null => {
+    if (!video || video.readyState < 2 || video.seeking) return null;
+    const currTime = video.currentTime;
+    const validDur = clampValidVideoDuration(video.duration);
+    if (validDur > 0) {
+      setCachedVideoDuration(id, validDur);
+      setDuration((prev) => (Math.abs(prev - validDur) > 0.01 ? validDur : prev));
+    }
+    const prevPos = getStoredVideoProgress();
+    // CRITICAL: Never let uninitialized 0s mount state overwrite an established valid progress
+    if (!hasRestoredInitialTimeRef.current && currTime <= 0.1 && prevPos > 0.5) {
+      return null;
+    }
+    const lastFrame = lastCapturedVideoFrameRef.current;
+    if (lastFrame?.source === video.currentSrc && Math.abs(lastFrame.time - currTime) < 0.05) {
+      captureLiveVideoFrame(id, video);
+      const cachedFrame: CapturedVideoPauseFrame = {
+        thumbUrl: lastFrame.thumbUrl,
+        posterUrl: lastFrame.posterUrl,
+        currentTime: currTime,
+        duration: validDur || undefined,
+      };
+      if (!options?.deferCommit && (cachedFrame.thumbUrl || cachedFrame.posterUrl)) {
+        commitCapturedVideoFrame(cachedFrame);
+      }
+      return cachedFrame;
+    }
+    if (currTime > 0.1 || hasRestoredInitialTimeRef.current) {
+      saveStoredVideoProgress(currTime, { force: hasRestoredInitialTimeRef.current });
+    }
+    if (validDur > 0) {
+      setProgress(Math.min(100, Math.max(0, (currTime / validDur) * 100)));
     }
     lastSavedTimeRef.current = currTime;
-    const updates: Partial<CardData> = { currentTime: currTime };
     const thumbUrl = generateThumbnail(video);
     const posterUrl = generateThumbnail(video, true);
-    if (thumbUrl) {
-      updates.thumbnailUrl = thumbUrl;
-      thumbCache.set(id, thumbUrl);
-      if (imageUrl) thumbCache.set(imageUrl, thumbUrl);
-      setLocalThumbnailUrl(thumbUrl);
-    }
-    if (posterUrl) {
-      updates.videoPosterUrl = posterUrl;
-    }
     if (thumbUrl || posterUrl) {
       videoPosterRevisionRef.current++;
-      lastCapturedVideoFrameRef.current = { source: video.currentSrc, time: currTime };
+      lastCapturedVideoFrameRef.current = {
+        source: video.currentSrc,
+        time: currTime,
+        thumbUrl,
+        posterUrl,
+      };
     }
     captureLiveVideoFrame(id, video);
-    stateRef.current.onUpdate(stateRef.current.id, updates, false);
+    const captured: CapturedVideoPauseFrame = {
+      thumbUrl,
+      posterUrl,
+      currentTime: currTime,
+      duration: validDur || undefined,
+    };
+    if (!options?.deferCommit) {
+      commitCapturedVideoFrame(captured);
+    }
+    return captured;
   };
+
+  const requestPauseVideo = useCallback((options?: { keepWasPlaying?: boolean }) => {
+    const seq = ++pauseTransitionSeqRef.current;
+    playingVideoSources.delete(id);
+    if (scrubSettleTimerRef.current) {
+      clearTimeout(scrubSettleTimerRef.current);
+      scrubSettleTimerRef.current = null;
+    }
+    isScrubbingPointerDownRef.current = false;
+    shouldFinalizeScrubAfterSeekRef.current = false;
+    pendingScrubSeekRef.current = null;
+    queuedSeekTimeRef.current = null;
+    isScrubbingVideoRef.current = false;
+    setIsScrubbingVideo(false);
+
+    const video = videoRef.current;
+    if (!video) {
+      isPausingToThumbnailRef.current = false;
+      setIsPausingToThumbnail(false);
+      setPlayingState(false);
+      return;
+    }
+
+    if (options?.keepWasPlaying) {
+      video.setAttribute('data-was-playing', 'true');
+    }
+
+    // Keep <video> and video controls mounted while preparing the matching paused thumbnail/poster.
+    isPlayingRef.current = false;
+    isPausingToThumbnailRef.current = true;
+    setIsPausingToThumbnail(true);
+    setPlayingState(false);
+
+    void executeVideoPauseTransition({
+      video,
+      isCancelled: () => pauseTransitionSeqRef.current !== seq,
+      includeOriginalTier: showOriginalRef.current,
+      captureFrame: (v) => captureAndSaveVideoState(v as HTMLVideoElement, { deferCommit: true }),
+      preloadImage: async (url, kind) => {
+        if (kind === 'thumb') {
+          await preloadThumbImage(url);
+        } else {
+          await preloadCanvasImage(url, kind);
+        }
+      },
+      commitCapturedFrame: (captured) => {
+        if (pauseTransitionSeqRef.current !== seq) return;
+        commitCapturedVideoFrame(captured);
+      },
+    }).finally(() => {
+      if (pauseTransitionSeqRef.current === seq) {
+        isPausingToThumbnailRef.current = false;
+        setIsPausingToThumbnail(false);
+      }
+    });
+  }, [id, commitCapturedVideoFrame]);
+
+  const requestPauseVideoRef = useRef(requestPauseVideo);
+  requestPauseVideoRef.current = requestPauseVideo;
+
+  const issueOrQueueVideoSeek = useCallback((video: HTMLVideoElement, targetTime: number, forceImmediate = false) => {
+    const dur = clampValidVideoDuration(video.duration) || duration || getCachedVideoDuration(id, data.videoDuration);
+    const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    const decision = resolveVideoScrubSeekStep({
+      targetTime,
+      duration: dur,
+      videoReadyState: video.readyState,
+      videoSeeking: forceImmediate ? false : video.seeking,
+      lastSeekIssuedAtMs: lastSeekIssuedAtMsRef.current,
+      nowMs,
+    });
+    if (decision.action === 'defer-until-metadata' || decision.action === 'queue-after-seeked') {
+      queuedSeekTimeRef.current = decision.clampedTime;
+      return;
+    }
+    queuedSeekTimeRef.current = null;
+    lastSeekIssuedAtMsRef.current = nowMs;
+    if (Math.abs(video.currentTime - decision.clampedTime) > 0.005) {
+      video.currentTime = decision.clampedTime;
+    } else if (shouldFinalizeScrubAfterSeekRef.current && !isScrubbingPointerDownRef.current && !isPlayingRef.current) {
+      shouldFinalizeScrubAfterSeekRef.current = false;
+      requestPauseVideoRef.current();
+    }
+  }, [id, duration, data.videoDuration]);
+
+  const startVideoScrub = useCallback(() => {
+    if (scrubSettleTimerRef.current) {
+      clearTimeout(scrubSettleTimerRef.current);
+      scrubSettleTimerRef.current = null;
+    }
+    isScrubbingPointerDownRef.current = true;
+    shouldFinalizeScrubAfterSeekRef.current = false;
+    pauseTransitionSeqRef.current += 1;
+    if (isPausingToThumbnailRef.current) {
+      isPausingToThumbnailRef.current = false;
+      setIsPausingToThumbnail(false);
+    }
+    if (!isScrubbingVideoRef.current) {
+      isScrubbingVideoRef.current = true;
+      setIsScrubbingVideo(true);
+    }
+    if (isPlayingRef.current && videoRef.current && !videoRef.current.paused) {
+      try {
+        videoRef.current.pause();
+      } catch {}
+    }
+  }, []);
+
+  const finishVideoScrub = useCallback(() => {
+    if (scrubSettleTimerRef.current) {
+      clearTimeout(scrubSettleTimerRef.current);
+      scrubSettleTimerRef.current = null;
+    }
+    isScrubbingPointerDownRef.current = false;
+
+    const el = videoContainerRef.current;
+    const mouse = typeof window !== 'undefined' ? (window as any).__lastMousePos : null;
+    if (el && mouse && mouse.x >= 0) {
+      const rect = el.getBoundingClientRect();
+      const isInside =
+        mouse.x >= rect.left &&
+        mouse.x <= rect.right &&
+        mouse.y >= rect.top &&
+        mouse.y <= rect.bottom;
+      if (!isInside && !isPlayingRef.current) {
+        setIsHovered(false);
+      }
+    }
+
+    const video = videoRef.current;
+    if (isPlayingRef.current) {
+      if (video && queuedSeekTimeRef.current !== null && video.readyState >= 1) {
+        const finalTime = queuedSeekTimeRef.current;
+        queuedSeekTimeRef.current = null;
+        video.currentTime = finalTime;
+      }
+      pendingScrubSeekRef.current = null;
+      shouldFinalizeScrubAfterSeekRef.current = false;
+      isScrubbingVideoRef.current = false;
+      setIsScrubbingVideo(false);
+      if (video && video.paused && !isCameraGestureActive()) {
+        video.play().catch(() => {});
+      }
+      return;
+    }
+
+    if (video && video.readyState >= 1) {
+      const dur = clampValidVideoDuration(video.duration) || duration || getCachedVideoDuration(id, data.videoDuration);
+      const finalTargetTime =
+        queuedSeekTimeRef.current ??
+        (pendingScrubSeekRef.current
+          ? (pendingScrubSeekRef.current.time ?? (dur > 0 ? computeSeekTimeFromPercent(pendingScrubSeekRef.current.percent, dur) : null))
+          : null);
+
+      queuedSeekTimeRef.current = null;
+      pendingScrubSeekRef.current = null;
+
+      if (finalTargetTime !== null && dur > 0) {
+        const clamped = clampVideoSeekTargetTime(finalTargetTime, dur);
+        saveStoredVideoProgress(clamped, { force: true });
+        if (Math.abs(video.currentTime - clamped) > 0.005) {
+          video.currentTime = clamped;
+        }
+      }
+
+      shouldFinalizeScrubAfterSeekRef.current = false;
+      requestPauseVideoRef.current();
+      return;
+    }
+
+    shouldFinalizeScrubAfterSeekRef.current = true;
+    scrubSettleTimerRef.current = setTimeout(() => {
+      scrubSettleTimerRef.current = null;
+      if (shouldFinalizeScrubAfterSeekRef.current && !isScrubbingPointerDownRef.current && !isPlayingRef.current) {
+        shouldFinalizeScrubAfterSeekRef.current = false;
+        pendingScrubSeekRef.current = null;
+        queuedSeekTimeRef.current = null;
+        requestPauseVideoRef.current();
+      }
+    }, 1200);
+  }, [id, duration, data.videoDuration, saveStoredVideoProgress]);
+
+  const finishVideoScrubRef = useRef(finishVideoScrub);
+  finishVideoScrubRef.current = finishVideoScrub;
+
+  const handleVideoProgressScrub = useCallback((pct: number, displayDuration: number) => {
+    if (!Number.isFinite(pct)) return;
+    const clampedPct = Math.min(100, Math.max(0, pct));
+    setProgress(clampedPct);
+    pauseTransitionSeqRef.current += 1;
+    if (isPausingToThumbnailRef.current) {
+      isPausingToThumbnailRef.current = false;
+      setIsPausingToThumbnail(false);
+    }
+    if (!isScrubbingVideoRef.current) {
+      isScrubbingVideoRef.current = true;
+      setIsScrubbingVideo(true);
+    }
+
+    const dur =
+      clampValidVideoDuration(videoRef.current?.duration) ||
+      clampValidVideoDuration(displayDuration) ||
+      duration ||
+      getCachedVideoDuration(id, data.videoDuration);
+
+    if (dur > 0) {
+      const targetTime = computeSeekTimeFromPercent(clampedPct, dur);
+      pendingScrubSeekRef.current = { percent: clampedPct, time: targetTime };
+      hasRestoredInitialTimeRef.current = true;
+      saveStoredVideoProgress(targetTime, { force: true });
+      initialSeekPosRef.current = targetTime;
+      if (videoRef.current) {
+        issueOrQueueVideoSeek(videoRef.current, targetTime);
+      } else {
+        onUpdate(id, { currentTime: targetTime }, false);
+      }
+    } else {
+      pendingScrubSeekRef.current = { percent: clampedPct, time: null };
+    }
+
+    if (!isScrubbingPointerDownRef.current) {
+      if (scrubSettleTimerRef.current) {
+        clearTimeout(scrubSettleTimerRef.current);
+      }
+      scrubSettleTimerRef.current = setTimeout(() => {
+        scrubSettleTimerRef.current = null;
+        finishVideoScrubRef.current();
+      }, 120);
+    }
+  }, [id, duration, data.videoDuration, saveStoredVideoProgress, issueOrQueueVideoSeek, onUpdate]);
+
+  useEffect(() => {
+    if (!isVideo) return;
+    const onGlobalPointerEnd = () => {
+      if (isScrubbingPointerDownRef.current) {
+        finishVideoScrubRef.current();
+      }
+    };
+    window.addEventListener('pointerup', onGlobalPointerEnd, true);
+    window.addEventListener('pointercancel', onGlobalPointerEnd, true);
+    window.addEventListener('blur', onGlobalPointerEnd);
+    return () => {
+      window.removeEventListener('pointerup', onGlobalPointerEnd, true);
+      window.removeEventListener('pointercancel', onGlobalPointerEnd, true);
+      window.removeEventListener('blur', onGlobalPointerEnd);
+      if (scrubSettleTimerRef.current) {
+        clearTimeout(scrubSettleTimerRef.current);
+        scrubSettleTimerRef.current = null;
+      }
+    };
+  }, [isVideo]);
 
   const captureVideoFrameRef = useRef(captureAndSaveVideoState);
   captureVideoFrameRef.current = captureAndSaveVideoState;
   useEffect(() => {
     if (!isVideo) return;
     const pauseForNano = () => {
-      setPlayingState(false);
+      if (!isPlayingRef.current && isPausingToThumbnailRef.current) return;
       const video = videoRef.current;
+      if (!video && !isPlayingRef.current) return;
       if (video) {
         video.removeAttribute('data-was-playing');
-        video.pause();
-        captureAndSaveVideoState(video);
+        captureLiveVideoFrame(id, video);
       }
+      requestPauseVideoRef.current();
     };
     window.addEventListener('canvas-nano-pause', pauseForNano);
     return () => window.removeEventListener('canvas-nano-pause', pauseForNano);
-  }, [isVideo]);
+  }, [id, isVideo]);
 
   useEffect(() => {
     return () => {
-      if (videoRef.current) {
-        captureAndSaveVideoState(videoRef.current);
+      pauseTransitionSeqRef.current += 1;
+      const video = videoRef.current;
+      if (video) {
+        if (video.readyState >= 1 && Number.isFinite(video.duration) && video.duration > 0) {
+          setCachedVideoDuration(id, video.duration);
+        }
+        if (video.readyState >= 2 && video.currentTime > 0.1) {
+          setCachedVideoProgress(id, video.currentTime);
+        }
+        if (!isPausingToThumbnailRef.current) {
+          captureVideoFrameRef.current(video);
+        }
       }
     };
-  }, [id]);
+  }, [id, activeVideoSrc]);
 
   // Intent-driven lazy restoration for Video Performance
   useEffect(() => {
@@ -3281,6 +3801,7 @@ export const GenerationCard = React.memo(function GenerationCard({
   const [showOriginal, setShowOriginal] = useState(false);
   const showOriginalRef = useRef(showOriginal);
   showOriginalRef.current = showOriginal;
+  const loadedOriginalUrlRef = useRef<string | null>(null);
 
   const dataRef = useRef(data);
   dataRef.current = data;
@@ -3296,15 +3817,24 @@ export const GenerationCard = React.memo(function GenerationCard({
 
     const evaluateOriginalImage = () => {
       const workspace = document.getElementById('canvas-workspace');
-      if ((window as any).isDraggingCard || (workspace?.getAttribute('data-gesture') === 'true' && !canUpgradeCardDuringGesture(id))) return;
+      const isPanningOrDragging =
+        Boolean((window as any).isDraggingCard) ||
+        Boolean((window as any).__nanoDragging) ||
+        workspace?.getAttribute('data-panning') === 'true' ||
+        workspace?.getAttribute('data-middle-pan') === 'true';
+      if (isPanningOrDragging) return;
+      if (workspace?.getAttribute('data-gesture') === 'true' && !canUpgradeCardDuringGesture(id)) return;
       const currentData = dataRef.current;
-      const hasImage = Boolean(currentData.originalImageUrl || currentData.imageUrl);
+      const hasImage = Boolean(currentData.originalImageUrl || currentData.trueOriginalImageUrl || currentData.imageUrl);
       if (!hasImage) return;
 
       const s = scale.get();
-      if (s <= 2.0) {
+      if (s < 2.0) {
         cancelPendingRestore();
-        if (showOriginalRef.current) setShowOriginal(false);
+        if (showOriginalRef.current) {
+          showOriginalRef.current = false;
+          setShowOriginal(false);
+        }
         return;
       }
 
@@ -3316,11 +3846,15 @@ export const GenerationCard = React.memo(function GenerationCard({
         ty: ty.get()
       };
       if (isCardIntersectingRectangle(currentData, vp)) {
-        if (showOriginalRef.current || cancelRestore) return;
-        const originalUrl = currentData.originalImageUrl || currentData.imageUrl;
+        const originalUrl = currentData.originalImageUrl || currentData.trueOriginalImageUrl || currentData.imageUrl;
         if (!originalUrl) return;
-        const centerX = (currentData.x * s + tx.get()) - window.innerWidth / 2;
-        const centerY = (currentData.y * s + ty.get()) - window.innerHeight / 2;
+        if ((showOriginalRef.current && loadedOriginalUrlRef.current === originalUrl) || cancelRestore) return;
+        const pointer = getHybridPointer();
+        const usePointer = getCanvasLoadingMode() === 'hybrid' && Number.isFinite(pointer.x) && Number.isFinite(pointer.y);
+        const focusX = usePointer ? pointer.x : window.innerWidth / 2;
+        const focusY = usePointer ? pointer.y : window.innerHeight / 2;
+        const centerX = (currentData.x * s + tx.get()) - focusX;
+        const centerY = (currentData.y * s + ty.get()) - focusY;
         const queuedRestore = scheduleOriginalImageRestore(id, centerX * centerX + centerY * centerY, async isCancelled => {
           const ready = await preloadAndDecodeImage(originalUrl, 'original');
           if (cancelRestore === queuedRestore) cancelRestore = null;
@@ -3334,8 +3868,8 @@ export const GenerationCard = React.memo(function GenerationCard({
             tx: tx.get(),
             ty: ty.get(),
           };
-          if (latestScale > 2 && isCardIntersectingRectangle(latest, latestViewport) &&
-              (document.getElementById('canvas-workspace')?.getAttribute('data-gesture') !== 'true' || canUpgradeCardDuringGesture(id))) {
+          if (latestScale >= 2.0 && isCardIntersectingRectangle(latest, latestViewport)) {
+            loadedOriginalUrlRef.current = originalUrl;
             showOriginalRef.current = true;
             setShowOriginal(true);
           }
@@ -3343,27 +3877,35 @@ export const GenerationCard = React.memo(function GenerationCard({
         cancelRestore = queuedRestore;
       } else {
         cancelPendingRestore();
-        if (showOriginalRef.current) setShowOriginal(false);
+        if (showOriginalRef.current) {
+          showOriginalRef.current = false;
+          setShowOriginal(false);
+        }
       }
     };
 
     const onZoom = () => {
       const currentData = dataRef.current;
-      const hasImage = Boolean(currentData.originalImageUrl || currentData.imageUrl);
+      const hasImage = Boolean(currentData.originalImageUrl || currentData.trueOriginalImageUrl || currentData.imageUrl);
       if (!hasImage) return;
 
-      const allowLiveUpgrade = !isCameraZoomingOut() && canUpgradeCardDuringGesture(id);
-      if (!allowLiveUpgrade || scale.get() <= 2.0) {
-        // Intent-driven lazy degradation on zoom-out or lazy/non-focal gesture:
-        // Drop back to proxy immediately to save heavy rasterization
+      if (scale.get() < 2.0) {
         if (showOriginalRef.current) {
           showOriginalRef.current = false;
           setShowOriginal(false);
         }
         cancelPendingRestore();
+        clearTimeout(timeout);
+        return;
+      }
+
+      const originalUrl = currentData.originalImageUrl || currentData.trueOriginalImageUrl || currentData.imageUrl;
+      if (showOriginalRef.current && loadedOriginalUrlRef.current === originalUrl) {
+        return;
       }
 
       clearTimeout(timeout);
+      const allowLiveUpgrade = !isCameraZoomingOut() && canUpgradeCardDuringGesture(id);
       if (allowLiveUpgrade) {
         evaluateOriginalImage();
         return;
@@ -3377,20 +3919,62 @@ export const GenerationCard = React.memo(function GenerationCard({
 
     const onDrag = () => {
       const currentData = dataRef.current;
-      const hasImage = Boolean(currentData.originalImageUrl || currentData.imageUrl);
+      const hasImage = Boolean(currentData.originalImageUrl || currentData.trueOriginalImageUrl || currentData.imageUrl);
       if (!hasImage) return;
 
-      clearTimeout(timeout);
-      // During active gesture, do not schedule showOriginal timers to avoid concurrent state updates
-      const workspace = typeof document !== 'undefined' ? document.getElementById('canvas-workspace') : null;
-      if (
-        (window as any).isDraggingCard || 
-        (window as any).__nanoDragging ||
-        workspace?.getAttribute('data-gesture') === 'true' ||
-        workspace?.getAttribute('data-panning') === 'true' ||
-        workspace?.getAttribute('data-zooming') === 'true'
-      ) {
+      const s = scale.get();
+      if (s < 2.0) {
+        if (showOriginalRef.current) {
+          showOriginalRef.current = false;
+          setShowOriginal(false);
+        }
         cancelPendingRestore();
+        clearTimeout(timeout);
+        return;
+      }
+
+      // If already displaying the current 4K original image, only downgrade if panned outside the viewport.
+      const originalUrl = currentData.originalImageUrl || currentData.trueOriginalImageUrl || currentData.imageUrl;
+      if (showOriginalRef.current && loadedOriginalUrlRef.current === originalUrl) {
+        const vp = {
+          viewportWidth: window.innerWidth,
+          viewportHeight: window.innerHeight,
+          scale: s,
+          tx: tx.get(),
+          ty: ty.get(),
+        };
+        if (!isCardIntersectingRectangle(currentData, vp)) {
+          showOriginalRef.current = false;
+          setShowOriginal(false);
+        }
+        return;
+      }
+
+      clearTimeout(timeout);
+      const workspace = typeof document !== 'undefined' ? document.getElementById('canvas-workspace') : null;
+      const isPanningOrDragging =
+        Boolean((window as any).isDraggingCard) ||
+        Boolean((window as any).__nanoDragging) ||
+        workspace?.getAttribute('data-panning') === 'true' ||
+        workspace?.getAttribute('data-middle-pan') === 'true';
+
+      // Never allocate 4096x4096 4K canvases mid-pan (AGENTS.md: only upgrade when >=200% and not dragging).
+      if (isPanningOrDragging) {
+        cancelPendingRestore();
+        return;
+      }
+
+      // During cursor-anchored zoom-in (where tx/ty co-vary with scale), allow live upgrade for focal cards,
+      // and do NOT cancel an already-queued restore just because the pointer moved slightly away.
+      const allowLiveUpgrade = !isCameraZoomingOut() && canUpgradeCardDuringGesture(id);
+      if (allowLiveUpgrade) {
+        evaluateOriginalImage();
+        return;
+      }
+      if (workspace?.getAttribute('data-gesture') === 'true' || workspace?.getAttribute('data-zooming') === 'true') {
+        if (isCameraZoomingOut()) {
+          cancelPendingRestore();
+        }
         return;
       }
 
@@ -3404,13 +3988,23 @@ export const GenerationCard = React.memo(function GenerationCard({
       evaluateOriginalImage();
     };
 
+    const onHybridWake = () => {
+      if (scale.get() < 2.0) return;
+      const currentData = dataRef.current;
+      const originalUrl = currentData.originalImageUrl || currentData.trueOriginalImageUrl || currentData.imageUrl;
+      if ((showOriginalRef.current && loadedOriginalUrlRef.current === originalUrl) || cancelRestore) return;
+      if (!isCameraZoomingOut() && canUpgradeCardDuringGesture(id)) {
+        evaluateOriginalImage();
+      }
+    };
+
     const unsubScale = scale.on('change', onZoom);
     const unsubTx = tx.on('change', onDrag);
     const unsubTy = ty.on('change', onDrag);
 
-    window.addEventListener('canvas-gesture-start', onZoom);
     window.addEventListener('resize', onZoom);
     window.addEventListener('canvas-styles-restored', onRestored);
+    window.addEventListener(CANVAS_HYBRID_POINTER_WAKE_EVENT, onHybridWake);
     evaluateOriginalImage();
 
     return () => {
@@ -3419,11 +4013,11 @@ export const GenerationCard = React.memo(function GenerationCard({
       unsubTx();
       unsubTy();
       clearTimeout(timeout);
-      window.removeEventListener('canvas-gesture-start', onZoom);
       window.removeEventListener('resize', onZoom);
       window.removeEventListener('canvas-styles-restored', onRestored);
+      window.removeEventListener(CANVAS_HYBRID_POINTER_WAKE_EVENT, onHybridWake);
     };
-  }, [scale, tx, ty]);
+  }, [scale, tx, ty, data.originalImageUrl, id]);
 
   const screenDpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
   const { width: w, height: h } = getCardSize(data);
@@ -3440,8 +4034,25 @@ export const GenerationCard = React.memo(function GenerationCard({
   const isAssetCard = Boolean(data.fileName || data.isAsset);
   const isScaleMicro = currentScale < 0.4;
 
-  // Bottom panel container is ALWAYS rendered for generation cards (!isAssetCard)
-  const shouldRenderBottomPanel = !isAssetCard;
+  // Render bottom prompt/action panel only on demand (single-selected, blank draft, generating, error, agent/picker target, or interactive lock)
+  const shouldRenderBottomPanel = shouldShowGenerationPromptPanel({
+    isAssetCard,
+    isSelected: Boolean(isSingleSelected ?? isSelected),
+    selectedCount: isSelected && isSingleSelected === false ? 2 : isSelected ? 1 : 0,
+    hasMedia: hasCardMedia(data),
+    state,
+    hasError: Boolean(data.generationError),
+    isAgentTarget: Boolean(isAgentTarget),
+    isEditingOrInteractive: Boolean(
+      isPromptEditing ||
+      openMenu ||
+      mentionMenuOpen ||
+      isReferenceFilePickerOpen ||
+      hoveredRefUrl ||
+      activePreviewUrl
+    ),
+    isPickerTarget: Boolean(isPickerTarget),
+  });
 
   
   useEffect(() => {
@@ -4975,7 +5586,7 @@ export const GenerationCard = React.memo(function GenerationCard({
       data-agent-target={`canvas.card.${id}`}
       data-agent-actions="mouse.move mouse.click mouse.doubleClick mouse.hover mouse.drag"
       data-selected={isSelected ? 'true' : 'false'}
-      className={`absolute top-0 left-0 pointer-events-none ${isSelected || isAgentTarget ? 'z-10' : 'z-0'}`}
+      className={`absolute top-0 left-0 pointer-events-none ${isSelected ? 'z-30' : isAgentTarget ? 'z-20' : isHovered ? 'z-10' : 'z-0'}`}
       style={{ transformOrigin: 'top left', transform: `translate(${displayX}px, ${displayY}px)` }}
       onPointerDownCapture={handleContainerPointerDown}
     >
@@ -5321,15 +5932,14 @@ export const GenerationCard = React.memo(function GenerationCard({
           isVideo ? (
             <div 
               ref={videoContainerRef}
-              className="absolute inset-0 overflow-hidden squircle pointer-events-auto"
+              className="absolute inset-0 overflow-hidden squircle pointer-events-auto group/video"
               onPointerDown={(e) => {
-                // If middle click (pan) or right click, immediately drop hover to unmount video
+                // If middle click (pan) or right click, immediately drop hover/play
                 if (e.button === 1 || e.button === 2) {
-                  if (!isPlaying) {
+                  if (!showVideoPlayer) {
                     setIsHovered(false);
                   } else if (videoRef.current && !videoRef.current.paused) {
-                    videoRef.current.setAttribute('data-was-playing', 'true');
-                    videoRef.current.pause();
+                    requestPauseVideo({ keepWasPlaying: true });
                   }
                 }
               }}
@@ -5345,20 +5955,6 @@ export const GenerationCard = React.memo(function GenerationCard({
                 }
                 setIsHovered(true);
               }}
-              onMouseMove={() => {
-                if ((window as any).isDraggingCard) return;
-                const workspace = document.getElementById('canvas-workspace');
-                if (
-                  workspace?.getAttribute('data-gesture') === 'true' || 
-                  workspace?.getAttribute('data-panning') === 'true' || 
-                  workspace?.getAttribute('data-zooming') === 'true'
-                ) {
-                  return;
-                }
-                if (!isHovered) {
-                  setIsHovered(true);
-                }
-              }}
               onMouseLeave={() => {
                 if ((window as any).isDraggingCard) return;
                 const workspace = document.getElementById('canvas-workspace');
@@ -5366,80 +5962,138 @@ export const GenerationCard = React.memo(function GenerationCard({
                   workspace?.getAttribute('data-gesture') === 'true' || 
                   workspace?.getAttribute('data-panning') === 'true' || 
                   workspace?.getAttribute('data-zooming') === 'true';
-                if (!isCanvasMotion && !isPlaying) {
+                if (!isCanvasMotion && !showVideoPlayer) {
                   setIsHovered(false);
                 }
               }}
               style={{
                 width: w,
                 height: h,
-                backgroundImage: (!effectiveVideoSrc || videoHasError || !isVideoFrameReady)
-                  ? (data.videoPosterUrl || data.thumbnailUrl || localThumbnailUrl || (imageUrl ? thumbCache.get(imageUrl) || thumbCache.get(id) : undefined))
-                    ? `url(${data.videoPosterUrl || data.thumbnailUrl || localThumbnailUrl || (imageUrl ? thumbCache.get(imageUrl) || thumbCache.get(id) : undefined)})`
-                    : undefined
-                  : undefined,
-                backgroundSize: 'cover',
-                backgroundPosition: 'center',
               }}
             >
-              <div className="absolute inset-0 w-full h-full overflow-hidden squircle group/video pointer-events-auto">
-                {effectiveVideoSrc && effectiveVideoSrc.trim() !== '' && !videoHasError && (
-                  <motion.video 
-                  initial={false}
-                  animate={{ opacity: 1 }}
+              {/* Base: CardImageCanvas for idle/hover/poster rendering with multi-level LOD & 2K/4K support */}
+              <CardImageCanvas
+                cardId={id}
+                thumbnailUrl={effectiveThumbnailUrl}
+                blurPlaceholderUrl={data.blurPlaceholderUrl}
+                imageUrl={effectiveVideoPosterUrl || imageUrl}
+                originalImageUrl={effectiveVideoPosterUrl || data.originalImageUrl || data.trueOriginalImageUrl || imageUrl}
+                showOriginal={showOriginal}
+                width={w}
+                height={h}
+                dpr={dpr}
+                state={state}
+                isZooming={isZooming}
+                disableTransition={true}
+                onLoaded={handleImageLoaded}
+                className="squircle"
+              />
+
+              {/* Transient Video Player Overlay - stays mounted until paused thumbnail/poster is decoded and painted */}
+              {showVideoPlayer && effectiveVideoSrc && effectiveVideoSrc.trim() !== '' && !videoHasError && (
+                <motion.video 
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: isVideoFrameReady ? 1 : 0 }}
+                  exit={{ opacity: 0 }}
                   transition={{ duration: 0 }}
                   ref={videoRef}
                   {...({ referrerPolicy: "no-referrer" } as any)}
                   src={effectiveVideoSrc} 
                   loop 
                   playsInline
-                  muted={!isPlaying}
-                  preload={isPlaying ? "auto" : "metadata"}
                   autoPlay={isPlaying && !isCameraGestureActive()}
-                  className="absolute inset-0 w-full h-full object-cover pointer-events-none group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform"
+                  className="absolute inset-0 w-full h-full object-cover pointer-events-none group-data-[zooming=true]/canvas:!transition-none group-data-[zooming=true]/canvas:!duration-0 group-data-[zooming=true]/canvas:will-change-transform z-10"
                   onLoadedData={(e) => {
-                    setIsCardLoaded(true);
-                    setIsVideoFrameReady(true);
-                    markVideoPainted();
                     const video = e.currentTarget;
+                    setIsCardLoaded(true);
+                    if (!video.seeking && hasRestoredInitialTimeRef.current) {
+                      setIsVideoFrameReady(true);
+                      markVideoPainted();
+                    }
                     if (video.duration) {
-                      setDuration(video.duration);
+                      saveStoredVideoDuration(video.duration);
                     }
                   }}
                   onLoadedMetadata={(e) => {
                     const video = e.currentTarget;
                     const dur = video.duration || 0;
-                    setDuration(dur);
+                    saveStoredVideoDuration(dur);
                     const vWidth = video.videoWidth;
                     const vHeight = video.videoHeight;
                     if (vWidth && vHeight && (!data.nativeWidth || !data.nativeHeight)) {
                       setActualDimensions({ width: vWidth, height: vHeight });
                       onUpdate(id, { nativeWidth: vWidth, nativeHeight: vHeight }, false);
                     }
+                    if (pendingScrubSeekRef.current && dur > 0) {
+                      const pendingPct = pendingScrubSeekRef.current.percent;
+                      const targetTime = clampVideoSeekTargetTime(
+                        pendingScrubSeekRef.current.time ?? computeSeekTimeFromPercent(pendingPct, dur),
+                        dur
+                      );
+                      pendingScrubSeekRef.current = null;
+                      queuedSeekTimeRef.current = null;
+                      hasRestoredInitialTimeRef.current = true;
+                      saveStoredVideoProgress(targetTime, { force: true });
+                      setProgress(pendingPct);
+                      lastSeekIssuedAtMsRef.current = typeof performance !== 'undefined' ? performance.now() : Date.now();
+                      video.currentTime = targetTime;
+                      if (shouldFinalizeScrubAfterSeekRef.current && !isScrubbingPointerDownRef.current && !isPlayingRef.current) {
+                        shouldFinalizeScrubAfterSeekRef.current = false;
+                        requestPauseVideoRef.current();
+                      }
+                      return;
+                    }
                     const savedPos = getStoredVideoProgress();
-                    if (savedPos > 0 && dur > 0 && savedPos < (dur - 0.4)) {
-                      video.currentTime = savedPos;
+                    const endMargin = resolveVideoEndResetMargin(dur);
+                    hasRestoredInitialTimeRef.current = true;
+                    if (savedPos > 0 && dur > 0 && savedPos < (dur - endMargin)) {
+                      if (Math.abs(video.currentTime - savedPos) > 0.1) {
+                        video.currentTime = savedPos;
+                      }
                       setProgress((savedPos / dur) * 100);
-                    } else if (dur > 0.05) {
-                      video.currentTime = 0.05;
+                    } else if (!isPlayingRef.current && dur > 0.05 && video.currentTime <= 0.01) {
+                      video.currentTime = Math.min(0.05, dur * 0.1);
                     }
                   }}
                   onCanPlay={(e) => {
                     const video = e.currentTarget;
-                    if (video.readyState >= 2) {
+                    if (video.duration) saveStoredVideoDuration(video.duration);
+                    if (pendingScrubSeekRef.current) {
+                      const dur = clampValidVideoDuration(video.duration) || duration || getCachedVideoDuration(id, data.videoDuration);
+                      if (dur > 0) {
+                        const pendingPct = pendingScrubSeekRef.current.percent;
+                        const targetTime = clampVideoSeekTargetTime(
+                          pendingScrubSeekRef.current.time ?? computeSeekTimeFromPercent(pendingPct, dur),
+                          dur
+                        );
+                        pendingScrubSeekRef.current = null;
+                        queuedSeekTimeRef.current = null;
+                        hasRestoredInitialTimeRef.current = true;
+                        saveStoredVideoProgress(targetTime, { force: true });
+                        setProgress(pendingPct);
+                        lastSeekIssuedAtMsRef.current = typeof performance !== 'undefined' ? performance.now() : Date.now();
+                        video.currentTime = targetTime;
+                      }
+                    } else if (!hasRestoredInitialTimeRef.current) {
+                      hasRestoredInitialTimeRef.current = true;
+                      const dur = video.duration || duration || getCachedVideoDuration(id, data.videoDuration);
+                      const endMargin = resolveVideoEndResetMargin(dur);
+                      const savedPos = getStoredVideoProgress();
+                      if (savedPos > 0 && dur > 0 && savedPos < (dur - endMargin) && Math.abs(video.currentTime - savedPos) > 0.25) {
+                        video.currentTime = savedPos;
+                      }
+                    }
+                    if (video.readyState >= 2 && !video.seeking && hasRestoredInitialTimeRef.current) {
                       setIsCardLoaded(true);
                       setIsVideoFrameReady(true);
                       markVideoPainted();
                     }
-                    if (video.duration) setDuration(video.duration);
-                    if (!hasRestoredInitialTimeRef.current) {
-                      hasRestoredInitialTimeRef.current = true;
-                      const savedPos = getStoredVideoProgress();
-                      if (savedPos > 0 && video.duration > 0 && savedPos < (video.duration - 0.4) && Math.abs(video.currentTime - savedPos) > 0.3) {
-                        video.currentTime = savedPos;
-                      }
+                    if (shouldFinalizeScrubAfterSeekRef.current && !isScrubbingPointerDownRef.current && !isPlayingRef.current && !video.seeking) {
+                      shouldFinalizeScrubAfterSeekRef.current = false;
+                      requestPauseVideoRef.current();
+                      return;
                     }
-                    if (isPlaying && video.paused && !isCameraGestureActive()) {
+                    if (isPlayingRef.current && !isPausingToThumbnailRef.current && !isScrubbingVideoRef.current && video.paused && !isCameraGestureActive()) {
                       const p = video.play();
                       if (p !== undefined) {
                         p.catch((err: any) => {
@@ -5451,105 +6105,158 @@ export const GenerationCard = React.memo(function GenerationCard({
                       }
                     }
                   }}
-                  onPlay={() => {
-                    if (!isPlaying) setIsPlaying(true);
-                  }}
                   onTimeUpdate={(e) => {
                     const video = e.currentTarget;
-                    const currTime = video.currentTime;
-                    if (video.duration > 0 && currTime >= video.duration - 0.4) {
-                      try { localStorage.removeItem(`mira_vid_pos_${id}`); } catch {}
-                      initialSeekPosRef.current = 0;
-                    } else if (currTime > 0.1) {
-                      saveStoredVideoProgress(currTime);
-                      initialSeekPosRef.current = currTime;
+                    if (video.readyState >= 2 && !isVideoFrameReady) {
+                      setIsVideoFrameReady(true);
                     }
                     if (video.duration) {
-                      setDuration(video.duration);
-                      setProgress((currTime / video.duration) * 100);
+                      saveStoredVideoDuration(video.duration);
                     }
-                    if (Math.abs(currTime - lastSavedTimeRef.current) >= 1.5) {
-                      lastSavedTimeRef.current = currTime;
-                      const updates: Partial<CardData> = { currentTime: currTime };
-                      onUpdate(id, updates, false);
+                    if (isScrubbingVideoRef.current || isPausingToThumbnailRef.current) {
+                      return;
+                    }
+                    const currTime = video.currentTime;
+                    const endMargin = resolveVideoEndResetMargin(video.duration);
+                    if (video.duration > 0 && currTime >= video.duration - endMargin) {
+                      clearCachedVideoProgress(id);
+                    } else if (currTime > 0.1) {
+                      saveStoredVideoProgress(currTime);
+                    }
+                    if (video.duration) {
+                      setProgress((currTime / video.duration) * 100);
                     }
                   }}
                   onPause={(e) => {
+                    if (isPausingToThumbnailRef.current || isScrubbingVideoRef.current) return;
                     const video = e.currentTarget;
                     captureAndSaveVideoState(video);
                   }}
                   onSeeked={(e) => {
                     const video = e.currentTarget;
+                    if (video.readyState >= 2) {
+                      setIsCardLoaded(true);
+                      setIsVideoFrameReady(true);
+                      markVideoPainted();
+                    }
+                    if (isScrubbingVideoRef.current) {
+                      captureLiveVideoFrame(id, video);
+                      if (queuedSeekTimeRef.current !== null && video.readyState >= 1) {
+                        const nextTime = queuedSeekTimeRef.current;
+                        queuedSeekTimeRef.current = null;
+                        lastSeekIssuedAtMsRef.current = typeof performance !== 'undefined' ? performance.now() : Date.now();
+                        if (Math.abs(video.currentTime - nextTime) > 0.005) {
+                          video.currentTime = nextTime;
+                          return;
+                        }
+                      }
+                      if (shouldFinalizeScrubAfterSeekRef.current && !isScrubbingPointerDownRef.current && !isPlayingRef.current) {
+                        shouldFinalizeScrubAfterSeekRef.current = false;
+                        requestPauseVideoRef.current();
+                      }
+                      return;
+                    }
+                    if (isPausingToThumbnailRef.current || isPlayingRef.current) return;
                     captureAndSaveVideoState(video);
                   }}
                   onError={() => {
                     refreshVideoUrl(true);
                   }}
                 />
-                )}
-                {videoHasError && (
-                  <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 p-4 text-center select-none pointer-events-auto z-[20]">
-                    <AlertCircle className="w-8 h-8 text-amber-500 mb-2 animate-bounce" />
-                    <span className="text-white text-xs font-semibold mb-1">视频加载失败</span>
-                    {videoLoadError && (
-                      <p className="text-white/70 text-[10px] mb-2 max-w-[200px] break-words line-clamp-2" role="alert">
-                        {videoLoadError}
-                      </p>
-                    )}
-                    <button
+              )}
+
+              {videoHasError && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 p-4 text-center select-none pointer-events-auto z-[20]">
+                  <AlertCircle className="w-8 h-8 text-amber-500 mb-2 animate-bounce" />
+                  <span className="text-white text-xs font-semibold mb-1">视频加载失败</span>
+                  {videoLoadError && (
+                    <p className="text-white/70 text-[10px] mb-2 max-w-[200px] break-words line-clamp-2" role="alert">
+                      {videoLoadError}
+                    </p>
+                  )}
+                  <button
+                    onPointerDown={(e) => {
+                      if (e.button === 0) e.stopPropagation();
+                    }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setVideoHasError(false);
+                      setVideoLoadError('');
+                      refreshVideoUrl(true);
+                      setIsPlaying(true);
+                    }}
+                    className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white rounded-lg text-[10px] font-bold shadow-md transition-colors active:scale-95"
+                  >
+                    重新获取视频地址
+                  </button>
+                </div>
+              )}
+
+              {!showVideoPlayer ? (() => {
+                const { playButtonDiameter, playButtonIconSize } = calculateVideoPlayButtonDimensions(w, h);
+                return (
+                  <div 
+                    className="absolute inset-0 flex items-center justify-center bg-black/25 hover:bg-black/35 transition-colors pointer-events-none z-20"
+                  >
+                    <div 
+                      className="rounded-full bg-white/40 dark:bg-black/50 border border-white/30 dark:border-white/10 shadow-xl flex items-center justify-center transform hover:scale-105 transition-transform cursor-pointer pointer-events-auto group-data-[scale-micro=true]/canvas:!scale-100"
+                      style={{
+                        width: playButtonDiameter,
+                        height: playButtonDiameter,
+                      }}
                       onPointerDown={(e) => {
-                        if (e.button === 0) e.stopPropagation();
+                        if (e.button === 0) {
+                          e.stopPropagation();
+                        } else if (e.button === 1 || e.button === 2) {
+                          if (!isPlaying) {
+                            setIsHovered(false);
+                          }
+                        }
                       }}
                       onClick={(e) => {
                         e.stopPropagation();
-                        setVideoHasError(false);
-                        setVideoLoadError('');
-                        refreshVideoUrl(true);
                         setIsPlaying(true);
                       }}
-                      className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white rounded-lg text-[10px] font-bold shadow-md transition-colors active:scale-95"
                     >
-                      重新获取视频地址
-                    </button>
+                      <svg 
+                        viewBox="0 0 24 24" 
+                        fill="currentColor" 
+                        xmlns="http://www.w3.org/2000/svg" 
+                        className="text-white/85"
+                        style={{
+                          width: playButtonIconSize,
+                          height: playButtonIconSize,
+                        }}
+                      >
+                        <path d={PLAY_BUTTON_SVG_PATH} />
+                      </svg>
+                    </div>
                   </div>
-                )}
-                {!isPlaying ? (() => {
+                );
+              })() : (
+                (() => {
                   const { playButtonDiameter, playButtonIconSize } = calculateVideoPlayButtonDimensions(w, h);
                   return (
                     <div 
-                      className="absolute inset-0 flex items-center justify-center bg-black/25 hover:bg-black/35 transition-colors pointer-events-none"
+                      className="absolute inset-0 bg-transparent hover:bg-black/5 transition-all duration-200 flex items-center justify-center pointer-events-none z-20"
                     >
                       <div 
-                        className="rounded-full bg-white/40 dark:bg-black/50 border border-white/30 dark:border-white/10 shadow-xl flex items-center justify-center transform hover:scale-105 transition-transform cursor-pointer pointer-events-auto group-data-[scale-micro=true]/canvas:!scale-100"
+                        className="rounded-full bg-white/40 dark:bg-black/50 border border-white/30 dark:border-white/10 shadow-xl flex items-center justify-center transform hover:scale-105 transition-transform duration-200 opacity-0 hover:opacity-100 cursor-pointer pointer-events-auto"
                         style={{
                           width: playButtonDiameter,
                           height: playButtonDiameter,
                         }}
                         onPointerDown={(e) => {
-                          // Prevent card drag only on left-click of play button, allow middle click to pan
                           if (e.button === 0) {
                             e.stopPropagation();
-                          } else if (e.button === 1 || e.button === 2) {
-                            if (!isPlaying) {
-                              setIsHovered(false);
-                            }
                           }
                         }}
                         onClick={(e) => {
                           e.stopPropagation();
-                          setIsPlaying(true);
-                          const video = videoRef.current;
-                          if (video) {
-                            video.muted = false;
-                            const playPromise = video.play();
-                            if (playPromise !== undefined) {
-                              playPromise.catch((err: any) => {
-                                if (err?.name === 'NotAllowedError') {
-                                  video.muted = true;
-                                  video.play().catch(() => {});
-                                }
-                              });
-                            }
+                          if (!isPlaying || isPausingToThumbnail) {
+                            setIsPlaying(true);
+                          } else {
+                            requestPauseVideo();
                           }
                         }}
                       >
@@ -5563,139 +6270,106 @@ export const GenerationCard = React.memo(function GenerationCard({
                             height: playButtonIconSize,
                           }}
                         >
-                          <path d={PLAY_BUTTON_SVG_PATH} />
+                          {!isPlaying || isPausingToThumbnail ? (
+                            <path d={PLAY_BUTTON_SVG_PATH} />
+                          ) : (
+                            <>
+                              <rect x="6" y="4.5" width="4" height="15" rx="1.5" />
+                              <rect x="14" y="4.5" width="4" height="15" rx="1.5" />
+                            </>
+                          )}
                         </svg>
                       </div>
                     </div>
                   );
-                })() : (
-                  (() => {
-                    const { playButtonDiameter, playButtonIconSize } = calculateVideoPlayButtonDimensions(w, h);
+                })()
+              )}
+
+              {/* Progress Bar Controller Overlay */}
+              {(isHovered || showVideoPlayer) && (
+              <div 
+                className={`absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/85 via-black/40 to-transparent p-4 pt-12 flex flex-col gap-2 transition-opacity duration-200 ${isScrubbingVideo ? 'opacity-100' : 'opacity-0 group-hover/video:opacity-100'} group-data-[scale-micro=true]/canvas:hidden z-20`}
+                onPointerDown={(e) => {
+                  if (e.button === 0) {
+                    e.stopPropagation();
+                  }
+                }}
+              >
+                  {(() => {
+                    const displayState = resolveVideoProgressDisplay({
+                      currentTime: videoRef.current?.currentTime ?? null,
+                      storedTime: getStoredVideoProgress(),
+                      duration: clampValidVideoDuration(videoRef.current?.duration) || duration || getCachedVideoDuration(id, data.videoDuration),
+                      stateProgress: progress,
+                      isPlayerMounted: showVideoPlayer && Boolean(videoRef.current),
+                      hasRestoredInitialTime: hasRestoredInitialTimeRef.current,
+                      isScrubbing: isScrubbingVideo,
+                      scrubTime: pendingScrubSeekRef.current?.time ?? queuedSeekTimeRef.current ?? null,
+                    });
                     return (
-                      <div 
-                        className="absolute inset-0 bg-transparent hover:bg-black/5 transition-all duration-200 flex items-center justify-center pointer-events-none"
-                      >
-                        <div 
-                          className="rounded-full bg-white/40 dark:bg-black/50 border border-white/30 dark:border-white/10 shadow-xl flex items-center justify-center transform hover:scale-105 transition-transform duration-200 opacity-0 hover:opacity-100 cursor-pointer pointer-events-auto"
-                          style={{
-                            width: playButtonDiameter,
-                            height: playButtonDiameter,
-                          }}
-                          onPointerDown={(e) => {
-                            // Prevent card drag only on left-click, allow middle click to pan
-                            if (e.button === 0) {
-                              e.stopPropagation();
-                            }
-                          }}
+                      <div className="flex items-center gap-3">
+                        <button
+                          type="button"
+                          className="text-white hover:text-blue-400 transition-colors cursor-pointer focus:outline-none flex-shrink-0"
                           onClick={(e) => {
                             e.stopPropagation();
-                            setIsPlaying(false);
-                            if (videoRef.current) {
-                              videoRef.current.pause();
+                            if (isPlaying && !isPausingToThumbnail) {
+                              requestPauseVideo();
+                            } else {
+                              setIsPlaying(true);
                             }
                           }}
                         >
-                          <svg 
-                            viewBox="0 0 24 24" 
-                            fill="currentColor" 
-                            xmlns="http://www.w3.org/2000/svg" 
-                            className="text-white/85"
-                            style={{
-                              width: playButtonIconSize,
-                              height: playButtonIconSize,
+                          {isPlaying && !isPausingToThumbnail ? (
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                              <path d="M6 19H10V5H6V19ZM14 5V19H18V5H14Z" fill="currentColor"/>
+                            </svg>
+                          ) : (
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                              <path d="M8 5V19L19 12L8 5Z" fill="currentColor"/>
+                            </svg>
+                          )}
+                        </button>
+
+                        <div className="relative flex-1 flex items-center h-8">
+                          <input
+                            type="range"
+                            min="0"
+                            max="100"
+                            step="0.1"
+                            value={displayState.progressPercent}
+                            onPointerDown={(e) => {
+                              if (e.button === 0) {
+                                e.stopPropagation();
+                                startVideoScrub();
+                              }
                             }}
-                          >
-                            <rect x="6" y="4.5" width="4" height="15" rx="1.5" />
-                            <rect x="14" y="4.5" width="4" height="15" rx="1.5" />
-                          </svg>
+                            onPointerUp={() => {
+                              if (isScrubbingPointerDownRef.current) {
+                                finishVideoScrub();
+                              }
+                            }}
+                            onPointerCancel={() => {
+                              if (isScrubbingPointerDownRef.current) {
+                                finishVideoScrub();
+                              }
+                            }}
+                            onChange={(e) => {
+                              const pct = parseFloat(e.target.value);
+                              handleVideoProgressScrub(pct, displayState.displayDuration);
+                            }}
+                            className="w-full h-8 py-3 bg-transparent appearance-none cursor-pointer accent-blue-500 focus:outline-none [&::-webkit-slider-runnable-track]:bg-white/25 hover:[&::-webkit-slider-runnable-track]:bg-white/40 [&::-webkit-slider-runnable-track]:h-1 [&::-webkit-slider-runnable-track]:rounded-full [&::-webkit-slider-runnable-track]:transition-colors [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-blue-500 hover:[&::-webkit-slider-thumb]:scale-125 hover:[&::-webkit-slider-thumb]:shadow-[0_0_8px_rgba(59,130,246,0.7)] [&::-webkit-slider-thumb]:transition-transform [&::-webkit-slider-thumb]:mt-[-4px] [&::-moz-range-track]:bg-white/25 [&::-moz-range-track]:h-1 [&::-moz-range-track]:rounded-full [&::-moz-range-thumb]:h-3 [&::-moz-range-thumb]:w-3 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:bg-blue-500 [&::-moz-range-thumb]:border-0 hover:[&::-moz-range-thumb]:scale-125"
+                          />
                         </div>
+
+                        <span className="text-[10px] font-mono text-white/90 select-none flex-shrink-0">
+                          {formatTime(displayState.displayTime)} / {formatTime(displayState.displayDuration)}
+                        </span>
                       </div>
                     );
-                  })()
-                )}
-
-                {/* Progress Bar Controller Overlay */}
-                {(isHovered || isPlaying) && (
-                <div 
-                  className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/85 via-black/40 to-transparent p-4 pt-12 flex flex-col gap-2 transition-opacity duration-200 opacity-0 group-hover/video:opacity-100 group-data-[scale-micro=true]/canvas:hidden"
-                  onPointerDown={(e) => {
-                    // Prevent card dragging when interacting with controls
-                    if (e.button === 0) {
-                      e.stopPropagation();
-                    }
-                  }}
-                >
-                  <div className="flex items-center gap-3">
-                    {/* Miniature Play/Pause Button */}
-                    <button
-                      type="button"
-                      className="text-white hover:text-blue-400 transition-colors cursor-pointer focus:outline-none flex-shrink-0"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        const nextPlaying = !isPlaying;
-                        setIsPlaying(nextPlaying);
-                        const video = videoRef.current;
-                        if (video) {
-                          if (nextPlaying) {
-                            video.muted = false;
-                            const playPromise = video.play();
-                            if (playPromise !== undefined) {
-                              playPromise.catch((err: any) => {
-                                if (err?.name === 'NotAllowedError') {
-                                  video.muted = true;
-                                  video.play().catch(() => {});
-                                }
-                              });
-                            }
-                          } else {
-                            video.pause();
-                          }
-                        }
-                      }}
-                    >
-                      {isPlaying ? (
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                          <path d="M6 19H10V5H6V19ZM14 5V19H18V5H14Z" fill="currentColor"/>
-                        </svg>
-                      ) : (
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                          <path d="M8 5V19L19 12L8 5Z" fill="currentColor"/>
-                        </svg>
-                      )}
-                    </button>
-
-                    {/* Range Slider */}
-                    <div className="relative flex-1 flex items-center h-8">
-                      <input
-                        type="range"
-                        min="0"
-                        max="100"
-                        step="0.1"
-                        value={progress > 0 ? progress : (duration > 0 && getStoredVideoProgress() > 0 ? (getStoredVideoProgress() / duration) * 100 : 0)}
-                        onPointerDown={(e) => {
-                          if (e.button === 0) e.stopPropagation();
-                        }}
-                        onChange={(e) => {
-                          const pct = parseFloat(e.target.value);
-                          setProgress(pct);
-                          if (videoRef.current && duration) {
-                            const targetTime = (pct / 100) * duration;
-                            videoRef.current.currentTime = targetTime;
-                            saveStoredVideoProgress(targetTime);
-                          }
-                        }}
-                        className="w-full h-8 py-3 bg-transparent appearance-none cursor-pointer accent-blue-500 focus:outline-none [&::-webkit-slider-runnable-track]:bg-white/25 hover:[&::-webkit-slider-runnable-track]:bg-white/40 [&::-webkit-slider-runnable-track]:h-1 [&::-webkit-slider-runnable-track]:rounded-full [&::-webkit-slider-runnable-track]:transition-colors [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-blue-500 hover:[&::-webkit-slider-thumb]:scale-125 hover:[&::-webkit-slider-thumb]:shadow-[0_0_8px_rgba(59,130,246,0.7)] [&::-webkit-slider-thumb]:transition-transform [&::-webkit-slider-thumb]:mt-[-4px] [&::-moz-range-track]:bg-white/25 [&::-moz-range-track]:h-1 [&::-moz-range-track]:rounded-full [&::-moz-range-thumb]:h-3 [&::-moz-range-thumb]:w-3 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:bg-blue-500 [&::-moz-range-thumb]:border-0 hover:[&::-moz-range-thumb]:scale-125"
-                      />
-                    </div>
-
-                    {/* Time Stamps */}
-                    <span className="text-[10px] font-mono text-white/90 select-none flex-shrink-0">
-                      {formatTime(videoRef.current?.currentTime ?? (getStoredVideoProgress() || 0))} / {formatTime(duration)}
-                    </span>
-                  </div>
-                </div>
-                )}
+                  })()}
               </div>
+              )}
             </div>
           ) : (
             <motion.div 
@@ -5713,7 +6387,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                 thumbnailUrl={effectiveThumbnailUrl}
                 blurPlaceholderUrl={data.blurPlaceholderUrl}
                 imageUrl={imageUrl}
-                originalImageUrl={data.originalImageUrl || imageUrl}
+                originalImageUrl={data.originalImageUrl || data.trueOriginalImageUrl || imageUrl}
                 showOriginal={showOriginal}
                 width={w}
                 height={h}
@@ -5859,12 +6533,12 @@ export const GenerationCard = React.memo(function GenerationCard({
         )}
       </div>
 
-      {/* Bottom Layer: Light Panel (Always rendered for generation cards) */}
+      {/* Bottom Layer: Light Panel (On-demand floating overlay below card body) */}
       {shouldRenderBottomPanel && (
       <div 
         onPointerEnter={() => setIsPromptPanelHovered(true)}
         onPointerLeave={() => setIsPromptPanelHovered(false)}
-        className={`generation-card-bottom-panel relative pointer-events-auto flex flex-col bg-gray-100 dark:bg-neutral-800 squircle p-4 gap-2 w-[480px] cursor-default self-start transform-gpu [&.drag-degraded]:!shadow-none [&.drag-degraded]:!backdrop-filter-none ${
+        className={`generation-card-bottom-panel absolute top-full left-0 mt-3 z-40 pointer-events-auto flex flex-col bg-gray-100 dark:bg-neutral-800 squircle p-4 gap-2 w-[480px] cursor-default self-start transform-gpu [&.drag-degraded]:!shadow-none [&.drag-degraded]:!backdrop-filter-none ${
         isSelected 
           ? 'border border-gray-300 dark:border-neutral-600' 
           : 'border border-gray-200 dark:border-neutral-700 shadow-[0_1px_2px_rgba(0,0,0,0.06),0_0_1px_rgba(0,0,0,0.08)] dark:shadow-[0_1px_2px_rgba(0,0,0,0.35)] hover:border-gray-300 dark:hover:border-neutral-600'

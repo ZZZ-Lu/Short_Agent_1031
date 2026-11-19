@@ -121,10 +121,14 @@ import {
   buildDockTransitionPhase3Prepare,
   buildDockTransitionPhase3Reveal,
   buildDockTransitionPlan,
+  computeProgressiveBatchCount,
   computeScriptBibleDockLayout,
   createIdleWidthTransitionPanels,
+  normalizeScrollOffset,
+  PANEL_OPEN_SETTLE_DELAY_MS,
   resolveDockOccupiedRightEdge,
   shouldForceExpandScriptOnRequestedViewChange,
+  shouldMountScriptBiblePanelBody,
   WIDTH_TRANSITION_TIMINGS,
   type DockWidthTransitionPanels,
 } from '../utils/scriptBibleDockLayout';
@@ -1098,6 +1102,9 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
     widthTransitionPanels.assets.hidden ||
     widthTransitionPanels.assets.opacity < 1;
   const sidePanelContentVersion = `${assetFilter}:${currentProject.characters?.length || 0}:${currentProject.locations?.length || 0}:${currentProject.props?.length || 0}:${cards?.length || 0}`;
+  const [isAnimationSettled, setIsAnimationSettled] = useState(false);
+  const [isSidePanelAnimationSettled, setIsSidePanelAnimationSettled] = useState(false);
+  const [isImagesPanelAnimationSettled, setIsImagesPanelAnimationSettled] = useState(false);
 
   const sidePanelScrollMemory = useUnifiedPanelScrollMemory({
     scopeKey: sidePanelScopeKey,
@@ -1111,12 +1118,13 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
       }
     },
     getScrollElement: () => sidePanelContentRef.current,
-    isActiveAndVisible:
-      isOpen &&
-      activeTab === 'script' &&
-      visualDock.sidePanel !== null &&
-      widthTransitionPanels.assets.mountExpandedContent &&
-      !widthTransitionPanels.assets.hidden,
+    isActiveAndVisible: shouldMountScriptBiblePanelBody({
+      isOpen,
+      isTabScript: activeTab === 'script',
+      isOpenAnimationSettled: isSidePanelAnimationSettled,
+      isPanelExpanded: visualDock.sidePanel !== null,
+      mountExpandedContent: widthTransitionPanels.assets.mountExpandedContent,
+    }) && !widthTransitionPanels.assets.hidden,
     isTransitioning: isSidePanelTransitioning,
     contentVersion: sidePanelContentVersion,
     maxWaitMs: 1600,
@@ -1166,7 +1174,6 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
   const typingTimerRef = useRef<NodeJS.Timeout | null>(null);
   const lastAssessedTextRef = useRef(currentProject?.scriptText || '');
   const [copiedId, setCopiedId] = useState<string | null>(null);
-  const [isAnimationSettled, setIsAnimationSettled] = useState(false);
   const [isScriptExpandSettled, setIsScriptExpandSettled] = useState<boolean>(() => isScriptExpanded);
   const [isExtractingAssets, setIsExtractingAssets] = useState(false);
   const [extractionFeedback, setExtractionFeedback] = useState<string | null>(null);
@@ -2221,14 +2228,25 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
 
   const imageFeed = useMemo(
     () =>
-      buildAssetImageFeed({
-        characters: displayCharacters,
-        locations: displayLocations,
-        props: displayProps,
-        assetFilter,
-        cards: cards || [],
-      }),
-    [displayCharacters, displayLocations, displayProps, assetFilter, cards]
+      !isOpen || activeTab !== 'script' || !isImagesPanelAnimationSettled
+        ? { sections: [], timelineCards: [], totalBoundImages: 0 }
+        : buildAssetImageFeed({
+            characters: displayCharacters,
+            locations: displayLocations,
+            props: displayProps,
+            assetFilter,
+            cards: cards || [],
+          }),
+    [
+      isOpen,
+      activeTab,
+      isImagesPanelAnimationSettled,
+      displayCharacters,
+      displayLocations,
+      displayProps,
+      assetFilter,
+      cards,
+    ]
   );
 
   const liveViewingAsset = useMemo(() => {
@@ -2329,7 +2347,7 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
             <img
               src={thumbSrc}
               alt=""
-              loading={thumbSrc.startsWith('data:') ? 'eager' : 'lazy'}
+              loading="lazy"
               decoding="async"
               referrerPolicy="no-referrer"
               className="w-5 h-5 rounded-md object-cover border border-black/10 dark:border-white/15 shrink-0 hover:border-blue-500/60 dark:hover:border-blue-400/60 transition-colors"
@@ -3042,12 +3060,143 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
       // Wait exactly for card scale/opacity animation (200ms) to settle completely
       const timer = setTimeout(() => {
         setIsAnimationSettled(true);
-      }, 210);
+      }, PANEL_OPEN_SETTLE_DELAY_MS.script);
       return () => clearTimeout(timer);
     } else {
       setIsAnimationSettled(false);
     }
   }, [isOpen]);
+
+  // Defer Assets & Images inner content mounting until their own card open animations finish
+  useEffect(() => {
+    if (isOpen && activeTab === 'script') {
+      setIsSidePanelAnimationSettled(false);
+      setIsImagesPanelAnimationSettled(false);
+      const assetsTimer = window.setTimeout(() => {
+        setIsSidePanelAnimationSettled(true);
+      }, PANEL_OPEN_SETTLE_DELAY_MS.assets);
+      const imagesTimer = window.setTimeout(() => {
+        setIsImagesPanelAnimationSettled(true);
+      }, PANEL_OPEN_SETTLE_DELAY_MS.images);
+      return () => {
+        window.clearTimeout(assetsTimer);
+        window.clearTimeout(imagesTimer);
+      };
+    } else {
+      setIsSidePanelAnimationSettled(false);
+      setIsImagesPanelAnimationSettled(false);
+    }
+  }, [isOpen, activeTab]);
+
+  const isAssetsBodyMounted = shouldMountScriptBiblePanelBody({
+    isOpen,
+    isTabScript: activeTab === 'script',
+    isOpenAnimationSettled: isSidePanelAnimationSettled,
+    isPanelExpanded: visualDock.sidePanel !== null,
+    mountExpandedContent: widthTransitionPanels.assets.mountExpandedContent,
+  });
+
+  const filteredAssetChars = useMemo(
+    () => (assetFilter === 'all' || assetFilter === 'characters' ? displayCharacters : []),
+    [assetFilter, displayCharacters]
+  );
+  const filteredAssetLocations = useMemo(
+    () => (assetFilter === 'all' || assetFilter === 'locations' ? displayLocations : []),
+    [assetFilter, displayLocations]
+  );
+  const filteredAssetProps = useMemo(
+    () => (assetFilter === 'all' || assetFilter === 'props' ? displayProps : []),
+    [assetFilter, displayProps]
+  );
+  const totalVisibleAssetItems =
+    filteredAssetChars.length + filteredAssetLocations.length + filteredAssetProps.length;
+  const shouldForceMountAllAssets =
+    Boolean(activeAssetHighlight) ||
+    (typeof window !== 'undefined' &&
+      normalizeScrollOffset(readScrollOffsetFromStorage(window.localStorage, sidePanelScrollSpec)) > 0);
+  const [assetsBatchLimit, setAssetsBatchLimit] = useState<number>(0);
+
+  useEffect(() => {
+    if (!isAssetsBodyMounted || visualDock.sidePanel !== 'assets') {
+      setAssetsBatchLimit(0);
+      return;
+    }
+    setAssetsBatchLimit((prev) =>
+      computeProgressiveBatchCount({
+        totalCount: totalVisibleAssetItems,
+        currentCount: prev,
+        initialBatchSize: 10,
+        batchStep: 12,
+        forceAll: shouldForceMountAllAssets,
+      })
+    );
+  }, [
+    isAssetsBodyMounted,
+    visualDock.sidePanel,
+    totalVisibleAssetItems,
+    shouldForceMountAllAssets,
+    effectiveProjectId,
+    assetFilter,
+  ]);
+
+  useEffect(() => {
+    if (
+      !isAssetsBodyMounted ||
+      visualDock.sidePanel !== 'assets' ||
+      assetsBatchLimit >= totalVisibleAssetItems
+    ) {
+      return;
+    }
+    const rafId = requestAnimationFrame(() => {
+      setAssetsBatchLimit((prev) =>
+        computeProgressiveBatchCount({
+          totalCount: totalVisibleAssetItems,
+          currentCount: prev,
+          initialBatchSize: 10,
+          batchStep: 12,
+          forceAll: shouldForceMountAllAssets,
+        })
+      );
+    });
+    return () => cancelAnimationFrame(rafId);
+  }, [
+    isAssetsBodyMounted,
+    visualDock.sidePanel,
+    assetsBatchLimit,
+    totalVisibleAssetItems,
+    shouldForceMountAllAssets,
+  ]);
+
+  const batchedCharacters = useMemo(
+    () =>
+      !isAssetsBodyMounted
+        ? []
+        : filteredAssetChars.slice(0, assetsBatchLimit),
+    [isAssetsBodyMounted, filteredAssetChars, assetsBatchLimit]
+  );
+  const batchedLocations = useMemo(
+    () =>
+      !isAssetsBodyMounted
+        ? []
+        : filteredAssetLocations.slice(0, Math.max(0, assetsBatchLimit - filteredAssetChars.length)),
+    [isAssetsBodyMounted, filteredAssetLocations, assetsBatchLimit, filteredAssetChars.length]
+  );
+  const batchedProps = useMemo(
+    () =>
+      !isAssetsBodyMounted
+        ? []
+        : filteredAssetProps.slice(
+            0,
+            Math.max(0, assetsBatchLimit - filteredAssetChars.length - filteredAssetLocations.length)
+          ),
+    [
+      isAssetsBodyMounted,
+      filteredAssetProps,
+      assetsBatchLimit,
+      filteredAssetChars.length,
+      filteredAssetLocations.length,
+    ]
+  );
 
   // Keep Script expand settled state aligned with visual shell expansion & mountExpandedContent
   useEffect(() => {
@@ -5270,8 +5419,16 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
                 onScroll={handleSidePanelScroll}
                 onMouseDown={(e) => handleContainerMouseDown(e, sidePanelContentRef)}
                 style={{ overflowAnchor: 'none' }}
-                className="flex-1 overflow-y-auto p-3 space-y-2 min-h-0 relative"
+                className={`flex-1 overflow-y-auto p-3 space-y-2 min-h-0 relative transition-opacity duration-150 ease-out ${
+                  !isAssetsBodyMounted || !sidePanelScrollMemory.isPositionReady
+                    ? 'opacity-0 pointer-events-none'
+                    : 'opacity-100'
+                }`}
               >
+                {!isAssetsBodyMounted ? (
+                  <div className="w-full flex-1 h-full" />
+                ) : (
+                <>
                 {boxSelection && boxSelection.isDragging && (
                   <div
                     className="absolute pointer-events-none z-50 bg-blue-500/15 border border-blue-500/50 rounded-lg"
@@ -5309,7 +5466,7 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
                       </div>
                     ) : (
                       <div className="flex flex-col gap-1.5">
-                        {(assetFilter === 'all' || assetFilter === 'characters') && displayCharacters.map((char) => {
+                        {(assetFilter === 'all' || assetFilter === 'characters') && batchedCharacters.map((char) => {
                           const isSelected = selectedAssetIds.has(char.id);
                           const isHighlightActive = activeAssetHighlight?.id === char.id && !activeAssetHighlight?.isVersion;
                           const charTargetId = buildAssetAgentTargetId('character', char.id);
@@ -5404,7 +5561,7 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
                           );
                         })}
 
-                        {(assetFilter === 'all' || assetFilter === 'locations') && displayLocations.map((loc) => {
+                        {(assetFilter === 'all' || assetFilter === 'locations') && batchedLocations.map((loc) => {
                           const isSelected = selectedAssetIds.has(loc.id);
                           const isHighlightActive = activeAssetHighlight?.id === loc.id && !activeAssetHighlight?.isVersion;
                           const locTargetId = buildAssetAgentTargetId('location', loc.id);
@@ -5499,7 +5656,7 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
                           );
                         })}
 
-                        {(assetFilter === 'all' || assetFilter === 'props') && displayProps.map((prop) => {
+                        {(assetFilter === 'all' || assetFilter === 'props') && batchedProps.map((prop) => {
                           const isSelected = selectedAssetIds.has(prop.id);
                           const isHighlightActive = activeAssetHighlight?.id === prop.id && !activeAssetHighlight?.isVersion;
                           const propTargetId = buildAssetAgentTargetId('prop', prop.id);
@@ -5641,6 +5798,8 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
                         )}
                       </div>
                     )}
+                </>
+                )}
                   </div>
                 </div>
               )}
@@ -5656,6 +5815,7 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
               timelineCards={imageFeed.timelineCards}
               totalBoundImages={imageFeed.totalBoundImages}
               isCardsLoading={isCardsLoading}
+              isEnterAnimationSettled={isImagesPanelAnimationSettled}
               activeAssetId={activeAssetHighlight?.id ?? null}
               activeAssetIsVersion={Boolean(activeAssetHighlight?.isVersion)}
               activeCategory={activeAssetHighlight?.category ?? null}

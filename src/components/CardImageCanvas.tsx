@@ -4,9 +4,8 @@ import {
   calculateObjectCover,
 } from '../utils/imageTextureCache';
 import { getOrLoadThumbImage, thumbCache, thumbImageCache } from '../utils/thumbnail';
-import { capDprToBudget } from '../utils/devicePixelBudget';
 import { cardOutline } from '../utils/cardLodAppearance';
-import { shouldPreserveCardCanvasBackingStore } from '../utils/viewportCulling';
+import { shouldPreserveCardCanvasBackingStore, computeCardCanvasTargetDpr } from '../utils/viewportCulling';
 import { canUpgradeCardDuringGesture, CANVAS_HYBRID_POINTER_WAKE_EVENT } from '../utils/canvasPerformance';
 
 export interface CardImageCanvasProps {
@@ -21,6 +20,7 @@ export interface CardImageCanvasProps {
   dpr?: number;
   state?: string;
   isZooming?: boolean;
+  disableTransition?: boolean;
   className?: string;
   onLoaded?: () => void;
 }
@@ -47,6 +47,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
   dpr = 1,
   state,
   isZooming = false,
+  disableTransition = false,
   className = '',
   onLoaded,
 }) {
@@ -62,6 +63,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
   const fadeStartTimeRef = useRef<number | null>(null);
   const isFadingOriginalRef = useRef<boolean>(false);
   const needsRestoreRedrawRef = useRef<boolean>(false);
+  const lastDrawKeyRef = useRef<string | null>(null);
 
   // Keep latest props in refs to avoid re-binding callbacks
   const propsRef = useRef({
@@ -76,6 +78,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     dpr,
     state,
     isZooming,
+    disableTransition,
     onLoaded,
   });
   propsRef.current = {
@@ -90,6 +93,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     dpr,
     state,
     isZooming,
+    disableTransition,
     onLoaded,
   };
 
@@ -124,7 +128,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const ctx = canvas.getContext('2d', { alpha: true, desynchronized: true, willReadFrequently: false });
+    const ctx = canvas.getContext('2d', { alpha: true, desynchronized: false, willReadFrequently: false });
     if (!ctx) return;
 
     const {
@@ -139,6 +143,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
       dpr: currentDpr,
       state: cardState,
       isZooming: zooming,
+      disableTransition: noUrlTransition,
     } = propsRef.current;
 
     if (w <= 0 || h <= 0) return;
@@ -153,54 +158,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
       document.getElementById('canvas-workspace')?.getAttribute('data-panning') === 'true'
     );
     const isGestureActive = rawGestureActive && !canUpgradeCardDuringGesture(cardId);
-    const effectiveShowOriginal = showOriginal && !isGestureActive;
-
-    const screenDpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
-    const baseDpr = Math.max(screenDpr, currentDpr || screenDpr);
-
-    // Dynamic resolution allocation:
-    // - Full LOD (!effectiveShowOriginal): proxy image is ~1200px max edge. Cap buffer to match proxy's resolution so all 1200px details are preserved.
-    // - Original LOD (effectiveShowOriginal): high-res original texture, capped to reasonable DPR (max 3.0 for background, 4.0 max) for deep zoom.
-    const maxFullDpr = Math.max(screenDpr, 1200 / Math.max(w, h, 1));
-    const targetDprCap = isGestureActive ? maxFullDpr : 3.0;
-    const actualDpr = effectiveShowOriginal
-      ? capDprToBudget(Math.min(baseDpr, targetDprCap), w, h, 8_000_000)
-      : Math.min(baseDpr, maxFullDpr);
-
-    const targetPxW = Math.round(w * actualDpr);
-    const targetPxH = Math.round(h * actualDpr);
-    const isGenerating = cardState === 'generating';
-
-    if (
-      !shouldPreserveCardCanvasBackingStore(
-        canvas.width,
-        canvas.height,
-        targetPxW,
-        targetPxH,
-        effectiveShowOriginal,
-        isGenerating
-      ) &&
-      (canvas.width !== targetPxW || canvas.height !== targetPxH)
-    ) {
-      canvas.width = targetPxW;
-      canvas.height = targetPxH;
-    }
-
-    const backingScaleX = canvas.width / w;
-    const backingScaleY = canvas.height / h;
-
-    ctx.save();
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    // Coordinate space normalization (from physical pixels to CSS pixels)
-    ctx.scale(backingScaleX, backingScaleY);
-
-    // Clip strictly to card squircle path to prevent any image corner bleeding/leakage
-    ctx.save();
-    ctx.clip(cardOutline(w, h, true, true));
-
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = isGestureActive ? 'low' : 'high';
+    const effectiveShowOriginal = Boolean(showOriginal);
 
     // 1. Check loaded states for Placeholder (prefer pre-baked blur), Micro, Full, and Original
     const effectiveThumbUrl =
@@ -226,101 +184,51 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     const origImg = (effectiveShowOriginal && originalImageUrl)
       ? getOrLoadCanvasImage(originalImageUrl, scheduleDraw, 'original')
       : null;
+    const origImgReady = Boolean(effectiveShowOriginal && origImg && origImg.complete && origImg.naturalWidth > 0);
 
-    // Helper to draw an image with object-cover calculation
-    const drawCover = (img: HTMLImageElement, alpha: number = 1) => {
-      if (!img || !img.complete || img.naturalWidth === 0) return;
-      const { sx, sy, sw, sh } = calculateObjectCover(
-        img.naturalWidth,
-        img.naturalHeight,
-        w,
-        h
-      );
-      ctx.globalAlpha = alpha;
-      ctx.drawImage(img, sx, sy, sw, sh, 0, 0, w, h);
-    };
+    const screenDpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
+
+    // Dynamic resolution allocation:
+    // - Full LOD (!effectiveShowOriginal): proxy image is ~1200px max edge. Cap buffer to match proxy's resolution.
+    // - Original LOD (effectiveShowOriginal): match original image's native resolution directly (up to 4K 4096px).
+    const actualDpr = computeCardCanvasTargetDpr(
+      w,
+      h,
+      screenDpr,
+      currentDpr || screenDpr,
+      origImgReady,
+      origImgReady && origImg ? origImg.naturalWidth : 0,
+      origImgReady && origImg ? origImg.naturalHeight : 0
+    );
+
+    const targetPxW = Math.round(w * actualDpr);
+    const targetPxH = Math.round(h * actualDpr);
+    const isGenerating = cardState === 'generating';
+
+    if (
+      !shouldPreserveCardCanvasBackingStore(
+        canvas.width,
+        canvas.height,
+        targetPxW,
+        targetPxH,
+        origImgReady,
+        isGenerating,
+        rawGestureActive
+      ) &&
+      (canvas.width !== targetPxW || canvas.height !== targetPxH)
+    ) {
+      canvas.width = targetPxW;
+      canvas.height = targetPxH;
+      lastDrawKeyRef.current = null;
+    }
 
     const fullImgReady = Boolean(fullImg && fullImg.complete && fullImg.naturalWidth > 0);
     const thumbReadyImg = (placeholderImg && placeholderImg.complete && placeholderImg.naturalWidth > 0)
       ? placeholderImg
       : (cachedThumbImg && cachedThumbImg.complete && cachedThumbImg.naturalWidth > 0 ? cachedThumbImg : null);
+    const useLowSmoothing = Boolean(isGestureActive && !effectiveShowOriginal);
 
-    // Track image URL transition for seamless double-buffered image switching
-    if (imageUrl && imageUrl !== lastLoadedUrlRef.current) {
-      if (fullImgReady && fullImg) {
-        if (prevImgRef.current && prevImgRef.current.url !== imageUrl && prevImgRef.current.img) {
-          transitionRef.current = {
-            prevImg: prevImgRef.current.img,
-            fadeStart: performance.now(),
-          };
-        }
-        lastLoadedUrlRef.current = imageUrl;
-        prevImgRef.current = { url: imageUrl, img: fullImg };
-      }
-    }
-
-    // 2. Base / Underlay Rendering (Keep rendering previous image or instant thumbnail placeholder while full image loads)
-    if (!fullImgReady && !transitionRef.current && prevImgRef.current?.img) {
-      drawCover(prevImgRef.current.img, 1);
-    } else if (!fullImgReady && thumbReadyImg) {
-      drawCover(thumbReadyImg, 1);
-    }
-
-    // 3. New Image Rendering (Bottom Layer - 100% Opaque)
-    if (fullImgReady && fullImg) {
-      if (isGenerating && !imageUrl) {
-        ctx.filter = 'blur(12px) brightness(0.95)';
-        drawCover(fullImg, 1);
-        ctx.filter = 'none';
-      } else {
-        drawCover(fullImg, 1);
-      }
-      prevImgRef.current = { url: imageUrl!, img: fullImg };
-    }
-
-    // 4. Image Transition Cross-Fade (Top Layer: Previous Image fades out 1.0 -> 0.0 over 500ms)
-    if (transitionRef.current) {
-      const now = performance.now();
-      const elapsed = now - transitionRef.current.fadeStart;
-      const FADE_DURATION = 500;
-      const progress = Math.min(1, elapsed / FADE_DURATION);
-      const fadeAlpha = 1 - progress;
-
-      if (fadeAlpha > 0) {
-        drawCover(transitionRef.current.prevImg, fadeAlpha);
-        scheduleDraw();
-      } else {
-        transitionRef.current = null;
-      }
-    }
-
-    // 5. Top Tier: Render Original High-Res (Intent-Driven Lazy Restoration)
-    if (effectiveShowOriginal && origImg && origImg.complete && origImg.naturalWidth > 0) {
-      if (zooming) {
-        drawCover(origImg, 1);
-      } else {
-        const now = performance.now();
-        if (!isFadingOriginalRef.current) {
-          isFadingOriginalRef.current = true;
-          fadeStartTimeRef.current = now;
-        }
-
-        const elapsed = now - (fadeStartTimeRef.current || now);
-        const fadeDuration = 150;
-        const progress = Math.min(1, elapsed / fadeDuration);
-
-        drawCover(origImg, progress);
-
-        if (progress < 1) {
-          scheduleDraw();
-        }
-      }
-    } else {
-      isFadingOriginalRef.current = false;
-      fadeStartTimeRef.current = null;
-    }
-
-    // 5. Track first paint completeness for Zero-Flicker Handoff
+    // Track first paint completeness for Zero-Flicker Handoff
     const hasMedia = Boolean(thumbnailUrl || imageUrl || originalImageUrl);
     let isPainted = false;
 
@@ -335,38 +243,156 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
       isPainted = placeholderImgDone;
     }
 
-    if (isPainted) {
+    const ensurePaintedRegistered = () => {
+      if (!isPainted) return;
       propsRef.current.onLoaded?.();
+      if (cardId && typeof window !== 'undefined') {
+        if (!(window as any).__paintedCardIds) {
+          (window as any).__paintedCardIds = new Set<string>();
+        }
+        if (!(window as any).__paintedCardIds.has(cardId) && paintedNoticeCardRef.current !== cardId) {
+          paintedNoticeCardRef.current = cardId;
+          // A completed draw in useLayoutEffect has not necessarily reached the
+          // screen. Let the browser present it before retiring the Nano underlay.
+          paintedNoticeFrameRef.current = requestAnimationFrame(() => {
+            paintedNoticeFrameRef.current = requestAnimationFrame(() => {
+              paintedNoticeFrameRef.current = null;
+              paintedNoticeCardRef.current = null;
+              if (canvasRef.current && propsRef.current.cardId === cardId) {
+                (window as any).__paintedCardIds.add(cardId);
+                window.dispatchEvent(new CustomEvent('card-painted', { detail: { cardId } }));
+              }
+            });
+          });
+        }
+      }
+    };
+
+    // Track image URL transition for seamless double-buffered image switching
+    if (imageUrl && imageUrl !== lastLoadedUrlRef.current) {
+      if (fullImgReady && fullImg) {
+        if (!noUrlTransition && prevImgRef.current && prevImgRef.current.url !== imageUrl && prevImgRef.current.img) {
+          transitionRef.current = {
+            prevImg: prevImgRef.current.img,
+            fadeStart: performance.now(),
+          };
+        } else if (noUrlTransition) {
+          transitionRef.current = null;
+        }
+        lastLoadedUrlRef.current = imageUrl;
+        prevImgRef.current = { url: imageUrl, img: fullImg };
+      }
     }
 
+    // Skip redundant 4096x4096 canvas clear + redraw when DPR scale tier steps (e.g. 2.25 -> 3.0 -> 4.0)
+    // or hybrid pointer wake fires while the backing store resolution and rendered bitmap are unchanged.
+    const drawKey = `${canvas.width}x${canvas.height}:${w}x${h}:${effectiveThumbUrl || ''}:${imageUrl || ''}:${originalImageUrl || ''}:${effectiveShowOriginal ? 1 : 0}:${origImgReady ? 1 : 0}:${fullImgReady ? 1 : 0}:${thumbReadyImg ? 1 : 0}:${isGenerating ? 1 : 0}:${useLowSmoothing ? 1 : 0}`;
+    if (
+      drawKey === lastDrawKeyRef.current &&
+      !transitionRef.current &&
+      !isFadingOriginalRef.current
+    ) {
+      ensurePaintedRegistered();
+      needsRestoreRedrawRef.current = Boolean(
+        useLowSmoothing ||
+        !isPainted ||
+        (showOriginal && !origImgReady)
+      );
+      return;
+    }
+
+    const backingScaleX = canvas.width / w;
+    const backingScaleY = canvas.height / h;
+
+    ctx.save();
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Coordinate space normalization (from physical pixels to CSS pixels)
+    ctx.scale(backingScaleX, backingScaleY);
+
+    // Clip strictly to card squircle path to prevent any image corner bleeding/leakage
+    ctx.save();
+    ctx.clip(cardOutline(w, h, true, true));
+
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = useLowSmoothing ? 'low' : 'high';
+
+    // Helper to draw an image with object-cover calculation
+    const drawCover = (img: HTMLImageElement, alpha: number = 1) => {
+      if (!img || !img.complete || img.naturalWidth === 0) return;
+      const { sx, sy, sw, sh } = calculateObjectCover(
+        img.naturalWidth,
+        img.naturalHeight,
+        w,
+        h
+      );
+      ctx.globalAlpha = alpha;
+      ctx.drawImage(img, sx, sy, sw, sh, 0, 0, w, h);
+    };
+
+    // When the 4K original tier is ready and no URL transition is active, draw only origImg
+    // instead of rasterizing both fullImg (16.7M px) and origImg (16.7M px) across the 4K backing store.
+    if (origImgReady && origImg && !transitionRef.current) {
+      drawCover(origImg, 1);
+      if (fullImgReady && fullImg && imageUrl) {
+        prevImgRef.current = { url: imageUrl, img: fullImg };
+      }
+      isFadingOriginalRef.current = false;
+      fadeStartTimeRef.current = null;
+    } else {
+      // 2. Base / Underlay Rendering (Keep rendering previous image or instant thumbnail placeholder while full image loads)
+      if (!fullImgReady && !transitionRef.current && prevImgRef.current?.img) {
+        drawCover(prevImgRef.current.img, 1);
+      } else if (!fullImgReady && thumbReadyImg) {
+        drawCover(thumbReadyImg, 1);
+      }
+
+      // 3. New Image Rendering (Bottom Layer - 100% Opaque)
+      if (fullImgReady && fullImg) {
+        if (isGenerating && !imageUrl) {
+          ctx.filter = 'blur(12px) brightness(0.95)';
+          drawCover(fullImg, 1);
+          ctx.filter = 'none';
+        } else {
+          drawCover(fullImg, 1);
+        }
+        prevImgRef.current = { url: imageUrl!, img: fullImg };
+      }
+
+      // 4. Image Transition Cross-Fade (Top Layer: Previous Image fades out 1.0 -> 0.0 over 500ms)
+      if (transitionRef.current) {
+        const now = performance.now();
+        const elapsed = now - transitionRef.current.fadeStart;
+        const FADE_DURATION = 500;
+        const progress = Math.min(1, elapsed / FADE_DURATION);
+        const fadeAlpha = 1 - progress;
+
+        if (fadeAlpha > 0) {
+          drawCover(transitionRef.current.prevImg, fadeAlpha);
+          scheduleDraw();
+        } else {
+          transitionRef.current = null;
+        }
+      }
+
+      // 5. Top Tier: Render Original High-Res if fading during URL transition
+      if (origImgReady && origImg) {
+        drawCover(origImg, 1);
+      }
+      isFadingOriginalRef.current = false;
+      fadeStartTimeRef.current = null;
+    }
+
+    ensurePaintedRegistered();
+
+    lastDrawKeyRef.current = transitionRef.current ? null : drawKey;
     needsRestoreRedrawRef.current = Boolean(
-      isGestureActive ||
+      useLowSmoothing ||
       !isPainted ||
       transitionRef.current !== null ||
-      (showOriginal && !effectiveShowOriginal) ||
+      (showOriginal && !origImgReady) ||
       isFadingOriginalRef.current
     );
-
-    if (isPainted && cardId && typeof window !== 'undefined') {
-      if (!(window as any).__paintedCardIds) {
-        (window as any).__paintedCardIds = new Set<string>();
-      }
-      if (!(window as any).__paintedCardIds.has(cardId) && paintedNoticeCardRef.current !== cardId) {
-        paintedNoticeCardRef.current = cardId;
-        // A completed draw in useLayoutEffect has not necessarily reached the
-        // screen. Let the browser present it before retiring the Nano underlay.
-        paintedNoticeFrameRef.current = requestAnimationFrame(() => {
-          paintedNoticeFrameRef.current = requestAnimationFrame(() => {
-            paintedNoticeFrameRef.current = null;
-            paintedNoticeCardRef.current = null;
-            if (canvasRef.current && propsRef.current.cardId === cardId) {
-              (window as any).__paintedCardIds.add(cardId);
-              window.dispatchEvent(new CustomEvent('card-painted', { detail: { cardId } }));
-            }
-          });
-        });
-      }
-    }
 
     ctx.restore(); // Restore clip path
     ctx.restore();
@@ -391,11 +417,13 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
     height,
     dpr,
     state,
+    disableTransition,
   ]);
 
   // Clean up painted registration on unmount
   useEffect(() => {
     return () => {
+      lastDrawKeyRef.current = null;
       if (paintedNoticeFrameRef.current !== null) {
         cancelAnimationFrame(paintedNoticeFrameRef.current);
         paintedNoticeFrameRef.current = null;
@@ -420,7 +448,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
       ) {
         return;
       }
-      if (!needsRestoreRedrawRef.current && !propsRef.current.showOriginal) {
+      if (!needsRestoreRedrawRef.current) {
         return;
       }
       scheduleDraw();

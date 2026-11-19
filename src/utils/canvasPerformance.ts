@@ -87,6 +87,9 @@ if (typeof window !== 'undefined') {
         deferredSurfaceTimer = null;
         scheduleSurfaceFrame();
       }
+      if (surfaceJobs.size === 0 && !canLoadDuringCameraGesture()) {
+        return;
+      }
       const now = performance.now();
       if (now - lastPointerWakeMs >= 48) {
         lastPointerWakeMs = now;
@@ -106,9 +109,11 @@ export function isHybridCardNear(id: string) {
 export function canRunHybridSurface(label?: string) {
   if (loadingMode !== 'hybrid') return true;
   if (!label) return false;
-  if (label.startsWith('original:') && cameraZoomingOut) return false;
-  // Admission jobs recheck live distance in their callback so they cannot block nearer mounts.
-  if (label.startsWith('mount:')) return true;
+  // Original 4K restore jobs are already gated by evaluateOriginalImage and serialized one-at-a-time.
+  // Never block activeOriginalRestore in surfaceJobs on pointer proximity, which would deadlock originalRestoreJobs.
+  if (label.startsWith('original:')) return !cameraZoomingOut;
+  // Admission and 4K downgrade cleanup jobs manage their own lifecycle without pointer blocking.
+  if (label.startsWith('mount:') || label.startsWith('downgrade:')) return true;
   const id = label.slice(label.indexOf(':') + 1);
   return isHybridCardNear(id);
 }
@@ -238,11 +243,43 @@ function pumpOriginalRestores() {
   }, { label: `original:${job.id}` });
 }
 
+const pendingDowngrades = new Map<string, () => void>();
+
+export function cancelOriginalImageDowngrade(id: string) {
+  const cancel = pendingDowngrades.get(id);
+  if (cancel) {
+    pendingDowngrades.delete(id);
+    cancel();
+  }
+}
+
+export function scheduleOriginalImageDowngrade(
+  id: string,
+  run: () => void,
+): () => void {
+  const existing = pendingDowngrades.get(id);
+  if (existing) return existing;
+  let active = true;
+  const cancelSurface = scheduleCanvasSurface(() => {
+    pendingDowngrades.delete(id);
+    if (active) run();
+  }, { label: `downgrade:${id}` });
+  const cancel = () => {
+    if (!active) return;
+    active = false;
+    if (pendingDowngrades.get(id) === cancel) pendingDowngrades.delete(id);
+    cancelSurface();
+  };
+  pendingDowngrades.set(id, cancel);
+  return cancel;
+}
+
 export function scheduleOriginalImageRestore(
   id: string,
   priority: number,
   run: (isCancelled: () => boolean) => Promise<void>,
 ): () => void {
+  cancelOriginalImageDowngrade(id);
   originalRestoreJobs.get(id)?.cancelStart?.();
   const previous = originalRestoreJobs.get(id);
   if (previous) previous.cancelled = true;

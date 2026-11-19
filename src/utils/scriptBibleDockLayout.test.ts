@@ -9,13 +9,16 @@ import {
   buildImagesScrollStorageKey,
   buildSidePanelScrollStorageKey,
   buildWidthTransitionPlan,
+  computeProgressiveBatchCount,
   computeScriptBibleDockLayout,
   computeUncoveredCanvasFocusTransform,
   createIdleWidthTransitionPanels,
   normalizeScrollOffset,
+  PANEL_OPEN_SETTLE_DELAY_MS,
   parseScriptScrollPositionsMap,
   resolveDockOccupiedRightEdge,
   shouldForceExpandScriptOnRequestedViewChange,
+  shouldMountScriptBiblePanelBody,
   shouldPersistImagesFeedScroll,
   shouldReapplyPendingImageScroll,
 } from './scriptBibleDockLayout';
@@ -544,5 +547,79 @@ test('resolveDockOccupiedRightEdge returns rightmost dock edge and computeUncove
   assert.equal(fallbackTransform.centerScreenY, 450);
   assert.equal(200 * fallbackTransform.scale + fallbackTransform.x, 720);
   assert.equal(200 * fallbackTransform.scale + fallbackTransform.y, 450);
+});
+
+test('shouldMountScriptBiblePanelBody defers heavy body DOM until card open animation settles and loading completes', () => {
+  assert.equal(PANEL_OPEN_SETTLE_DELAY_MS.script, 210);
+  assert.equal(PANEL_OPEN_SETTLE_DELAY_MS.assets, 300);
+  assert.equal(PANEL_OPEN_SETTLE_DELAY_MS.images, 320);
+
+  // During card open animation (isOpenAnimationSettled = false) -> body stays unmounted
+  assert.equal(
+    shouldMountScriptBiblePanelBody({
+      isOpen: true,
+      isTabScript: true,
+      isOpenAnimationSettled: false,
+      isPanelExpanded: true,
+      mountExpandedContent: true,
+      isCardsLoading: false,
+    }),
+    false
+  );
+
+  // While collapsed, non-script tab, dock width transitioning, or cards loading -> unmounted
+  assert.equal(
+    shouldMountScriptBiblePanelBody({
+      isOpen: true,
+      isTabScript: true,
+      isOpenAnimationSettled: true,
+      isPanelExpanded: false,
+      mountExpandedContent: true,
+    }),
+    false
+  );
+  assert.equal(
+    shouldMountScriptBiblePanelBody({
+      isOpen: true,
+      isTabScript: true,
+      isOpenAnimationSettled: true,
+      isPanelExpanded: true,
+      mountExpandedContent: false,
+    }),
+    false
+  );
+  assert.equal(
+    shouldMountScriptBiblePanelBody({
+      isOpen: true,
+      isTabScript: true,
+      isOpenAnimationSettled: true,
+      isPanelExpanded: true,
+      mountExpandedContent: true,
+      isCardsLoading: true,
+    }),
+    false
+  );
+
+  // Settled + expanded + ready -> mounts inner body cleanly
+  assert.equal(
+    shouldMountScriptBiblePanelBody({
+      isOpen: true,
+      isTabScript: true,
+      isOpenAnimationSettled: true,
+      isPanelExpanded: true,
+      mountExpandedContent: true,
+      isCardsLoading: false,
+    }),
+    true
+  );
+});
+
+test('computeProgressiveBatchCount steps smoothly across frames and bypasses batching when forceAll is true', () => {
+  assert.equal(computeProgressiveBatchCount({ totalCount: 0, currentCount: 0 }), 0);
+  assert.equal(computeProgressiveBatchCount({ totalCount: 25, currentCount: 0, initialBatchSize: 6, batchStep: 8 }), 6);
+  assert.equal(computeProgressiveBatchCount({ totalCount: 25, currentCount: 6, initialBatchSize: 6, batchStep: 8 }), 14);
+  assert.equal(computeProgressiveBatchCount({ totalCount: 25, currentCount: 14, initialBatchSize: 6, batchStep: 8 }), 22);
+  assert.equal(computeProgressiveBatchCount({ totalCount: 25, currentCount: 22, initialBatchSize: 6, batchStep: 8 }), 25);
+  assert.equal(computeProgressiveBatchCount({ totalCount: 40, currentCount: 0, forceAll: true }), 40);
 });
 

@@ -82,3 +82,60 @@ export function getReferencePreviewLayout(prompt: string | undefined, dimensions
     ? Math.min(280, Math.max(80, Math.round(448 * dimensions.height / dimensions.width))) : 200;
   return { promptHeight, previewHeight, height: Math.max(promptHeight, previewHeight), expands: previewHeight > promptHeight };
 }
+
+export interface CardMediaPresence {
+  imageUrl?: string | null;
+  originalImageUrl?: string | null;
+  trueOriginalImageUrl?: string | null;
+  thumbnailUrl?: string | null;
+  fileData?: unknown;
+  originalFileData?: unknown;
+  trueOriginalFileData?: unknown;
+  isVideo?: boolean;
+}
+
+export function hasCardMedia(card: CardMediaPresence | undefined | null): boolean {
+  if (!card) return false;
+  return Boolean(
+    card.imageUrl ||
+    card.originalImageUrl ||
+    card.trueOriginalImageUrl ||
+    card.thumbnailUrl ||
+    card.fileData ||
+    card.originalFileData ||
+    card.trueOriginalFileData ||
+    card.isVideo
+  );
+}
+
+export interface PromptPanelVisibilityInput {
+  isAssetCard: boolean;
+  isSelected?: boolean;
+  selectedCount?: number;
+  hasMedia?: boolean;
+  state?: string;
+  hasError?: boolean;
+  isAgentTarget?: boolean;
+  isEditingOrInteractive?: boolean;
+  isPickerTarget?: boolean;
+}
+
+/**
+ * Pure visibility policy for the generation card bottom prompt panel:
+ * - Asset cards never display a prompt panel.
+ * - Completed media cards hide the prompt panel by default for a clean canvas.
+ * - Displays on demand when single-selected (never on multi-select), blank draft,
+ *   actively generating, failed with error, agent-targeted, picker-targeted, or actively editing.
+ */
+export function shouldShowGenerationPromptPanel(input: PromptPanelVisibilityInput): boolean {
+  if (input.isAssetCard) return false;
+  const isSingleSelected = Boolean(
+    input.isSelected && (input.selectedCount === undefined || input.selectedCount === 1)
+  );
+  if (isSingleSelected) return true;
+  if (!input.hasMedia) return true;
+  if (input.state === 'generating' || Boolean(input.hasError)) return true;
+  if (Boolean(input.isAgentTarget) || Boolean(input.isPickerTarget)) return true;
+  if (Boolean(input.isEditingOrInteractive)) return true;
+  return false;
+}

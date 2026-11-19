@@ -723,3 +723,48 @@ export function computeUncoveredCanvasFocusTransform(
   };
 }
 
+/**
+ * Matches outer Framer Motion open durations for the 3 Script Bible dock cards so heavy inner
+ * content (CodeMirror, Asset rows/thumbnails, and AssetImageFeed cards/images) mounts
+ * asynchronously after each card finishes gliding in.
+ */
+export const PANEL_OPEN_SETTLE_DELAY_MS = {
+  script: 210,
+  assets: 300,
+  images: 320,
+} as const;
+
+export function shouldMountScriptBiblePanelBody(params: {
+  isOpen: boolean;
+  isTabScript: boolean;
+  isOpenAnimationSettled: boolean;
+  isPanelExpanded: boolean;
+  mountExpandedContent?: boolean;
+  isCardsLoading?: boolean;
+}): boolean {
+  if (!params.isOpen || !params.isTabScript) return false;
+  if (!params.isOpenAnimationSettled) return false;
+  if (!params.isPanelExpanded) return false;
+  if (params.mountExpandedContent === false) return false;
+  if (params.isCardsLoading) return false;
+  return true;
+}
+
+export function computeProgressiveBatchCount(params: {
+  totalCount: number;
+  currentCount: number;
+  initialBatchSize?: number;
+  batchStep?: number;
+  forceAll?: boolean;
+}): number {
+  const total = Math.max(0, Math.floor(params.totalCount || 0));
+  if (total === 0) return 0;
+  if (params.forceAll) return total;
+  const current = Math.max(0, Math.floor(params.currentCount || 0));
+  const initial = Math.max(1, Math.floor(params.initialBatchSize ?? 6));
+  const step = Math.max(1, Math.floor(params.batchStep ?? 8));
+  if (current <= 0) {
+    return Math.min(total, initial);
+  }
+  return Math.min(total, current + step);
+}

@@ -21,6 +21,8 @@ import {
   User,
 } from 'lucide-react';
 import {
+  computeProgressiveBatchCount,
+  normalizeScrollOffset,
   WIDTH_TRANSITION_TIMINGS,
   type DockPanelLayout,
   type PanelWidthTransitionMeta,
@@ -93,6 +95,7 @@ export interface AssetImageFeedPanelProps {
   verifyingOrGeneratingAssetIds?: string[];
   widthTransition?: PanelWidthTransitionMeta;
   isCardsLoading?: boolean;
+  isEnterAnimationSettled?: boolean;
   agentFocusedTargetId?: string | null;
   agentFocusedTargetIds?: string[];
 }
@@ -207,6 +210,7 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
   verifyingOrGeneratingAssetIds = [],
   widthTransition,
   isCardsLoading = false,
+  isEnterAnimationSettled = true,
   agentFocusedTargetId = null,
   agentFocusedTargetIds = [],
 }: AssetImageFeedPanelProps) {
@@ -320,6 +324,8 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
     Boolean(widthTransition && widthTransition.opacity < 1);
   const isExpandedContentMounted =
     layout.expanded && widthTransition?.mountExpandedContent !== false;
+  const isFeedBodyMounted =
+    isExpandedContentMounted && isEnterAnimationSettled && !isCardsLoading;
   const imagesContentVersion = `${sections.length}:${timelineCards.length}:${totalBoundImages}:${isWideMode ? 'wide' : 'std'}`;
 
   const {
@@ -338,7 +344,7 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
       }
     },
     getScrollElement: () => scrollContainerRef.current,
-    isActiveAndVisible: isExpandedContentMounted && !widthTransition?.hidden,
+    isActiveAndVisible: isFeedBodyMounted && !widthTransition?.hidden,
     isTransitioning: isImagesTransitioning,
     isFilteredView: onlyShowActiveAsset,
     contentVersion: imagesContentVersion,
@@ -560,15 +566,80 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
     });
   }, [timelineCards, onlyShowActiveAsset, activeAssetId, activeCategory]);
 
+  const activeFeedTotalCount =
+    viewMode === 'sections' ? displayedSections.length : displayedTimelineCards.length;
+  const shouldForceMountAllFeedItems =
+    onlyShowActiveAsset ||
+    Boolean(focusFeedAssetKey) ||
+    (typeof window !== 'undefined' &&
+      normalizeScrollOffset(readScrollOffsetFromStorage(window.localStorage, scrollSpec)) > 0);
+  const [feedBatchLimit, setFeedBatchLimit] = useState<number>(0);
+
+  useEffect(() => {
+    if (!isFeedBodyMounted) {
+      setFeedBatchLimit(0);
+      return;
+    }
+    setFeedBatchLimit((prev) =>
+      computeProgressiveBatchCount({
+        totalCount: activeFeedTotalCount,
+        currentCount: prev,
+        initialBatchSize: 6,
+        batchStep: 8,
+        forceAll: shouldForceMountAllFeedItems,
+      })
+    );
+  }, [isFeedBodyMounted, activeFeedTotalCount, shouldForceMountAllFeedItems, projectId, viewMode]);
+
+  useEffect(() => {
+    if (!isFeedBodyMounted || feedBatchLimit >= activeFeedTotalCount) {
+      return;
+    }
+    const rafId = requestAnimationFrame(() => {
+      setFeedBatchLimit((prev) =>
+        computeProgressiveBatchCount({
+          totalCount: activeFeedTotalCount,
+          currentCount: prev,
+          initialBatchSize: 6,
+          batchStep: 8,
+          forceAll: shouldForceMountAllFeedItems,
+        })
+      );
+    });
+    return () => cancelAnimationFrame(rafId);
+  }, [isFeedBodyMounted, feedBatchLimit, activeFeedTotalCount, shouldForceMountAllFeedItems]);
+
+  const batchedSections = useMemo(
+    () =>
+      !isFeedBodyMounted
+        ? []
+        : displayedSections.length <= feedBatchLimit
+          ? displayedSections
+          : displayedSections.slice(0, feedBatchLimit),
+    [isFeedBodyMounted, displayedSections, feedBatchLimit]
+  );
+
+  const batchedTimelineCards = useMemo(
+    () =>
+      !isFeedBodyMounted
+        ? []
+        : displayedTimelineCards.length <= feedBatchLimit
+          ? displayedTimelineCards
+          : displayedTimelineCards.slice(0, feedBatchLimit),
+    [isFeedBodyMounted, displayedTimelineCards, feedBatchLimit]
+  );
+
   const requiredInitialUrls = useMemo(
     () =>
-      collectInitialFeedImageUrls({
-        viewMode,
-        sections: displayedSections,
-        timelineCards: displayedTimelineCards,
-        maxCount: 12,
-      }),
-    [viewMode, displayedSections, displayedTimelineCards]
+      !isFeedBodyMounted
+        ? []
+        : collectInitialFeedImageUrls({
+            viewMode,
+            sections: batchedSections,
+            timelineCards: batchedTimelineCards,
+            maxCount: 6,
+          }),
+    [isFeedBodyMounted, viewMode, batchedSections, batchedTimelineCards]
   );
 
   const allInitialImagesSettled = useMemo(
@@ -576,28 +647,28 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
     [requiredInitialUrls, imageLoadStateByUrl]
   );
 
-  // Reset initial feed reveal gate when project changes or project cards start reloading from IndexedDB
+  // Reset initial feed reveal gate when project changes, panel closes/animates in, or project cards reload
   useEffect(() => {
-    if (isCardsLoading || !isExpandedContentMounted) {
+    if (!isFeedBodyMounted) {
       setIsFeedRevealed(false);
       setInitialBatchTimedOut(false);
     }
-  }, [isCardsLoading, isExpandedContentMounted, projectId]);
+  }, [isFeedBodyMounted, projectId]);
 
   // Safety fallback timer so slow/external images never keep the panel hidden indefinitely
   useEffect(() => {
-    if (isCardsLoading || !isExpandedContentMounted || isFeedRevealed || allInitialImagesSettled) {
+    if (!isFeedBodyMounted || isFeedRevealed || allInitialImagesSettled) {
       return;
     }
     const timer = window.setTimeout(() => {
       setInitialBatchTimedOut(true);
     }, 360);
     return () => window.clearTimeout(timer);
-  }, [isCardsLoading, isExpandedContentMounted, isFeedRevealed, allInitialImagesSettled]);
+  }, [isFeedBodyMounted, isFeedRevealed, allInitialImagesSettled]);
 
-  // Smooth rAF reveal identical to widthTransition Phase 3 once cards + initial images are ready
+  // Smooth rAF reveal identical to widthTransition Phase 3 once card open settles + initial images are ready
   useEffect(() => {
-    if (isCardsLoading || !isExpandedContentMounted) {
+    if (!isFeedBodyMounted) {
       return;
     }
     if (!isFeedRevealed && (allInitialImagesSettled || initialBatchTimedOut)) {
@@ -606,7 +677,7 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
       });
       return () => cancelAnimationFrame(rafId);
     }
-  }, [isCardsLoading, isExpandedContentMounted, isFeedRevealed, allInitialImagesSettled, initialBatchTimedOut]);
+  }, [isFeedBodyMounted, isFeedRevealed, allInitialImagesSettled, initialBatchTimedOut]);
 
   const sectionLookup = useMemo(() => {
     const map = new Map<string, AssetImageFeedSection>();
@@ -656,6 +727,7 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
       agentTargetId?: string;
       isDragTarget?: boolean;
       isGeneratingForSection?: boolean;
+      isEager?: boolean;
     } = {}
   ) => {
     const {
@@ -666,6 +738,7 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
       agentTargetId,
       isDragTarget = false,
       isGeneratingForSection = false,
+      isEager = false,
     } = options;
 
     const meta = CATEGORY_META[section.category];
@@ -817,7 +890,7 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
               width={img.nativeWidth}
               height={img.nativeHeight}
               style={img.aspectRatio ? { aspectRatio: img.aspectRatio } : undefined}
-              loading="eager"
+              loading={isEager ? 'eager' : 'lazy'}
               decoding="async"
               referrerPolicy="no-referrer"
               onLoad={(e) => {
@@ -1311,15 +1384,10 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
       ) : !isExpandedContentMounted ? null : (
         <div
           style={{
-            opacity: !isFeedRevealed || isCardsLoading ? 0 : widthTransition ? widthTransition.opacity : 1,
-            visibility:
-              !isFeedRevealed || isCardsLoading || widthTransition?.hidden
-                ? 'hidden'
-                : 'visible',
+            opacity: widthTransition ? widthTransition.opacity : 1,
+            visibility: widthTransition?.hidden ? 'hidden' : 'visible',
             pointerEvents:
-              !isFeedRevealed ||
-              isCardsLoading ||
-              (widthTransition && (widthTransition.opacity < 1 || widthTransition.hidden))
+              widthTransition && (widthTransition.opacity < 1 || widthTransition.hidden)
                 ? 'none'
                 : undefined,
             transition:
@@ -1442,9 +1510,13 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
             onScroll={handleFeedScroll}
             data-agent-target="images.feed.scroll"
             style={{ overflowAnchor: 'none' }}
-            className="flex-1 overflow-y-auto p-3 pb-24 min-h-0"
+            className={`flex-1 overflow-y-auto p-3 pb-24 min-h-0 transition-opacity duration-150 ease-out ${
+              !isFeedBodyMounted || !isFeedRevealed ? 'opacity-0 pointer-events-none' : 'opacity-100'
+            }`}
           >
-            {viewMode === 'sections' ? (
+            {!isFeedBodyMounted ? (
+              <div className="w-full flex-1 h-full" />
+            ) : viewMode === 'sections' ? (
               displayedSections.length === 0 ? (
                 <div className="py-12 px-4 flex flex-col items-center justify-center text-center">
                   <div className="w-16 h-12 rounded-2xl bg-gray-200/70 dark:bg-neutral-800 flex items-center justify-center mb-3">
@@ -1459,7 +1531,7 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
                 </div>
               ) : (
                 <div className="flex flex-col gap-3">
-                  {displayedSections.map((section) => {
+                  {batchedSections.map((section, sectionIndex) => {
                     const meta = CATEGORY_META[section.category];
                     const categoryMatches = !activeCategory || activeCategory === section.category;
                     const isSectionActive =
@@ -1527,6 +1599,7 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
                         agentTargetId: sectionTargetId,
                         isDragTarget,
                         isGeneratingForSection,
+                        isEager: sectionIndex < 6,
                       });
                     }
 
@@ -1645,13 +1718,14 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
                         </div>
 
                         <div className="flex flex-col gap-2.5">
-                          {section.images.map((img) =>
+                          {section.images.map((img, imgIndex) =>
                             renderImageTile(section, img, {
                               isStandaloneSingle: false,
                               showSectionTitle: false,
                               isAgentFocused: Boolean(
                                 img.cardId && focusedTargetList.includes(img.cardId)
                               ),
+                              isEager: sectionIndex < 4 && imgIndex < 2,
                             })
                           )}
                           {isGeneratingForSection && (
@@ -1682,7 +1756,7 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
               </div>
             ) : (
               <div className="flex flex-col gap-3">
-                {displayedTimelineCards.map((entry) => {
+                {batchedTimelineCards.map((entry, entryIndex) => {
                   const sec = sectionLookup.get(`${entry.category}:${entry.assetId}`) || {
                     key: `${entry.category}:${entry.assetId}`,
                     assetId: entry.assetId,
@@ -1716,6 +1790,7 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
                     isActive: timelineActive,
                     isAgentFocused: timelineAgentFocused,
                     agentTargetId: timelineSectionTargetId,
+                    isEager: entryIndex < 6,
                   });
                 })}
               </div>

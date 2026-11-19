@@ -503,6 +503,49 @@ export function getOrLoadThumbImage(
 }
 
 /**
+ * Preload and decode a thumbnail HTMLImageElement into thumbImageCache.
+ */
+export async function preloadThumbImage(
+  url: string | null | undefined,
+  timeoutMs: number = 450
+): Promise<HTMLImageElement | null> {
+  if (!url) return null;
+  const waitForDecode = async (img: HTMLImageElement | null) => {
+    if (!img) return null;
+    if (typeof img.decode === 'function') {
+      await Promise.race([
+        img.decode().catch(() => {}),
+        new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+      ]);
+    }
+    return img;
+  };
+
+  const immediate = getOrLoadThumbImage(url);
+  if (immediate) {
+    return waitForDecode(immediate);
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (img: HTMLImageElement | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      void waitForDecode(img).then(resolve);
+    };
+    const timer = setTimeout(() => {
+      finish(thumbImageCache.get(url) || null);
+    }, timeoutMs);
+
+    const loaded = getOrLoadThumbImage(url, () => finish(thumbImageCache.get(url) || null));
+    if (loaded) {
+      finish(loaded);
+    }
+  });
+}
+
+/**
  * Universal media thumbnail getter/creator.
  * Checks memory cache -> existing thumbnailUrl -> generates from media source -> caches result.
  */

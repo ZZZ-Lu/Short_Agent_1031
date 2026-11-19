@@ -2,10 +2,10 @@
  * Fast binary header parser to retrieve image dimensions in < 1ms
  * without decoding the full bitmap.
  */
-export async function fastGetImageDimensions(file: File): Promise<{ width: number; height: number }> {
+export async function fastGetImageDimensions(file: Blob): Promise<{ width: number; height: number }> {
   try {
-    // Read first 128KB which contains the headers of 99.9% of images
-    const slice = file.slice(0, 131072);
+    // Read first 1MB which contains the headers of even metadata-heavy 4K/8K images
+    const slice = file.slice(0, 1048576);
     const buffer = await slice.arrayBuffer();
     const view = new DataView(buffer);
     const bytes = new Uint8Array(buffer);
@@ -99,11 +99,11 @@ export async function fastGetImageDimensions(file: File): Promise<{ width: numbe
     console.warn('Fast header parse failed, falling back:', err);
   }
 
-  // 5. Fast fallback using createImageBitmap with 60ms timeout to avoid drop-time stalls
+  // 5. Fast fallback using createImageBitmap with 250ms timeout for large 4K/8K images
   if (typeof createImageBitmap === 'function') {
     try {
       const bmpPromise = createImageBitmap(file);
-      const timeoutPromise = new Promise<null>((r) => setTimeout(() => r(null), 60));
+      const timeoutPromise = new Promise<null>((r) => setTimeout(() => r(null), 250));
       const bmp = await Promise.race([bmpPromise, timeoutPromise]);
       if (bmp) {
         const { width, height } = bmp;

@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react';
 import type { MotionValue } from 'motion/react';
 import { getCappedDpr } from '../utils/devicePixelBudget';
-import { computeGridDisplaySpacing } from '../utils/viewportCulling';
+import { computeGridPatternSpec, DEFAULT_GRID_DOT_RADIUS_CSS } from '../utils/viewportCulling';
 
 /** A repeating texture keeps the number of draw calls constant at every zoom. */
 export function CanvasGridBackground({ tx, ty, scale }: {
@@ -16,12 +16,13 @@ export function CanvasGridBackground({ tx, ty, scale }: {
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     const tile = document.createElement('canvas');
-    tile.width = tile.height = 128;
+    tile.width = tile.height = 64;
     const tileCtx = tile.getContext('2d');
     if (!ctx || !tileCtx) return;
     let pattern: CanvasPattern | null = null;
     let raf: number | null = null;
     let lastRadius = -1;
+    let lastTileSize = -1;
 
     const draw = () => {
       raf = null;
@@ -43,21 +44,35 @@ export function CanvasGridBackground({ tx, ty, scale }: {
         canvas.height = pixelHeight;
       }
       const rawScale = scale.get();
-      const spacing = computeGridDisplaySpacing(rawScale, 48, 16);
-      const tileRadius = Math.max(2, Math.min(24, Math.round(((2 * 128) / spacing) * 2) / 2));
-      if (!pattern || tileRadius !== lastRadius) {
-        tileCtx.clearRect(0, 0, 128, 128);
-        tileCtx.fillStyle = '#a1a1aa';
+      const { spacing, tileSize, dotRadiusTile } = computeGridPatternSpec(
+        rawScale,
+        dpr,
+        48,
+        DEFAULT_GRID_DOT_RADIUS_CSS,
+        isGestureActive
+      );
+      const radiusTolerance = isGestureActive ? 0.08 : 0.03;
+      if (!pattern || tileSize !== lastTileSize || Math.abs(dotRadiusTile - lastRadius) > radiusTolerance) {
+        if (tile.width !== tileSize || tile.height !== tileSize) {
+          tile.width = tileSize;
+          tile.height = tileSize;
+        } else {
+          tileCtx.clearRect(0, 0, tileSize, tileSize);
+        }
+        const center = tileSize / 2;
+        tileCtx.fillStyle = '#8b8b95';
         tileCtx.beginPath();
-        tileCtx.arc(64, 64, tileRadius, 0, Math.PI * 2);
+        tileCtx.arc(center, center, dotRadiusTile, 0, Math.PI * 2);
         tileCtx.fill();
         pattern = ctx.createPattern(tile, 'repeat');
-        lastRadius = tileRadius;
+        lastTileSize = tileSize;
+        lastRadius = dotRadiusTile;
       }
       if (!pattern) return;
       const offsetX = ((tx.get() % spacing) + spacing) % spacing;
       const offsetY = ((ty.get() % spacing) + spacing) % spacing;
-      pattern.setTransform(new DOMMatrix([spacing / 128, 0, 0, spacing / 128, offsetX, offsetY]));
+      const tileScale = spacing / tileSize;
+      pattern.setTransform(new DOMMatrix([tileScale, 0, 0, tileScale, offsetX, offsetY]));
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, width, height);
       ctx.fillStyle = pattern;

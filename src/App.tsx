@@ -18,9 +18,9 @@ import { NanoLodCanvas } from './components/NanoLodCanvas';
 import { FpsCounter, showToastNotice } from './components/FpsCounter';
 import { generateImageThumbnail, generateVideoThumbnail, generateNativeVideoPoster, getOrCreateMediaThumbnail, thumbCache, MAX_THUMBNAIL_EDGE } from './utils/thumbnail';
 import { fastGetImageDimensions } from './utils/imageHeader';
-import { resizeImageOffThread } from './utils/imageResize';
+import { resizeImageOffThread, resizeImageWithMetaOffThread } from './utils/imageResize';
 import { yieldToMain } from './utils/yieldToMain';
-import { getOrLoadCanvasImage } from './utils/imageTextureCache';
+import { getOrLoadCanvasImage, evictOriginalImageCache } from './utils/imageTextureCache';
 import { getCardWorldBounds, isCardIntersectingRectangle, getLodMountQuota, getLodUnmountQuota, UNMOUNT_TARGET_DURATION_MS, pickZoomOutUnmountBatch, getNanoLodThreshold, CARD_DENSITY_HIGH_THRESHOLD, HIGH_RENDER_WEIGHT_THRESHOLD, calculateTotalRenderWeight, FRAME_BUDGET_MS } from './utils/viewportCulling';
 import { getHybridPointer, setHybridProximityProvider, isHybridCardNear, CANVAS_IDLE_MS, scheduleCanvasSurface, canLoadDuringCameraGesture, subscribeCanvasLoadingMode, getCanvasLoadingMode, CANVAS_HYBRID_POINTER_WAKE_EVENT, setCameraZoomingOut, isCameraZoomingOut, setCameraTweenZooming } from './utils/canvasPerformance';
 import { isCanvasOverlayControlTarget, shouldPassThroughCanvasCardMiddleButton } from './utils/canvasPointerPassThrough';
@@ -28,7 +28,7 @@ import { readyPromptPanels } from './utils/promptSurfaceCache';
 import { createCardMountStore, ProgressiveGenerationCard } from './components/ProgressiveGenerationCard';
 import { canRetireDomForNano, type LodFrame } from './utils/lodHandoff';
 import { buildCardQuadTree, QuadTree, BoundingBox } from './utils/quadTree';
-import { getBottomPanelHeight } from './utils/cardLayout';
+import { hasCardMedia, shouldShowGenerationPromptPanel } from './utils/cardLayout';
 import { createSquareLetterboxImage, createVerticalWidescreenSlices, unpadLandmarks } from './utils/squareImageLetterbox';
 import { cropBoundingBoxFromImage } from './utils/imageCropper';
 import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X, MousePointerClick, Video, ArrowUp, ChevronDown, ChevronUp, RotateCcw, Star, ImagePlus } from 'lucide-react';
@@ -236,50 +236,78 @@ const getVideoDimensions = (url: string): Promise<MediaDimensions> => {
   });
 };
 
-const compressAndResizeImage = async (file: File, maxDim = 1200, quality = 0.85): Promise<Blob> => {
+const compressAndResizeImageWithMeta = async (
+  file: Blob,
+  maxDim = 1200,
+  quality = 0.85,
+  generate4kIfOver = false
+): Promise<{ blob: Blob; blob4k?: Blob; width: number; height: number }> => {
   try {
-    return await resizeImageOffThread(file, maxDim, quality);
+    return await resizeImageWithMetaOffThread(file, maxDim, quality, generate4kIfOver);
   } catch {
     // Keep support for browsers without OffscreenCanvas and recover from worker failures.
+    // Use URL.createObjectURL instead of FileReader.readAsDataURL so >4K files never fail Base64 limits.
     return new Promise((resolve) => {
-    const reader = new FileReader();
-    reader.onload = (e) => {
+      const objectUrl = URL.createObjectURL(file);
       const img = new Image();
-      img.onload = () => {
-        let width = img.naturalWidth;
-        let height = img.naturalHeight;
-        
-        if (width > maxDim || height > maxDim) {
-          if (width > height) {
-            height = Math.round((height * maxDim) / width);
-            width = maxDim;
-          } else {
-            width = Math.round((width * maxDim) / height);
-            height = maxDim;
+      img.onload = async () => {
+        try {
+          const origW = img.naturalWidth;
+          const origH = img.naturalHeight;
+          const mimeType =
+            file.type === 'image/png' || file.type === 'image/webp'
+              ? 'image/webp'
+              : 'image/jpeg';
+
+          const renderScaled = (targetMax: number, q: number): Promise<Blob> =>
+            new Promise((resBlob) => {
+              let width = origW;
+              let height = origH;
+              if (width > targetMax || height > targetMax) {
+                if (width > height) {
+                  height = Math.round((height * targetMax) / width);
+                  width = targetMax;
+                } else {
+                  width = Math.round((width * targetMax) / height);
+                  height = targetMax;
+                }
+              }
+              const canvas = document.createElement('canvas');
+              canvas.width = width;
+              canvas.height = height;
+              const ctx = canvas.getContext('2d');
+              if (ctx) {
+                ctx.imageSmoothingEnabled = true;
+                ctx.imageSmoothingQuality = 'high';
+                ctx.drawImage(img, 0, 0, width, height);
+                canvas.toBlob((b) => resBlob(b || file), mimeType, q);
+              } else {
+                resBlob(file);
+              }
+            });
+
+          const blob = await renderScaled(maxDim, quality);
+          let blob4k: Blob | undefined;
+          if (generate4kIfOver && (origW > 4096 || origH > 4096)) {
+            blob4k = await renderScaled(4096, 0.9);
           }
-        }
-        
-        const canvas = document.createElement('canvas');
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.drawImage(img, 0, 0, width, height);
-          const mimeType = file.type === 'image/png' ? 'image/png' : 'image/jpeg';
-          canvas.toBlob((blob) => {
-            resolve(blob || file);
-          }, mimeType, quality);
-        } else {
-          resolve(file);
+          resolve({ blob, blob4k, width: origW, height: origH });
+        } finally {
+          URL.revokeObjectURL(objectUrl);
         }
       };
-      img.onerror = () => resolve(file);
-      img.src = e.target?.result as string;
-    };
-    reader.onerror = () => resolve(file);
-    reader.readAsDataURL(file);
+      img.onerror = () => {
+        URL.revokeObjectURL(objectUrl);
+        resolve({ blob: file, width: 0, height: 0 });
+      };
+      img.src = objectUrl;
     });
   }
+};
+
+const compressAndResizeImage = async (file: Blob, maxDim = 1200, quality = 0.85): Promise<Blob> => {
+  const res = await compressAndResizeImageWithMeta(file, maxDim, quality, false);
+  return res.blob;
 };
 
 const blobToDataUrl = (blob: Blob): Promise<string> => new Promise((resolve, reject) => {
@@ -3093,16 +3121,24 @@ export default function App() {
       let trueOriginalFileData: Blob | undefined;
       let originalImageUrl: string | undefined;
       let trueOriginalImageUrl: string | undefined;
+      let realWidth = width;
+      let realHeight = height;
 
       if (isImage) {
         try {
-          processedFile = await compressAndResizeImage(file, 1200);
+          const resized1200 = await compressAndResizeImageWithMeta(file, 1200, 0.85, true);
+          processedFile = resized1200.blob;
+          if (resized1200.width > 0 && resized1200.height > 0) {
+            realWidth = resized1200.width;
+            realHeight = resized1200.height;
+          }
           const maxTextureDim = 4096;
-          if (width > maxTextureDim || height > maxTextureDim) {
+          if (realWidth > maxTextureDim || realHeight > maxTextureDim) {
             trueOriginalFileData = file;
             trueOriginalImageUrl = fileUrl;
-            originalFileData = await compressAndResizeImage(file, maxTextureDim, 0.9);
-            originalImageUrl = URL.createObjectURL(originalFileData);
+            const proxy4k = resized1200.blob4k || (await compressAndResizeImage(file, maxTextureDim, 0.9));
+            originalFileData = proxy4k;
+            originalImageUrl = URL.createObjectURL(proxy4k);
           } else {
             originalFileData = file;
             originalImageUrl = fileUrl;
@@ -3112,7 +3148,7 @@ export default function App() {
           processedFile = file;
           originalFileData = file;
           originalImageUrl = fileUrl;
-          if (width > 4096 || height > 4096) {
+          if (realWidth > 4096 || realHeight > 4096) {
             trueOriginalFileData = file;
             trueOriginalImageUrl = fileUrl;
           }
@@ -3159,6 +3195,8 @@ export default function App() {
           setCards(prev => prev.map(existing => existing.id === card.id ? {
             ...existing, imageUrl: closeupThumbnailUrl, thumbnailUrl,
             fileData: processedFile,
+            nativeWidth: realWidth,
+            nativeHeight: realHeight,
           } : existing), false);
           await yieldToMain();
           await yieldToMain();
@@ -3188,12 +3226,17 @@ export default function App() {
         fullDetailThumbnailUrl,
         closeupThumbnailUrl,
         videoPosterUrl,
+        nativeWidth: realWidth,
+        nativeHeight: realHeight,
       };
 
       // Decode the full proxy into the same canvas image cache before exposing it to React.
       // Its first canvas draw then happens while the card is still held and marked importing.
-      await warmCanvasImage(processedFileUrl);
-      if (originalImageUrl && tScale.get() > 2 && originalImageUrl !== processedFileUrl) {
+      const warmTargetUrl = isVideo ? (videoPosterUrl || closeupThumbnailUrl) : processedFileUrl;
+      if (warmTargetUrl) {
+        await warmCanvasImage(warmTargetUrl);
+      }
+      if (!isVideo && originalImageUrl && tScale.get() >= 2 && originalImageUrl !== processedFileUrl) {
         await warmCanvasImage(originalImageUrl, 'original');
       }
       await yieldToMain();
@@ -3664,6 +3707,62 @@ export default function App() {
           } else {
             setTimeout(scheduleInitialThumbnails, 1000);
           }
+
+          // Background-migrate any historical >4K image cards whose originalFileData is still >4096px
+          // so zooming >=200% always renders the 4096px 4K proxy instead of the raw >4K file.
+          const migrateHistoricalOver4kCards = async () => {
+            for (const card of processedSaved) {
+              if (!mounted) return;
+              if (card.isVideo) continue;
+              const candidateBlob =
+                card.originalFileData instanceof Blob
+                  ? card.originalFileData
+                  : card.fileData instanceof Blob
+                    ? card.fileData
+                    : null;
+              if (!candidateBlob) continue;
+              const dims = await fastGetImageDimensions(candidateBlob);
+              if (!dims || (dims.width <= 4096 && dims.height <= 4096)) continue;
+              try {
+                const blob4k = await compressAndResizeImage(candidateBlob, 4096, 0.9);
+                if (!mounted || blob4k === candidateBlob) continue;
+                const url4k = URL.createObjectURL(blob4k);
+                const rawTrueBlob =
+                  card.trueOriginalFileData instanceof Blob
+                    ? card.trueOriginalFileData
+                    : candidateBlob;
+                const rawTrueUrl =
+                  card.trueOriginalImageUrl ||
+                  card.originalImageUrl ||
+                  URL.createObjectURL(rawTrueBlob);
+                if (card.originalImageUrl) {
+                  evictOriginalImageCache(card.originalImageUrl);
+                }
+                setCards(
+                  prev =>
+                    prev.map(c =>
+                      c.id === card.id
+                        ? {
+                            ...c,
+                            trueOriginalFileData: rawTrueBlob,
+                            trueOriginalImageUrl: rawTrueUrl,
+                            originalFileData: blob4k,
+                            originalImageUrl: url4k,
+                            nativeWidth: c.nativeWidth || dims.width,
+                            nativeHeight: c.nativeHeight || dims.height,
+                          }
+                        : c
+                    ),
+                  false
+                );
+              } catch (err) {
+                console.warn('[App] Failed to migrate >4K card to 4K proxy:', err);
+              }
+            }
+          };
+          setTimeout(() => {
+            void migrateHistoricalOver4kCards();
+          }, 300);
         } else {
           // If this is the default project, check if legacy un-scoped cards exist first
           let fallbackCards: CardData[] | null = null;
@@ -3927,7 +4026,7 @@ export default function App() {
         ...c,
         ...(baselineConfig ? { baselineConfig } : {}),
         ...((('imageUrl' in updates && updates.imageUrl !== c.imageUrl) ||
-          ('fileData' in updates && updates.fileData !== c.fileData)) ? { videoPosterUrl: undefined } : {}),
+          ('fileData' in updates && Boolean(c.fileData) && updates.fileData !== c.fileData)) ? { videoPosterUrl: undefined } : {}),
         ...updates
       };
     }), shouldPush);
@@ -8526,17 +8625,11 @@ export default function App() {
        minX = -1000; minY = -1000; maxX = 1000; maxY = 1000;
     } else {
        cardsRef.current.forEach(c => {
-         const dim = getCardSize(c);
-         const isGenerationCard = !c.fileName && !c.isAsset;
-         const panelH = isGenerationCard ? getBottomPanelHeight(c.prompt, c.referenceImages?.length) + 12 : 0;
-         const panelW = 480;
-         const effectiveLeft = Math.min(c.x, isGenerationCard ? c.x + (dim.width - panelW) / 2 : c.x);
-         const effectiveRight = Math.max(c.x + dim.width, isGenerationCard ? c.x + (dim.width + panelW) / 2 : c.x + dim.width);
-
-         if (effectiveLeft < minX) minX = effectiveLeft;
-         if (c.y < minY) minY = c.y;
-         if (effectiveRight > maxX) maxX = effectiveRight;
-         if (c.y + dim.height + panelH > maxY) maxY = c.y + dim.height + panelH;
+         const bounds = getCardWorldBounds(c);
+         if (bounds.minX < minX) minX = bounds.minX;
+         if (bounds.minY < minY) minY = bounds.minY;
+         if (bounds.maxX > maxX) maxX = bounds.maxX;
+         if (bounds.maxY > maxY) maxY = bounds.maxY;
        });
     }
     
@@ -9475,6 +9568,8 @@ export default function App() {
   const visibleCardsRef = useRef<CardData[]>([]);
   const agentFocusRef = useRef(agentFocus);
   agentFocusRef.current = agentFocus;
+  const agentQuickInputRef = useRef(agentQuickInput);
+  agentQuickInputRef.current = agentQuickInput;
 
   const abortMountQueue = useCallback(() => {
     mountQueueAbortRef.current.aborted = true;
@@ -9698,7 +9793,24 @@ export default function App() {
                 return;
               }
               const imageReady = Boolean((window as any).__paintedCardIds?.has(card.id));
-              const panelReady = Boolean(card.fileName || card.isAsset || readyPromptPanels.has(card.id));
+              const selIds = selectedCardIdsRef.current;
+              const isPickerActive = Boolean(pickerSessionRef.current || assetBindPickerSessionRef.current);
+              const quickInput = agentQuickInputRef.current;
+              const isAgentTargetForCard = Boolean(
+                agentFocusRef.current.focusedMap[card.id] ||
+                (quickInput?.isOpen && (quickInput.targetIds?.includes(card.id) || quickInput.targetId === card.id))
+              );
+              const expectsPanel = shouldShowGenerationPromptPanel({
+                isAssetCard: Boolean(card.fileName || card.isAsset),
+                isSelected: !isPickerActive && selIds.length === 1 && selIds[0] === card.id,
+                selectedCount: !isPickerActive ? selIds.length : 0,
+                hasMedia: hasCardMedia(card),
+                state: card.state,
+                hasError: Boolean(card.generationError),
+                isAgentTarget: isAgentTargetForCard,
+                isPickerTarget: pickerSessionRef.current?.targetCardId === card.id,
+              });
+              const panelReady = !expectsPanel || readyPromptPanels.has(card.id);
               if (imageReady && panelReady) finish();
             };
             window.addEventListener('card-painted', check);
@@ -10143,6 +10255,7 @@ export default function App() {
               isPickerAlreadyBound={isPickerAlreadyBound}
               onStartCanvasPicker={handleStartCanvasPicker}
               isSelected={selectedCardIds.includes(card.id) && !pickerSession && !assetBindPickerSession}
+              isSingleSelected={selectedCardIds.length === 1 && selectedCardIds[0] === card.id && !pickerSession && !assetBindPickerSession}
               isAgentTarget={isAgentTarget}
               agentFocusRole={agentFocusRole}
               agentInspectScenario={agentInspectScenario}

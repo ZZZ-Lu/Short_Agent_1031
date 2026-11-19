@@ -17,8 +17,34 @@ export const originalImageCache = new Map<string, HTMLImageElement>();
 // LRU tracking for original high-resolution images
 const originalLruQueue: string[] = [];
 
+// Track 4K-capped original textures without touching element.dataset
+const capped4kImages = new WeakSet<HTMLImageElement>();
+const cappingInProgressImages = new WeakSet<HTMLImageElement>();
+const cappedBlobUrls = new WeakMap<HTMLImageElement, string>();
+
 // Map from URL -> Set of callbacks to trigger when loaded
 const pendingCallbacks = new Map<string, Set<() => void>>();
+
+/**
+ * Evict a specific URL from the original high-res texture cache (e.g. when replaced by a migrated 4K proxy).
+ */
+export function evictOriginalImageCache(url: string | null | undefined) {
+  if (!url) return;
+  const img = originalImageCache.get(url);
+  if (img) {
+    const cappedUrl = cappedBlobUrls.get(img);
+    if (cappedUrl) {
+      URL.revokeObjectURL(cappedUrl);
+      cappedBlobUrls.delete(img);
+    }
+    img.src = '';
+    originalImageCache.delete(url);
+  }
+  const idx = originalLruQueue.indexOf(url);
+  if (idx !== -1) {
+    originalLruQueue.splice(idx, 1);
+  }
+}
 
 /**
  * Get or asynchronously load an image for Canvas rendering.
@@ -35,7 +61,12 @@ export function getOrLoadCanvasImage(
   const existing = targetMap.get(url);
 
   if (existing) {
-    if (existing.complete && existing.naturalWidth > 0) {
+    const isWithinTierCap =
+      tier !== 'original' ||
+      (!cappingInProgressImages.has(existing) &&
+        ((existing.naturalWidth <= 4096 && existing.naturalHeight <= 4096) ||
+          capped4kImages.has(existing)));
+    if (existing.complete && existing.naturalWidth > 0 && isWithinTierCap) {
       if (tier === 'original') {
         touchOriginalLru(url);
       }
@@ -64,7 +95,7 @@ export function getOrLoadCanvasImage(
     pendingCallbacks.get(url)!.add(onLoaded);
   }
 
-  img.onload = () => {
+  const flushCallbacks = () => {
     const callbacks = pendingCallbacks.get(url);
     if (callbacks) {
       callbacks.forEach(cb => {
@@ -77,7 +108,61 @@ export function getOrLoadCanvasImage(
       pendingCallbacks.delete(url);
     }
   };
+
+  img.onload = () => {
+    if (
+      tier === 'original' &&
+      (img.naturalWidth > 4096 || img.naturalHeight > 4096) &&
+      !capped4kImages.has(img) &&
+      !cappingInProgressImages.has(img) &&
+      typeof document !== 'undefined'
+    ) {
+      cappingInProgressImages.add(img);
+      try {
+        const maxDim = 4096;
+        const scale = Math.min(maxDim / img.naturalWidth, maxDim / img.naturalHeight);
+        const targetW = Math.max(1, Math.round(img.naturalWidth * scale));
+        const targetH = Math.max(1, Math.round(img.naturalHeight * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = targetW;
+        canvas.height = targetH;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'high';
+          ctx.drawImage(img, 0, 0, targetW, targetH);
+          canvas.toBlob(
+            (blob) => {
+              cappingInProgressImages.delete(img);
+              capped4kImages.add(img);
+              if (blob) {
+                const prevCappedUrl = cappedBlobUrls.get(img);
+                if (prevCappedUrl) {
+                  URL.revokeObjectURL(prevCappedUrl);
+                }
+                const cappedUrl = URL.createObjectURL(blob);
+                cappedBlobUrls.set(img, cappedUrl);
+                img.src = cappedUrl;
+              } else {
+                flushCallbacks();
+              }
+            },
+            'image/jpeg',
+            0.9
+          );
+          return;
+        }
+      } catch (capErr) {
+        cappingInProgressImages.delete(img);
+        capped4kImages.add(img);
+        console.warn('[imageTextureCache] Failed to cap >4K image to 4096px:', capErr);
+      }
+    }
+    cappingInProgressImages.delete(img);
+    flushCallbacks();
+  };
   img.onerror = () => {
+    cappingInProgressImages.delete(img);
     if (img.crossOrigin === 'anonymous') {
       console.warn(`[imageTextureCache] CORS load failed for ${tier} image (likely blocked by hosting CDN). Retrying without crossOrigin: ${url}`);
       img.removeAttribute('crossOrigin');
@@ -110,6 +195,57 @@ export function getOrLoadCanvasImage(
 }
 
 /**
+ * Preload and decode a canvas texture image into fullImageCache / originalImageCache.
+ * Resolves cleanly even on timeout or decode errors so callers never hang.
+ */
+export async function preloadCanvasImage(
+  url: string | null | undefined,
+  tier: 'full' | 'original' = 'full',
+  timeoutMs: number = 450
+): Promise<HTMLImageElement | null> {
+  if (!url) return null;
+  const targetMap = tier === 'original' ? originalImageCache : fullImageCache;
+
+  const waitForDecode = async (img: HTMLImageElement | null) => {
+    if (!img) return null;
+    if (typeof img.decode === 'function') {
+      await Promise.race([
+        img.decode().catch(() => {}),
+        new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+      ]);
+    }
+    return img;
+  };
+
+  const immediate = getOrLoadCanvasImage(url, undefined, tier);
+  if (immediate) {
+    return waitForDecode(immediate);
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (img: HTMLImageElement | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      void waitForDecode(img).then(resolve);
+    };
+    const timer = setTimeout(() => {
+      finish(targetMap.get(url) || null);
+    }, timeoutMs);
+
+    const loaded = getOrLoadCanvasImage(
+      url,
+      () => finish(targetMap.get(url) || null),
+      tier
+    );
+    if (loaded) {
+      finish(loaded);
+    }
+  });
+}
+
+/**
  * Update LRU queue for original high-res image cache
  */
 function touchOriginalLru(url: string) {
@@ -129,6 +265,11 @@ function enforceOriginalLruLimit() {
     if (oldestUrl) {
       const img = originalImageCache.get(oldestUrl);
       if (img) {
+        const cappedUrl = cappedBlobUrls.get(img);
+        if (cappedUrl) {
+          URL.revokeObjectURL(cappedUrl);
+          cappedBlobUrls.delete(img);
+        }
         img.src = ''; // Release browser image decoding buffer
       }
       originalImageCache.delete(oldestUrl);
