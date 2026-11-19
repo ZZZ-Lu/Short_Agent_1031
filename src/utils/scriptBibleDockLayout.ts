@@ -252,7 +252,7 @@ export type DockPanelKey = 'script' | 'assets' | 'images';
 
 export type WidthTransitionPhase = 'idle' | 'fade-out' | 'resizing' | 'reveal';
 
-export type DockPanelAction = 'none' | 'resize' | 'expand' | 'collapse';
+export type DockPanelAction = 'none' | 'resize' | 'move' | 'move-mini' | 'expand' | 'collapse';
 
 export interface DockVisualState {
   isScriptExpanded: boolean;
@@ -265,6 +265,10 @@ export interface PanelWidthTransitionMeta {
   frozenWidth: number | null;
   opacity: number;
   hidden: boolean;
+  /** True while an expanded moving/resizing panel suspends its inner subtree via content-visibility: hidden */
+  suspendSubtree: boolean;
+  /** True while the outer shell is actively gliding so expensive clip masks / containment degrade cleanly */
+  isGliding: boolean;
   fadeDurationMs: number;
   mountExpandedContent: boolean;
   miniOpacity: number;
@@ -273,11 +277,21 @@ export interface PanelWidthTransitionMeta {
 
 export type DockWidthTransitionPanels = Record<DockPanelKey, PanelWidthTransitionMeta>;
 
+/**
+ * Trade-time-for-framerate ("用时间换帧数") choreography timings:
+ * 1. Fade out affected content cleanly (110ms)
+ * 2. Hide/unmount/suspend subtrees and pause ~3 frames (50ms) BEFORE shells move so React/GC/compositor settle
+ * 3. Glide completely empty lightweight shells via GPU translate3d + width/height (280ms)
+ * 4. Post-glide safety buffer (45ms) so shells have 100% landed before any panel reveals
+ * 5. Reveal affected panels one-by-one with generous stagger (90ms) and smooth compositor fade-in (160ms)
+ */
 export const WIDTH_TRANSITION_TIMINGS = {
-  fadeOutMs: 95,
-  shellResizeMs: 260,
-  revealStaggerMs: 55,
-  fadeInMs: 140,
+  fadeOutMs: 110,
+  preGlidePauseMs: 50,
+  shellResizeMs: 280,
+  postGlideBufferMs: 45,
+  revealStaggerMs: 90,
+  fadeInMs: 160,
 } as const;
 
 export function createIdleWidthTransitionPanels(): DockWidthTransitionPanels {
@@ -286,6 +300,8 @@ export function createIdleWidthTransitionPanels(): DockWidthTransitionPanels {
       frozenWidth: null,
       opacity: 1,
       hidden: false,
+      suspendSubtree: false,
+      isGliding: false,
       fadeDurationMs: 0,
       mountExpandedContent: true,
       miniOpacity: 1,
@@ -295,6 +311,8 @@ export function createIdleWidthTransitionPanels(): DockWidthTransitionPanels {
       frozenWidth: null,
       opacity: 1,
       hidden: false,
+      suspendSubtree: false,
+      isGliding: false,
       fadeDurationMs: 0,
       mountExpandedContent: true,
       miniOpacity: 1,
@@ -304,6 +322,8 @@ export function createIdleWidthTransitionPanels(): DockWidthTransitionPanels {
       frozenWidth: null,
       opacity: 1,
       hidden: false,
+      suspendSubtree: false,
+      isGliding: false,
       fadeDurationMs: 0,
       mountExpandedContent: true,
       miniOpacity: 1,
@@ -326,8 +346,8 @@ export interface DockTransitionPlan extends WidthTransitionPlan {
 const PANEL_ORDER: DockPanelKey[] = ['images', 'assets', 'script'];
 
 /**
- * Classifies every panel transition across expand, collapse, and width-change operations so
- * inner DOM freezes/unmounts cleanly before outer shell resizing ("用时间换帧数").
+ * Classifies every panel transition across expand, collapse, width-change, and position-shift
+ * operations so inner DOM hides cleanly before outer shells glide ("用时间换帧数").
  */
 export function buildDockTransitionPlan(params: {
   prevLayout: ScriptBibleDockLayout;
@@ -370,6 +390,16 @@ export function buildDockTransitionPlan(params: {
       affectedPanels[key] = true;
       frozenWidths[key] = prev.width;
       revealOrder.push(key);
+    } else if (prev.expanded && next.expanded && prev.left !== next.left) {
+      actions[key] = 'move';
+      affectedPanels[key] = true;
+      frozenWidths[key] = null;
+      revealOrder.push(key);
+    } else if (!prev.expanded && !next.expanded && prev.left !== next.left) {
+      actions[key] = 'move-mini';
+      affectedPanels[key] = true;
+      frozenWidths[key] = null;
+      revealOrder.push(key);
     }
   }
 
@@ -383,7 +413,7 @@ export function buildDockTransitionPlan(params: {
 }
 
 /**
- * Backward-compatible alias for width-only transition planning (and full expand/collapse/resize).
+ * Backward-compatible alias for width-only transition planning (and full expand/collapse/resize/move).
  */
 export function buildWidthTransitionPlan(params: {
   prevLayout: ScriptBibleDockLayout;
@@ -402,21 +432,25 @@ export function buildDockTransitionPhase1(plan: DockTransitionPlan): DockWidthTr
   const next = createIdleWidthTransitionPanels();
   for (const key of PANEL_ORDER) {
     const action = plan.actions[key];
-    if (action === 'expand') {
+    if (action === 'expand' || action === 'move-mini') {
       next[key] = {
         frozenWidth: null,
         opacity: 1,
         hidden: false,
+        suspendSubtree: false,
+        isGliding: false,
         fadeDurationMs: WIDTH_TRANSITION_TIMINGS.fadeOutMs,
         mountExpandedContent: false,
         miniOpacity: 0,
         miniHidden: false,
       };
-    } else if (action === 'collapse' || action === 'resize') {
+    } else if (action === 'collapse' || action === 'resize' || action === 'move') {
       next[key] = {
         frozenWidth: plan.frozenWidths[key],
         opacity: 0,
         hidden: false,
+        suspendSubtree: false,
+        isGliding: false,
         fadeDurationMs: WIDTH_TRANSITION_TIMINGS.fadeOutMs,
         mountExpandedContent: true,
         miniOpacity: 1,
@@ -440,27 +474,33 @@ export function buildDockTransitionPhase2(
         frozenWidth: null,
         opacity: 0,
         hidden: true,
+        suspendSubtree: false,
+        isGliding: true,
         fadeDurationMs: 0,
         mountExpandedContent: false,
         miniOpacity: 0,
         miniHidden: true,
       };
-    } else if (action === 'collapse') {
+    } else if (action === 'collapse' || action === 'move-mini') {
       next[key] = {
         ...prev[key],
         frozenWidth: null,
         opacity: 0,
         hidden: true,
+        suspendSubtree: false,
+        isGliding: true,
         fadeDurationMs: 0,
         mountExpandedContent: false,
         miniOpacity: 0,
         miniHidden: true,
       };
-    } else if (action === 'resize') {
+    } else if (action === 'resize' || action === 'move') {
       next[key] = {
         ...prev[key],
         opacity: 0,
         hidden: true,
+        suspendSubtree: true,
+        isGliding: true,
         fadeDurationMs: 0,
         mountExpandedContent: true,
       };
@@ -474,13 +514,15 @@ export function buildDockTransitionPhase3Prepare(
   key: DockPanelKey,
   action: DockPanelAction
 ): DockWidthTransitionPanels {
-  if (action === 'expand' || action === 'resize') {
+  if (action === 'expand' || action === 'resize' || action === 'move') {
     return {
       ...prev,
       [key]: {
         frozenWidth: null,
         opacity: 0,
         hidden: false,
+        suspendSubtree: false,
+        isGliding: false,
         fadeDurationMs: 0,
         mountExpandedContent: true,
         miniOpacity: 1,
@@ -488,13 +530,15 @@ export function buildDockTransitionPhase3Prepare(
       },
     };
   }
-  if (action === 'collapse') {
+  if (action === 'collapse' || action === 'move-mini') {
     return {
       ...prev,
       [key]: {
         frozenWidth: null,
         opacity: 1,
         hidden: false,
+        suspendSubtree: false,
+        isGliding: false,
         fadeDurationMs: 0,
         mountExpandedContent: false,
         miniOpacity: 0,
@@ -510,7 +554,7 @@ export function buildDockTransitionPhase3Reveal(
   key: DockPanelKey,
   action: DockPanelAction
 ): DockWidthTransitionPanels {
-  if (action === 'expand' || action === 'resize') {
+  if (action === 'expand' || action === 'resize' || action === 'move') {
     return {
       ...prev,
       [key]: {
@@ -518,16 +562,19 @@ export function buildDockTransitionPhase3Reveal(
         frozenWidth: null,
         opacity: 1,
         hidden: false,
+        suspendSubtree: false,
+        isGliding: false,
         fadeDurationMs: WIDTH_TRANSITION_TIMINGS.fadeInMs,
         mountExpandedContent: true,
       },
     };
   }
-  if (action === 'collapse') {
+  if (action === 'collapse' || action === 'move-mini') {
     return {
       ...prev,
       [key]: {
         ...prev[key],
+        isGliding: false,
         miniOpacity: 1,
         miniHidden: false,
         fadeDurationMs: WIDTH_TRANSITION_TIMINGS.fadeInMs,

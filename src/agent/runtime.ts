@@ -12,6 +12,7 @@ export interface RuntimeEvent {
   type: 'user' | 'thought' | 'tool' | 'answer' | 'system';
   text: string;
   speak?: string;
+  hasFullAnswer?: boolean;
   toolName?: string;
   callId?: string;
   status?: RuntimeToolStatus;
@@ -354,8 +355,16 @@ export class AgentRuntime {
         safeNarration.forEach(text => this.addEvent(task, { turnId, type: 'thought', text }));
         const fullAnswer = result.response || result.speak || result.fullAnswer;
         const shortSpeak = result.speak && result.speak.trim() ? result.speak.trim() : undefined;
+        const hasFullAnswer =
+          typeof result.hasFullAnswer === 'boolean'
+            ? result.hasFullAnswer
+            : Boolean(
+                result.response &&
+                  result.response.trim() &&
+                  (!shortSpeak || result.response.trim() !== shortSpeak)
+              );
         if (fullAnswer) {
-          this.addEvent(task, { turnId, type: 'answer', text: fullAnswer, speak: shortSpeak });
+          this.addEvent(task, { turnId, type: 'answer', text: fullAnswer, speak: shortSpeak, hasFullAnswer });
         }
 
         // Sync cognitive state fields if returned in the turn result
@@ -860,7 +869,11 @@ export class AgentRuntime {
         e =>
           e.type === 'tool' &&
           e.status === 'succeeded' &&
-          (e.toolName === 'asset.create' || e.toolName === 'asset.update' || e.toolName === 'asset.commitProvenance' || e.toolName === 'asset.delete')
+          (e.toolName === 'asset.create' ||
+            e.toolName === 'asset.update' ||
+            e.toolName === 'asset.commitProvenance' ||
+            e.toolName === 'asset.delete' ||
+            e.toolName === 'script.editDirectory')
       );
       const hasCompletedPlanStep = Array.isArray(task.plan) && task.plan.some(p => p && p.status === 'completed');
       const loadedTools = Array.isArray(task.context?.tools) ? task.context.tools : [];

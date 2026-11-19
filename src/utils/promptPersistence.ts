@@ -83,7 +83,9 @@ export function isObsoletePromptText(text: string): boolean {
     text.includes('则保持为 pending",') ||
     text.includes('仅在调用 sys.endTask 结案汇报、调用 user.ask 向用户提问或无需调工具直接回复时，同时输出“- 对用户说的话（简版）”与“- 对用户说的话（完整版）”') ||
     text.includes('当前子步骤处于“已读取待写入落盘”还是“已写入落盘完成”状态？') ||
-    text.includes('[ ] 3. 全局验收结案')
+    text.includes('[ ] 3. 全局验收结案') ||
+    text.includes('## 0. 意图识别与分流（每次收到新消息时最先判定）') ||
+    text.includes('## 前置环节：意图识别（每次收到新消息或尚未进入明确任务时最先执行）')
   );
 }
 

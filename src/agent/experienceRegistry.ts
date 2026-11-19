@@ -115,6 +115,26 @@ export const AGENT_EXPERIENCE_PLAYBOOKS: AgentExperiencePlaybook[] = [
         '返回全局计划与验收阶段后，基于已核实的视觉比对结论调用 sys.endTask，在【用户沟通】中向用户输出清晰完整的相符性核验报告。',
     },
   },
+  {
+    id: 'script_directory_editing',
+    title: '剧本目录条目编辑与结构调整经验',
+    taskTypes: ['编辑目录', '重命名场次', '新增场次', '删除场次', '拆分场次', '合并场次', '调整目录顺序'],
+    keywords: [
+      '目录', '重命名', '改名', '新增场次', '添加场次', '新增分集', '删除场次', '删掉场次',
+      '拆分场次', '合并场次', '调整顺序', '移动场次', '场次号', '分集标题', 'directory', 'editDirectory',
+    ],
+    summary: '适用于对剧本分集或场次目录条目执行重命名、新增、删除、拆分、合并或移动顺序，并同步更新剧本正文对应标题行。',
+    steps: {
+      gatherInfo:
+        '展开 ["script"] 分类，先装载并调用 script.directory 获取目标集/场的唯一 ID（id）与当前标题；若涉及按段落拆分场次（split），同步调用 script.read 读取目标场次的段落序号（index）。',
+      makePlan:
+        '根据探查到的唯一 ID 列出清晰的编辑计划（若用户仅要求删除目录条目但未说明是否删除正文，优先使用安全默认 deleteMode="header_only" 或在存在歧义时通过 user.ask 确认；多处相邻或批量修改可整理为一次 operations 数组调用）。',
+      execute:
+        '装载 ["script.editDirectory"]（如需读取段落再拆场则同时装载 "script.read"），传入唯一 targetId 与符合目录识别格式的标题执行落盘；工具返回成功及最新 affectedEpisodes 即为已生效真值，无需回查 script.directory。',
+      verify:
+        '核对 script.editDirectory 返回的 changes 与最新总集数/总场次数无误后，返回全局计划阶段调用 sys.endTask 向用户简明汇报改动明细。',
+    },
+  },
 ];
 
 export interface ExperienceSearchResult {

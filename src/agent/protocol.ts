@@ -4,6 +4,7 @@ export type AgentToolName =
   | 'sys.selectContext'
   | 'experience.search'
   | 'script.directory'
+  | 'script.editDirectory'
   | 'script.read'
   | 'script.search'
   | 'asset.list'
@@ -41,8 +42,8 @@ export const TOOL_CATEGORIES: Record<string, ToolCategoryMeta> = {
   script: {
     id: 'script',
     name: '剧本数据工具箱',
-    description: '后台直接读取剧本元数据(readMetadata)、完整目录(readDirectory)、分集正文(readEpisode)及全文快速检索(search)',
-    toolIds: ['script.readMetadata', 'script.readDirectory', 'script.readEpisode', 'script.search'],
+    description: '后台直接读取剧本元数据(readMetadata)、完整目录(directory)、编辑目录条目(editDirectory)、分集正文(read)及全文快速检索(search)',
+    toolIds: ['script.directory', 'script.editDirectory', 'script.read', 'script.search', 'script.readMetadata', 'script.readDirectory', 'script.readEpisode'],
   },
   asset: {
     id: 'asset',
@@ -81,6 +82,7 @@ export interface AgentTurnResult {
   narration: string[];
   speak?: string;
   fullAnswer?: string;
+  hasFullAnswer?: boolean;
   taskTitle?: string;
   goal?: string;
   subGoal?: string;

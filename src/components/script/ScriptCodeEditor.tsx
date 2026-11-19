@@ -32,6 +32,7 @@ export interface ScriptCodeEditorRef {
   resolveScrollTopForAnchor: (anchor: ScriptScrollAnchor) => number;
   focus: () => void;
   getSelection: () => { start: number; end: number };
+  getSelectionRect: () => { left: number; right: number; top: number; bottom: number } | null;
   setSelection: (start: number, end: number) => void;
   getEditorView: () => EditorView | null;
 }
@@ -133,6 +134,14 @@ const createDecorationRanges = (
           className = isActive
             ? 'cm-search-highlight-active'
             : 'cm-search-highlight';
+          break;
+        case 'annotation':
+          className = isActive
+            ? 'cm-annotation-highlight-active'
+            : 'cm-annotation-highlight';
+          break;
+        case 'agent-selection':
+          className = 'cm-agent-selection-highlight';
           break;
         default:
           className = isActive
@@ -295,6 +304,41 @@ export const ScriptCodeEditor = forwardRef<ScriptCodeEditorRef, ScriptCodeEditor
           const main = viewRef.current.state.selection.main;
           return { start: main.from, end: main.to };
         },
+        getSelectionRect: () => {
+          const view = viewRef.current;
+          if (!view) return null;
+          const main = view.state.selection.main;
+          if (main.empty) return null;
+
+          // Prefer DOM selection bounding rect when inside this editor (captures exact multi-line box)
+          if (typeof window !== 'undefined') {
+            const sel = window.getSelection();
+            if (sel && !sel.isCollapsed && sel.rangeCount > 0) {
+              const range = sel.getRangeAt(0);
+              if (view.dom.contains(range.commonAncestorContainer)) {
+                const domRect = range.getBoundingClientRect();
+                if (domRect.width > 0 || domRect.height > 0) {
+                  return {
+                    left: domRect.left,
+                    right: domRect.right,
+                    top: domRect.top,
+                    bottom: domRect.bottom,
+                  };
+                }
+              }
+            }
+          }
+
+          // Fallback to CodeMirror coordinate projection
+          const startCoords = view.coordsAtPos(main.from);
+          const endCoords = view.coordsAtPos(main.to);
+          if (!startCoords && !endCoords) return null;
+          const left = Math.min(startCoords?.left ?? endCoords!.left, endCoords?.left ?? startCoords!.left);
+          const right = Math.max(startCoords?.right ?? endCoords!.right, endCoords?.right ?? startCoords!.right);
+          const top = Math.min(startCoords?.top ?? endCoords!.top, endCoords?.top ?? startCoords!.top);
+          const bottom = Math.max(startCoords?.bottom ?? endCoords!.bottom, endCoords?.bottom ?? startCoords!.bottom);
+          return { left, right, top, bottom };
+        },
         setSelection: (start, end) => {
           const view = viewRef.current;
           if (!view) return;
@@ -341,7 +385,7 @@ export const ScriptCodeEditor = forwardRef<ScriptCodeEditorRef, ScriptCodeEditor
           caretColor: '#3b82f6',
         },
         '.cm-line': {
-          padding: '0',
+          padding: '0 3px',
           fontWeight: '500',
         },
         '&.cm-focused .cm-cursor': {
@@ -357,67 +401,95 @@ export const ScriptCodeEditor = forwardRef<ScriptCodeEditorRef, ScriptCodeEditor
         // Provenance annotations: clean, non-conflicting, comfortable highlight
         '.cm-provenance-highlight': {
           backgroundColor: 'rgba(59, 130, 246, 0.20)',
-          borderRadius: '3px',
-          boxShadow: '0 0 0 1.5px rgba(59, 130, 246, 0.35)',
+          border: '1px solid rgba(59, 130, 246, 0.38)',
+          borderRadius: '4px',
+          padding: '0.5px 2px',
+          boxDecorationBreak: 'clone',
+          WebkitBoxDecorationBreak: 'clone',
           color: 'inherit !important',
-          transition: 'background-color 150ms ease, box-shadow 150ms ease',
+          transition: 'background-color 150ms ease, border-color 150ms ease',
         },
         '.cm-provenance-highlight-active': {
           backgroundColor: 'rgba(59, 130, 246, 0.30)',
-          borderRadius: '3px',
-          boxShadow: '0 0 0 1.5px rgba(59, 130, 246, 0.65)',
+          border: '1.5px solid rgba(59, 130, 246, 0.68)',
+          borderRadius: '4px',
+          padding: '0.5px 2px',
+          boxDecorationBreak: 'clone',
+          WebkitBoxDecorationBreak: 'clone',
           fontWeight: '600',
           color: 'inherit !important',
-          transition: 'background-color 150ms ease, box-shadow 150ms ease',
+          transition: 'background-color 150ms ease, border-color 150ms ease',
         },
         // Asset types annotations (Character, Location, Prop)
         '.cm-character-highlight': {
           backgroundColor: 'rgba(168, 85, 247, 0.18)',
-          borderRadius: '3px',
-          boxShadow: '0 0 0 1.5px rgba(168, 85, 247, 0.35)',
+          border: '1px solid rgba(168, 85, 247, 0.38)',
+          borderRadius: '4px',
+          padding: '0.5px 2px',
+          boxDecorationBreak: 'clone',
+          WebkitBoxDecorationBreak: 'clone',
           color: 'inherit !important',
         },
         '.cm-character-highlight-active': {
           backgroundColor: 'rgba(168, 85, 247, 0.34)',
-          borderRadius: '3px',
-          boxShadow: '0 0 0 2px rgba(168, 85, 247, 0.75)',
+          border: '1.5px solid rgba(168, 85, 247, 0.75)',
+          borderRadius: '4px',
+          padding: '0.5px 2px',
+          boxDecorationBreak: 'clone',
+          WebkitBoxDecorationBreak: 'clone',
           fontWeight: '600',
           color: 'inherit !important',
         },
         '.cm-location-highlight': {
           backgroundColor: 'rgba(16, 185, 129, 0.18)',
-          borderRadius: '3px',
-          boxShadow: '0 0 0 1.5px rgba(16, 185, 129, 0.35)',
+          border: '1px solid rgba(16, 185, 129, 0.38)',
+          borderRadius: '4px',
+          padding: '0.5px 2px',
+          boxDecorationBreak: 'clone',
+          WebkitBoxDecorationBreak: 'clone',
           color: 'inherit !important',
         },
         '.cm-location-highlight-active': {
           backgroundColor: 'rgba(16, 185, 129, 0.34)',
-          borderRadius: '3px',
-          boxShadow: '0 0 0 2px rgba(16, 185, 129, 0.75)',
+          border: '1.5px solid rgba(16, 185, 129, 0.75)',
+          borderRadius: '4px',
+          padding: '0.5px 2px',
+          boxDecorationBreak: 'clone',
+          WebkitBoxDecorationBreak: 'clone',
           fontWeight: '600',
           color: 'inherit !important',
         },
         '.cm-prop-highlight': {
           backgroundColor: 'rgba(245, 158, 11, 0.18)',
-          borderRadius: '3px',
-          boxShadow: '0 0 0 1.5px rgba(245, 158, 11, 0.35)',
+          border: '1px solid rgba(245, 158, 11, 0.38)',
+          borderRadius: '4px',
+          padding: '0.5px 2px',
+          boxDecorationBreak: 'clone',
+          WebkitBoxDecorationBreak: 'clone',
           color: 'inherit !important',
         },
         '.cm-prop-highlight-active': {
           backgroundColor: 'rgba(245, 158, 11, 0.34)',
-          borderRadius: '3px',
-          boxShadow: '0 0 0 2px rgba(245, 158, 11, 0.75)',
+          border: '1.5px solid rgba(245, 158, 11, 0.75)',
+          borderRadius: '4px',
+          padding: '0.5px 2px',
+          boxDecorationBreak: 'clone',
+          WebkitBoxDecorationBreak: 'clone',
           fontWeight: '600',
           color: 'inherit !important',
         },
         '.cm-search-highlight': {
           backgroundColor: 'rgba(234, 179, 8, 0.25)',
-          borderRadius: '2px',
+          borderRadius: '3px',
+          boxDecorationBreak: 'clone',
+          WebkitBoxDecorationBreak: 'clone',
         },
         '.cm-search-highlight-active': {
           backgroundColor: 'rgba(234, 179, 8, 0.45)',
-          borderRadius: '2px',
-          boxShadow: '0 0 0 1.5px rgba(234, 179, 8, 0.8)',
+          border: '1.5px solid rgba(234, 179, 8, 0.8)',
+          borderRadius: '3px',
+          boxDecorationBreak: 'clone',
+          WebkitBoxDecorationBreak: 'clone',
           fontWeight: '600',
         },
         // Inline squircle badge widget styling
@@ -464,6 +536,57 @@ export const ScriptCodeEditor = forwardRef<ScriptCodeEditorRef, ScriptCodeEditor
           backgroundColor: 'rgba(245, 158, 11, 0.22)',
           color: '#f59e0b',
           border: '1px solid rgba(245, 158, 11, 0.4)',
+        },
+        // User script annotations: warm yellow highlight with per-line cloned rounded borders
+        '.cm-annotation-highlight': {
+          backgroundColor: 'rgba(250, 204, 21, 0.26)',
+          border: '1px solid rgba(234, 179, 8, 0.62)',
+          borderRadius: '4px',
+          padding: '0.5px 2px',
+          boxDecorationBreak: 'clone',
+          WebkitBoxDecorationBreak: 'clone',
+          color: 'inherit !important',
+          transition: 'background-color 150ms ease, border-color 150ms ease',
+        },
+        '.cm-annotation-highlight-active': {
+          backgroundColor: 'rgba(250, 204, 21, 0.42)',
+          border: '1.5px solid rgba(202, 138, 4, 0.88)',
+          borderRadius: '4px',
+          padding: '0.5px 2px',
+          boxDecorationBreak: 'clone',
+          WebkitBoxDecorationBreak: 'clone',
+          fontWeight: '600',
+          color: 'inherit !important',
+          transition: 'background-color 150ms ease, border-color 150ms ease',
+        },
+        '.cm-badge-annotation': {
+          backgroundColor: 'rgba(254, 240, 138, 0.88)',
+          color: '#a16207',
+          border: '1px solid rgba(234, 179, 8, 0.72)',
+          fontSize: '9px',
+          fontWeight: '700',
+          lineHeight: '1',
+          padding: '1.5px 4.5px',
+          marginLeft: '3px',
+          verticalAlign: 'super',
+          position: 'relative',
+          top: '-0.2em',
+        },
+        '.dark & .cm-badge-annotation': {
+          backgroundColor: 'rgba(234, 179, 8, 0.28)',
+          color: '#fde047',
+          border: '1px solid rgba(250, 204, 21, 0.55)',
+        },
+        // Locked Agent selection highlight: stays visible while Agent QuickInput holds focus
+        '.cm-agent-selection-highlight': {
+          backgroundColor: 'rgba(168, 85, 247, 0.22)',
+          border: '1px solid rgba(168, 85, 247, 0.55)',
+          borderRadius: '4px',
+          padding: '0.5px 2px',
+          boxDecorationBreak: 'clone',
+          WebkitBoxDecorationBreak: 'clone',
+          color: 'inherit !important',
+          transition: 'background-color 150ms ease, border-color 150ms ease',
         },
       });
 
@@ -518,7 +641,16 @@ export const ScriptCodeEditor = forwardRef<ScriptCodeEditorRef, ScriptCodeEditor
           baseTheme,
           annotationsField,
           EditorView.domEventHandlers({
+            mousedown(event, view) {
+              // Preserve active text selection on right-click so summoning Agent never collapses it
+              if (event.button === 2 && !view.state.selection.main.empty) {
+                event.preventDefault();
+                return true;
+              }
+              return false;
+            },
             click(event, view) {
+              if (!view.state.selection.main.empty) return false;
               const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
               if (pos !== null) {
                 const hit = annotationsRef.current.find(a => pos >= a.from && pos <= a.to);

@@ -103,7 +103,9 @@ function isObsoleteMainPrompt(text: string): boolean {
       text.includes('则保持为 pending",') ||
       text.includes('仅在调用 sys.endTask 结案汇报、调用 user.ask 向用户提问或无需调工具直接回复时，同时输出“- 对用户说的话（简版）”与“- 对用户说的话（完整版）”') ||
       text.includes('当前子步骤处于“已读取待写入落盘”还是“已写入落盘完成”状态？') ||
-      text.includes('[ ] 3. 全局验收结案')
+      text.includes('[ ] 3. 全局验收结案') ||
+      text.includes('## 0. 意图识别与分流（每次收到新消息时最先判定）') ||
+      text.includes('## 前置环节：意图识别（每次收到新消息或尚未进入明确任务时最先执行）')
     );
   }
 
@@ -205,6 +207,25 @@ const parametersForTool = (toolId: string) => {
   const schemas: Record<string, { properties: Record<string, unknown>; required?: string[] }> = {
     'sys.selectContext': { properties: { level: { type: 'integer', enum: [0, 1] }, tools: { type: 'array', items: { type: 'string' } }, prompts: { type: 'array', items: { type: 'string' } } }, required: ['level', 'tools', 'prompts'] },
     'script.directory': { properties: { query: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 200 } } },
+    'script.editDirectory': {
+      properties: {
+        action: { type: 'string', enum: ['rename', 'add', 'delete', 'split', 'merge', 'move'], description: '目录编辑动作：rename（重命名）、add（新增）、delete（删除）、split（拆分）、merge（合并）、move（移动顺序）' },
+        targetId: { type: 'string', description: '目标目录条目的唯一 ID（优先使用 script.directory 返回的 id）' },
+        target: { type: 'string', description: '可选，目标集/场标识（若存在重名必须改传 targetId）' },
+        targetType: { type: 'string', enum: ['episode', 'scene'], description: '可选，限定目标类型为分集(episode)或场次(scene)' },
+        entryType: { type: 'string', enum: ['episode', 'scene'], description: '新增条目时的类型：episode（分集）或 scene（场次）' },
+        newTitle: { type: 'string', description: 'rename/split/merge 时的新目录标题（须符合分集或场次识别格式）' },
+        title: { type: 'string', description: 'add 时的新目录标题（须符合分集或场次识别格式）' },
+        content: { type: 'string', description: 'add 时可选附带的正文内容' },
+        position: { type: 'string', enum: ['before', 'after', 'start', 'end'], description: 'add/move 时的插入/移动位置' },
+        anchorId: { type: 'string', description: 'position 为 before/after 时的定位参考条目唯一 ID' },
+        deleteMode: { type: 'string', enum: ['header_only', 'with_content'], description: 'delete 时的删除模式：默认 header_only（仅移除标题行保留正文），明确要连正文删除时传 with_content' },
+        beforeParagraph: { type: 'integer', minimum: 1, description: 'split 时的拆分点：场内 1-based 段落序号（来自 script.read）' },
+        beforeLine: { type: 'integer', minimum: 1, description: 'split 时的拆分点：剧本 1-based 行号' },
+        mergeIntoId: { type: 'string', description: 'merge 时的目标合并条目 ID（不传则默认并入前一同级条目）' },
+        operations: { type: 'array', items: { type: 'object' }, description: '批量目录编辑操作列表，按顺序执行并自动追踪行号偏移' },
+      },
+    },
     'script.read': {
       properties: {
         episode: { type: 'string', description: '可选，按分集筛选读取（如 "第一集"、"1"）' },
@@ -511,44 +532,122 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
   });
 
   app.post("/api/script-toc-pattern", async (req, res) => {
-    const { sampleText, systemPrompt, modelType = 'auto', apiKey, deepseekKey } = req.body;
+    const {
+      sampleText,
+      systemPrompt,
+      modelType = 'auto',
+      apiKey,
+      deepseekKey,
+      agentModelType,
+      agentApiKey,
+    } = req.body;
     if (!sampleText || typeof sampleText !== "string") {
       return res.status(400).json({ error: "Missing sampleText in request body" });
     }
 
-    try {
-      if (modelType !== 'heuristic') {
-        const modelConfig = getModelConfig(modelType, apiKey || deepseekKey);
-        const data = await executeChatCompletion({
+    const promptText =
+      systemPrompt || '分析剧本标题格式并返回 tocPattern、scenePattern、types、flags、patternDescription 的 JSON。';
+
+    const TOC_MODEL_TIMEOUT_MS = 15000;
+
+    const tryModelCandidate = async (candidateModelType: string, candidateKey?: string) => {
+      const modelConfig = getModelConfig(candidateModelType, candidateKey);
+      if (!modelConfig.apiKey) {
+        return { skippedNoKey: true as const };
+      }
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+      const data = await Promise.race([
+        executeChatCompletion({
           modelConfig,
           jsonMode: true,
           stream: false,
           messages: [
-            { role: 'system', content: systemPrompt || '分析剧本标题格式并返回 pattern、flags、patternDescription 的 JSON。' },
+            { role: 'system', content: promptText },
             { role: 'user', content: sampleText.slice(0, 4000) }
           ]
-        });
-        const parsed = robustParseJson(data.content || '{}') || {};
-        if (parsed.scenePattern || parsed.pattern || parsed.tocPattern) {
-          return res.json({ 
-            ...parsed,
-            confidence: 'ai' 
-          });
+        }),
+        new Promise<never>((_, reject) => {
+          timeoutHandle = setTimeout(() => {
+            const timeoutErr = new Error(`Model TOC recognition timed out after ${TOC_MODEL_TIMEOUT_MS}ms`);
+            timeoutErr.name = 'TocModelTimeoutError';
+            reject(timeoutErr);
+          }, TOC_MODEL_TIMEOUT_MS);
+        }),
+      ]).finally(() => {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+      });
+      const parsed = robustParseJson(data.content || '{}') || {};
+      const hasRules =
+        Boolean(parsed.scenePattern || parsed.pattern || parsed.tocPattern) ||
+        (Array.isArray(parsed.types) && parsed.types.length > 0);
+      if (!hasRules) {
+        return { emptyResult: true as const };
+      }
+      return {
+        parsed,
+        modelUsed: modelConfig.actualModel,
+        providerUsed: modelConfig.provider,
+      };
+    };
+
+    let fallbackReason: 'explicit_heuristic' | 'no_api_key' | 'model_error' | 'model_timeout' = 'no_api_key';
+
+    if (modelType === 'heuristic') {
+      fallbackReason = 'explicit_heuristic';
+    } else {
+      const candidates: Array<{ model: string; key?: string }> = [
+        { model: modelType, key: apiKey || deepseekKey },
+      ];
+      if (
+        typeof agentModelType === 'string' &&
+        agentModelType.trim() &&
+        agentModelType !== 'heuristic' &&
+        (agentModelType !== modelType || (agentApiKey && agentApiKey !== (apiKey || deepseekKey)))
+      ) {
+        candidates.push({ model: agentModelType, key: agentApiKey || apiKey || deepseekKey });
+      }
+
+      let attemptedAnyModel = false;
+      for (const candidate of candidates) {
+        try {
+          const outcome = await tryModelCandidate(candidate.model, candidate.key);
+          if ('skippedNoKey' in outcome) {
+            continue;
+          }
+          attemptedAnyModel = true;
+          if ('parsed' in outcome && outcome.parsed) {
+            return res.json({
+              ...outcome.parsed,
+              confidence: 'ai',
+              modelUsed: outcome.modelUsed,
+              providerUsed: outcome.providerUsed,
+            });
+          }
+          fallbackReason = 'model_error';
+        } catch (error: any) {
+          attemptedAnyModel = true;
+          fallbackReason = error?.name === 'TocModelTimeoutError' ? 'model_timeout' : 'model_error';
+          console.warn(
+            `Model TOC pattern recognition failed (${candidate.model}), trying next fallback:`,
+            error.message || error
+          );
         }
       }
 
-    } catch (error: any) {
-      console.warn("DeepSeek pattern recognition unavailable, falling back to heuristic engine:", error.message || error);
+      if (!attemptedAnyModel) {
+        fallbackReason = 'no_api_key';
+      }
     }
 
-    // Heuristic inference fallback when DeepSeek is unavailable or explicitly disabled.
+    // Heuristic script fallback ONLY when model node & agent model are unavailable or failed.
     const fallbackResult = inferPatternHeuristically(sampleText);
     return res.json({
       tocPattern: fallbackResult.tocPattern,
       scenePattern: fallbackResult.scenePattern,
       flags: fallbackResult.flags,
       patternDescription: fallbackResult.patternDescription,
-      confidence: "heuristic"
+      confidence: "heuristic",
+      fallbackReason,
     });
   });
 
@@ -944,6 +1043,12 @@ export const CODE_PIPELINE_PROMPTS: NodePromptConfig = ${JSON.stringify(prompts,
               toolObs.push(
                 `${warningHeader}【工具 script.directory 执行成功】（共 ${dirOut.total ?? 0} 个集数条目 | 场次总计: ${dirOut.totalScenes ?? '未知'} | 段落总计: ${dirOut.totalParagraphs ?? '未知'} | 正文字数: ${dirOut.totalChars ?? '未知'} 字 | 每轮建议上限: ${dirOut.recommendedBatchMaxChars ?? RECOMMENDED_BATCH_MAX_CHARS} 字）\n${serializeCleanOutput(slimDirOut)}`
               );
+            } else if (name === 'script.editDirectory' && output && typeof output === 'object') {
+              const editOut = output as any;
+              const { projectId: _epid, source: _esrc, ...slimEditOut } = editOut;
+              toolObs.push(
+                `【工具 script.editDirectory 执行成功】（已落盘 ${editOut.appliedCount ?? 0} 项改动 | 当前总集数: ${editOut.totalEpisodes ?? '未知'} | 总场次数: ${editOut.totalScenes ?? '未知'} | 剧本正文与目录已同步）\n${serializeCleanOutput(slimEditOut)}`
+              );
             } else if (name === 'script.read' && output && typeof output === 'object') {
               const readOut = output as any;
               const warningHeader = formatWarningHeader(readOut);
@@ -1107,52 +1212,24 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         ...sharedHeaderLines,
         ``,
         `# 当前阶段职责与工作指南`,
-        `当前你处于【全局计划与验收阶段】，你的核心职责是：先识别用户真实意图并完成分流；当确认存在明确可执行任务时，检索同类任务经验、制定传入执行阶段的“当前计划”、按需装载工具切入执行，并在计划全部达成后核验结案。`,
-        ``,
-        `## 前置环节：意图识别（每次收到新消息或尚未进入明确任务时最先执行）`,
-        `结合用户输入原文、当前认知状态与当前聚焦目标，先判断当前诉求属于以下哪一条路径，完成分流后再决定是否检索经验或调工具：`,
-        `- **路径 A · 日常寒暄 / 能力咨询 / 通用问答（直接响应，1 轮结束）**：`,
-        `  * 适用场景：用户仅打招呼、寒暄、询问你能做什么或提问无需读写/修改项目数据的通用问题（即使界面当前停留在某个面板或卡片上，只要用户表达本身未提出针对该对象的分析、提取、修改或生成诉求，仍属路径 A）。`,
-        `  * 执行方式：无需调用 experience.search，无需调用 sys.selectContext 展开工具分类，也无需在思考中列出 \`[ ]\` 待办任务计划；在 \`工具调用\` 中写 \`无\`，直接在 \`用户沟通\` 中亲和自然地回应或作答（若当前已有可见聚焦目标，可简短顺带询问是否需要围绕它提供协助）。`,
-        `- **路径 B · 意图指向模糊或关键边界待确认（先问清，不盲查）**：`,
-        `  * 适用场景：用户表达了模糊或开放式诉求（例如围绕当前聚焦对象仅说“帮我处理/整理/看看这个”等），但具体操作类型、目标范围、版本归属或期望结果尚不明确，无法仅凭已有上下文自证。`,
-        `  * 执行方式：不提前调用 experience.search 或批量探查项目数据；直接基于当前聚焦目标与已可见信息梳理 2~4 个清晰可行的选项或确认点，立即调用 user.ask 简明询问用户（问题与选项直接写在 \`用户沟通\` 简版与完整版中），待用户明确方向后再切入后续任务流程。`,
-        `- **路径 C · 明确可执行任务（进入“检索经验 + 四步走”闭环）**：`,
-        `  * 适用场景：用户已下达清晰具体的创作、提取、建档、核验、修改、画面标注、生图/视频或特定项目数据查询指令（包括经 user.ask 确认后方向已明确的指令）。`,
-        `  * 执行方式：按下方“检索经验 + 四步走”规范推进任务。`,
-        ``,
-        `## 后续任务规范——仅路径 C 执行“检索经验 + 四步走”闭环（搜集足够的信息 → 制定足够清晰的计划 → 实施 → 验收）：`,
-        `0. 检索同类任务经验（路径 C 任务初启时执行）：确认进入路径 C 且尚未检索经验时，优先调用 experience.search（传入贴合当前任务类型的关键词；可与首次展开工具分类的 sys.selectContext({"categories": [...]}) 同轮并发调用），获取该类任务的四步走最佳实践指南；`,
-        `1. 搜集足够的信息（探查期，数据未知时）：在尚未掌握目标数据分布与现有状态前，先制定宏观探查计划；首次展开分类时一次性展开任务涉及的全部工具箱分类，探查期结合所获经验装载只读探查工具建立全局视野、搜集足够的信息，不提前装载写入或修改工具；`,
-        `2. 制定足够清晰的计划（获知数据分布后动态重规划）：“当前计划”专用于驱动局部执行阶段（1 级）推进具体工具操作，仅列出需调用业务工具执行的探查、读写、画面观察核验或生成步骤（不将“验收结案/向用户汇报”列为计划步骤）。当探查结果返回了数据分布概览或触发数据量预警时，必须对照 experience.search 返回的计划制定标准与探查结果，在“当前计划”中将宏观任务拆解为边界明确、分批推进的具体子步骤（结合各场次/集数字数 charCount 规划合批，每轮合批总字数控制在工具建议上限 recommendedBatchMaxChars 内，重头戏大场次独立成批；若涉及多版本/造型演进，先从目录人物表与检索命中切片中梳理完整造型版本清单，并将每一批需创建或追加的具体版本动作显式写进计划步骤标题）；涉及数据写入的任务，每个子步骤必须定义为“读取该批数据并立即完成创建或增量更新落盘”的完整读写闭环（即使操作对象为单个目标实体，也必须按“首批读取并调用创建工具建档落盘 → 后续每批读取并调用更新工具增量追加”拆解，不规划无写入动作的纯读取囤积步骤或留到最后一步才汇总创建）；`,
-        `3. 实施（成套装载工具切入执行）：计划明确后，在 tools 参数中同时成套装载所需的具体业务工具 ID 切入执行阶段，按计划步骤推进完成每一项闭环；`,
-        `4. 验收（全局核验与结案）：从执行阶段返回后，对照“最终目标”与“当前计划”逐项验收所有步骤；确认全部真实达成后，调用 sys.endTask 结束任务并向用户汇报。`,
+        `当前你处于【全局计划与验收阶段】，核心职责是按以下闭环推进任务：`,
+        `0. 意图识别：结合用户输入与当前聚焦目标判断诉求——若可直接作答则回复并调用 sys.endTask 结束；若意图模糊或边界不清则调用 user.ask 确认；若为明确可执行任务则进入下方流程；`,
+        `1. 检索同类任务经验：初启时调用 experience.search（可与 sys.selectContext 同轮并发）；`,
+        `2. 探查与制定计划：探查数据分布，动态重规划“当前计划”（将任务拆解为首批读取+创建、后续读取+增量更新闭环步骤）；`,
+        `3. 实施：成套装载工具切入执行；`,
+        `4. 验收：确认全部达成后调用 sys.endTask 结案。`,
         ``,
         `# 输出格式`,
         `状态检查：`,
-        `{回顾并检查下面的“认知状态”与本轮“工具执行结果 / 页面观察”。`,
-        `- 意图识别判定：当前输入属于“路径 A（日常寒暄/纯问答）”、“路径 B（意图待确认）”还是“路径 C（明确可执行任务）”？（若已处于路径 C 任务推进或验收中，标注“延续路径 C”）`,
-        `- 最终目标是什么？（路径 A 记为“日常交流/暂无工程任务”；路径 B/C 结合当前聚焦目标、多轮对话与用户输入归纳）`,
-        `- 本轮执行结果与事实盘点：上一步工具返回了哪些具体结果？是否已获取同类任务经验（experience.search）？是否获知了数据分布概览或触发了数据量预警？`,
-        `- 原计划完成度核对：对照现有“当前计划”，哪些步骤已真实达成（[x]），哪些尚待推进（[ ]）？最终目标是否已全部达成？`,
-        `- 工具准备：路径 A 无需调工具；路径 B 优先调用 user.ask 确认需求；仅当处于路径 C 时，盘点本轮需调用 experience.search、首次展开哪些工具箱分类（categories，可与 experience.search 同轮并发调用，一次性展开任务涉及的全部工具箱分类），或成套装载哪些具体读写工具（tools）进入执行阶段。}`,
+        `{盘点认知状态、本轮工具事实、意图判断与原计划完成度}`,
         `思考：`,
-        `{使用内心独白的方式，先完成意图识别分流，再推进对应逻辑推演：`,
-        `- 1. 意图分流与策略推演：`,
-        `  * 若为路径 A（日常寒暄/能力咨询/纯问答）：直接构思自然亲切的回应或解答（若当前已有可见聚焦目标，可顺带轻问是否需要围绕它协助），跳过经验检索、工具展开与任务拆解；`,
-        `  * 若为路径 B（方向或边界存在客观歧义）：基于当前聚焦目标与已可见信息梳理清晰简明的确认选项，决定直接调用 user.ask 向用户核实；`,
-        `  * 若为路径 C（明确可执行任务）：结合当前进展、已获取经验与返回的数据规模结构推演下一步策略（初启尚未检索经验时，决定同轮并发调用 experience.search 与 sys.selectContext 展开分类；获知数据分布或触发数据量预警时，严格对照经验标准梳理关键状态/版本清单，拆分为“首批读取+创建、后续每批读取+增量更新”读写批次）；`,
-        `- 2. 制定或更新“当前计划”（仅路径 C 输出完整 [x]/[ ] 业务执行步骤列表，不列入“验收结案/向用户汇报”步骤；路径 A 与路径 B 本项写“暂无任务计划，无需建表”）：`,
-        `  * 路径 C 初次规划（数据未知时）：列出待由工具执行的探查与操作步骤（如：[ ] 1. 搜集足够的信息（探查项目数据现状）；[ ] 2. 根据探查结果细化计划并分批实施目标操作）；`,
-        `  * 路径 C 动态重规划（获知数据分布或触发数据量预警时）：直接将旧宏观步骤替换为按经验标准与数据分布拆解的“首批读取+创建、后续每批读取+增量更新”闭环子步骤列表（在步骤标题中写明唯一场次 ID 与本批需创建/追加的具体版本动作）；`,
-        `  * 路径 C 常规推进：列出当前计划各步骤完成状态（[x] / [ ]）；`,
-        `- 3. 下一步行动与重点笔记盘点：路径 A 在工具调用写“无”并直接回复；路径 B 决定调用 user.ask；路径 C 若所有步骤均已真实达成则调用 sys.endTask 结案，否则明确下一步小目标、工具与参数，并盘点需跨轮引用的实体 ID、造型版本清单、待办线索与自我提醒。}`,
+        `{内心独白：1. 意图识别与策略推演；2. 制定或更新当前计划步骤（[x]/[ ]）；3. 下一步行动与重点参数}`,
         `工具调用：`,
-        `{若需调用工具，严格按双花括号格式输出本轮要调用的工具指令：{{调用 工具名称, {"参数名": "参数值"}}}（无参数可简写为 {{调用 工具名称}}）；若判定为路径 A 无需调用工具直接回复，写“无”}`,
+        `{按格式输出本轮要调用的工具指令}`,
         `用户沟通：`,
         `{`,
-        `- 对用户说的话（简版）：“口语化介绍当前回应、提问、阶段进展或结论，控制在30字以内（每轮必填；注意调用工具不等于完成任务）”`,
-        `- 对用户说的话（完整版）：“（按需选填：仅在路径 A 直接回答、调用 user.ask 向用户提问、或调用 sys.endTask 结案汇总时输出；若本轮仅调用 experience.search / sys.selectContext 推进路径 C 中间步骤，无需输出完整版）”`,
+        `- 对用户说的话（简版）：“...”`,
+        `- 对用户说的话（完整版）：“（按需选填）”`,
         `}`,
         ``,
         `# 可用工具`,
@@ -1364,11 +1441,13 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         }
 
         // 2. Match full version: 对用户说的话（完整版） or 对用户说的话(完整版)
+        let hasExplicitFullAnswer = false;
         const fullMatch = fullContent.match(/(?:-|\*|\+)?\s*对用户说的话\s*[（(]\s*完整版\s*[）)]\s*[:：]\s*[“"']?([\s\S]*?)[”"']?(?=(?:(?:-|\*|\+)?\s*对用户说的话\s*[（(]\s*简版\s*[）)]|\{\{|$))/i);
         if (fullMatch && fullMatch[1]) {
           const candidateFull = fullMatch[1].replace(/^[“"'\s{]+|[”"'\s}]+$/g, '').trim();
           if (!/^(?:[（(]?\s*(?:无需输出|无|略|不需要|暂无|无需完整版)[^）)]*[）)]?|-+)$/i.test(candidateFull)) {
             fullAnswerText = candidateFull;
+            hasExplicitFullAnswer = Boolean(candidateFull);
           }
         }
 
@@ -1383,6 +1462,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
             } else {
               speakText = raw.slice(0, 30) + '...';
               fullAnswerText = raw;
+              hasExplicitFullAnswer = true;
             }
           }
         }
@@ -1399,6 +1479,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
               fullAnswerText = rawComm;
               const firstSentence = rawComm.split(/[。！？\n]/)[0] || rawComm;
               speakText = firstSentence.length > 30 ? firstSentence.slice(0, 28) + '...' : firstSentence;
+              hasExplicitFullAnswer = rawComm.length > 40 || rawComm.includes('\n');
             }
           }
         }
@@ -1426,6 +1507,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         if (cleanContent) {
           narration.push(cleanContent);
         }
+        (message as any).__hasExplicitFullAnswer = hasExplicitFullAnswer;
       }
       
       let parsed: any = {
@@ -1433,6 +1515,7 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         speak: speakText,
         response: fullAnswerText || speakText || '',
         fullAnswer: fullAnswerText || speakText || '',
+        hasFullAnswer: Boolean((message as any).__hasExplicitFullAnswer),
       };
       const allowedTools = enabledToolIds;
       const toolNameByFunction = new Map(AGENT_TOOL_REGISTRY.map((tool) => [functionNameForTool(tool.id), tool.id]));
@@ -1828,6 +1911,48 @@ ${effectiveCardContext.imageUrl ? '- 图像数据：已随请求注入多模态�
         } else if (normalizedName === 'asset.delete') {
           if (!argsObj.id && (!Array.isArray(argsObj.ids) || argsObj.ids.length === 0)) {
             schemaError = '【参数校验错误】asset.delete 缺少必需参数：请传入目标资产 "id"（单个）或 "ids"（批量删除数组）。';
+          }
+        } else if (normalizedName === 'script.editDirectory') {
+          const validActions = ['rename', 'add', 'delete', 'split', 'merge', 'move'];
+          if (Array.isArray(argsObj.operations)) {
+            if (argsObj.operations.length === 0) {
+              schemaError = '【参数校验错误】script.editDirectory 批量参数 "operations" 数组不能为空。';
+            }
+          } else if (!argsObj.action || !validActions.includes(String(argsObj.action))) {
+            schemaError = '【参数校验错误】script.editDirectory 缺少或无效参数 "action"，可选值为 "rename" | "add" | "delete" | "split" | "merge" | "move"（或传批量数组 "operations"）。';
+          } else {
+            const act = String(argsObj.action);
+            if (act === 'rename') {
+              if (!argsObj.targetId && argsObj.target === undefined) {
+                schemaError = '【参数校验错误】script.editDirectory(rename) 缺少目标参数 "targetId"（或 "target"）。';
+              } else if ((!argsObj.newTitle || !String(argsObj.newTitle).trim()) && (!argsObj.title || !String(argsObj.title).trim())) {
+                schemaError = '【参数校验错误】script.editDirectory(rename) 缺少必需参数 "newTitle"。';
+              }
+            } else if (act === 'add') {
+              if ((!argsObj.title || !String(argsObj.title).trim()) && (!argsObj.newTitle || !String(argsObj.newTitle).trim())) {
+                schemaError = '【参数校验错误】script.editDirectory(add) 缺少必需参数 "title"。';
+              }
+            } else if (act === 'delete') {
+              if (!argsObj.targetId && argsObj.target === undefined) {
+                schemaError = '【参数校验错误】script.editDirectory(delete) 缺少目标参数 "targetId"（或 "target"）。';
+              }
+            } else if (act === 'split') {
+              if (!argsObj.targetId && argsObj.target === undefined) {
+                schemaError = '【参数校验错误】script.editDirectory(split) 缺少目标参数 "targetId"（或 "target"）。';
+              } else if ((!argsObj.newTitle || !String(argsObj.newTitle).trim()) && (!argsObj.title || !String(argsObj.title).trim())) {
+                schemaError = '【参数校验错误】script.editDirectory(split) 缺少必需参数 "newTitle"。';
+              } else if (argsObj.beforeParagraph === undefined && argsObj.beforeLine === undefined) {
+                schemaError = '【参数校验错误】script.editDirectory(split) 缺少拆分点参数 "beforeParagraph" 或 "beforeLine"。';
+              }
+            } else if (act === 'merge') {
+              if (!argsObj.targetId && !argsObj.sourceId && argsObj.target === undefined) {
+                schemaError = '【参数校验错误】script.editDirectory(merge) 缺少目标参数 "targetId"（或 "sourceId"）。';
+              }
+            } else if (act === 'move') {
+              if (!argsObj.targetId && argsObj.target === undefined) {
+                schemaError = '【参数校验错误】script.editDirectory(move) 缺少目标参数 "targetId"（或 "target"）。';
+              }
+            }
           }
         } else if (normalizedName === 'script.search') {
           const rawEpisode = argsObj.episode ?? argsObj.episodeId;

@@ -52,9 +52,18 @@ const episodeHeader = /^(?:【\s*)?(?:第\s*([0-9]+|[一二三四五六七八九
 
 function resolveScenesForScript(
   scriptText: string,
-  options?: { scenePattern?: string; flags?: string; precomputedScenes?: SceneChunk[] }
+  options?: {
+    scenePattern?: string;
+    tocPattern?: string;
+    flags?: string;
+    preferCustomOnly?: boolean;
+    precomputedScenes?: SceneChunk[];
+  }
 ): SceneChunk[] {
-  const freshScenes = sliceScriptIntoScenes(scriptText, options?.scenePattern, options?.flags);
+  const freshScenes = sliceScriptIntoScenes(scriptText, options?.scenePattern, options?.flags, {
+    tocPattern: options?.tocPattern,
+    preferCustomOnly: options?.preferCustomOnly,
+  });
   const pre = options?.precomputedScenes;
   if (!Array.isArray(pre) || pre.length === 0) {
     return freshScenes;
@@ -78,19 +87,54 @@ function resolveScenesForScript(
 
 export const parseScriptEpisodes = (
   scriptText: string,
-  options?: { scenePattern?: string; flags?: string; precomputedScenes?: SceneChunk[]; includeParagraphs?: boolean }
+  options?: {
+    scenePattern?: string;
+    tocPattern?: string;
+    flags?: string;
+    preferCustomOnly?: boolean;
+    precomputedScenes?: SceneChunk[];
+    includeParagraphs?: boolean;
+  }
 ): ScriptEpisode[] => {
   if (!scriptText) return [];
   const lines = scriptText.split('\n');
-  const starts = lines.flatMap((raw, index) => {
-    const trimmed = raw.trim();
-    if (!trimmed || /^\d+\s*[-—–]\s*\d+/.test(trimmed)) return [];
-    const match = trimmed.match(episodeHeader);
-    if (!match) return [];
-    const epNum = match[1] || match[2] || match[3] || String(index + 1);
-    const startChar = lines.slice(0, index).reduce((total, line) => total + line.length + 1, 0);
-    return [{ index, startChar, number: epNum, title: trimmed }];
-  });
+
+  let customEpisodeRx: RegExp | null = null;
+  if (
+    options?.tocPattern &&
+    options.tocPattern.trim() &&
+    (!options.scenePattern || !options.tocPattern.includes(options.scenePattern))
+  ) {
+    try {
+      const cleanedFlags = String(options.flags || 'i').replace(/[^imsuy]/g, '');
+      customEpisodeRx = new RegExp(options.tocPattern.trim(), cleanedFlags.includes('i') ? cleanedFlags : `${cleanedFlags}i`);
+    } catch {
+      customEpisodeRx = null;
+    }
+  }
+
+  const collectEpisodeStarts = (strictCustom: boolean) =>
+    lines.flatMap((raw, index) => {
+      const trimmed = raw.trim();
+      if (!trimmed || /^\d+\s*[-—–]\s*\d+/.test(trimmed)) return [];
+      const customMatched = customEpisodeRx ? customEpisodeRx.test(trimmed) : false;
+      const defaultMatch = strictCustom && customEpisodeRx ? null : trimmed.match(episodeHeader);
+      if (!customMatched && !defaultMatch) return [];
+      const epNum =
+        defaultMatch?.[1] ||
+        defaultMatch?.[2] ||
+        defaultMatch?.[3] ||
+        trimmed.match(/([0-9]+|[一二三四五六七八九十百千]+)/)?.[1] ||
+        String(index + 1);
+      const startChar = lines.slice(0, index).reduce((total, line) => total + line.length + 1, 0);
+      return [{ index, startChar, number: epNum, title: trimmed }];
+    });
+
+  const useStrictCustom = Boolean(options?.preferCustomOnly && customEpisodeRx);
+  let starts = collectEpisodeStarts(useStrictCustom);
+  if (useStrictCustom && starts.length === 0) {
+    starts = collectEpisodeStarts(false);
+  }
 
   const allScenes = resolveScenesForScript(scriptText, options);
 
@@ -156,14 +200,18 @@ export const readScriptDirectory = (
     query?: string;
     tailOnly?: boolean;
     scenePattern?: string;
+    tocPattern?: string;
     flags?: string;
+    preferCustomOnly?: boolean;
     precomputedScenes?: SceneChunk[];
   } = {}
 ) => {
   const lines = scriptText ? scriptText.split('\n') : [];
   let entries = parseScriptEpisodes(scriptText, {
     scenePattern: options.scenePattern,
+    tocPattern: options.tocPattern,
     flags: options.flags,
+    preferCustomOnly: options.preferCustomOnly,
     precomputedScenes: options.precomputedScenes,
     includeParagraphs: false,
   });

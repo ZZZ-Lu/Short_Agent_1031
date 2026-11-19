@@ -655,6 +655,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
     }
 
     const expectsBottomPanel = (card: CardData) => {
+      if (card.isText) return false;
       const targetIds = agentTargetCardIdsRef.current;
       const isAgentTargetInSet = Boolean(
         targetIds && (targetIds instanceof Set ? targetIds.has(card.id) : targetIds.includes(card.id))
@@ -738,7 +739,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       const cardYBase = cardY;
 
       const isSelected = selectedIds.includes(card.id);
-      if (isSelected) {
+      if (isSelected && !card.isText) {
         const scaleFactor = 1.05;
         const sMinus1 = scaleFactor - 1;
         const extraW = dim.width * sMinus1;
@@ -839,8 +840,9 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       let imgHeight = liveFrame ? liveFrame.height : 0;
 
       if (!drawSourceImg) {
-        const cachedRawThumb = card.imageUrl
-          ? Boolean(fullImageCache.get(card.imageUrl)?.complete || thumbImageCache.get(card.imageUrl)?.complete)
+        const fullKey = card.isVideo ? card.videoPosterUrl : card.imageUrl;
+        const cachedRawThumb = fullKey
+          ? Boolean(fullImageCache.get(fullKey)?.complete || thumbImageCache.get(fullKey)?.complete)
           : false;
         const primaryThumb =
           (standard && card.isVideo ? card.videoPosterUrl : undefined) ||
@@ -853,7 +855,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
           primaryThumb ||
           (!card.isVideo && !deferColdRaw ? (card.imageUrl || card.originalImageUrl) : undefined);
 
-        const full = card.imageUrl ? fullImageCache.get(card.imageUrl) : undefined;
+        const full = fullKey ? fullImageCache.get(fullKey) : undefined;
         if (!cardThumbOnly && standard && full?.complete && full.naturalWidth > 0) {
           drawSourceImg = full;
           imgWidth = full.naturalWidth;
@@ -892,7 +894,40 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       const reveal = hasValidSourceImg ? mediaRevealProgress(card.id) : 0;
 
       // 2. Solid Base Fill or Nano LOD Skeleton Screen (only when image does not yet fully cover the card)
-      if (!hasValidSourceImg || reveal < 1) {
+      if (card.isText) {
+        ctx.fillStyle = dark ? '#1d1e22' : '#ffffff';
+        ctx.fillRect(cardX, cardY, dim.width, dim.height);
+        // Header strip
+        const headerH = Math.min(54, dim.height * 0.11);
+        ctx.fillStyle = dark ? '#26272c' : '#f7f7f9';
+        ctx.fillRect(cardX, cardY, dim.width, headerH);
+        ctx.fillStyle = dark ? '#32343c' : '#e5e7eb';
+        ctx.fillRect(cardX, cardY + headerH, dim.width, 1);
+        // Blue accent badge in header
+        const padX = 24;
+        ctx.fillStyle = dark ? '#3b82f6' : '#2563eb';
+        ctx.fillRect(cardX + padX, cardY + headerH * 0.34, 14, 14);
+        if (screenW >= 44) {
+          ctx.save();
+          ctx.fillStyle = dark ? '#e5e7eb' : '#1f2937';
+          ctx.font = '600 18px system-ui, -apple-system, sans-serif';
+          ctx.textBaseline = 'middle';
+          const titleStr = (card.textTitle || '未命名文本').slice(0, 16);
+          ctx.fillText(titleStr, cardX + padX + 24, cardY + headerH * 0.52);
+          ctx.restore();
+        }
+        // Stylized body text lines
+        const lineWidths = [0.76, 0.88, 0.82, 0.64, 0.86, 0.78, 0.90, 0.70, 0.84, 0.56];
+        ctx.fillStyle = dark ? '#32343d' : '#e5e7eb';
+        let ly = cardY + headerH + 34;
+        const maxLineW = dim.width - padX * 2;
+        for (const ratioW of lineWidths) {
+          if (ly + 14 > cardY + dim.height - 28) break;
+          ctx.fillRect(cardX + padX, ly, maxLineW * ratioW, 12);
+          ly += 34;
+        }
+        hasDrawnThumbnail = true;
+      } else if (!hasValidSourceImg || reveal < 1) {
         if (isGenerating) {
           ctx.fillStyle = colorGenerating;
           ctx.fillRect(cardX, cardY, dim.width, dim.height);

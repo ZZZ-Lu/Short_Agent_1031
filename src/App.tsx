@@ -1,5 +1,5 @@
 import { EntryBlurOverlay } from './components/EntryBlurOverlay';
-import { executeProjectReadTool, executeProjectAssetMutation } from './agent/projectTools';
+import { executeProjectReadTool, executeProjectAssetMutation, executeProjectScriptMutation } from './agent/projectTools';
 import { registerCardEntries, requestCardEntries, stageCardEntry, startCardEntry, startMediaReveal, mediaRevealProgress, MEDIA_REVEAL_MS, CARD_ENTRY_MS, isNewCardAwaitingLod } from './utils/cardEntrance';
 import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
 import { AgentCursor, buildDynamicSelectionPrompt, HudContextMessage } from './components/AgentCursor';
@@ -10,13 +10,51 @@ import {
   resolveAgentCursorStoragePoint,
   isPointInDockCardRects,
 } from './agent/agentCursorPosition';
+import {
+  buildPersistedAgentCursorSnapshot,
+  hydrateAgentCursorRuntimeState,
+  readPersistedAgentCursorState,
+  removePersistedAgentCursorState,
+  writePersistedAgentCursorState,
+} from './agent/agentCursorPersistence';
+import {
+  AgentSpeakMeta,
+  AgentSummonTargetDescriptor,
+  buildSummonDialogue,
+  computeSummonMotion,
+  createInitialSummonHistory,
+  describeCardsAsSummonTarget,
+  isCurrentSpeakMetaKind,
+  SummonHistoryState,
+  SummonInteractionKind,
+} from './agent/agentSummonDialogue';
 import { AgentContextMenu } from './components/AgentContextMenu';
+import { QiqiCalloutOverlay, type QiqiCalloutState } from './components/QiqiCalloutOverlay';
+import {
+  createRightClickGestureController,
+  QIQI_CALLOUT_HOLD_AFTER_TRIGGER_MS,
+  RIGHT_CLICK_LONG_PRESS_MS,
+} from './utils/rightClickGesture';
 import { GenerationCard, CardData, CARD_DIMENSIONS, getCardSize, safeParseJsonResponse, compressImageBlob, resolveReferenceToPayload, SubjectLandmarks, VisualElementAnnotation, pauseVideosForNanoLod } from './components/GenerationCard';
+import { TextCardPreviewOverlay } from './components/TextCardPreviewOverlay';
+import {
+  buildManualTextCardData,
+  buildTextCardData,
+  computeTextCardPlacement,
+  deriveTextCardTitle,
+  shouldCreateTextCardForAnswer,
+} from './utils/textCard';
 import { WORKRALLY_IMAGE_MODELS, WORKRALLY_IMAGE_TOOL } from './config/workrallyImageModels';
 import { WORKRALLY_VIDEO_MODELS, WORKRALLY_VIDEO_TOOL } from './config/workrallyVideoModels';
 import { NanoLodCanvas } from './components/NanoLodCanvas';
 import { FpsCounter, showToastNotice } from './components/FpsCounter';
 import { generateImageThumbnail, generateVideoThumbnail, generateNativeVideoPoster, getOrCreateMediaThumbnail, thumbCache, MAX_THUMBNAIL_EDGE } from './utils/thumbnail';
+import {
+  buildCompletedVideoCardPatch,
+  buildDemoFallbackPatch,
+  defaultVideoPosterFailureGuard,
+  prepareGeneratedVideoAssets,
+} from './utils/videoAssetPipeline';
 import { fastGetImageDimensions } from './utils/imageHeader';
 import { resizeImageOffThread, resizeImageWithMetaOffThread } from './utils/imageResize';
 import { yieldToMain } from './utils/yieldToMain';
@@ -45,6 +83,11 @@ import { mergeMultiVersionAssetList } from './utils/assetVersions';
 import { buildAssetAgentTargetId, resolveAssetItemFromProject, parseAssetAgentTargetId, resolveAllAssetTargetIds } from './utils/assetAgentTarget';
 import { escapeAttrSelectorValue, safeQuerySelector } from './utils/domSelector';
 import { ScriptView, readScriptMetadata, readScriptDirectory, readScriptEpisode, searchScript } from './agent/scriptTools';
+import {
+  buildScriptSelectionSnapshot,
+  formatScriptSelectionCardContext,
+  type ScriptSelectionContextSnapshot,
+} from './agent/scriptSelectionContext';
 import type { AgentToolCall, AgentTurnResult } from './agent/protocol';
 import { AgentRuntime, type RuntimeTask } from './agent/runtime';
 import { snapshotRuntimeTask, type AgentRuntimeTrace } from './agent/debugTrace';
@@ -725,6 +768,11 @@ export default function App() {
   const [scriptViewRequest, setScriptViewRequest] = useState<ScriptView>('script');
   const [requestedTocItemId, setRequestedTocItemId] = useState<string | null>(null);
   const [scriptSelection, setScriptSelection] = useState<ScriptSelection>(null);
+  const scriptSelectionRef = useRef<ScriptSelection>(null);
+  const handleScriptSelectionChange = useCallback((selection: ScriptSelection) => {
+    scriptSelectionRef.current = selection;
+    setScriptSelection(selection);
+  }, []);
   const scriptViewRef = useRef({
     drawerOpen: typeof window !== 'undefined' && localStorage.getItem('is_script_drawer_open') === 'true',
     tocOpen: typeof window !== 'undefined' && localStorage.getItem('is_script_toc_open') === 'true',
@@ -929,6 +977,25 @@ export default function App() {
     currentY: number;
   } | null>(null);
 
+  // Hydrate initial per-project Agent cursor position & state synchronously on first render
+  const [previewTextCardId, setPreviewTextCardId] = useState<string | null>(null);
+  const createdTextCardEventIdsRef = useRef<Set<string>>(new Set());
+  const initialAgentCursorHydrationRef = useRef<ReturnType<typeof hydrateAgentCursorRuntimeState> | null>(null);
+  if (!initialAgentCursorHydrationRef.current) {
+    const initialViewport =
+      typeof window !== 'undefined'
+        ? { width: window.innerWidth, height: window.innerHeight }
+        : undefined;
+    const persistedCursor =
+      typeof window !== 'undefined'
+        ? readPersistedAgentCursorState(window.localStorage, currentProjectId, initialViewport)
+        : null;
+    initialAgentCursorHydrationRef.current = hydrateAgentCursorRuntimeState(
+      persistedCursor,
+      initialViewport
+    );
+  }
+
   // Agent State
   const [agentState, setAgentState] = useState<{
     x: number;
@@ -937,51 +1004,59 @@ export default function App() {
     visible: boolean;
     isActive: boolean;
     isMoving: boolean;
+    moveDurationMs?: number;
     speak?: string;
+    speakMeta?: AgentSpeakMeta;
     lastPrompt?: string;
     lastPromptTargetId?: string | null;
     cursorMode?: 'default' | 'inspect' | 'working' | 'interact';
     isSleeping?: boolean;
-  }>(() => ({ 
-    x: typeof window !== 'undefined' ? window.innerWidth - 80 : 0, 
-    y: typeof window !== 'undefined' ? window.innerHeight - 150 : 0, 
-    coordinateSpace: 'canvas',
-    visible: true, 
-    isActive: false, 
-    isMoving: false, 
-    cursorMode: 'default',
-    isSleeping: false,
-  }));
-  const [sleepWakeHint, setSleepWakeHint] = useState<{
-    x: number;
-    y: number;
-    key: number;
-  } | null>(null);
-  const sleepWakeHintTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const rightClickWakePressRef = useRef<{
-    startX: number;
-    startY: number;
-    timer: NodeJS.Timeout | null;
-    wokeByLongPress: boolean;
-  }>({ startX: 0, startY: 0, timer: null, wokeByLongPress: false });
-
-  const clearSleepWakeHint = useCallback(() => {
-    if (sleepWakeHintTimerRef.current) {
-      clearTimeout(sleepWakeHintTimerRef.current);
-      sleepWakeHintTimerRef.current = null;
+  }>(() => initialAgentCursorHydrationRef.current!.agentState);
+  const summonHistoryRef = useRef<SummonHistoryState>(createInitialSummonHistory());
+  const summonMoveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const summonSeqRef = useRef(0);
+  const cancelPendingSummonMove = useCallback(() => {
+    summonSeqRef.current += 1;
+    if (summonMoveTimerRef.current) {
+      clearTimeout(summonMoveTimerRef.current);
+      summonMoveTimerRef.current = null;
     }
-    setSleepWakeHint(null);
+  }, []);
+  useEffect(() => {
+    return () => {
+      if (summonMoveTimerRef.current) {
+        clearTimeout(summonMoveTimerRef.current);
+        summonMoveTimerRef.current = null;
+      }
+    };
+  }, []);
+  const [qiqiCallout, setQiqiCallout] = useState<QiqiCalloutState | null>(null);
+  const qiqiCalloutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const qiqiCalloutIdRef = useRef(0);
+
+  const clearQiqiCallout = useCallback(() => {
+    if (qiqiCalloutTimerRef.current) {
+      clearTimeout(qiqiCalloutTimerRef.current);
+      qiqiCalloutTimerRef.current = null;
+    }
+    setQiqiCallout(null);
   }, []);
 
-  const showSleepWakeHint = useCallback((clientX: number, clientY: number) => {
-    if (sleepWakeHintTimerRef.current) {
-      clearTimeout(sleepWakeHintTimerRef.current);
+  const triggerQiqiCallout = useCallback((clientX: number, clientY: number) => {
+    if (qiqiCalloutTimerRef.current) {
+      clearTimeout(qiqiCalloutTimerRef.current);
+      qiqiCalloutTimerRef.current = null;
     }
-    setSleepWakeHint({ x: clientX, y: clientY, key: Date.now() });
-    sleepWakeHintTimerRef.current = setTimeout(() => {
-      setSleepWakeHint(null);
-      sleepWakeHintTimerRef.current = null;
-    }, 1100);
+    qiqiCalloutIdRef.current += 1;
+    setQiqiCallout({
+      id: qiqiCalloutIdRef.current,
+      x: clientX,
+      y: clientY,
+    });
+    qiqiCalloutTimerRef.current = setTimeout(() => {
+      setQiqiCallout(null);
+      qiqiCalloutTimerRef.current = null;
+    }, QIQI_CALLOUT_HOLD_AFTER_TRIGGER_MS);
   }, []);
   const [agentFocus, setAgentFocus] = useState<AgentFocusSnapshot>(() => agentFocusManager.getSnapshot());
   useEffect(() => {
@@ -1061,16 +1136,16 @@ export default function App() {
     }
   }, [tScale, tx, ty]);
 
-  const detachActiveTaskToConcurrentCursor = useCallback(() => {
+  const detachActiveTaskToConcurrentCursor = useCallback((): boolean => {
     const runningTaskId = activeTaskIdRef.current;
-    if (!runningTaskId) return;
+    if (!runningTaskId) return false;
     const runningTask = runtimeRef.current?.getTask(runningTaskId);
-    if (runningTask && (runningTask.status === 'waiting_user' || runningTask.pendingAskCallId)) return;
+    if (runningTask && (runningTask.status === 'waiting_user' || runningTask.pendingAskCallId)) return false;
     const isTaskStillActive = Boolean(
       isAgentRunningRef.current ||
       (runningTask && ['planning', 'waiting_tools', 'running'].includes(runningTask.status as string))
     );
-    if (!isTaskStillActive) return;
+    if (!isTaskStillActive) return false;
 
     const badge = taskBadgeMapRef.current.get(runningTaskId) || activeTaskBadgeNumberRef.current || 1;
     const currentCursor = agentStateRef.current;
@@ -1105,7 +1180,103 @@ export default function App() {
     setIsAgentThinking(false);
     setIsAgentAsking(false);
     setActiveTaskBadgeNumber(undefined);
+    return true;
   }, []);
+
+  const applyNaturalAgentSummon = useCallback((params: {
+    nextPos?: { x: number; y: number; coordinateSpace: AgentCoordinateSpace };
+    toScreen: { x: number; y: number };
+    target: AgentSummonTargetDescriptor;
+    targetKey: string;
+    wasSleeping: boolean;
+    isConcurrentDetach: boolean;
+    interactionKind: SummonInteractionKind;
+  }) => {
+    const cur = agentStateRef.current;
+    const camera = { tx: tx.get(), ty: ty.get(), scale: tScale.get() || 1 };
+    const fromScreen = toScreenPoint(cur, camera);
+    const viewport =
+      typeof window !== 'undefined'
+        ? { width: window.innerWidth, height: window.innerHeight }
+        : null;
+
+    const motion =
+      params.interactionKind === 'summon'
+        ? computeSummonMotion({
+            fromScreen,
+            toScreen: params.toScreen,
+            viewport,
+            wasVisible: cur.visible,
+          })
+        : {
+            distancePx: 0,
+            isOffscreen: false,
+            distanceTier: 'near' as const,
+            travelDurationMs: 0,
+          };
+
+    const dialogue = buildSummonDialogue({
+      now: Date.now(),
+      distancePx: motion.distancePx,
+      isOffscreen: motion.isOffscreen,
+      distanceTier: motion.distanceTier,
+      travelDurationMs: motion.travelDurationMs,
+      wasSleeping: params.wasSleeping,
+      isConcurrentDetach: params.isConcurrentDetach,
+      target: params.target,
+      targetKey: params.targetKey,
+      history: summonHistoryRef.current,
+      interactionKind: params.interactionKind,
+    });
+    summonHistoryRef.current = dialogue.nextHistory;
+
+    cancelPendingSummonMove();
+    const seq = summonSeqRef.current;
+
+    if (params.interactionKind === 'summon') {
+      const initialSpeak = dialogue.inTransitSpeak || dialogue.arrivalSpeak;
+      const initialMeta: AgentSpeakMeta = {
+        kind: dialogue.inTransitSpeak ? 'transit' : 'summon',
+        text: initialSpeak,
+      };
+      setAgentState(prev => ({
+        ...prev,
+        ...(params.nextPos ?? {}),
+        speak: initialSpeak,
+        speakMeta: initialMeta,
+        isMoving: true,
+        moveDurationMs: dialogue.travelDurationMs,
+        visible: true,
+        isSleeping: false,
+      }));
+      summonMoveTimerRef.current = setTimeout(() => {
+        if (summonSeqRef.current !== seq) return;
+        summonMoveTimerRef.current = null;
+        setAgentState(prev => {
+          if (dialogue.inTransitSpeak && prev.speak === dialogue.inTransitSpeak) {
+            return {
+              ...prev,
+              isMoving: false,
+              speak: dialogue.arrivalSpeak,
+              speakMeta: { kind: 'summon', text: dialogue.arrivalSpeak },
+            };
+          }
+          return { ...prev, isMoving: false };
+        });
+      }, dialogue.travelDurationMs);
+    } else {
+      setAgentState(prev => ({
+        ...prev,
+        ...(params.nextPos ?? {}),
+        speak: dialogue.arrivalSpeak,
+        speakMeta: { kind: 'summon', text: dialogue.arrivalSpeak },
+        isMoving: false,
+        moveDurationMs: undefined,
+        visible: true,
+        isSleeping: false,
+      }));
+    }
+  }, [cancelPendingSummonMove, tScale, tx, ty]);
 
   const isThinkingOrLoadingPhrase = useCallback((s?: string) => {
     if (!s) return false;
@@ -1178,8 +1349,14 @@ export default function App() {
   }, [isThinkingOrLoadingPhrase]);
 
   // Whenever Agent stops running AND inspect queue is empty, automatically purge any lingering thinking/loading speech and reset cursor mode to 'default'
+  const hadActiveAgentRunRef = useRef(false);
   useEffect(() => {
-    if (!isAgentRunning && !isAgentThinking && inspectQueueRef.current.length === 0) {
+    if (isAgentRunning || isAgentThinking || inspectQueueRef.current.length > 0) {
+      hadActiveAgentRunRef.current = true;
+      return;
+    }
+    if (hadActiveAgentRunRef.current) {
+      hadActiveAgentRunRef.current = false;
       resetAgentStateToDefault();
     }
   }, [isAgentRunning, isAgentThinking, resetAgentStateToDefault]);
@@ -1196,11 +1373,10 @@ export default function App() {
     placeholder?: string;
     focusTrigger?: number;
     onAskResolve?: (answer: string) => void;
-  } | null>(() => ({
-    isOpen: true,
-    targetId: null,
-    placeholder: "输入你的想法...",
-  }));
+    scriptSelectionSnapshot?: ScriptSelectionContextSnapshot | null;
+  } | null>(() => initialAgentCursorHydrationRef.current!.agentQuickInput);
+  const agentQuickInputRef = useRef(agentQuickInput);
+  agentQuickInputRef.current = agentQuickInput;
   // 🛡️ Decoupling Principle: Keep user's manual selection (selectedCardIds) strictly decoupled
   // from Agent's target (agentQuickInput.targetId / targetIds & agentFocus).
   // Left-clicking a card only updates selectedCardIds (User Blue border);
@@ -1516,10 +1692,11 @@ export default function App() {
         const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
         const targetCards = newlySelectedIds.map(id => allCards.find(c => c.id === id)).filter((c): c is CardData => Boolean(c));
         const promptText = buildDynamicSelectionPrompt(targetCards);
-        
+        cancelPendingSummonMove();
         setAgentState(prevAgent => ({
           ...prevAgent,
-          speak: promptText
+          speak: promptText,
+          speakMeta: { kind: 'selection', text: promptText },
         }));
 
         if (!prevQuick) {
@@ -1549,11 +1726,16 @@ export default function App() {
     setAgentSelectionBox(null);
   }, []);
 
-  const buildUiTargetFocusInfo = useCallback((rawTargetId: string): {
+  const buildUiTargetFocusInfo = useCallback((
+    rawTargetId: string,
+    options?: { scriptSelectionOverride?: ScriptSelectionContextSnapshot | null }
+  ): {
     targetId: string;
     speak: string;
     title: string;
     contextSummary: string;
+    targetDescriptor: AgentSummonTargetDescriptor;
+    scriptSelection?: ScriptSelectionContextSnapshot | null;
   } => {
     const proj = currentProjectRef.current;
     let targetId = rawTargetId;
@@ -1583,18 +1765,29 @@ export default function App() {
         ? selectedAssetIdsRef.current.size
         : Math.max(1, focusAssetCount);
 
+      const category: 'character' | 'location' | 'prop' =
+        resolved?.category === 'character' || targetId.startsWith('assets.item.character.')
+          ? 'character'
+          : resolved?.category === 'location' || targetId.startsWith('assets.item.location.')
+            ? 'location'
+            : 'prop';
+      const targetDescriptor: AgentSummonTargetDescriptor =
+        assetCount > 1
+          ? { kind: 'asset_multi', count: assetCount }
+          : { kind: 'asset_item', category, name };
+
       let speakText = '';
       if (assetCount > 1) {
         speakText = `选了 ${assetCount} 项资产，需要我做什么？`;
-      } else if (resolved?.category === 'character' || targetId.startsWith('assets.item.character.')) {
+      } else if (category === 'character') {
         speakText = `选了角色【${name}】，需要我做什么？`;
-      } else if (resolved?.category === 'location' || targetId.startsWith('assets.item.location.')) {
+      } else if (category === 'location') {
         speakText = `选了场景【${name}】，需要我做什么？`;
       } else {
         speakText = `选了道具【${name}】，需要我做什么？`;
       }
 
-      if (resolved?.category === 'character' || targetId.startsWith('assets.item.character.')) {
+      if (category === 'character') {
         const summaryLines = [
           `【当前聚焦的剧本角色资产】`,
           isVersion ? `- 版本ID: ${itemId}` : `- 资产ID: ${itemId}`,
@@ -1611,10 +1804,11 @@ export default function App() {
           speak: speakText,
           title: `角色资产：${name}`,
           contextSummary: summaryLines.join('\n'),
+          targetDescriptor,
         };
       }
 
-      if (resolved?.category === 'location' || targetId.startsWith('assets.item.location.')) {
+      if (category === 'location') {
         const summaryLines = [
           `【当前聚焦的剧本场景资产】`,
           isVersion ? `- 版本ID: ${itemId}` : `- 资产ID: ${itemId}`,
@@ -1632,6 +1826,7 @@ export default function App() {
           speak: speakText,
           title: `场景资产：${name}`,
           contextSummary: summaryLines.join('\n'),
+          targetDescriptor,
         };
       }
 
@@ -1651,23 +1846,24 @@ export default function App() {
         speak: speakText,
         title: `道具资产：${name}`,
         contextSummary: summaryLines.join('\n'),
+        targetDescriptor,
       };
     }
 
     if (targetId === 'script.text') {
-      const selText = scriptSelection?.text?.trim();
-      if (selText) {
-        const snippet = selText.length > 16 ? `${selText.slice(0, 16)}...` : selText;
+      const hasExplicitOverride = options !== undefined && 'scriptSelectionOverride' in options;
+      const selectionSnapshot = hasExplicitOverride
+        ? (options.scriptSelectionOverride ?? null)
+        : buildScriptSelectionSnapshot(scriptSelectionRef.current, proj);
+      if (selectionSnapshot) {
+        const formatted = formatScriptSelectionCardContext(selectionSnapshot);
         return {
           targetId: 'script.text',
-          speak: `选了剧本片段「${snippet}」，需要我做什么？`,
-          title: `剧本选中片段`,
-          contextSummary: [
-            `【当前聚焦的剧本正文片段】`,
-            `- 选中文本范围: [${scriptSelection?.start ?? 0}, ${scriptSelection?.end ?? selText.length}]`,
-            `- 选中剧本内容:`,
-            selText,
-          ].join('\n'),
+          speak: formatted.speak,
+          title: formatted.title,
+          contextSummary: formatted.markdownSummary,
+          targetDescriptor: { kind: 'script_selection', snippet: formatted.chipPreview },
+          scriptSelection: formatted.scriptSelection,
         };
       }
       const preview = (proj?.scriptText || '').slice(0, 1200);
@@ -1681,6 +1877,8 @@ export default function App() {
           `- 剧本总字数: ${(proj?.scriptText || '').length}`,
           preview ? `- 剧本开头节选:\n${preview}` : '',
         ].filter(Boolean).join('\n'),
+        targetDescriptor: { kind: 'script_body' },
+        scriptSelection: null,
       };
     }
 
@@ -1691,6 +1889,7 @@ export default function App() {
         speak: '选了剧本章节，需要我做什么？',
         title: `剧本目录章节 (${tocId})`,
         contextSummary: `【当前聚焦目标：剧本目录章节 (${targetId})】`,
+        targetDescriptor: { kind: 'script_chapter', label: tocId },
       };
     }
 
@@ -1705,6 +1904,7 @@ export default function App() {
           `- 场景数量: ${proj?.locations?.length || 0}`,
           `- 道具数量: ${proj?.props?.length || 0}`,
         ].join('\n'),
+        targetDescriptor: { kind: 'asset_list' },
       };
     }
 
@@ -1713,8 +1913,9 @@ export default function App() {
       speak: `选了界面组件【${targetId}】，需要我做什么？`,
       title: `界面目标：${targetId}`,
       contextSummary: `【当前聚焦目标：${targetId}】`,
+      targetDescriptor: { kind: 'ui_panel', label: targetId },
     };
-  }, [scriptSelection]);
+  }, []);
 
   const resolveAgentUiTargetAtPoint = useCallback((clientX: number, clientY: number) => {
     if (typeof document === 'undefined') return null;
@@ -1776,7 +1977,7 @@ export default function App() {
     // 1. Precise Hit-Test: Check both the Agent cursor arrow tip and release pointer position
     const uiTarget = resolveAgentUiTargetAtPoint(tipScreenX, tipScreenY) || resolveAgentUiTargetAtPoint(screenX, screenY);
 
-    clearSleepWakeHint();
+    clearQiqiCallout();
     if (uiTarget) {
       setContextMenus(prev => { const next = { ...prev }; delete next['user']; return next; });
       const parsed = parseAssetAgentTargetId(uiTarget.targetId);
@@ -1798,14 +1999,15 @@ export default function App() {
         agentFocusManager.setPrimaryFocus(uiTarget.targetId, 'inspect', 'drag_agent');
       }
 
-      setAgentState(prev => ({
-        ...prev,
-        ...storedPos,
-        speak: uiTarget.speak,
-        isMoving: false,
-        visible: true,
-        isSleeping: false,
-      }));
+      applyNaturalAgentSummon({
+        nextPos: storedPos,
+        toScreen: { x: tipScreenX, y: tipScreenY },
+        target: uiTarget.targetDescriptor,
+        targetKey: uiTarget.targetId,
+        wasSleeping: false,
+        isConcurrentDetach: false,
+        interactionKind: 'drag',
+      });
       setAgentQuickInput({
         isOpen: true,
         x: tipScreenX,
@@ -1814,7 +2016,8 @@ export default function App() {
         canvasY: finalCanvasY,
         targetId: uiTarget.targetId,
         targetIds,
-        focusTrigger: Date.now()
+        focusTrigger: Date.now(),
+        scriptSelectionSnapshot: uiTarget.targetId === 'script.text' ? (uiTarget.scriptSelection ?? null) : null,
       });
       return;
     }
@@ -1857,20 +2060,20 @@ export default function App() {
         agentFocusManager.setPrimaryFocus(hitCard.id, 'inspect', 'drag_agent');
       }
 
-      const promptText = buildDynamicSelectionPrompt(targetCards);
       const lastReplyObj = hitCard.chatHistory && hitCard.chatHistory.length > 0
         ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant' && !m.text.includes('生好了，我先看下'))
         : undefined;
       const lastReply = lastReplyObj ? ((lastReplyObj as any).shortText || lastReplyObj.text) : undefined;
 
-      setAgentState(prev => ({
-        ...prev,
-        ...storedPos,
-        speak: promptText,
-        isMoving: false,
-        visible: true,
-        isSleeping: false,
-      }));
+      applyNaturalAgentSummon({
+        nextPos: storedPos,
+        toScreen: { x: tipScreenX, y: tipScreenY },
+        target: describeCardsAsSummonTarget(targetCards),
+        targetKey: targetIds.join(','),
+        wasSleeping: false,
+        isConcurrentDetach: false,
+        interactionKind: 'drag',
+      });
       setAgentQuickInput({
         isOpen: true,
         x: screenX,
@@ -1884,15 +2087,15 @@ export default function App() {
       });
     } else {
       agentFocusManager.clearAll();
-      const promptText = "我能帮什么忙？";
-      setAgentState(prev => ({
-        ...prev,
-        ...storedPos,
-        speak: promptText,
-        isMoving: false,
-        visible: true,
-        isSleeping: false,
-      }));
+      applyNaturalAgentSummon({
+        nextPos: storedPos,
+        toScreen: { x: tipScreenX, y: tipScreenY },
+        target: { kind: 'blank_canvas' },
+        targetKey: 'blank',
+        wasSleeping: false,
+        isConcurrentDetach: false,
+        interactionKind: 'drag',
+      });
       setAgentQuickInput({
         isOpen: true,
         x: screenX,
@@ -1905,12 +2108,13 @@ export default function App() {
         focusTrigger: Date.now()
       });
     }
-  }, [cards, clearSleepWakeHint, resolveAgentUiTargetAtPoint, tScale, tx, ty]);
+  }, [applyNaturalAgentSummon, cards, clearQiqiCallout, resolveAgentUiTargetAtPoint, tScale, tx, ty]);
 
   // Click on Agent pointer to toggle sleep / wake state
   const handleClickAgentPointer = useCallback(() => {
     // If Agent is awake and HUD is open/visible, clicking puts Agent into sleep state
     if (!agentState.isSleeping && (agentState.speak || agentQuickInput?.isOpen)) {
+      cancelPendingSummonMove();
       if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
       agentFocusManager.clearAll();
       setContextMenus(prev => {
@@ -1919,7 +2123,7 @@ export default function App() {
         delete next['user'];
         return next;
       });
-      setAgentState(prev => ({ ...prev, speak: undefined, isSleeping: true }));
+      setAgentState(prev => ({ ...prev, speak: undefined, speakMeta: undefined, isMoving: false, isSleeping: true }));
       
       // Clear the current active card draft and persist delete to IndexedDB on close
       const currentTarget = agentQuickInput?.targetId || 'global';
@@ -1928,7 +2132,8 @@ export default function App() {
 
       setAgentQuickInput(null);
     } else {
-      clearSleepWakeHint();
+      clearQiqiCallout();
+      const wasSleeping = Boolean(agentStateRef.current.isSleeping);
       const camera = { tx: tx.get(), ty: ty.get(), scale: tScale.get() || 1 };
       const { x: screenX, y: screenY } = toScreenPoint(agentState, camera);
       const { x: canvasX, y: canvasY } = toCanvasPoint(agentState, camera);
@@ -1953,13 +2158,14 @@ export default function App() {
           agentFocusManager.setPrimaryFocus(uiTarget.targetId, 'inspect', 'pointer_click');
         }
 
-        setAgentState(prev => ({
-          ...prev,
-          speak: uiTarget.speak,
-          isMoving: false,
-          visible: true,
-          isSleeping: false,
-        }));
+        applyNaturalAgentSummon({
+          toScreen: { x: screenX, y: screenY },
+          target: uiTarget.targetDescriptor,
+          targetKey: uiTarget.targetId,
+          wasSleeping,
+          isConcurrentDetach: false,
+          interactionKind: 'click_wake',
+        });
         setAgentQuickInput({
           isOpen: true,
           x: screenX,
@@ -1968,7 +2174,8 @@ export default function App() {
           canvasY,
           targetId: uiTarget.targetId,
           targetIds,
-          focusTrigger: Date.now()
+          focusTrigger: Date.now(),
+          scriptSelectionSnapshot: uiTarget.targetId === 'script.text' ? (uiTarget.scriptSelection ?? null) : null,
         });
         return;
       }
@@ -2006,19 +2213,19 @@ export default function App() {
           agentFocusManager.setPrimaryFocus(hitCard.id, 'inspect', 'pointer_click');
         }
 
-        const promptText = buildDynamicSelectionPrompt(targetCards);
         const lastReplyObj = hitCard.chatHistory && hitCard.chatHistory.length > 0
           ? [...hitCard.chatHistory].reverse().find(m => m.role === 'assistant' && !m.text.includes('生好了，我先看下'))
           : undefined;
         const lastReply = lastReplyObj ? ((lastReplyObj as any).shortText || lastReplyObj.text) : undefined;
 
-        setAgentState(prev => ({
-          ...prev,
-          speak: promptText,
-          isMoving: false,
-          visible: true,
-          isSleeping: false,
-        }));
+        applyNaturalAgentSummon({
+          toScreen: { x: screenX, y: screenY },
+          target: describeCardsAsSummonTarget(targetCards),
+          targetKey: targetIds.join(','),
+          wasSleeping,
+          isConcurrentDetach: false,
+          interactionKind: 'click_wake',
+        });
         setAgentQuickInput({
           isOpen: true,
           x: screenX,
@@ -2032,14 +2239,14 @@ export default function App() {
         });
       } else {
         agentFocusManager.clearAll();
-        const promptText = "我能帮什么忙？";
-        setAgentState(prev => ({
-          ...prev,
-          speak: promptText,
-          isMoving: false,
-          visible: true,
-          isSleeping: false,
-        }));
+        applyNaturalAgentSummon({
+          toScreen: { x: screenX, y: screenY },
+          target: { kind: 'blank_canvas' },
+          targetKey: 'blank',
+          wasSleeping,
+          isConcurrentDetach: false,
+          interactionKind: 'click_wake',
+        });
         setAgentQuickInput({
           isOpen: true,
           x: screenX,
@@ -2053,7 +2260,7 @@ export default function App() {
         });
       }
     }
-  }, [agentState, agentQuickInput?.isOpen, cards, clearSleepWakeHint, resolveAgentUiTargetAtPoint, tScale, tx, ty]);
+  }, [agentState, agentQuickInput?.isOpen, applyNaturalAgentSummon, cancelPendingSummonMove, cards, clearQiqiCallout, resolveAgentUiTargetAtPoint, tScale, tx, ty]);
 
   // Canvas Reference Picker Session State
   const [pickerSession, setPickerSession] = useState<{
@@ -2812,37 +3019,46 @@ export default function App() {
 
             const result = parsed.data;
             if (result.completed && result.mediaUrl) {
-              let thumb: string | undefined;
-              if (card.isVideo) {
+              const finalIsVideo = Boolean(result.isVideo !== undefined ? result.isVideo : card.isVideo);
+              let preparedVideoAssets = null;
+              if (finalIsVideo) {
                 try {
-                  thumb = await generateVideoThumbnail(result.mediaUrl, MAX_THUMBNAIL_EDGE);
-                  if (thumb) {
-                    thumbCache.set(card.id, thumb);
-                    thumbCache.set(result.mediaUrl, thumb);
-                  }
+                  defaultVideoPosterFailureGuard.clear(result.mediaUrl);
+                  preparedVideoAssets = await prepareGeneratedVideoAssets({
+                    cardId: card.id,
+                    mediaUrl: result.mediaUrl,
+                    downloadRemoteBlob: true,
+                    isCancelled: () => loadedProjectIdRef.current !== currentProjectId,
+                  });
                 } catch (e) {
-                  console.warn('[App] Auto video thumb generation in task recovery info:', e);
+                  console.warn('[App] Auto video asset preparation in task recovery info:', e);
                 }
               }
               if (loadedProjectIdRef.current !== currentProjectId) break;
 
+              const completionPatch = finalIsVideo
+                ? buildCompletedVideoCardPatch({
+                    mediaUrl: result.mediaUrl,
+                    assets: preparedVideoAssets,
+                    isVideo: true,
+                    markCompleted: true,
+                  })
+                : {
+                    imageUrl: result.mediaUrl,
+                    isVideo: false,
+                    state: 'completed' as const,
+                    generationError: undefined,
+                  };
+
               setCards(prev => prev.map(current =>
                 current.id === card.id && current.mcpTaskId === card.mcpTaskId
-                  ? {
-                      ...current,
-                      imageUrl: result.mediaUrl,
-                      isVideo: result.isVideo !== undefined ? result.isVideo : current.isVideo,
-                      ...(thumb ? { thumbnailUrl: thumb } : {}),
-                      state: 'completed',
-                      generationError: undefined,
-                    }
+                  ? { ...current, ...completionPatch }
                   : current
               ), false);
 
               const updatedCard: CardData = {
                 ...card,
-                imageUrl: result.mediaUrl,
-                state: 'completed',
+                ...completionPatch,
               };
               enqueueCardInspection(updatedCard, result.mediaUrl);
               break;
@@ -2866,34 +3082,44 @@ export default function App() {
             }
 
             if (result.mediaUrl) {
-              let thumb: string | undefined;
-              if (card.isVideo) {
+              const finalIsVideo = Boolean(result.isVideo !== undefined ? result.isVideo : card.isVideo);
+              let preparedVideoAssets = null;
+              if (finalIsVideo) {
                 try {
-                  thumb = await generateVideoThumbnail(result.mediaUrl, MAX_THUMBNAIL_EDGE);
-                  if (thumb) {
-                    thumbCache.set(card.id, thumb);
-                    thumbCache.set(result.mediaUrl, thumb);
-                  }
+                  defaultVideoPosterFailureGuard.clear(result.mediaUrl);
+                  preparedVideoAssets = await prepareGeneratedVideoAssets({
+                    cardId: card.id,
+                    mediaUrl: result.mediaUrl,
+                    downloadRemoteBlob: true,
+                    isCancelled: () => loadedProjectIdRef.current !== currentProjectId,
+                  });
                 } catch (e) {}
               }
               if (loadedProjectIdRef.current !== currentProjectId) break;
+
+              const completionPatch = finalIsVideo
+                ? buildCompletedVideoCardPatch({
+                    mediaUrl: result.mediaUrl,
+                    assets: preparedVideoAssets,
+                    isVideo: true,
+                    markCompleted: true,
+                  })
+                : {
+                    imageUrl: result.mediaUrl,
+                    isVideo: false,
+                    state: 'completed' as const,
+                    generationError: undefined,
+                  };
+
               setCards(prev => prev.map(current =>
                 current.id === card.id && current.mcpTaskId === card.mcpTaskId
-                  ? {
-                      ...current,
-                      imageUrl: result.mediaUrl,
-                      isVideo: result.isVideo !== undefined ? result.isVideo : current.isVideo,
-                      ...(thumb ? { thumbnailUrl: thumb } : {}),
-                      state: 'completed',
-                      generationError: undefined,
-                    }
+                  ? { ...current, ...completionPatch }
                   : current
               ), false);
 
               const updatedCard: CardData = {
                 ...card,
-                imageUrl: result.mediaUrl,
-                state: 'completed',
+                ...completionPatch,
               };
               enqueueCardInspection(updatedCard, result.mediaUrl);
               break;
@@ -3418,6 +3644,140 @@ export default function App() {
   }, [tx, ty, tScale, currentProjectId]);
   // -------------------------------------
 
+  // --- Agent Cursor Per-Project Persistence & Sync ---
+  const loadedAgentCursorProjectIdRef = useRef<string>(currentProjectId);
+  const isFirstAgentCursorSyncRef = useRef(true);
+  const agentCursorSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const flushAgentCursorPersistence = useCallback((projectIdOverride?: string) => {
+    if (agentCursorSaveTimerRef.current !== null) {
+      clearTimeout(agentCursorSaveTimerRef.current);
+      agentCursorSaveTimerRef.current = null;
+    }
+    if (typeof window === 'undefined') return;
+    const pid = projectIdOverride || currentProjectIdRef.current;
+    if (!pid || loadedAgentCursorProjectIdRef.current !== pid) return;
+    const snapshot = buildPersistedAgentCursorSnapshot({
+      agentState: agentStateRef.current,
+      quickInput: agentQuickInputRef.current,
+    });
+    writePersistedAgentCursorState(window.localStorage, pid, snapshot);
+  }, []);
+
+  const applyRestoredAgentCursorFocus = useCallback(
+    (focusTarget: { primary: string; references: string[] } | null) => {
+      if (focusTarget) {
+        if (focusTarget.references.length > 0) {
+          agentFocusManager.batchSetFocus({
+            primary: focusTarget.primary,
+            references: focusTarget.references,
+            role: 'inspect',
+            referenceRole: 'inspect',
+            sourceTool: 'restore_cursor',
+            cursorMode: 'inspect',
+          });
+        } else {
+          agentFocusManager.setPrimaryFocus(focusTarget.primary, 'inspect', 'restore_cursor');
+        }
+      } else {
+        agentFocusManager.clearAll(0);
+        agentFocusManager.setCursorMode('default');
+      }
+    },
+    []
+  );
+
+  // Restore persisted Agent cursor focus on initial mount, and restore full position & state on project switch
+  useEffect(() => {
+    if (isFirstAgentCursorSyncRef.current) {
+      isFirstAgentCursorSyncRef.current = false;
+      loadedAgentCursorProjectIdRef.current = currentProjectId;
+      applyRestoredAgentCursorFocus(initialAgentCursorHydrationRef.current?.focusTarget ?? null);
+      return;
+    }
+
+    if (agentCursorSaveTimerRef.current !== null) {
+      clearTimeout(agentCursorSaveTimerRef.current);
+      agentCursorSaveTimerRef.current = null;
+    }
+    if (agentSpeakTimerRef.current) {
+      clearTimeout(agentSpeakTimerRef.current);
+      agentSpeakTimerRef.current = null;
+    }
+    clearQiqiCallout();
+
+    const viewport =
+      typeof window !== 'undefined'
+        ? { width: window.innerWidth, height: window.innerHeight }
+        : undefined;
+    const persisted =
+      typeof window !== 'undefined'
+        ? readPersistedAgentCursorState(window.localStorage, currentProjectId, viewport)
+        : null;
+    const hydrated = hydrateAgentCursorRuntimeState(persisted, viewport);
+
+    agentStateRef.current = hydrated.agentState;
+    agentQuickInputRef.current = hydrated.agentQuickInput;
+    setAgentState(hydrated.agentState);
+    setAgentQuickInput(hydrated.agentQuickInput);
+    setPreviewTextCardId(null);
+    applyRestoredAgentCursorFocus(hydrated.focusTarget);
+    loadedAgentCursorProjectIdRef.current = currentProjectId;
+  }, [currentProjectId, applyRestoredAgentCursorFocus, clearQiqiCallout]);
+
+  // Debounced per-project persistence whenever Agent cursor position or resting state changes
+  useEffect(() => {
+    if (!currentProjectId || loadedAgentCursorProjectIdRef.current !== currentProjectId) return;
+    if (agentCursorSaveTimerRef.current !== null) {
+      clearTimeout(agentCursorSaveTimerRef.current);
+    }
+    agentCursorSaveTimerRef.current = setTimeout(() => {
+      agentCursorSaveTimerRef.current = null;
+      flushAgentCursorPersistence(currentProjectId);
+    }, 120);
+    return () => {
+      if (agentCursorSaveTimerRef.current !== null) {
+        clearTimeout(agentCursorSaveTimerRef.current);
+        agentCursorSaveTimerRef.current = null;
+      }
+    };
+  }, [
+    currentProjectId,
+    agentState.x,
+    agentState.y,
+    agentState.coordinateSpace,
+    agentState.visible,
+    agentState.isSleeping,
+    agentState.speak,
+    agentState.cursorMode,
+    agentQuickInput?.isOpen,
+    agentQuickInput?.targetId,
+    agentQuickInput?.targetIds,
+    flushAgentCursorPersistence,
+  ]);
+
+  // Flush Agent cursor persistence on reload / tab hide so fast drag/click-then-refresh never loses state
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const handleFlush = () => {
+      flushAgentCursorPersistence();
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        flushAgentCursorPersistence();
+      }
+    };
+    window.addEventListener('pagehide', handleFlush);
+    window.addEventListener('beforeunload', handleFlush);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      window.removeEventListener('pagehide', handleFlush);
+      window.removeEventListener('beforeunload', handleFlush);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [flushAgentCursorPersistence]);
+  // ---------------------------------------------------
+
   const projectTransitionRef = useRef(false);
   const flushCurrentProject = async () => {
     let snapshot: CardData[];
@@ -3441,6 +3801,7 @@ export default function App() {
         return;
       }
     }
+    flushAgentCursorPersistence(currentProjectId);
     dirtySaveRef.current = null;
     loadedProjectIdRef.current = null;
     setIsLoading(true);
@@ -3461,6 +3822,7 @@ export default function App() {
         showToastNotice(`保存失败：${String(error)}`, { duration: 6000 }); return;
       }
     }
+    flushAgentCursorPersistence(currentProjectId);
     loadedProjectIdRef.current = null;
     setIsLoading(true);
 
@@ -3508,6 +3870,9 @@ export default function App() {
     if (projects.length <= 1) return;
     try { await deleteCardsForProject(projectId); }
     catch (error) { showToastNotice(`删除失败：${String(error)}`, { duration: 6000 }); return; }
+    if (typeof window !== 'undefined') {
+      removePersistedAgentCursorState(window.localStorage, projectId);
+    }
     setProjects(prev => {
       const remaining = prev.filter(p => p.id !== projectId);
       if (currentProjectId === projectId) {
@@ -4264,26 +4629,37 @@ export default function App() {
             return forkedCard;
           }
           if (resResult.ok && result.success && result.mediaUrl) {
-            let thumb: string | undefined;
-            if (forkedCard.isVideo) {
+            const finalIsVideo = Boolean(result.isVideo ?? forkedCard.isVideo);
+            let preparedVideoAssets = null;
+            if (finalIsVideo) {
               try {
-                thumb = await generateVideoThumbnail(result.mediaUrl, MAX_THUMBNAIL_EDGE);
-                if (thumb) {
-                  thumbCache.set(newId, thumb);
-                  thumbCache.set(result.mediaUrl, thumb);
-                }
+                defaultVideoPosterFailureGuard.clear(result.mediaUrl);
+                preparedVideoAssets = await prepareGeneratedVideoAssets({
+                  cardId: newId,
+                  mediaUrl: result.mediaUrl,
+                  downloadRemoteBlob: true,
+                });
               } catch (e) {
-                console.warn('Auto video thumb generation in handleForkCard error:', e);
+                console.warn('Auto video asset preparation in handleForkCard error:', e);
               }
             }
-            handleUpdateCard(newId, { 
-              imageUrl: result.mediaUrl,
-              isVideo: result.isVideo ?? forkedCard.isVideo,
-              ...(thumb ? { thumbnailUrl: thumb } : {}),
-              state: 'completed',
-              mcpTaskId: result.taskIds?.[0],
-              generationError: undefined,
-            }, true);
+            if (finalIsVideo) {
+              handleUpdateCard(newId, buildCompletedVideoCardPatch({
+                mediaUrl: result.mediaUrl,
+                assets: preparedVideoAssets,
+                isVideo: true,
+                mcpTaskId: result.taskIds?.[0],
+                markCompleted: true,
+              }), true);
+            } else {
+              handleUpdateCard(newId, { 
+                imageUrl: result.mediaUrl,
+                isVideo: false,
+                state: 'completed',
+                mcpTaskId: result.taskIds?.[0],
+                generationError: undefined,
+              }, true);
+            }
             return forkedCard;
           } else {
             const errMsg = result.error || '生成失败，请稍后重试';
@@ -4294,10 +4670,14 @@ export default function App() {
 
         // Fallback demo timeout
         setTimeout(() => {
-          handleUpdateCard(newId, { 
-            imageUrl: "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=800&auto=format&fit=crop",
-            state: 'completed'
-          }, true);
+          handleUpdateCard(
+            newId,
+            buildDemoFallbackPatch(
+              "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=800&auto=format&fit=crop",
+              Boolean(forkedCard.isVideo)
+            ),
+            true
+          );
         }, 2000);
       } catch (err: any) {
         console.error('Fork card generation error:', err);
@@ -5351,7 +5731,17 @@ export default function App() {
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
 
-    clearSleepWakeHint();
+    const ownerId = isTrusted ? 'user' : 'agent';
+    // Long-press summon NEVER opens a right-click context menu; dismiss any open menu cleanly
+    setContextMenus(prev => {
+      if (!prev[ownerId]) return prev;
+      const next = { ...prev };
+      delete next[ownerId];
+      return next;
+    });
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('mira-dismiss-contextmenus'));
+    }
 
     const cursorX = clientX - rect.left;
     const cursorY = clientY - rect.top;
@@ -5367,20 +5757,15 @@ export default function App() {
       (activeTaskIdRef.current && runtimeRef.current?.getTask(activeTaskIdRef.current)?.status === 'running')
     );
 
-    // 1. First check if right-click is on any Script / Asset / UI panel target
+    const wasSleeping = Boolean(agentStateRef.current.isSleeping);
+    // 1. First check if long-press is on any Script / Asset / UI panel target
     const uiTarget = resolveAgentUiTargetAtPoint(clientX, clientY);
     const inDockCards = isPointInDockCardRects(clientX, clientY);
     const summonPos = resolveAgentCursorStoragePoint(clientX, clientY, canvasX, canvasY, inDockCards);
     if (uiTarget) {
-      const ownerId = isTrusted ? 'user' : 'agent';
-      // Never show blank-canvas creation menu when right-clicking Script/Asset UI panels
-      setContextMenus(prev => {
-        const next = { ...prev };
-        delete next[ownerId];
-        return next;
-      });
+      let didDetachConcurrent = false;
       if (isAgentBusy && ownerId === 'user') {
-        detachActiveTaskToConcurrentCursor();
+        didDetachConcurrent = detachActiveTaskToConcurrentCursor();
       }
 
       if (ownerId === 'user') {
@@ -5411,27 +5796,26 @@ export default function App() {
           canvasY: canvasY,
           targetId: uiTarget.targetId,
           targetIds,
-          focusTrigger: Date.now()
+          focusTrigger: Date.now(),
+          scriptSelectionSnapshot: uiTarget.targetId === 'script.text' ? (uiTarget.scriptSelection ?? null) : null,
         });
-        setAgentState(prev => ({
-          ...prev,
-          ...summonPos,
-          speak: uiTarget.speak,
-          isMoving: true,
-          visible: true,
-          isSleeping: false,
-        }));
-        setTimeout(() => {
-          setAgentState(prev => ({ ...prev, isMoving: false }));
-        }, 400);
+        applyNaturalAgentSummon({
+          nextPos: summonPos,
+          toScreen: { x: clientX, y: clientY },
+          target: uiTarget.targetDescriptor,
+          targetKey: uiTarget.targetId,
+          wasSleeping,
+          isConcurrentDetach: didDetachConcurrent,
+          interactionKind: 'summon',
+        });
       }
       return;
     }
-    
+
     const hitDomElement = targetElement || (typeof document !== 'undefined' ? document.elementFromPoint(clientX, clientY) : null);
     const cardElement = hitDomElement?.closest ? hitDomElement.closest('[data-card-id]') : null;
     let targetId = cardElement ? cardElement.getAttribute('data-card-id') : null;
-    
+
     // Perform instant world-coordinate hit-testing to identify the target card if not found from DOM
     if (!targetId) {
       const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
@@ -5445,32 +5829,13 @@ export default function App() {
       }
     }
 
-    if (isAgentBusy) {
-      if (!targetId) {
-        // 在空白画布右键时，仅弹出普通创建卡片上下文菜单，不打扰也不移动正在工作的 Agent
-        const menuWidth = 260;
-        const clampedX = typeof window !== 'undefined' ? Math.max(12, Math.min(clientX, window.innerWidth - menuWidth - 20)) : clientX;
-        const clampedY = typeof window !== 'undefined' ? Math.max(12, Math.min(clientY, window.innerHeight - 155)) : clientY;
-        const ownerId = isTrusted ? 'user' : 'agent';
-        setContextMenus(prev => ({
-          ...prev,
-          [ownerId]: {
-            x: clampedX,
-            y: clampedY,
-            canvasX: canvasX,
-            canvasY: canvasY,
-            targetId: null
-          }
-        }));
-        return;
-      }
-      if (isTrusted) {
-        detachActiveTaskToConcurrentCursor();
-      }
+    let didDetachConcurrent = false;
+    if (isAgentBusy && isTrusted) {
+      didDetachConcurrent = detachActiveTaskToConcurrentCursor();
     }
 
     // Determine the target IDs for the Agent.
-    // If the right-clicked card is part of the user's active multi-selection, 
+    // If the right-clicked card is part of the user's active multi-selection,
     // we inherit the multi-selection, so all of them are targeted!
     let targetIds: string[] = [];
     if (targetId) {
@@ -5482,7 +5847,6 @@ export default function App() {
       }
     }
 
-    const ownerId = isTrusted ? 'user' : 'agent';
     if (ownerId === 'user') {
       const hitCard = targetId ? cardsRef.current.find(c => c.id === targetId) : undefined;
       const lastReplyObj = hitCard && hitCard.chatHistory && hitCard.chatHistory.length > 0
@@ -5506,6 +5870,12 @@ export default function App() {
         agentFocusManager.clearAll();
       }
 
+      if (!targetId) {
+        // Clear global draft so quick input starts fresh at this new canvas location
+        setCardDrafts(prev => ({ ...prev, global: '' }));
+        deleteDraft('global');
+      }
+
       setAgentQuickInput({
         isOpen: true,
         targetId: targetId || null,
@@ -5513,240 +5883,253 @@ export default function App() {
         lastReply,
         focusTrigger: Date.now()
       });
+
+      const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
+      const targetCardObj = targetId ? allCards.find(c => c.id === targetId) : null;
+      const targetCards = targetId
+        ? (targetIds.length > 1
+            ? targetIds.map(id => allCards.find(c => c.id === id)).filter((c): c is CardData => Boolean(c))
+            : (targetCardObj ? [targetCardObj] : []))
+        : [];
+      applyNaturalAgentSummon({
+        nextPos: summonPos,
+        toScreen: { x: clientX, y: clientY },
+        target: describeCardsAsSummonTarget(targetCards),
+        targetKey: targetId ? targetIds.join(',') : 'blank',
+        wasSleeping,
+        isConcurrentDetach: didDetachConcurrent,
+        interactionKind: 'summon',
+      });
     } else {
       setAgentQuickInput(null);
     }
+  }, [applyNaturalAgentSummon, cards, detachActiveTaskToConcurrentCursor, isAgentRunning, isAgentThinking, resolveAgentUiTargetAtPoint, tScale, tx, ty]);
 
-    const menuWidth = 260;
-    const menuHeight = 135;
-    const hudHeight = 80;
+  const handleShortRightClickRelease = useCallback((
+    clientX: number,
+    clientY: number,
+    isTrusted: boolean,
+    targetElement?: Element | null
+  ) => {
+    const ownerId = isTrusted ? 'user' : 'agent';
+    const hitDomElement =
+      targetElement ||
+      (typeof document !== 'undefined' ? document.elementFromPoint(clientX, clientY) : null);
 
-    const clampedX = typeof window !== 'undefined' ? Math.max(12, Math.min(clientX, window.innerWidth - menuWidth - 20)) : clientX;
-    
-    // When opening on blank canvas, cascade menu down below the Agent cursor and HUD so they don't overlap
-    let menuY = clientY + hudHeight;
-    if (typeof window !== 'undefined') {
-      if (menuY + menuHeight > window.innerHeight - 16) {
-        if (clientY - menuHeight - 12 >= 16) {
-          menuY = clientY - menuHeight - 12;
-        } else {
-          menuY = Math.max(12, window.innerHeight - menuHeight - 16);
-        }
-      }
+    // Ignore clicks inside lightbox or already-open context menus
+    if (
+      hitDomElement?.closest?.(
+        '[data-testid="fullscreen-image-lightbox"], [data-allow-native-context-menu="true"], [data-agent-context-menu="true"], [data-asset-context-menu="true"]'
+      )
+    ) {
+      return;
     }
-    
-    if (!targetId) {
-      // Clear global draft so quick input starts fresh at this new canvas location
-      setCardDrafts(prev => ({ ...prev, global: '' }));
-      deleteDraft('global');
 
-      setContextMenus(prev => ({
-        ...prev,
-        [ownerId]: {
-          x: clampedX,
-          y: menuY,
-          canvasX: canvasX,
-          canvasY: canvasY,
-          targetId: null
-        }
-      }));
-    } else {
+    // 1. Asset item short right-click -> open AssetItemContextMenu at release point (never summons Agent)
+    const assetItemEl = hitDomElement?.closest?.('[data-asset-item="true"]');
+    if (assetItemEl) {
       setContextMenus(prev => {
+        if (!prev[ownerId]) return prev;
         const next = { ...prev };
         delete next[ownerId];
         return next;
       });
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(
+          new CustomEvent('mira-asset-contextmenu', {
+            detail: {
+              clientX,
+              clientY,
+              agentTargetId: assetItemEl.getAttribute('data-agent-target'),
+            },
+          })
+        );
+      }
+      return;
     }
 
-    if (ownerId === 'user') {
+    // 2. Non-asset UI panels, modals, inputs, or Agent cursor -> do not open canvas context menu
+    const uiTarget = resolveAgentUiTargetAtPoint(clientX, clientY);
+    if (
+      uiTarget ||
+      hitDomElement?.closest?.(
+        '[data-prevent-canvas-wheel="true"], [data-modal="true"], [role="dialog"], [data-agent-cursor-root="true"], aside, header, nav, input, textarea'
+      )
+    ) {
+      setContextMenus(prev => {
+        if (!prev[ownerId]) return prev;
+        const next = { ...prev };
+        delete next[ownerId];
+        return next;
+      });
+      return;
+    }
+
+    // 3. Canvas workspace (blank canvas or canvas card) -> open AgentContextMenu at release point without moving/waking Agent
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    const cursorX = clientX - rect.left;
+    const cursorY = clientY - rect.top;
+    const canvasX = (cursorX - tx.get()) / tScale.get();
+    const canvasY = (cursorY - ty.get()) / tScale.get();
+
+    const cardElement = hitDomElement?.closest ? hitDomElement.closest('[data-card-id]') : null;
+    let targetId = cardElement ? cardElement.getAttribute('data-card-id') : null;
+    if (!targetId) {
       const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
-      const targetCardObj = targetId ? allCards.find(c => c.id === targetId) : null;
-      const targetCards = targetId 
-        ? (targetIds.length > 1 
-            ? targetIds.map(id => allCards.find(c => c.id === id)).filter((c): c is CardData => Boolean(c))
-            : (targetCardObj ? [targetCardObj] : []))
-        : [];
-      const promptText = buildDynamicSelectionPrompt(targetCards);
-      setAgentState(prev => ({
-        ...prev,
-        ...summonPos,
-        speak: promptText,
-        isMoving: true,
-        visible: true,
-        isSleeping: false,
-      }));
-      setTimeout(() => {
-        setAgentState(prev => ({ ...prev, isMoving: false }));
-      }, 400);
+      for (let i = allCards.length - 1; i >= 0; i--) {
+        const c = allCards[i];
+        const dim = getCardSize(c);
+        if (canvasX >= c.x && canvasX <= c.x + dim.width && canvasY >= c.y && canvasY <= c.y + dim.height) {
+          targetId = c.id;
+          break;
+        }
+      }
     }
-  }, [cards, clearSleepWakeHint, detachActiveTaskToConcurrentCursor, isAgentRunning, isAgentThinking, resolveAgentUiTargetAtPoint, tScale, tx, ty]);
 
-  // Global right-click sleep/wake interceptor (380ms long-press right-click wakes Agent; short right-click while sleeping shows wake hint while preserving context menus)
+    const menuWidth = 260;
+    const menuHeight = 170;
+    const clampedX = typeof window !== 'undefined' ? Math.max(12, Math.min(clientX, window.innerWidth - menuWidth - 20)) : clientX;
+    const clampedY = typeof window !== 'undefined' ? Math.max(12, Math.min(clientY, window.innerHeight - menuHeight - 16)) : clientY;
+
+    setContextMenus(prev => ({
+      ...prev,
+      [ownerId]: {
+        x: clampedX,
+        y: clampedY,
+        canvasX,
+        canvasY,
+        targetId: targetId || null,
+      },
+    }));
+  }, [cards, resolveAgentUiTargetAtPoint, tScale, tx, ty]);
+
+  // Unified global right-click gesture interceptor:
+  // - Short right-click (released before 380ms): triggers context menu ONLY on pointer release (never on press)
+  // - Long-press right-click (held >= 380ms): shows top-right "呼喊七七" animation & summons Agent cursor (never opens context menu)
   useEffect(() => {
-    const LONG_PRESS_WAKE_MS = 380;
+    const isNativeMenuAllowedTarget = (target: Element | null) =>
+      Boolean(
+        target?.closest?.(
+          '[data-testid="fullscreen-image-lightbox"], [data-allow-native-context-menu="true"]'
+        )
+      );
+
+    const isInsideOpenContextMenu = (target: Element | null) =>
+      Boolean(
+        target?.closest?.('[data-agent-context-menu="true"], [data-asset-context-menu="true"]')
+      );
+
+    const controller = createRightClickGestureController<Element | null>({
+      longPressMs: RIGHT_CLICK_LONG_PRESS_MS,
+      callbacks: {
+        onLongPress: ({ x, y, isTrusted, target }) => {
+          triggerQiqiCallout(x, y);
+          summonAgentAtClientPoint(x, y, isTrusted, target);
+        },
+        onShortClick: ({ x, y, isTrusted, target }) => {
+          handleShortRightClickRelease(x, y, isTrusted, target);
+        },
+      },
+    });
 
     const onPointerDownCapture = (e: PointerEvent) => {
-      if (e.button !== 2) {
-        clearSleepWakeHint();
-        return;
-      }
-      if (rightClickWakePressRef.current.timer) {
-        clearTimeout(rightClickWakePressRef.current.timer);
-        rightClickWakePressRef.current.timer = null;
-      }
-      rightClickWakePressRef.current.startX = e.clientX;
-      rightClickWakePressRef.current.startY = e.clientY;
-      rightClickWakePressRef.current.wokeByLongPress = false;
-
-      if (!agentStateRef.current.isSleeping) return;
-
       const targetEl = e.target as Element | null;
-      const clientX = e.clientX;
-      const clientY = e.clientY;
-      const isTrusted = e.isTrusted;
+      if (e.button === 2) {
+        if (isNativeMenuAllowedTarget(targetEl) || isInsideOpenContextMenu(targetEl)) {
+          controller.cancel();
+          return;
+        }
+      }
+      controller.handlePointerDown({
+        button: e.button,
+        x: e.clientX,
+        y: e.clientY,
+        isTrusted: e.isTrusted,
+        target: targetEl,
+      });
+    };
 
-      rightClickWakePressRef.current.timer = setTimeout(() => {
-        rightClickWakePressRef.current.timer = null;
-        rightClickWakePressRef.current.wokeByLongPress = true;
-        summonAgentAtClientPoint(clientX, clientY, isTrusted, targetEl);
-      }, LONG_PRESS_WAKE_MS);
+    const onPointerMoveCapture = (e: PointerEvent) => {
+      controller.handlePointerMove({ x: e.clientX, y: e.clientY });
+    };
+
+    const onPointerUpCapture = (e: PointerEvent) => {
+      if (e.button !== 2) return;
+      const targetEl =
+        (typeof document !== 'undefined' ? document.elementFromPoint(e.clientX, e.clientY) : null) ||
+        (e.target as Element | null);
+      controller.handlePointerUp({
+        button: e.button,
+        x: e.clientX,
+        y: e.clientY,
+        isTrusted: e.isTrusted,
+        target: targetEl,
+      });
+    };
+
+    const onPointerCancelCapture = () => {
+      controller.cancel();
     };
 
     const onKeyDownCapture = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        clearSleepWakeHint();
+        controller.cancel();
       }
     };
 
-    const onPointerMoveCapture = (e: PointerEvent) => {
-      if (!rightClickWakePressRef.current.timer) return;
-      const dist = Math.hypot(
-        e.clientX - rightClickWakePressRef.current.startX,
-        e.clientY - rightClickWakePressRef.current.startY
-      );
-      if (dist > 8) {
-        clearTimeout(rightClickWakePressRef.current.timer);
-        rightClickWakePressRef.current.timer = null;
-      }
-    };
-
-    const onPointerUpOrCancelCapture = (e: PointerEvent) => {
-      if (e.button !== 2) return;
-      if (rightClickWakePressRef.current.timer) {
-        // Released before LONG_PRESS_WAKE_MS elapsed -> short right-click while sleeping!
-        clearTimeout(rightClickWakePressRef.current.timer);
-        rightClickWakePressRef.current.timer = null;
-        if (agentStateRef.current.isSleeping) {
-          showSleepWakeHint(e.clientX, e.clientY);
-        }
-      }
+    const onWindowBlur = () => {
+      controller.cancel();
     };
 
     const onContextMenuCapture = (e: MouseEvent) => {
-      // Note: On Linux & macOS, `contextmenu` fires immediately on right-button press (before pointerup),
-      // whereas on Windows it fires on pointerup. Never clear the hold timer here!
-      if (rightClickWakePressRef.current.wokeByLongPress) {
-        rightClickWakePressRef.current.wokeByLongPress = false;
-        e.preventDefault();
-        e.stopPropagation();
+      const targetEl = e.target as Element | null;
+      // Preserve native context menu inside fullscreen image lightbox or explicit native-menu opt-in regions
+      if (isNativeMenuAllowedTarget(targetEl)) {
         return;
       }
-
-      if (agentStateRef.current.isSleeping) {
-        // Do NOT stopPropagation here so component-level context menus (e.g. AssetItemContextMenu
-        // in ProjectScriptBible and blank-canvas AgentContextMenu in handleContextMenu) still open normally!
-        const targetEl = e.target as Element | null;
-        if (targetEl?.closest?.('[data-asset-item="true"]')) {
-          setContextMenus(prev => {
-            if (!prev['user']) return prev;
-            const next = { ...prev };
-            delete next['user'];
-            return next;
-          });
-        }
-        // If contextmenu was triggered without an active pointerdown timer (e.g. keyboard/synthetic contextmenu), show hint immediately
-        if (!rightClickWakePressRef.current.timer) {
-          showSleepWakeHint(e.clientX, e.clientY);
-        }
+      // Allow synthetic (non-trusted) contextmenu events dispatched by automated tools to pass through
+      if (!e.isTrusted) {
+        return;
       }
+      // Always suppress native browser context menu AND prevent press-timed React onContextMenu
+      // handlers from firing on macOS/Linux; short-click menus open strictly on pointerup.
+      e.preventDefault();
+      e.stopPropagation();
     };
 
     window.addEventListener('pointerdown', onPointerDownCapture, true);
     window.addEventListener('pointermove', onPointerMoveCapture, true);
-    window.addEventListener('pointerup', onPointerUpOrCancelCapture, true);
-    window.addEventListener('pointercancel', onPointerUpOrCancelCapture, true);
+    window.addEventListener('pointerup', onPointerUpCapture, true);
+    window.addEventListener('pointercancel', onPointerCancelCapture, true);
     window.addEventListener('contextmenu', onContextMenuCapture, true);
     window.addEventListener('keydown', onKeyDownCapture, true);
+    window.addEventListener('blur', onWindowBlur);
     return () => {
+      controller.dispose();
       window.removeEventListener('pointerdown', onPointerDownCapture, true);
       window.removeEventListener('pointermove', onPointerMoveCapture, true);
-      window.removeEventListener('pointerup', onPointerUpOrCancelCapture, true);
-      window.removeEventListener('pointercancel', onPointerUpOrCancelCapture, true);
+      window.removeEventListener('pointerup', onPointerUpCapture, true);
+      window.removeEventListener('pointercancel', onPointerCancelCapture, true);
       window.removeEventListener('contextmenu', onContextMenuCapture, true);
       window.removeEventListener('keydown', onKeyDownCapture, true);
+      window.removeEventListener('blur', onWindowBlur);
     };
-  }, [clearSleepWakeHint, showSleepWakeHint, summonAgentAtClientPoint]);
+  }, [
+    handleShortRightClickRelease,
+    summonAgentAtClientPoint,
+    triggerQiqiCallout,
+  ]);
 
   const handleContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
-    if (agentStateRef.current.isSleeping) {
-      const rect = containerRef.current?.getBoundingClientRect();
-      if (rect) {
-        const cursorX = e.clientX - rect.left;
-        const cursorY = e.clientY - rect.top;
-        const canvasX = (cursorX - tx.get()) / tScale.get();
-        const canvasY = (cursorY - ty.get()) / tScale.get();
-        const uiTarget = resolveAgentUiTargetAtPoint(e.clientX, e.clientY);
-
-        let targetId: string | null = null;
-        if (!uiTarget) {
-          const hitDomElement = (e.target as Element | null) || (typeof document !== 'undefined' ? document.elementFromPoint(e.clientX, e.clientY) : null);
-          const cardElement = hitDomElement?.closest ? hitDomElement.closest('[data-card-id]') : null;
-          targetId = cardElement ? cardElement.getAttribute('data-card-id') : null;
-          if (!targetId) {
-            const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
-            for (let i = allCards.length - 1; i >= 0; i--) {
-              const c = allCards[i];
-              const dim = getCardSize(c);
-              if (canvasX >= c.x && canvasX <= c.x + dim.width && canvasY >= c.y && canvasY <= c.y + dim.height) {
-                targetId = c.id;
-                break;
-              }
-            }
-          }
-        }
-
-        const ownerId = e.nativeEvent.isTrusted ? 'user' : 'agent';
-        if (!uiTarget && !targetId) {
-          // Blank canvas has a creation context menu: show it normally without waking or moving the sleeping Agent
-          const menuWidth = 260;
-          const clampedX = typeof window !== 'undefined' ? Math.max(12, Math.min(e.clientX, window.innerWidth - menuWidth - 20)) : e.clientX;
-          const clampedY = typeof window !== 'undefined' ? Math.max(12, Math.min(e.clientY, window.innerHeight - 155)) : e.clientY;
-          setContextMenus(prev => ({
-            ...prev,
-            [ownerId]: {
-              x: clampedX,
-              y: clampedY,
-              canvasX,
-              canvasY,
-              targetId: null,
-            },
-          }));
-        } else {
-          setContextMenus(prev => {
-            if (!prev[ownerId]) return prev;
-            const next = { ...prev };
-            delete next[ownerId];
-            return next;
-          });
-        }
-      }
-      if (!rightClickWakePressRef.current.timer) {
-        showSleepWakeHint(e.clientX, e.clientY);
-      }
-      return;
+    // Trusted user right-clicks are handled exclusively by the capture-phase gesture controller
+    // (short-press on release for menus, long-press for Agent summon).
+    // Only handle synthetic (non-trusted) events here if dispatched programmatically.
+    if (!e.nativeEvent.isTrusted) {
+      handleShortRightClickRelease(e.clientX, e.clientY, false, e.target as Element | null);
     }
-    summonAgentAtClientPoint(e.clientX, e.clientY, e.nativeEvent.isTrusted, e.target as Element | null);
   };
 
   const handleCreateCard = (ownerId: string = 'user', isVideo = false) => {
@@ -5780,6 +6163,132 @@ export default function App() {
     });
     return newId;
   };
+
+  const handleCreateTextCard = (ownerId: string = 'user') => {
+    const menu = contextMenus[ownerId];
+    if (!menu) return;
+    const newId = `txt_${Math.random().toString(36).substring(2, 11)}`;
+    const newCard = buildManualTextCardData(newId, menu.canvasX, menu.canvasY);
+    requestCardEntries(currentProjectId, [newCard.id]);
+    setCards(prev => [...prev, newCard]);
+    if (ownerId === 'user') setSelectedCardIds([newCard.id]);
+
+    setContextMenus(prev => {
+      const next = { ...prev };
+      delete next[ownerId];
+      return next;
+    });
+    return newId;
+  };
+
+  const handleForkTextCard = useCallback((sourceCardId: string) => {
+    const sourceCard = cardsRef.current.find(c => c.id === sourceCardId);
+    if (!sourceCard || !sourceCard.isText) return;
+    const placement = computeTextCardPlacement({
+      existingCards: cardsRef.current,
+      sourceCard,
+    });
+    const newId = `txt_${Math.random().toString(36).substring(2, 11)}`;
+    const baseTitle = (sourceCard.textTitle || '未命名文本').replace(/\s*副本$/, '');
+    const forkedCard = buildTextCardData({
+      id: newId,
+      x: placement.x,
+      y: placement.y,
+      title: `${baseTitle} 副本`,
+      content: sourceCard.textContent || '',
+      derivedFromId: sourceCard.id,
+    });
+    requestCardEntries(currentProjectRef.current.id, [forkedCard.id]);
+    setCards(prev => [...prev, forkedCard]);
+    setSelectedCardIds([forkedCard.id]);
+    return newId;
+  }, []);
+
+  const handleLocateTextCardOnCanvas = useCallback((cardId: string) => {
+    const targetCard = cardsRef.current.find(c => c.id === cardId);
+    setPreviewTextCardId(null);
+    setIsScriptDrawerOpen(false);
+    if (!targetCard) return;
+    const dim = getCardSize(targetCard);
+    setSelectedCardIds([targetCard.id]);
+    requestAnimationFrame(() => {
+      panToCanvasPos(targetCard.x + dim.width / 2, targetCard.y + dim.height / 2);
+    });
+  }, []);
+
+  const spawnAgentTextCardForAnswer = useCallback(
+    (
+      event: { id: string; text?: string; speak?: string; hasFullAnswer?: boolean },
+      task: RuntimeTask
+    ) => {
+      if (!shouldCreateTextCardForAnswer(event)) return null;
+      if (createdTextCardEventIdsRef.current.has(event.id)) return null;
+      if (cardsRef.current.some(c => c.sourceAgentEventId === event.id)) {
+        createdTextCardEventIdsRef.current.add(event.id);
+        return null;
+      }
+
+      const parsed = parseAgentCommunication(event.text || '');
+      const fullContent = (parsed.fullText || event.text || '').trim();
+      if (!fullContent) return null;
+
+      createdTextCardEventIdsRef.current.add(event.id);
+
+      const contextCardId = task.cardContext?.cardId || task.cardContext?.targetId;
+      const sourceCard = contextCardId
+        ? cardsRef.current.find(c => c.id === contextCardId) || null
+        : null;
+
+      const scaleVal = tScale.get() || 1;
+      const txVal = tx.get();
+      const tyVal = ty.get();
+      const viewportW = typeof window !== 'undefined' ? window.innerWidth : 1440;
+      const viewportH = typeof window !== 'undefined' ? window.innerHeight : 900;
+      const fallbackViewportCenterCanvas = {
+        x: (viewportW / 2 - txVal) / scaleVal,
+        y: (viewportH / 2 - tyVal) / scaleVal,
+      };
+
+      const curAgent = agentStateRef.current;
+      const anchorCanvasPoint =
+        !scriptViewRef.current.drawerOpen && curAgent
+          ? curAgent.coordinateSpace === 'screen'
+            ? toCanvasPoint(curAgent, { tx: txVal, ty: tyVal, scale: scaleVal })
+            : { x: curAgent.x, y: curAgent.y }
+          : null;
+
+      const placement = computeTextCardPlacement({
+        existingCards: cardsRef.current,
+        sourceCard,
+        anchorCanvasPoint,
+        fallbackViewportCenterCanvas,
+      });
+
+      const newId = `txt_${Math.random().toString(36).substring(2, 11)}`;
+      const newCard = buildTextCardData({
+        id: newId,
+        x: placement.x,
+        y: placement.y,
+        title: deriveTextCardTitle(fullContent, task.title),
+        content: fullContent,
+        derivedFromId: sourceCard?.id,
+        sourceAgentEventId: event.id,
+      });
+
+      requestCardEntries(currentProjectRef.current.id, [newCard.id]);
+      setCards(prev => [...prev, newCard]);
+
+      // Option A: If Script Bible drawer is currently open over the canvas,
+      // float a preview overlay of the newly created Text Card right on top;
+      // closing the preview leaves the Text Card safely persisted on the canvas.
+      if (scriptViewRef.current.drawerOpen) {
+        setPreviewTextCardId(newCard.id);
+      }
+
+      return newCard.id;
+    },
+    [parseAgentCommunication, tScale, tx, ty]
+  );
 
   const inspectPage = useCallback(async (options: Record<string, unknown> = {}) => {
     // If the script drawer is open and in script view, but the textarea is still settling (due to the 210ms anti-jank delay),
@@ -5841,9 +6350,13 @@ export default function App() {
         const rawCardId = id.replace('canvas.card.', '');
         const cardObj = cardsRef.current.find(c => c.id === rawCardId);
         if (cardObj) {
-          const cardType = cardObj.isVideo ? '视频' : (cardObj.isAsset ? '资产' : '生图');
-          const title = cardObj.fileName ? `[${cardObj.fileName}]` : '未命名卡片';
-          const promptSnip = cardObj.prompt ? `"${cardObj.prompt.slice(0, 24)}..."` : '(无提示词)';
+          const cardType = cardObj.isText ? '文本' : (cardObj.isVideo ? '视频' : (cardObj.isAsset ? '资产' : '生图'));
+          const title = cardObj.isText
+            ? `[${cardObj.textTitle || '未命名文本'}]`
+            : (cardObj.fileName ? `[${cardObj.fileName}]` : '未命名卡片');
+          const promptSnip = cardObj.isText
+            ? (cardObj.textContent ? `"${cardObj.textContent.slice(0, 24)}..."` : '(空文本)')
+            : (cardObj.prompt ? `"${cardObj.prompt.slice(0, 24)}..."` : '(无提示词)');
           label = `画布卡片 ${title} (${cardType}, ${cardObj.state}, ${cardObj.ratio}, ${promptSnip})`;
         }
       } else if (id === 'script.search.counter') {
@@ -6339,6 +6852,16 @@ export default function App() {
     if (signal?.aborted) return { aborted: true };
     if (call.name === 'experience.search' || call.name === 'script.directory' || call.name === 'script.read' || call.name === 'script.search' || call.name === 'asset.list' || call.name === 'asset.searchProvenanceCandidates') {
       return executeProjectReadTool(call.name, call.arguments, currentProjectRef.current);
+    }
+    if (call.name === 'script.editDirectory') {
+      const { updatedProject, output } = executeProjectScriptMutation(call.name, call.arguments, currentProjectRef.current);
+      if (Object.keys(updatedProject).length > 0) {
+        handleUpdateCurrentProject(updatedProject);
+      }
+      if (task.cardContext) {
+        task.cardContext = refreshTaskCardContext(task.cardContext, currentProjectRef.current, cardsRef.current);
+      }
+      return output;
     }
     if (call.name === 'asset.create' || call.name === 'asset.update' || call.name === 'asset.delete' || call.name === 'asset.commitProvenance' || call.name === 'asset.bindImage') {
       const { updatedProject, output } = executeProjectAssetMutation(call.name, call.arguments, currentProjectRef.current, cardsRef.current);
@@ -7160,18 +7683,22 @@ export default function App() {
   extractCardImageBase64Ref.current = extractCardImageBase64;
 
   const formatCardContextInfo = useCallback((card: CardData, hasImage: boolean): string => {
-    const cardType = card.isVideo ? '视频生成卡片' : (card.isAsset ? '素材/参考卡片' : '生图卡片');
+    const cardType = card.isText ? '文本卡片' : (card.isVideo ? '视频生成卡片' : (card.isAsset ? '素材/参考卡片' : '生图卡片'));
     const prompt = card.prompt || card.lastGeneratedPrompt || '';
     const refCount = card.referenceImages?.length || 0;
     
     const lines: string[] = [
       `【当前右键聚焦的目标卡片信息】`,
       `- 卡片ID: ${card.id}`,
-      `- 标题/分集: ${card.fileName || '未命名卡片'}`,
+      `- 标题/分集: ${card.isText ? (card.textTitle || '未命名文本') : (card.fileName || '未命名卡片')}`,
       `- 卡片类型: ${cardType}`,
-      `- 提示词 (Prompt): ${prompt ? `"${prompt}"` : '(空)'}`,
-      `- 画幅比例: ${card.ratio || '默认'}`,
-      `- 分辨率: ${card.res || '2K'}`,
+      ...(card.isText
+        ? [`- 文本正文:\n${card.textContent || '(空)'}`]
+        : [
+            `- 提示词 (Prompt): ${prompt ? `"${prompt}"` : '(空)'}`,
+            `- 画幅比例: ${card.ratio || '默认'}`,
+            `- 分辨率: ${card.res || '2K'}`,
+          ]),
     ];
 
     if (card.lastGeneratedPrompt && card.lastGeneratedPrompt !== prompt) {
@@ -7274,11 +7801,21 @@ export default function App() {
           console.warn('Auto card context generation failed:', e);
         }
       } else {
-        const uiInfo = buildUiTargetFocusInfo(agentFocusedTargetId);
+        const frozenScriptSelection =
+          agentFocusedTargetId === 'script.text'
+            ? (agentQuickInputRef.current?.scriptSelectionSnapshot ?? null)
+            : null;
+        const uiInfo = buildUiTargetFocusInfo(
+          agentFocusedTargetId,
+          agentFocusedTargetId === 'script.text'
+            ? { scriptSelectionOverride: frozenScriptSelection }
+            : undefined
+        );
         effectiveCardContext = {
           targetId: uiInfo.targetId,
           title: uiInfo.title,
           markdownSummary: uiInfo.contextSummary,
+          ...(uiInfo.scriptSelection ? { scriptSelection: uiInfo.scriptSelection } : {}),
         };
       }
     }
@@ -7964,6 +8501,13 @@ export default function App() {
               }
             }
 
+            // Spawn first-class Text Cards ONLY when Agent explicitly produced a full version ("完整版")
+            for (const evt of task.events) {
+              if (evt.type === 'answer' && evt.hasFullAnswer) {
+                spawnAgentTextCardForAnswer(evt, task);
+              }
+            }
+
             // If task is bound to a specific card context, sync answer events to that card's chat history
             const cardId = task.cardContext?.cardId || task.cardContext?.targetId;
             if (cardId) {
@@ -8266,11 +8810,24 @@ export default function App() {
     );
   }, [tScale, tx, ty]);
 
-  const handleCardAgentChat = useCallback(async (targetCardId: string, promptText: string) => {
+  const handleCardAgentChat = useCallback(async (
+    targetCardId: string,
+    promptText: string,
+    options?: { scriptSelectionSnapshot?: ScriptSelectionContextSnapshot | null }
+  ) => {
     const allCards = cardsRef.current.length > 0 ? cardsRef.current : cards;
     const targetCard = allCards.find(c => c.id === targetCardId) || cards.find(c => c.id === targetCardId);
     if (!targetCard) {
-      const uiInfo = buildUiTargetFocusInfo(targetCardId);
+      const hasExplicitSelection = options !== undefined && 'scriptSelectionSnapshot' in options;
+      const frozenScriptSelection = hasExplicitSelection
+        ? (options.scriptSelectionSnapshot ?? null)
+        : (targetCardId === 'script.text' ? (agentQuickInputRef.current?.scriptSelectionSnapshot ?? null) : null);
+      const uiInfo = buildUiTargetFocusInfo(
+        targetCardId,
+        targetCardId === 'script.text'
+          ? { scriptSelectionOverride: frozenScriptSelection }
+          : undefined
+      );
       setGlobalChatHistory(prev => [
         ...prev,
         {
@@ -8284,6 +8841,7 @@ export default function App() {
         targetId: uiInfo.targetId,
         title: uiInfo.title,
         markdownSummary: uiInfo.contextSummary,
+        ...(uiInfo.scriptSelection ? { scriptSelection: uiInfo.scriptSelection } : {}),
       });
       return;
     }
@@ -8347,7 +8905,7 @@ export default function App() {
         markdownSummary: cardInfo,
       });
     }
-  }, [cards, extractCardImageBase64, formatCardContextInfo]);
+  }, [buildUiTargetFocusInfo, cards, extractCardImageBase64, formatCardContextInfo]);
 
   const handlePauseTask = () => {
     if (!runtimeRef.current || !activeTaskIdRef.current) return;
@@ -8386,7 +8944,7 @@ export default function App() {
   const handleSendTaskChat = async () => {
     const msg = taskChatMessage.trim();
     if (!msg) return;
-    clearSleepWakeHint();
+    clearQiqiCallout();
     setAgentState(prev => prev.isSleeping ? { ...prev, isSleeping: false } : prev);
     setTaskChatMessage('');
     setIsTaskChatOpen(false);
@@ -8425,8 +8983,11 @@ export default function App() {
           if (agentQuickInput?.isOpen) {
             return prev;
           }
-          if (prev.speak === '选中了这组内容，要调整什么？' || prev.speak === '我能帮什么忙？') {
-            return { ...prev, speak: undefined };
+          if (
+            isCurrentSpeakMetaKind(prev.speak, prev.speakMeta, ['summon', 'transit', 'selection']) ||
+            isDefaultSelectionPrompt(prev.speak)
+          ) {
+            return { ...prev, speak: undefined, speakMeta: undefined };
           }
           return prev;
         });
@@ -9006,10 +9567,17 @@ export default function App() {
       if (target) {
         const closestInput = target.closest('textarea, input, select') as HTMLElement | null;
         const isFocusedInput = closestInput && document.activeElement === closestInput;
-        
-        const isInsideOverlay = target.closest(
-          '[data-prevent-canvas-wheel], [data-modal], aside, .overflow-y-auto, .overflow-x-auto, .overflow-auto, [role="dialog"]'
-        );
+        const closestTextCard = target.closest('[data-card-kind="text"]') as HTMLElement | null;
+        const isUnselectedTextCard =
+          closestTextCard !== null &&
+          closestTextCard.getAttribute('data-selected') !== 'true' &&
+          !target.closest('[data-prevent-canvas-wheel]');
+
+        const isInsideOverlay =
+          !isUnselectedTextCard &&
+          target.closest(
+            '[data-prevent-canvas-wheel], [data-modal], aside, .overflow-y-auto, .overflow-x-auto, .overflow-auto, [role="dialog"]'
+          );
 
         if (isFocusedInput || isInsideOverlay) {
           return;
@@ -9568,8 +10136,6 @@ export default function App() {
   const visibleCardsRef = useRef<CardData[]>([]);
   const agentFocusRef = useRef(agentFocus);
   agentFocusRef.current = agentFocus;
-  const agentQuickInputRef = useRef(agentQuickInput);
-  agentQuickInputRef.current = agentQuickInput;
 
   const abortMountQueue = useCallback(() => {
     mountQueueAbortRef.current.aborted = true;
@@ -10120,7 +10686,7 @@ export default function App() {
         onViewChange={setScriptView}
         requestedTocItemId={requestedTocItemId}
         onTocItemOpened={handleTocItemOpened}
-        onSelectionChange={setScriptSelection}
+        onSelectionChange={handleScriptSelectionChange}
         onRequestGenerateAsset={handleRequestGenerateAsset}
         onRequestGenerateAssetImage={handleRequestGenerateAssetImage}
         onStartCanvasAssetBind={handleStartCanvasAssetBind}
@@ -10134,6 +10700,17 @@ export default function App() {
         isAgentSleeping={Boolean(agentState.isSleeping)}
         selectedAssetIds={selectedAssetIds}
         onSelectedAssetIdsChange={setSelectedAssetIds}
+        lockedAgentSelection={
+          agentQuickInput?.isOpen &&
+          agentQuickInput.targetId === 'script.text' &&
+          agentQuickInput.scriptSelectionSnapshot &&
+          agentQuickInput.scriptSelectionSnapshot.projectId === currentProject.id
+            ? {
+                start: agentQuickInput.scriptSelectionSnapshot.start,
+                end: agentQuickInput.scriptSelectionSnapshot.end,
+              }
+            : null
+        }
       />
 
       {/* Top Right Controls */}
@@ -10268,6 +10845,8 @@ export default function App() {
               onDelete={handleCardDelete}
               onUpdate={handleUpdateCard}
               onForkCard={handleForkCard}
+              onForkTextCard={handleForkTextCard}
+              onOpenTextPreview={setPreviewTextCardId}
               onBindToScriptAsset={handleBindToScriptAsset}
               onHover={setHoveredCardId}
             />
@@ -10511,6 +11090,8 @@ export default function App() {
                     return;
                   }
                   const currentTarget = agentQuickInput.targetId;
+                  const frozenScriptSelection =
+                    currentTarget === 'script.text' ? (agentQuickInput.scriptSelectionSnapshot ?? null) : null;
                   const currentKey = currentTarget || 'global';
                   setCardDrafts(prev => ({ ...prev, [currentKey]: '' }));
                   deleteDraft(currentKey); // Delete draft from IndexedDB on submit
@@ -10518,7 +11099,9 @@ export default function App() {
                     isOpen: true,
                     targetId: currentTarget,
                     placeholder: "输入你的想法...",
+                    scriptSelectionSnapshot: null,
                   }));
+                  cancelPendingSummonMove();
                   if (agentSpeakTimerRef.current) clearTimeout(agentSpeakTimerRef.current);
                   setIsAgentAsking(false);
                   isAgentRunningRef.current = true;
@@ -10529,6 +11112,7 @@ export default function App() {
                     lastPrompt: prompt,
                     lastPromptTargetId: currentTarget,
                     speak: "正在思考...",
+                    speakMeta: undefined,
                     visible: true
                   }));
                   if (!prompt) {
@@ -10566,7 +11150,9 @@ export default function App() {
                       agentFocusManager.setPrimaryFocus(currentTarget, 'working', 'quick_input');
                       agentFocusManager.setCursorMode('default');
                     }
-                    await handleCardAgentChat(currentTarget, prompt);
+                    await handleCardAgentChat(currentTarget, prompt, {
+                      scriptSelectionSnapshot: frozenScriptSelection,
+                    });
                   } else {
                     setGlobalChatHistory(prev => [
                       ...prev,
@@ -10601,9 +11187,14 @@ export default function App() {
                   setCardDrafts(prev => ({ ...prev, [currentTarget]: '' }));
                   deleteDraft(currentTarget); // Delete draft from IndexedDB on close
                   setAgentQuickInput(prev => ({ isOpen: true, targetId: prev?.targetId || null, placeholder: "输入你的想法..." }));
+                  cancelPendingSummonMove();
                   setAgentState(prev => {
-                    if (!prev.speak || prev.speak.startsWith('选了') || prev.speak === '我能帮什么忙？' || prev.speak === '选中了这组内容，要调整什么？') {
-                      return { ...prev, speak: undefined };
+                    if (
+                      !prev.speak ||
+                      isCurrentSpeakMetaKind(prev.speak, prev.speakMeta, ['summon', 'transit', 'selection']) ||
+                      isDefaultSelectionPrompt(prev.speak)
+                    ) {
+                      return { ...prev, speak: undefined, speakMeta: undefined };
                     }
                     return prev;
                   });
@@ -10613,45 +11204,28 @@ export default function App() {
         }
         onClickPointer={handleClickAgentPointer}
         onDragAgent={(newX, newY, coordinateSpace) => {
+          cancelPendingSummonMove();
           setAgentState(prev => ({
             ...prev,
             x: newX,
             y: newY,
             coordinateSpace,
             isMoving: false,
+            moveDurationMs: undefined,
           }));
         }}
         onDragAgentEnd={handleDragAgentEnd}
         onDismissSpeak={() => {
-          setAgentState(prev => ({ ...prev, speak: undefined }));
+          cancelPendingSummonMove();
+          setAgentState(prev => ({ ...prev, speak: undefined, speakMeta: undefined }));
         }}
         onStartAgentBoxSelect={handleStartAgentBoxSelect}
         onUpdateAgentBoxSelect={handleUpdateAgentBoxSelect}
         onEndAgentBoxSelect={handleEndAgentBoxSelect}
       />
 
-      {/* Short Right-Click Wake Hint when Agent is Sleeping */}
-      <AnimatePresence>
-        {sleepWakeHint && (
-          <motion.div
-            key="agent-sleep-wake-hint"
-            data-testid="agent-sleep-wake-hint"
-            initial={{ opacity: 0, y: 2 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -2 }}
-            transition={{ duration: 0.12, ease: [0.16, 1, 0.3, 1] }}
-            className="fixed z-[10000] pointer-events-none select-none text-[11px] font-normal leading-none text-[#a45cf8] whitespace-nowrap"
-            style={{
-              left: typeof window !== 'undefined' ? Math.max(12, Math.min(sleepWakeHint.x + 6, window.innerWidth - 130)) : sleepWakeHint.x + 6,
-              top: typeof window !== 'undefined'
-                ? (sleepWakeHint.y >= 36 ? Math.min(sleepWakeHint.y - 24, window.innerHeight - 28) : sleepWakeHint.y + 12)
-                : sleepWakeHint.y - 24,
-            }}
-          >
-            长按右键唤醒agent
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {/* Long-Press Right-Click "呼喊七七" Callout Animation at Top-Right of User Cursor */}
+      <QiqiCalloutOverlay callout={qiqiCallout} isDarkMode={isDarkMode} />
 
       {/* Resident Bottom-Right Mira Dialogue Box */}
       {isTaskPanelCollapsed ? (
@@ -10996,28 +11570,31 @@ export default function App() {
               }}
               onClose={() => {
                 setContextMenus(prev => { const next = {...prev}; delete next['user']; return next; });
-                setAgentQuickInput(null);
-                setAgentState(prev => {
-                  if (prev.speak === '选中了这组内容，要调整什么？' || prev.speak === '我能帮什么忙？') {
-                    return { ...prev, speak: undefined };
-                  }
-                  return prev;
-                });
               }}
               onAction={async (action, targetId) => {
-                setAgentState(prev => {
-                  if (prev.speak === '选中了这组内容，要调整什么？' || prev.speak === '我能帮什么忙？') {
-                    return { ...prev, speak: undefined };
-                  }
-                  return prev;
-                });
                 if (action === 'new_card') handleCreateCard(ownerId);
                 else if (action === 'new_video_card') handleCreateCard(ownerId, true);
+                else if (action === 'new_text_card') handleCreateTextCard(ownerId);
+                else if (action === 'preview_text_card' && targetId) {
+                  setPreviewTextCardId(targetId);
+                }
+                else if (action === 'fork_text_card' && targetId) {
+                  handleForkTextCard(targetId);
+                }
+                else if (action === 'copy_text_card' && targetId) {
+                  const target = cardsRef.current.find(c => c.id === targetId);
+                  if (target?.textContent && typeof navigator !== 'undefined' && navigator.clipboard) {
+                    navigator.clipboard.writeText(target.textContent).catch(() => {});
+                    showToastNotice('已复制文本卡片内容', { duration: 2200 });
+                  }
+                }
                 else if (action === 'delete' && targetId) {
                   setCards(prev => prev.filter(c => c.id !== targetId));
+                  if (previewTextCardId === targetId) setPreviewTextCardId(null);
                 }
                 else if (action === 'clear') {
                   setCards([]);
+                  setPreviewTextCardId(null);
                 }
                 else if (action === 'variant' && targetId) {
                   await handleCardAgentChat(targetId, '请以该卡片为基准，参考其构图与主体，生成一张新的变体卡片。');
@@ -11031,6 +11608,24 @@ export default function App() {
               }}
             />
           ))}
+      </AnimatePresence>
+
+      {/* Floating Text Card Preview Overlay (Option A when Script Drawer is open, or on Expand Read) */}
+      <AnimatePresence>
+        {previewTextCardId && (() => {
+          const previewCard = cards.find(c => c.id === previewTextCardId && c.isText) || null;
+          if (!previewCard) return null;
+          return (
+            <TextCardPreviewOverlay
+              key={previewCard.id}
+              card={previewCard}
+              showLocateOnCanvas={isScriptDrawerOpen}
+              onClose={() => setPreviewTextCardId(null)}
+              onUpdate={handleUpdateCard}
+              onLocateOnCanvas={handleLocateTextCardOnCanvas}
+            />
+          );
+        })()}
       </AnimatePresence>
 
 

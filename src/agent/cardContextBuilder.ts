@@ -1,6 +1,10 @@
 import type { CardData } from '../components/GenerationCard';
 import type { ScriptProject } from '../types/script';
 import { resolveAssetItemFromProject } from '../utils/assetAgentTarget';
+import {
+  formatScriptSelectionCardContext,
+  type ScriptSelectionContextSnapshot,
+} from './scriptSelectionContext';
 
 export interface CardLineageNode {
   id: string;
@@ -302,13 +306,20 @@ export function formatSingleCardContextSync(
     ``,
     `## 1. 当前目标卡片 (Target Focus)`,
     `- 卡片ID: \`${targetCard.id}\``,
-    `- 标题/标签: ${targetCard.fileName ? `**[${targetCard.fileName}]**` : '未命名卡片'}`,
-    `- 类型: ${targetCard.isVideo ? '视频生成卡片' : (targetCard.isAsset ? '素材/参考资产' : '生图卡片')}`,
-    `- 提示词 (Prompt): ${targetCard.prompt ? `"${targetCard.prompt}"` : '(空)'}`,
-    ...(targetCard.lastGeneratedPrompt && targetCard.lastGeneratedPrompt !== targetCard.prompt ? [`- 历史生成提示词: "${targetCard.lastGeneratedPrompt}"`] : []),
-    `- 画幅比例与分辨率: ${targetCard.ratio || '9:16'} · ${targetCard.res || '2K'}`,
-    ...(targetCard.mcpModel ? [`- 关联模型: ${targetCard.mcpModel}`] : []),
-    `- 关联参考图数量: ${targetCard.referenceImages?.length || (targetCard.referenceImageUrl ? 1 : 0)} 张`,
+    `- 标题/标签: ${targetCard.isText ? `**[${targetCard.textTitle || '未命名文本'}]**` : (targetCard.fileName ? `**[${targetCard.fileName}]**` : '未命名卡片')}`,
+    `- 类型: ${targetCard.isText ? '文本卡片' : (targetCard.isVideo ? '视频生成卡片' : (targetCard.isAsset ? '素材/参考资产' : '生图卡片'))}`,
+    ...(targetCard.isText
+      ? [
+          `- 文本卡片正文内容:\n${targetCard.textContent || '(空)'}`,
+          `- 协作约定: 若用户要求修改、扩写或重构该文本卡片内容，请直接输出完整版回答，系统会自动在右侧生成一张新的衍生文本卡片。`,
+        ]
+      : [
+          `- 提示词 (Prompt): ${targetCard.prompt ? `"${targetCard.prompt}"` : '(空)'}`,
+          ...(targetCard.lastGeneratedPrompt && targetCard.lastGeneratedPrompt !== targetCard.prompt ? [`- 历史生成提示词: "${targetCard.lastGeneratedPrompt}"`] : []),
+          `- 画幅比例与分辨率: ${targetCard.ratio || '9:16'} · ${targetCard.res || '2K'}`,
+          ...(targetCard.mcpModel ? [`- 关联模型: ${targetCard.mcpModel}`] : []),
+          `- 关联参考图数量: ${targetCard.referenceImages?.length || (targetCard.referenceImageUrl ? 1 : 0)} 张`,
+        ]),
     ``,
     `## 2. 谱系拓扑与引用关系 (Lineage & DAG Topology)`,
     `- **演进摘要**: ${lineage.evolutionSummary}`,
@@ -489,19 +500,25 @@ export async function buildMultiCardInjectedContext(
 
   selectedCards.forEach((card, idx) => {
     const detail = cardDetails[idx];
-    const cardTitle = card.fileName ? `**[${card.fileName}]**` : `卡片 #${card.id.slice(-6)}`;
+    const cardTitle = card.isText
+      ? `**[${card.textTitle || '未命名文本'}]**`
+      : (card.fileName ? `**[${card.fileName}]**` : `卡片 #${card.id.slice(-6)}`);
     const imgRefStr = detail.imageLabelIndex ? ` (对应 [图 ${detail.imageLabelIndex}])` : '';
 
     lines.push(`## 📌 卡片 ${idx + 1}: ${cardTitle}${imgRefStr}`);
     lines.push(`- 卡片ID: \`${card.id}\``);
-    lines.push(`- 类型: ${card.isVideo ? '视频生成卡片' : (card.isAsset ? '素材/参考资产' : '生图卡片')}`);
-    lines.push(`- 提示词 (Prompt): ${card.prompt ? `"${card.prompt}"` : '(空)'}`);
-    if (card.lastGeneratedPrompt && card.lastGeneratedPrompt !== card.prompt) {
-      lines.push(`- 历史生成提示词: "${card.lastGeneratedPrompt}"`);
-    }
-    lines.push(`- 画幅比例与分辨率: ${card.ratio || '9:16'} · ${card.res || '2K'}`);
-    if (card.mcpModel) {
-      lines.push(`- 关联模型: ${card.mcpModel}`);
+    lines.push(`- 类型: ${card.isText ? '文本卡片' : (card.isVideo ? '视频生成卡片' : (card.isAsset ? '素材/参考资产' : '生图卡片'))}`);
+    if (card.isText) {
+      lines.push(`- 文本内容:\n${(card.textContent || '(空)').slice(0, 2400)}`);
+    } else {
+      lines.push(`- 提示词 (Prompt): ${card.prompt ? `"${card.prompt}"` : '(空)'}`);
+      if (card.lastGeneratedPrompt && card.lastGeneratedPrompt !== card.prompt) {
+        lines.push(`- 历史生成提示词: "${card.lastGeneratedPrompt}"`);
+      }
+      lines.push(`- 画幅比例与分辨率: ${card.ratio || '9:16'} · ${card.res || '2K'}`);
+      if (card.mcpModel) {
+        lines.push(`- 关联模型: ${card.mcpModel}`);
+      }
     }
     lines.push(`- 画布坐标: (X: ${Math.round(card.x)}, Y: ${Math.round(card.y)})`);
 
@@ -692,6 +709,17 @@ export function refreshTaskCardContext(
   }
 
   if (targetId === 'script.text') {
+    const frozenSelection = cardContext.scriptSelection as ScriptSelectionContextSnapshot | undefined;
+    if (frozenSelection && typeof frozenSelection.text === 'string' && frozenSelection.text.trim()) {
+      const formatted = formatScriptSelectionCardContext(frozenSelection);
+      return {
+        ...cardContext,
+        targetId: 'script.text',
+        title: formatted.title,
+        markdownSummary: formatted.markdownSummary,
+        scriptSelection: frozenSelection,
+      };
+    }
     if (typeof cardContext.markdownSummary === 'string' && cardContext.markdownSummary.includes('【当前聚焦的剧本正文片段】')) {
       return cardContext;
     }

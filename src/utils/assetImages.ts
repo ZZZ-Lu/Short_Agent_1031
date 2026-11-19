@@ -29,6 +29,7 @@ export interface LiveCardSnapshot {
   customWidth?: number;
   customHeight?: number;
   isVideo?: boolean;
+  isText?: boolean;
 }
 
 export interface ResolvedAssetImageEntry {
@@ -825,7 +826,7 @@ export interface AssetBindPickerTarget {
 export function isCanvasCardEligibleForAssetBind(
   card?: LiveCardSnapshot | null
 ): boolean {
-  if (!card || card.isVideo) return false;
+  if (!card || card.isVideo || card.isText) return false;
   return Boolean(getCardBindPreviewUrl(card));
 }
 

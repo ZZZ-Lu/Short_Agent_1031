@@ -631,17 +631,289 @@ export async function getOrCreateMediaThumbnail(
   }
 }
 
+export interface VideoPosterCaptureResult {
+  posterUrl: string;
+  width?: number;
+  height?: number;
+  duration?: number;
+}
+
 // A zero edge requests the actual decoded video dimensions, without resizing.
 export function getVideoThumbnailDimensions(width: number, height: number, maxEdge: number) {
   return maxEdge === 0 ? { width, height } : getThumbnailDimensions(width, height, maxEdge);
 }
 const videoThumbnailCache = new Map<string, string>();
+const videoPosterMetadataCache = new Map<string, VideoPosterCaptureResult>();
 // Only one full-resolution video decoder runs at a time across visible cards.
 let videoPosterQueue: Promise<unknown> = Promise.resolve();
-export function generateNativeVideoPoster(source: string | Blob, isCancelled: () => boolean = () => false): Promise<string> {
-  const task = videoPosterQueue.then(() => isCancelled() ? '' : generateVideoThumbnail(source, 0));
+
+async function captureVideoFrameWithMetadata(
+  videoSource: string | Blob,
+  maxEdge: number = 0,
+  quality: number = 0.90,
+  seekTime: number = 0,
+  isCancelled: () => boolean = () => false
+): Promise<VideoPosterCaptureResult> {
+  if (!videoSource || isCancelled()) {
+    return { posterUrl: '' };
+  }
+  if (typeof videoSource === 'string' && videoSource.trim() === '') {
+    return { posterUrl: '' };
+  }
+
+  const cacheKey = typeof videoSource === 'string'
+    ? `${maxEdge}:${quality}:${seekTime}:${videoSource}`
+    : null;
+  if (cacheKey) {
+    const cachedMeta = videoPosterMetadataCache.get(cacheKey);
+    if (cachedMeta) {
+      return cachedMeta;
+    }
+  }
+
+  return new Promise((resolve, reject) => {
+    if (isCancelled()) {
+      resolve({ posterUrl: '' });
+      return;
+    }
+
+    const video = document.createElement('video');
+    video.style.position = 'fixed';
+    video.style.top = '-9999px';
+    video.style.left = '-9999px';
+    video.style.width = '1px';
+    video.style.height = '1px';
+    video.style.opacity = '0';
+    video.style.pointerEvents = 'none';
+    video.setAttribute('playsinline', '');
+    video.setAttribute('webkit-playsinline', '');
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = 'auto';
+    (video as any).referrerPolicy = 'no-referrer';
+
+    let tempUrl: string | null = null;
+    let isAttached = false;
+    let timeoutId: ReturnType<typeof setTimeout>;
+    let cancelPollId: ReturnType<typeof setInterval>;
+    let hasCaptured = false;
+    let seekAttempts = 0;
+
+    const cleanup = () => {
+      clearTimeout(timeoutId);
+      clearInterval(cancelPollId);
+      video.onloadedmetadata = null;
+      video.onloadeddata = null;
+      video.oncanplay = null;
+      video.onseeked = null;
+      video.ontimeupdate = null;
+      video.onerror = null;
+      try {
+        video.pause();
+      } catch {}
+      video.src = '';
+      if (isAttached && video.parentNode) {
+        video.parentNode.removeChild(video);
+      }
+      if (tempUrl) {
+        URL.revokeObjectURL(tempUrl);
+      }
+    };
+
+    const finishWithResult = (posterUrl: string) => {
+      const width = video.videoWidth > 0 ? video.videoWidth : undefined;
+      const height = video.videoHeight > 0 ? video.videoHeight : undefined;
+      const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : undefined;
+      const result: VideoPosterCaptureResult = { posterUrl, width, height, duration };
+      cleanup();
+      if (cacheKey && posterUrl) {
+        if (videoThumbnailCache.size >= 32) videoThumbnailCache.delete(videoThumbnailCache.keys().next().value!);
+        videoThumbnailCache.set(cacheKey, posterUrl);
+        if (videoPosterMetadataCache.size >= 32) videoPosterMetadataCache.delete(videoPosterMetadataCache.keys().next().value!);
+        videoPosterMetadataCache.set(cacheKey, result);
+        if (maxEdge === MAX_THUMBNAIL_EDGE && typeof videoSource === 'string') {
+          thumbCache.set(videoSource, posterUrl);
+        }
+      }
+      resolve(result);
+    };
+
+    const capture = () => {
+      if (hasCaptured) return;
+      if (isCancelled()) {
+        hasCaptured = true;
+        cleanup();
+        resolve({ posterUrl: '' });
+        return;
+      }
+      if (!video.videoWidth || !video.videoHeight) return;
+
+      try {
+        const origW = video.videoWidth || 640;
+        const origH = video.videoHeight || 360;
+        const { width: tw, height: th } = getVideoThumbnailDimensions(origW, origH, maxEdge);
+
+        const canvas = document.createElement('canvas');
+        canvas.width = tw;
+        canvas.height = th;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          cleanup();
+          return reject(new Error('2D context unavailable'));
+        }
+
+        drawImageHighQuality(ctx, video, tw, th);
+
+        try {
+          const sampleW = Math.min(tw, 20);
+          const sampleH = Math.min(th, 20);
+          const sampleData = ctx.getImageData(
+            Math.floor((tw - sampleW) / 2),
+            Math.floor((th - sampleH) / 2),
+            sampleW,
+            sampleH
+          ).data;
+          let isAllBlack = true;
+          for (let i = 0; i < sampleData.length; i += 4) {
+            if (sampleData[i] > 18 || sampleData[i + 1] > 18 || sampleData[i + 2] > 18) {
+              isAllBlack = false;
+              break;
+            }
+          }
+          if (isAllBlack && seekAttempts < 2 && video.duration && video.duration > 0.3) {
+            seekAttempts++;
+            video.currentTime = 0.25;
+            return;
+          }
+        } catch {}
+
+        hasCaptured = true;
+        let dataUrl = '';
+        try {
+          dataUrl = canvas.toDataURL('image/webp', quality);
+          if (!dataUrl.startsWith('data:image/webp')) {
+            dataUrl = canvas.toDataURL('image/jpeg', quality);
+          }
+        } catch {
+          dataUrl = canvas.toDataURL('image/jpeg', quality);
+        }
+        finishWithResult(dataUrl);
+      } catch (err) {
+        cleanup();
+        reject(err);
+      }
+    };
+
+    cancelPollId = setInterval(() => {
+      if (!hasCaptured && isCancelled()) {
+        hasCaptured = true;
+        cleanup();
+        resolve({ posterUrl: '' });
+      }
+    }, 150);
+
+    timeoutId = setTimeout(() => {
+      if (!hasCaptured && !isCancelled() && video.videoWidth && video.videoHeight) {
+        hasCaptured = true;
+        try {
+          const { width: tw, height: th } = getVideoThumbnailDimensions(video.videoWidth, video.videoHeight, maxEdge);
+          const canvas = document.createElement('canvas');
+          canvas.width = tw;
+          canvas.height = th;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            drawImageHighQuality(ctx, video, tw, th);
+            const dataUrl = canvas.toDataURL('image/jpeg', quality);
+            finishWithResult(dataUrl);
+            return;
+          }
+        } catch {}
+      }
+      cleanup();
+      reject(new Error('Video poster capture timed out'));
+    }, 8000);
+
+    const targetSeek = seekTime > 0.05 ? seekTime : 0.08;
+    const triggerSeek = () => {
+      if (hasCaptured) return;
+      if (isCancelled()) {
+        hasCaptured = true;
+        cleanup();
+        resolve({ posterUrl: '' });
+        return;
+      }
+      if (Math.abs(video.currentTime - targetSeek) > 0.04) {
+        try {
+          video.currentTime = targetSeek;
+        } catch {}
+      }
+    };
+
+    video.onloadedmetadata = triggerSeek;
+    video.onloadeddata = triggerSeek;
+    video.oncanplay = triggerSeek;
+    video.onseeked = capture;
+    video.ontimeupdate = () => {
+      if (video.currentTime >= Math.max(0.05, targetSeek - 0.05)) {
+        capture();
+      }
+    };
+
+    video.onerror = () => {
+      if (video.crossOrigin === 'anonymous' && typeof videoSource === 'string') {
+        video.removeAttribute('crossOrigin');
+        video.src = videoSource;
+        video.load();
+        return;
+      }
+      cleanup();
+      reject(new Error('Video load failed for poster capture'));
+    };
+
+    if (videoSource instanceof Blob) {
+      tempUrl = URL.createObjectURL(videoSource);
+      video.src = tempUrl;
+    } else if (typeof videoSource === 'string' && videoSource.trim()) {
+      let resolvedSrc = videoSource;
+      if (/^https?:\/\//i.test(videoSource) && typeof window !== 'undefined' && !videoSource.startsWith(window.location.origin)) {
+        resolvedSrc = `/api/mcp/workrally/proxy-media?url=${encodeURIComponent(videoSource)}`;
+      }
+      if (!resolvedSrc.startsWith('data:') && !resolvedSrc.startsWith('blob:')) {
+        video.crossOrigin = 'anonymous';
+      }
+      video.src = resolvedSrc;
+    } else {
+      cleanup();
+      resolve({ posterUrl: '' });
+      return;
+    }
+
+    if (typeof document !== 'undefined' && document.body) {
+      document.body.appendChild(video);
+      isAttached = true;
+    }
+
+    video.load();
+    const playPromise = video.play();
+    if (playPromise !== undefined) {
+      playPromise.catch(() => {});
+    }
+  });
+}
+
+export function captureVideoPosterWithMetadata(
+  source: string | Blob,
+  isCancelled: () => boolean = () => false
+): Promise<VideoPosterCaptureResult> {
+  const task = videoPosterQueue.then(() =>
+    isCancelled() ? { posterUrl: '' } : captureVideoFrameWithMetadata(source, 0, 0.90, 0, isCancelled)
+  );
   videoPosterQueue = task.catch(() => {});
   return task;
+}
+
+export function generateNativeVideoPoster(source: string | Blob, isCancelled: () => boolean = () => false): Promise<string> {
+  return captureVideoPosterWithMetadata(source, isCancelled).then(result => result.posterUrl);
 }
 
 /**

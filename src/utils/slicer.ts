@@ -202,22 +202,45 @@ export function extractSceneParagraphs(
   return paragraphs;
 }
 
+export interface SliceScriptOptions {
+  tocPattern?: string;
+  preferCustomOnly?: boolean;
+}
+
 export function sliceScriptIntoScenes(
   scriptText: string,
   scenePattern?: string,
-  flags: string = 'gim'
+  flags: string = 'gim',
+  options?: SliceScriptOptions
 ): SceneChunk[] {
   if (!scriptText || !scriptText.trim()) return [];
 
   try {
+    const normalizeFlags = (rawFlags: string) => {
+      const cleaned = String(rawFlags || '').replace(/[^gimsuy]/g, '').replace(/g/g, '');
+      return cleaned || 'im';
+    };
+    const validFlags = normalizeFlags(flags);
+
     let customSceneRx: RegExp | null = null;
     if (scenePattern && scenePattern.trim()) {
-      let validFlags = String(flags || '').replace(/[^gimsuy]/g, '').replace(/g/g, '');
-      if (!validFlags) validFlags = 'im';
       try {
         customSceneRx = new RegExp(String(scenePattern), validFlags);
       } catch {
         customSceneRx = null;
+      }
+    }
+
+    let customEpisodeRx: RegExp | null = null;
+    if (
+      options?.tocPattern &&
+      options.tocPattern.trim() &&
+      (!scenePattern || !options.tocPattern.includes(scenePattern))
+    ) {
+      try {
+        customEpisodeRx = new RegExp(String(options.tocPattern), validFlags);
+      } catch {
+        customEpisodeRx = null;
       }
     }
 
@@ -230,8 +253,6 @@ export function sliceScriptIntoScenes(
     }
 
     const scenes: SceneChunk[] = [];
-    let currentEpisodeId: string | undefined;
-    let currentEpisodeTitle: string | undefined;
 
     interface RawSceneStart {
       lineIdx: number;
@@ -246,38 +267,62 @@ export function sliceScriptIntoScenes(
       consumedNextLine?: boolean;
     }
 
-    const sceneStarts: RawSceneStart[] = [];
-
-    for (let i = 0; i < lines.length; i++) {
-      const trimmed = lines[i].trim();
-      if (!trimmed) continue;
-
-      if (DEFAULT_EPISODE_RX.test(trimmed) && !/^\d+\s*[-—–]\s*\d+/.test(trimmed)) {
-        const bracket = trimmed.match(/^【(.+?)】/);
-        currentEpisodeTitle = bracket ? bracket[1].trim() : trimmed;
-        currentEpisodeId = `episode-${i + 1}`;
-        continue;
+    const matchesEpisodeLine = (trimmed: string, strictCustom: boolean) => {
+      if (/^\d+\s*[-—–]\s*\d+/.test(trimmed)) return false;
+      if (strictCustom && customEpisodeRx) {
+        return customEpisodeRx.test(trimmed);
       }
+      return (customEpisodeRx ? customEpisodeRx.test(trimmed) : false) || DEFAULT_EPISODE_RX.test(trimmed);
+    };
 
-      const isSceneLine =
-        (customSceneRx ? customSceneRx.test(trimmed) : false) || DEFAULT_SCENE_RX.test(trimmed);
+    const collectSceneStarts = (strictCustom: boolean): RawSceneStart[] => {
+      const collected: RawSceneStart[] = [];
+      let currentEpisodeId: string | undefined;
+      let currentEpisodeTitle: string | undefined;
 
-      if (isSceneLine) {
-        const nextLine = i + 1 < lines.length ? lines[i + 1] : undefined;
-        const meta = parseSceneHeaderMetadata(trimmed, nextLine);
-        sceneStarts.push({
-          lineIdx: i,
-          charIndex: lineOffsets[i],
-          episodeId: currentEpisodeId,
-          episodeTitle: currentEpisodeTitle,
-          rawTitleLine: trimmed,
-          sceneNumber: meta.sceneNumber,
-          timeOfDay: meta.timeOfDay,
-          type: meta.type,
-          locationName: meta.locationName,
-          consumedNextLine: meta.consumedNextLine,
-        });
+      for (let i = 0; i < lines.length; i++) {
+        const trimmed = lines[i].trim();
+        if (!trimmed) continue;
+
+        if (matchesEpisodeLine(trimmed, strictCustom)) {
+          const bracket = trimmed.match(/^【(.+?)】/);
+          currentEpisodeTitle = bracket ? bracket[1].trim() : trimmed;
+          currentEpisodeId = `episode-${i + 1}`;
+          continue;
+        }
+
+        const isSceneLine =
+          strictCustom && customSceneRx
+            ? customSceneRx.test(trimmed)
+            : (customSceneRx ? customSceneRx.test(trimmed) : false) || DEFAULT_SCENE_RX.test(trimmed);
+
+        if (isSceneLine) {
+          const nextLine = i + 1 < lines.length ? lines[i + 1] : undefined;
+          const meta = parseSceneHeaderMetadata(trimmed, nextLine);
+          collected.push({
+            lineIdx: i,
+            charIndex: lineOffsets[i],
+            episodeId: currentEpisodeId,
+            episodeTitle: currentEpisodeTitle,
+            rawTitleLine: trimmed,
+            sceneNumber: meta.sceneNumber,
+            timeOfDay: meta.timeOfDay,
+            type: meta.type,
+            locationName: meta.locationName,
+            consumedNextLine: meta.consumedNextLine,
+          });
+        }
       }
+      return collected;
+    };
+
+    const useStrictCustomFirst = Boolean(options?.preferCustomOnly && customSceneRx);
+    let sceneStarts = collectSceneStarts(useStrictCustomFirst);
+    let activeStrictCustom = useStrictCustomFirst;
+    if (useStrictCustomFirst && sceneStarts.length === 0) {
+      // Safety net: fall back to default regex only if strict AI pattern matched zero scenes
+      sceneStarts = collectSceneStarts(false);
+      activeStrictCustom = false;
     }
 
     for (let idx = 0; idx < sceneStarts.length; idx++) {
@@ -287,7 +332,7 @@ export function sliceScriptIntoScenes(
       // 如果当前场与下一场之间夹着新的一集标题行（如“第二集”），将当前场的结束行收缩到新集标题行之前
       for (let checkIdx = curr.lineIdx + 1; checkIdx <= endLineIdx; checkIdx++) {
         const checkTrimmed = lines[checkIdx].trim();
-        if (checkTrimmed && DEFAULT_EPISODE_RX.test(checkTrimmed) && !/^\d+\s*[-—–]\s*\d+/.test(checkTrimmed)) {
+        if (checkTrimmed && matchesEpisodeLine(checkTrimmed, activeStrictCustom)) {
           endLineIdx = checkIdx - 1;
           break;
         }

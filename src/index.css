@@ -123,6 +123,16 @@ body[data-middle-pan="true"] [data-dock-card="true"] > * {
   pointer-events: none !important;
 }
 
+/* Trade-time-for-framerate dock shell glide degradation:
+   Temporarily swap superellipse clip mask to standard rounded corners and apply strict
+   layout/paint containment so outer dock shells glide purely on the compositor without
+   per-frame mask re-rasterization or hit-testing overhead. */
+[data-dock-card="true"][data-dock-gliding="true"] {
+  corner-shape: round !important;
+  contain: strict !important;
+  pointer-events: none !important;
+}
+
 #canvas-workspace[data-zooming="true"] .generation-card,
 #canvas-workspace[data-panning="true"] .generation-card,
 #canvas-workspace[data-gesture="true"] .generation-card,

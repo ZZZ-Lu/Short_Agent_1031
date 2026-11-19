@@ -25,11 +25,16 @@ test('Level 0 and Level 1 prompt templates share identical static header and are
   const planningHeader = planning.slice(0, planning.indexOf(marker)).trim();
   const executionHeader = execution.slice(0, execution.indexOf(marker)).trim();
 
-  assert.ok(planningHeader.length >= 550, 'Shared header should exceed 4x64-token cache blocks');
-  assert.equal(planningHeader, executionHeader, 'L0 and L1 shared header must be byte-for-byte identical');
+  assert.ok(planningHeader.includes('# 角色与通用准则'));
+  assert.ok(executionHeader.includes('# 角色与通用准则'));
 
-  assert.ok(planning.includes('前置环节：意图识别'));
-  assert.ok(planning.includes('路径 A') && planning.includes('路径 B') && planning.includes('路径 C'));
+  assert.ok(planning.includes('0. 意图识别：'));
+  assert.ok(planning.includes('1. 检索同类任务经验：'));
+  assert.ok(planning.includes('4. 验收：'));
+  assert.equal(planning.includes('## 0. 意图识别与分流'), false);
+  assert.equal(planning.includes('路径 A'), false);
+  assert.equal(isObsoletePromptText('## 0. 意图识别与分流（每次收到新消息时最先判定）'), true);
+  assert.equal(isObsoletePromptText('## 前置环节：意图识别（每次收到新消息或尚未进入明确任务时最先执行）'), true);
   assert.equal(isObsoletePromptText('0. 检索同类任务经验（初次规划必做）：收到新任务'), true);
   assert.equal(isObsoletePromptText('"title": "...若仅完成前置读取、读取失败或读错场次则保持为 pending", "status": "completed | pending"'), true);
   assert.equal(

@@ -4,6 +4,12 @@ import { ArrowUp } from 'lucide-react';
 import { CardData } from './GenerationCard';
 import { AgentCoordinateSpace } from '../agent/agentCursorPosition';
 import {
+  AgentSpeakMeta,
+  buildNaturalSelectionPrompt,
+  describeCardsAsSummonTarget,
+  isCurrentSpeakMetaKind,
+} from '../agent/agentSummonDialogue';
+import {
   QIQI_TRI,
   QIQI_PIVOT,
   QIQI_VIEWBOX,
@@ -16,61 +22,7 @@ export { QIQI_STATES, mkQiqiSvg };
 export type { QiqiStateSpec };
 
 export function buildDynamicSelectionPrompt(cards: CardData[]): string {
-  if (!cards || cards.length === 0) {
-    return "我能帮什么忙？";
-  }
-
-  if (cards.length === 1) {
-    const card = cards[0];
-    const rawName = (card.name || card.fileName || card.prompt || '')
-      .replace(/\.(png|jpg|jpeg|webp|gif|mp4|mov|webm)$/i, '')
-      .trim();
-    const cleanName = rawName.replace(/[\r\n]+/g, ' ').trim();
-
-    if (cleanName && cleanName.length <= 12) {
-      return `选了【${cleanName}】，需要我做什么？`;
-    }
-
-    if (card.isVideo) {
-      return "选了 1 个视频，需要我做什么？";
-    }
-    if (card.imageUrl || card.fileData || card.isAsset || card.thumbnailUrl) {
-      return "选了 1 张图片，需要我做什么？";
-    }
-    return "选了 1 个卡片，需要我做什么？";
-  }
-
-  let videoCount = 0;
-  let imageCount = 0;
-  let otherCount = 0;
-
-  for (const c of cards) {
-    if (c.isVideo) {
-      videoCount++;
-    } else if (c.imageUrl || c.fileData || c.isAsset || c.thumbnailUrl) {
-      imageCount++;
-    } else {
-      otherCount++;
-    }
-  }
-
-  const total = cards.length;
-
-  if (imageCount === total) {
-    return `选了 ${total} 张图片，需要我做什么？`;
-  }
-  if (videoCount === total) {
-    return `选了 ${total} 个视频，需要我做什么？`;
-  }
-  if (otherCount === total) {
-    return `选了 ${total} 个卡片，需要我做什么？`;
-  }
-
-  if (imageCount > 0 && videoCount > 0 && otherCount === 0) {
-    return `选了 ${imageCount} 张图片和 ${videoCount} 个视频，需要我做什么？`;
-  }
-
-  return `选了 ${total} 个卡片，需要我做什么？`;
+  return buildNaturalSelectionPrompt(describeCardsAsSummonTarget(cards));
 }
 
 export interface HudContextMessage {
@@ -100,7 +52,9 @@ interface AgentCursorProps {
     visible: boolean;
     isActive: boolean;
     isMoving: boolean;
+    moveDurationMs?: number;
     speak?: string;
+    speakMeta?: AgentSpeakMeta;
     lastPrompt?: string;
     lastPromptTargetId?: string | null;
     cursorMode?: 'default' | 'inspect' | 'working' | 'interact';
@@ -485,37 +439,39 @@ export const AgentCursor = React.memo(function AgentCursor({
     return null;
   }, [submittedUserPrompt, isAgentRunning, isAgentAsking, agentState.isAsking, quickInput?.isOpen, quickInput?.onAskResolve, quickInput?.targetId, quickInput?.contextHistory, quickInput?.lastReply, agentState.lastPrompt, agentState.lastPromptTargetId]);
 
-  const hasSelectedCanvasCards = Boolean(selectedCards && selectedCards.length > 0);
-  const isDefaultOrSelectionSpeak = !agentState.speak ||
-    rawIsThinking ||
-    (hasSelectedCanvasCards && agentState.speak.startsWith('选了')) ||
-    agentState.speak === '我能帮什么忙？';
+  const isGenericGreetingSpeak = (speak?: string) =>
+    speak === '需要我做什么？' || speak === '我能帮什么忙？';
+  const isSummonOrSelectionSpeak =
+    isCurrentSpeakMetaKind(agentState.speak, agentState.speakMeta, ['summon', 'transit', 'selection']) ||
+    isGenericGreetingSpeak(agentState.speak) ||
+    Boolean(agentState.speak && agentState.speak.startsWith('选了'));
+  const needsFallbackIdlePrompt = !agentState.speak || rawIsThinking;
 
   // Effective agent speak for Row 2:
   // If user has submitted a prompt:
-  //   - Never revert to dynamic selection prompt ("选了X张图片...") or greeting ("我能帮什么忙？")!
-  //   - If agentState.speak has actual agent text (not selection or generic greeting), show it.
+  //   - Never revert to summon/selection greeting prompt!
+  //   - If agentState.speak has actual agent text (not summon/selection/thinking), show it.
   //   - Otherwise show "正在思考..." during thinking/submitting.
   // When Agent is actively running/executing without submittedUserPrompt:
   //   - Strictly execution/thinking mode: show active speak or fallback to "正在思考..." / "正在操作...".
   // When idle and quickInput is open:
-  //   - Show dynamic selection prompt for canvas cards, or preserve specific UI/script/asset selection speak.
+  //   - Preserve natural summon/selection/transit speak from agentState.speak; fall back to dynamicPromptText only when empty/stale-thinking.
   const effectiveAgentSpeak = submittedUserPrompt
-    ? (agentState.speak && !agentState.speak.startsWith('选了') && agentState.speak !== '我能帮什么忙？' && !isThinkingPhrase(agentState.speak)
+    ? (agentState.speak && !isSummonOrSelectionSpeak && !isThinkingPhrase(agentState.speak)
         ? agentState.speak
         : "正在思考...")
     : (isAgentRunning
-        ? (agentState.speak && !agentState.speak.startsWith('选了') && agentState.speak !== '我能帮什么忙？' 
-            ? agentState.speak 
+        ? (agentState.speak && !isSummonOrSelectionSpeak
+            ? agentState.speak
             : (isActuallyThinking ? "正在思考..." : "正在操作..."))
-        : (quickInput?.isOpen && submitStep === 'idle' && isDefaultOrSelectionSpeak)
+        : (quickInput?.isOpen && submitStep === 'idle' && needsFallbackIdlePrompt)
             ? dynamicPromptText
             : (rawIsThinking && isAgentRunning === false)
               ? undefined
               : (agentState.speak || (quickInput?.isOpen ? dynamicPromptText : undefined)));
 
   const effectiveIsThinking = submittedUserPrompt
-    ? (agentState.speak && !agentState.speak.startsWith('选了') && agentState.speak !== '我能帮什么忙？' && !isThinkingPhrase(agentState.speak)
+    ? (agentState.speak && !isSummonOrSelectionSpeak && !isThinkingPhrase(agentState.speak)
         ? false
         : true)
     : (isAgentRunning
@@ -589,6 +545,11 @@ export const AgentCursor = React.memo(function AgentCursor({
   const bubbleBgClass = isDarkMode 
     ? 'bg-[#18181c]/95 border border-[#a45cf8]/25 shadow-[0_4px_20px_rgba(0,0,0,0.7),0_0_14px_rgba(164,92,248,0.18)]' 
     : 'bg-white/95 border border-purple-200/80 shadow-[0_4px_20px_rgba(0,0,0,0.12),0_0_14px_rgba(168,85,247,0.15)]';
+  const speechBubbleBgClass = isDarkMode
+    ? 'bg-[#18181c] border border-[#a45cf8]/25 shadow-[0_4px_20px_rgba(0,0,0,0.7),0_0_14px_rgba(164,92,248,0.18)]'
+    : 'bg-white border border-purple-200/80 shadow-[0_4px_20px_rgba(0,0,0,0.12),0_0_14px_rgba(168,85,247,0.15)]';
+  const speechBubbleTailFill = isDarkMode ? '#18181c' : '#ffffff';
+  const speechBubbleTailStroke = isDarkMode ? 'rgba(164, 92, 248, 0.25)' : 'rgba(233, 213, 255, 0.8)';
   // Plan 1: Receding memory archival layer for historical conversation bubble
   const historyBubbleBgClass = isDarkMode 
     ? 'bg-[#141417]/85 border border-[#a45cf8]/15 shadow-[0_2px_12px_rgba(0,0,0,0.55)]' 
@@ -684,14 +645,16 @@ export const AgentCursor = React.memo(function AgentCursor({
       );
       const transition = zoomingNow && currentCoordSpace === 'canvas'
         ? { type: 'tween', duration: 0.15, ease: 'easeOut' }
-        : agentState.isMoving 
-          ? { type: 'spring', damping: 28, stiffness: 450, mass: 0.35 }
+        : agentState.isMoving
+          ? (typeof agentState.moveDurationMs === 'number' && agentState.moveDurationMs > 0
+              ? { type: 'tween', duration: agentState.moveDurationMs / 1000, ease: [0.22, 1, 0.36, 1] }
+              : { type: 'spring', damping: 28, stiffness: 450, mass: 0.35 })
           : { duration: 0 };
           
       animate(agentPosX, agentState.x, transition as any);
       animate(agentPosY, agentState.y, transition as any);
     }
-  }, [agentState.x, agentState.y, currentCoordSpace, isDragging, isZooming, agentState.isMoving, agentPosX, agentPosY, isScreenSpaceMV, transform.tScale, transform.tx, transform.ty]);
+  }, [agentState.x, agentState.y, agentState.moveDurationMs, currentCoordSpace, isDragging, isZooming, agentState.isMoving, agentPosX, agentPosY, isScreenSpaceMV, transform.tScale, transform.tx, transform.ty]);
 
   // Derive screen position instantly: invariant when anchored to dock card ('screen'), transformed with camera when on canvas ('canvas')
   const targetScreenX = useTransform(
@@ -853,6 +816,12 @@ export const AgentCursor = React.memo(function AgentCursor({
       data-agent-coord-space={currentCoordSpace}
       data-agent-sleeping={isSleeping ? 'true' : 'false'}
       data-agent-asking={isAsking ? 'true' : 'false'}
+      data-agent-move-duration-ms={agentState.moveDurationMs ?? ''}
+      data-agent-speak-kind={
+        isCurrentSpeakMetaKind(agentState.speak, agentState.speakMeta, ['summon', 'transit', 'selection'])
+          ? agentState.speakMeta?.kind
+          : (effectiveAgentSpeak ? 'reply' : '')
+      }
       className="fixed top-0 left-0 z-[9999] flex items-center select-none pointer-events-none"
       style={{ x: targetScreenX, y: targetScreenY }}
       initial={false}
@@ -981,7 +950,7 @@ export const AgentCursor = React.memo(function AgentCursor({
         </div>
         
         {/* Stacked Agent HUD beside Cursor */}
-        <div className="absolute left-8.5 top-1 flex flex-col gap-1.5 items-start pointer-events-none">
+        <div className="absolute left-9 top-1 flex flex-col gap-1.5 items-start pointer-events-none">
           {/* Primary Speech Row Anchor (Level with Agent Mouse Cursor Pointer) */}
           <div className="relative pointer-events-none min-h-[30px] flex items-center">
             {/* Row 1: Memory shelf - Anchored stably ABOVE Row 2 */}
@@ -1029,11 +998,11 @@ export const AgentCursor = React.memo(function AgentCursor({
             </AnimatePresence>
    
             {/* Row 2: Speaking Text UI - Level with Cursor Pointer */}
-            <AnimatePresence mode="wait">
+            <AnimatePresence>
               {row2Content && (
                 <motion.div
-                  key={row2Content.text}
-                  initial={{ opacity: 0, scale: 0.82, y: 0 }}
+                  key="agent-speech-bubble"
+                  initial={{ opacity: 0, scale: 0.88, y: 0 }}
                   animate={{ opacity: 1, scale: 1, y: 0 }}
                   exit={isSubmitting ? { 
                     opacity: 0, 
@@ -1052,13 +1021,40 @@ export const AgentCursor = React.memo(function AgentCursor({
                 >
                   <div className="relative px-3.5 py-1.5 flex items-center origin-left">
                     <div 
-                      className={`absolute inset-0 rounded-xl corner-squircle ${bubbleBgClass}`} 
+                      className={`absolute inset-0 rounded-xl corner-squircle ${speechBubbleBgClass}`} 
                       style={{
+                        borderTopLeftRadius: 0,
                         willChange: 'transform',
                         transform: 'translate3d(0,0,0)',
                         backfaceVisibility: 'hidden',
                       }}
                     />
+                    {/* Top-left speech bubble triangle tail pointing toward the Agent cursor */}
+                    <svg
+                      aria-hidden="true"
+                      data-testid="agent-speech-bubble-tail"
+                      width="9"
+                      height="10"
+                      viewBox="0 0 9 10"
+                      fill="none"
+                      className="absolute -left-[7px] top-0 z-[1] pointer-events-none overflow-visible"
+                      style={{
+                        transform: 'translate3d(0,0,0)',
+                        backfaceVisibility: 'hidden',
+                      }}
+                    >
+                      <path
+                        d="M 7.5 0.5 L 1.6 0.5 C 0.5 0.5 0.1 1.4 0.8 2.2 L 7.5 9.5 L 8.6 9.5 L 8.6 1 L 7.5 1 Z"
+                        fill={speechBubbleTailFill}
+                      />
+                      <path
+                        d="M 7.5 0.5 L 1.6 0.5 C 0.5 0.5 0.1 1.4 0.8 2.2 L 7.5 9.5"
+                        stroke={speechBubbleTailStroke}
+                        strokeWidth="1"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
                     <div className="relative z-10 flex items-center" style={{ transform: 'translateZ(0)' }}>
                       <SingleLineMarquee text={row2Content.text} isDarkMode={isDarkMode} speaker={row2Content.type} />
                     </div>
@@ -1079,7 +1075,7 @@ export const AgentCursor = React.memo(function AgentCursor({
                 className="pointer-events-auto select-none shrink-0"
                 onPointerDown={(e) => e.stopPropagation()}
               >
-                <div className="relative flex items-center w-[290px]">
+                <div className="relative flex flex-col w-[290px]">
                   <div 
                     className={`absolute inset-0 rounded-xl corner-squircle ${bubbleBgClass}`} 
                     style={{
@@ -1088,7 +1084,7 @@ export const AgentCursor = React.memo(function AgentCursor({
                       backfaceVisibility: 'hidden',
                     }}
                   />
-                  
+
                   <form
                     onSubmit={handleFormSubmit}
                     className="relative z-10 flex items-center w-full px-3 py-1 gap-1.5"

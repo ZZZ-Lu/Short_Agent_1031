@@ -27,6 +27,7 @@ import {
   type DockPanelLayout,
   type PanelWidthTransitionMeta,
 } from '../utils/scriptBibleDockLayout';
+import type { DockPanelDomRefs } from '../utils/dockDomChoreography';
 import {
   areInitialFeedImagesSettled,
   collectInitialFeedImageUrls,
@@ -51,10 +52,14 @@ import {
 } from '../hooks/useUnifiedPanelScrollMemory';
 import {
   buildScrollScopeKey,
-  readScrollOffsetFromStorage,
+  computeImagesScrollAnchorFromLayout,
+  readImagesScrollAnchorFromStorage,
+  resolveImagesTargetTopFromAnchor,
   resolveProjectScopedRawValue,
+  writeImagesScrollAnchorToStorage,
   writeProjectScopedRawValue,
-  writeScrollOffsetToStorage,
+  type ImagesFeedAnchorItemLayout,
+  type ImagesScrollAnchor,
 } from '../utils/scrollMemory';
 import {
   buildAssetAgentTargetId,
@@ -94,6 +99,8 @@ export interface AssetImageFeedPanelProps {
   focusFeedAssetKey?: FeedFocusTargetRequest | null;
   verifyingOrGeneratingAssetIds?: string[];
   widthTransition?: PanelWidthTransitionMeta;
+  dockDomRefs?: DockPanelDomRefs;
+  dockChoreographyActiveRef?: React.RefObject<boolean>;
   isCardsLoading?: boolean;
   isEnterAnimationSettled?: boolean;
   agentFocusedTargetId?: string | null;
@@ -209,6 +216,8 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
   focusFeedAssetKey,
   verifyingOrGeneratingAssetIds = [],
   widthTransition,
+  dockDomRefs,
+  dockChoreographyActiveRef,
   isCardsLoading = false,
   isEnterAnimationSettled = true,
   agentFocusedTargetId = null,
@@ -314,49 +323,195 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
   );
   const scopeKey = useMemo(() => buildScrollScopeKey(scrollSpec), [scrollSpec]);
 
+  const imagesAnchorCacheRef = useRef<{ scopeKey: string; anchor: ImagesScrollAnchor } | null>(
+    null
+  );
+  const readImagesAnchor = useCallback((): ImagesScrollAnchor => {
+    if (typeof window === 'undefined') return { top: 0 };
+    if (imagesAnchorCacheRef.current?.scopeKey === scopeKey) {
+      return imagesAnchorCacheRef.current.anchor;
+    }
+    const anchor = readImagesScrollAnchorFromStorage(
+      window.localStorage,
+      effectiveProjectId,
+      viewMode
+    );
+    imagesAnchorCacheRef.current = { scopeKey, anchor };
+    return anchor;
+  }, [scopeKey, effectiveProjectId, viewMode]);
+
+  const measureFeedAnchorItems = useCallback(
+    (container: HTMLElement): ImagesFeedAnchorItemLayout[] => {
+      if (dockDomRefs?.expandedContent?.style.contentVisibility === 'hidden') {
+        return [];
+      }
+      const containerRect = container.getBoundingClientRect();
+      if (containerRect.height <= 0) return [];
+      const nodes = container.querySelectorAll<HTMLElement>('[data-feed-scroll-anchor]');
+      const items: ImagesFeedAnchorItemLayout[] = [];
+      const currentScrollTop = container.scrollTop;
+      for (let i = 0; i < nodes.length; i += 1) {
+        const node = nodes[i];
+        const key = node.getAttribute('data-feed-scroll-anchor');
+        if (!key) continue;
+        const rect = node.getBoundingClientRect();
+        if (rect.height <= 0) continue;
+        items.push({
+          key,
+          top: rect.top - containerRect.top + currentScrollTop,
+          height: rect.height,
+        });
+      }
+      return items;
+    },
+    [dockDomRefs]
+  );
+
+  const resolveImagesAnchorTargetTop = useCallback((): number | null => {
+    if (dockDomRefs?.expandedContent?.style.contentVisibility === 'hidden') {
+      return null;
+    }
+    const container = scrollContainerRef.current;
+    if (!container || container.clientHeight <= 0) return null;
+    const anchor = readImagesAnchor();
+    const items = measureFeedAnchorItems(container);
+    if (items.length === 0) return null;
+    const maxScrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
+    return resolveImagesTargetTopFromAnchor({
+      anchor,
+      maxScrollTop,
+      items,
+    });
+  }, [dockDomRefs, measureFeedAnchorItems, readImagesAnchor]);
+
+  const isChoreographyManaged = Boolean(
+    dockChoreographyActiveRef?.current ||
+      (widthTransition &&
+        (widthTransition.isGliding ||
+          widthTransition.hidden ||
+          widthTransition.suspendSubtree ||
+          widthTransition.opacity < 1 ||
+          widthTransition.miniHidden ||
+          widthTransition.miniOpacity < 1 ||
+          !widthTransition.mountExpandedContent))
+  );
   const isShellWidthTransitioning = useShellWidthTransitionGuard(
     layout.width,
-    layout.expanded
+    layout.expanded,
+    WIDTH_TRANSITION_TIMINGS.shellResizeMs + 160,
+    isChoreographyManaged
   );
   const isImagesTransitioning =
     isShellWidthTransitioning ||
     Boolean(widthTransition?.hidden) ||
+    Boolean(widthTransition?.suspendSubtree) ||
+    Boolean(widthTransition?.isGliding) ||
     Boolean(widthTransition && widthTransition.opacity < 1);
   const isExpandedContentMounted =
     layout.expanded && widthTransition?.mountExpandedContent !== false;
   const isFeedBodyMounted =
     isExpandedContentMounted && isEnterAnimationSettled && !isCardsLoading;
   const imagesContentVersion = `${sections.length}:${timelineCards.length}:${totalBoundImages}:${isWideMode ? 'wide' : 'std'}`;
+  const imagesRealignSignal = `${isWideMode ? 'wide' : 'std'}:${Math.round(layout.width)}`;
 
   const {
     cancelPendingRestore,
     handleScrollEvent,
     reapplyPendingRestore,
+    flushScrollMemory,
+    captureCurrentScrollMemory,
   } = useUnifiedPanelScrollMemory({
     scopeKey,
-    readPersistedScrollTop: () =>
-      typeof window !== 'undefined'
-        ? readScrollOffsetFromStorage(window.localStorage, scrollSpec)
-        : 0,
-    writePersistedScrollTop: (top) => {
+    readPersistedScrollTop: () => readImagesAnchor().top,
+    captureScrollMetadata: (top, el) => {
+      const items = measureFeedAnchorItems(el);
+      const maxScrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+      return computeImagesScrollAnchorFromLayout({
+        scrollTop: top,
+        maxScrollTop,
+        items,
+      });
+    },
+    writePersistedScrollTop: (top, metadata) => {
       if (typeof window !== 'undefined') {
-        writeScrollOffsetToStorage(window.localStorage, scrollSpec, top);
+        const metaAnchor =
+          metadata && typeof metadata === 'object' ? (metadata as ImagesScrollAnchor) : null;
+        const nextAnchor: ImagesScrollAnchor = metaAnchor ? { ...metaAnchor, top } : { top };
+        imagesAnchorCacheRef.current = { scopeKey, anchor: nextAnchor };
+        writeImagesScrollAnchorToStorage(
+          window.localStorage,
+          effectiveProjectId,
+          viewMode,
+          nextAnchor
+        );
       }
     },
+    resolveRestoreTargetTop: resolveImagesAnchorTargetTop,
     getScrollElement: () => scrollContainerRef.current,
-    isActiveAndVisible: isFeedBodyMounted && !widthTransition?.hidden,
+    isActiveAndVisible: isFeedBodyMounted,
     isTransitioning: isImagesTransitioning,
     isFilteredView: onlyShowActiveAsset,
     contentVersion: imagesContentVersion,
+    realignSignal: imagesRealignSignal,
     maxWaitMs: 2800,
   });
 
   const handleFeedScroll = useCallback(
     (e: React.UIEvent<HTMLDivElement>) => {
+      if (dockChoreographyActiveRef?.current) {
+        const expandedEl = dockDomRefs?.expandedContent;
+        if (
+          !expandedEl ||
+          expandedEl.style.visibility === 'hidden' ||
+          expandedEl.style.contentVisibility === 'hidden' ||
+          expandedEl.style.pointerEvents === 'none'
+        ) {
+          return;
+        }
+      }
       handleScrollEvent(e.currentTarget.scrollTop);
     },
-    [handleScrollEvent]
+    [dockChoreographyActiveRef, dockDomRefs, handleScrollEvent]
   );
+
+  const syncScrollMemoryBeforeLayoutAction = useCallback(() => {
+    flushScrollMemory();
+    if (dockChoreographyActiveRef?.current || isImagesTransitioning || onlyShowActiveAsset) {
+      return;
+    }
+    const container = scrollContainerRef.current;
+    if (!container || container.clientHeight <= 0) {
+      return;
+    }
+    const currentTop = normalizeScrollOffset(container.scrollTop);
+    const savedAnchor = readImagesAnchor();
+    const resolvedTarget = resolveImagesAnchorTargetTop();
+    const needsFreshCapture =
+      (currentTop > 0 && !savedAnchor.anchorKey) ||
+      (currentTop === 0 && savedAnchor.top > 0) ||
+      (resolvedTarget !== null && Math.abs(currentTop - resolvedTarget) > 3);
+    if (needsFreshCapture) {
+      captureCurrentScrollMemory();
+    }
+  }, [
+    captureCurrentScrollMemory,
+    dockChoreographyActiveRef,
+    flushScrollMemory,
+    isImagesTransitioning,
+    onlyShowActiveAsset,
+    readImagesAnchor,
+    resolveImagesAnchorTargetTop,
+  ]);
+
+  const handleWideModeToggleClick = useCallback(() => {
+    syncScrollMemoryBeforeLayoutAction();
+    onToggleWideMode?.();
+  }, [onToggleWideMode, syncScrollMemoryBeforeLayoutAction]);
+
+  const handleCollapseClick = useCallback(() => {
+    syncScrollMemoryBeforeLayoutAction();
+    onCollapse();
+  }, [onCollapse, syncScrollMemoryBeforeLayoutAction]);
 
   const handleCloseLightbox = useCallback(() => {
     setLightboxImage(null);
@@ -571,8 +726,7 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
   const shouldForceMountAllFeedItems =
     onlyShowActiveAsset ||
     Boolean(focusFeedAssetKey) ||
-    (typeof window !== 'undefined' &&
-      normalizeScrollOffset(readScrollOffsetFromStorage(window.localStorage, scrollSpec)) > 0);
+    normalizeScrollOffset(readImagesAnchor().top) > 0;
   const [feedBatchLimit, setFeedBatchLimit] = useState<number>(0);
 
   useEffect(() => {
@@ -771,6 +925,7 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
       <div
         key={tileKey}
         data-feed-card="true"
+        data-feed-scroll-anchor={`tile:${tileKey}`}
         data-feed-section={section.key}
         data-feed-image-id={img.id}
         {...(img.cardId ? { 'data-feed-card-id': img.cardId } : {})}
@@ -1112,6 +1267,7 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
       <div
         key={section.key}
         data-feed-card="true"
+        data-feed-scroll-anchor={`placeholder:${section.key}`}
         data-feed-section={section.key}
         data-feed-asset-id={section.assetId}
         data-agent-target={sectionTargetId}
@@ -1294,54 +1450,399 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
     );
   };
 
+  const renderImageTileRef = useRef(renderImageTile);
+  renderImageTileRef.current = renderImageTile;
+  const renderPlaceholderTileRef = useRef(renderPlaceholderTile);
+  renderPlaceholderTileRef.current = renderPlaceholderTile;
+
+  // Decouple heavy feed tile VDOM construction from dock layout/position props so shifting
+  // the outer shell (layout.left / zIndex / hover) during sibling collapse/expand does 0ms
+  // of tile reconciliation work.
+  const memoizedFeedBody = useMemo(() => {
+    if (!isFeedBodyMounted) {
+      return <div className="w-full flex-1 h-full" />;
+    }
+    if (viewMode === 'sections') {
+      if (displayedSections.length === 0) {
+        return (
+          <div className="py-12 px-4 flex flex-col items-center justify-center text-center">
+            <div className="w-16 h-12 rounded-2xl bg-gray-200/70 dark:bg-neutral-800 flex items-center justify-center mb-3">
+              <ImageIcon className="w-6 h-6 text-gray-400 dark:text-neutral-500" />
+            </div>
+            <p className="text-xs font-bold text-gray-700 dark:text-neutral-200">
+              暂无匹配的资产条目
+            </p>
+            <p className="text-[11px] text-gray-400 dark:text-neutral-500 mt-1">
+              先在左侧提取或新建资产后，这里会以图片卡片流形式展示资产图。
+            </p>
+          </div>
+        );
+      }
+      return (
+        <div className="flex flex-col gap-3">
+          {batchedSections.map((section, sectionIndex) => {
+            const meta = CATEGORY_META[section.category];
+            const categoryMatches = !activeCategory || activeCategory === section.category;
+            const isSectionActive =
+              Boolean(activeAssetId) &&
+              categoryMatches &&
+              ((activeAssetId === section.assetId &&
+                Boolean(activeAssetIsVersion) === Boolean(section.isVersion)) ||
+                (!activeAssetIsVersion && section.parentId === activeAssetId));
+            const sectionTargetId = buildAssetAgentTargetId(
+              section.category,
+              section.assetId,
+              section.parentId
+            );
+            const boundCardIds = section.images
+              .map((img) => img.cardId)
+              .filter((id): id is string => Boolean(id));
+            const isSectionAgentFocused = isAssetSectionAgentFocused(
+              section,
+              focusedTargetList,
+              boundCardIds
+            );
+            const isDragTarget = dragOverSectionKey === section.key;
+            const isGeneratingForSection = verifyingOrGeneratingAssetIds.includes(
+              section.assetId
+            );
+            const displayTitle = section.parentName
+              ? `${section.parentName} · ${section.name}`
+              : section.name;
+
+            if (section.images.length === 0) {
+              return renderPlaceholderTileRef.current(
+                section,
+                isSectionActive,
+                isSectionAgentFocused,
+                isDragTarget,
+                isGeneratingForSection
+              );
+            }
+
+            if (section.images.length === 1 && !isGeneratingForSection) {
+              const singleImg = section.images[0];
+              const singlePreviewSrc = resolveEntryPreviewSrc(singleImg);
+              const hasLivePreview = Boolean(
+                singlePreviewSrc && imageLoadStateByUrl[singlePreviewSrc] !== 'error'
+              );
+              const isCardGenerating = singleImg.cardState === 'generating';
+              if (!hasLivePreview) {
+                return renderPlaceholderTileRef.current(
+                  section,
+                  isSectionActive,
+                  isSectionAgentFocused,
+                  isDragTarget,
+                  isCardGenerating,
+                  singleImg
+                );
+              }
+              return renderImageTileRef.current(section, singleImg, {
+                isStandaloneSingle: true,
+                isActive: isSectionActive,
+                isAgentFocused: isSectionAgentFocused,
+                agentTargetId: sectionTargetId,
+                isDragTarget,
+                isGeneratingForSection,
+                isEager: sectionIndex < 6,
+              });
+            }
+
+            const groupBorderMode = isDragTarget
+              ? 'none'
+              : resolveSelectionBorderMode({
+                  isUserSelected: isSectionActive,
+                  isAgentFocused: isSectionAgentFocused,
+                });
+            return (
+              <div
+                key={section.key}
+                data-feed-section={section.key}
+                data-feed-asset-id={section.assetId}
+                data-agent-target={sectionTargetId}
+                data-selection-border-mode={groupBorderMode}
+                onDragOver={(e) => handleDragOver(e, section.key)}
+                onDragLeave={(e) => handleDragLeave(e, section.key)}
+                onDrop={(e) => handleDrop(e, section)}
+                className={`relative rounded-[24px] corner-squircle p-2.5 transition-colors ${
+                  isDragTarget
+                    ? 'bg-blue-50/90 dark:bg-blue-950/40'
+                    : groupBorderMode === 'dual'
+                      ? 'bg-gradient-to-br from-blue-50/70 to-purple-50/70 dark:from-blue-950/30 dark:to-purple-950/30'
+                      : groupBorderMode === 'agent'
+                        ? 'bg-purple-50/70 dark:bg-purple-950/30'
+                        : groupBorderMode === 'user'
+                          ? 'bg-blue-50/70 dark:bg-blue-950/30'
+                          : 'bg-white/65 dark:bg-white/[0.03]'
+                }`}
+              >
+                {isDragTarget || groupBorderMode !== 'none' ? (
+                  <div
+                    key="selection-overlay"
+                    aria-hidden
+                    className={`${!isDragTarget && groupBorderMode === 'dual' ? 'dual-selection-border ' : ''}absolute inset-0 pointer-events-none rounded-[24px] corner-squircle z-30 select-none`}
+                    style={getSelectionOverlayStyle(
+                      isDragTarget ? 'user' : (groupBorderMode as Exclude<SelectionBorderMode, 'none'>),
+                      '2px'
+                    )}
+                  />
+                ) : (
+                  <div
+                    key="idle-border"
+                    aria-hidden
+                    className="absolute inset-0 pointer-events-none rounded-[24px] corner-squircle z-30 select-none border border-gray-200/80 dark:border-white/[0.07]"
+                  />
+                )}
+                <div className="flex items-center justify-between gap-2 mb-2 px-0.5">
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onSelectSection(section);
+                    }}
+                    className="flex items-center gap-1.5 min-w-0 flex-1 text-left cursor-pointer group"
+                  >
+                    <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${meta.dotClass}`} />
+                    <span className="text-xs font-bold text-gray-900 dark:text-neutral-100 truncate group-hover:text-blue-600 dark:group-hover:text-blue-300 transition-colors">
+                      {displayTitle}
+                    </span>
+                    <span className="text-[11px] text-gray-400 dark:text-neutral-500 shrink-0 tabular-nums">
+                      {section.images.length} 张
+                    </span>
+                  </button>
+
+                  <div className="flex items-center gap-1 shrink-0">
+                    {onStartCanvasBind && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onStartCanvasBind(section);
+                        }}
+                        aria-label={`为 ${displayTitle} 从画布绑定`}
+                        title="从画布绑定"
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg text-[11px] font-medium text-gray-500 dark:text-neutral-400 hover:text-blue-600 dark:hover:text-blue-300 hover:bg-blue-50/80 dark:hover:bg-blue-950/40 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                      >
+                        <MousePointerClick className="w-3 h-3" />
+                        <span>从画布绑定</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onOpenBindModal(section);
+                      }}
+                      aria-label={`为 ${displayTitle} 列表或本地上传绑定`}
+                      title="列表或本地上传绑定"
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg text-[11px] font-medium text-gray-500 dark:text-neutral-400 hover:text-blue-600 dark:hover:text-blue-300 hover:bg-blue-50/80 dark:hover:bg-blue-950/40 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                    >
+                      <ImagePlus className="w-3 h-3" />
+                      <span>列表/上传</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onRequestAgentGenerate(section);
+                      }}
+                      disabled={isGeneratingForSection}
+                      aria-label={`为 ${displayTitle} 生成绑定`}
+                      title="生成绑定"
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg text-[11px] font-medium text-gray-500 dark:text-neutral-400 hover:text-purple-600 dark:hover:text-purple-300 hover:bg-purple-50/80 dark:hover:bg-purple-950/40 disabled:opacity-50 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                    >
+                      {isGeneratingForSection ? (
+                        <RefreshCw className="w-3 h-3 animate-spin text-purple-500" />
+                      ) : (
+                        <Sparkles className="w-3 h-3" />
+                      )}
+                      <span>{isGeneratingForSection ? '生成中' : '生成绑定'}</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div className="flex flex-col gap-2.5">
+                  {section.images.map((img, imgIndex) =>
+                    renderImageTileRef.current(section, img, {
+                      isStandaloneSingle: false,
+                      showSectionTitle: false,
+                      isAgentFocused: Boolean(
+                        img.cardId && focusedTargetList.includes(img.cardId)
+                      ),
+                      isEager: sectionIndex < 4 && imgIndex < 2,
+                    })
+                  )}
+                  {isGeneratingForSection && (
+                    <div
+                      data-feed-scroll-anchor={`generating:${section.key}`}
+                      className="rounded-[24px] corner-squircle overflow-hidden border border-purple-300/60 dark:border-purple-500/40 bg-purple-50/70 dark:bg-purple-950/25 h-44 flex flex-col items-center justify-center gap-1.5 animate-pulse"
+                    >
+                      <RefreshCw className="w-5 h-5 text-purple-500 animate-spin" />
+                      <span className="text-[11px] font-medium text-purple-600 dark:text-purple-300">
+                        正在生成...
+                      </span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    if (displayedTimelineCards.length === 0) {
+      return (
+        <div className="py-12 px-4 flex flex-col items-center justify-center text-center">
+          <div className="w-16 h-12 rounded-2xl corner-squircle bg-gray-200/70 dark:bg-neutral-800 flex items-center justify-center mb-3">
+            <ImageIcon className="w-6 h-6 text-gray-400 dark:text-neutral-500" />
+          </div>
+          <p className="text-xs font-bold text-gray-700 dark:text-neutral-200">
+            暂无已绑定的资产图
+          </p>
+          <p className="text-[11px] text-gray-400 dark:text-neutral-500 mt-1">
+            切换回「按资产」视图可为任意占位图卡片绑定或生成资产图。
+          </p>
+        </div>
+      );
+    }
+
+    return (
+      <div className="flex flex-col gap-3">
+        {batchedTimelineCards.map((entry, entryIndex) => {
+          const sec = sectionLookup.get(`${entry.category}:${entry.assetId}`) || {
+            key: `${entry.category}:${entry.assetId}`,
+            assetId: entry.assetId,
+            parentId: entry.parentId,
+            parentName: entry.parentName,
+            name: entry.assetName,
+            category: entry.category,
+            isVersion: entry.isVersion,
+            subtitle: '',
+            images: [entry.image],
+          };
+          const timelineActive =
+            Boolean(activeAssetId) &&
+            (!activeCategory || activeCategory === entry.category) &&
+            ((activeAssetId === entry.assetId &&
+              Boolean(activeAssetIsVersion) === Boolean(entry.isVersion)) ||
+              (!activeAssetIsVersion && entry.parentId === activeAssetId));
+          const timelineSectionTargetId = buildAssetAgentTargetId(
+            sec.category,
+            sec.assetId,
+            sec.parentId
+          );
+          const timelineAgentFocused = isAssetSectionAgentFocused(
+            sec,
+            focusedTargetList,
+            entry.image.cardId ? [entry.image.cardId] : undefined
+          );
+          return renderImageTileRef.current(sec, entry.image, {
+            isStandaloneSingle: false,
+            showSectionTitle: true,
+            isActive: timelineActive,
+            isAgentFocused: timelineAgentFocused,
+            agentTargetId: timelineSectionTargetId,
+            isEager: entryIndex < 6,
+          });
+        })}
+      </div>
+    );
+  }, [
+    isFeedBodyMounted,
+    viewMode,
+    displayedSections,
+    batchedSections,
+    displayedTimelineCards,
+    batchedTimelineCards,
+    sectionLookup,
+    activeAssetId,
+    activeAssetIsVersion,
+    activeCategory,
+    focusedTargetList,
+    dragOverSectionKey,
+    verifyingOrGeneratingAssetIds,
+    imageLoadStateByUrl,
+    loadedDimensionsByKey,
+    isWideMode,
+    onSelectSection,
+    onStartCanvasBind,
+    onOpenBindModal,
+    onRequestAgentGenerate,
+    onSetPrimaryImage,
+    onUnbindImage,
+    onFocusCanvasCard,
+    handleDragOver,
+    handleDragLeave,
+    handleDrop,
+    markImageSettled,
+  ]);
+
   return (
-    <motion.div
-      initial={{ opacity: 0, scale: 0.97, y: -8 }}
-      animate={{
-        opacity: 1,
-        scale: 1,
-        y: 0,
-        transition: { duration: 0.22, delay: 0.1, ease: panelEase },
+    <div
+      ref={(el) => {
+        if (dockDomRefs) dockDomRefs.shell = el;
       }}
-      exit={{
-        opacity: 0,
-        scale: 0.97,
-        y: -8,
-        transition: { duration: 0.16, ease: panelEase },
-      }}
-      data-dock-card="true"
-      data-prevent-canvas-wheel="true"
-      data-agent-target={layout.expanded ? 'images.panel' : 'images.collapsed'}
-      onMouseEnter={() => {
-        if (!layout.expanded) onMiniMouseEnter();
-      }}
-      onMouseMove={(e) => {
-        if (!layout.expanded) onMiniMouseMove(e);
-      }}
-      onMouseLeave={() => {
-        if (!layout.expanded) onMiniMouseLeave();
-      }}
-      onPointerDown={(e) => e.stopPropagation()}
-      onWheel={(e) => e.stopPropagation()}
+      data-dock-shell="true"
+      data-dock-gliding={widthTransition?.isGliding ? 'true' : undefined}
       style={{
-        left: `${layout.left}px`,
+        transform: `translate3d(${layout.left}px, 0, 0)`,
         width: `${layout.width}px`,
+        height: `${layout.height}px`,
         zIndex: layout.zIndex,
-        transitionProperty: 'left, width, height, box-shadow',
+        willChange: widthTransition?.isGliding ? 'transform' : undefined,
+        transitionProperty: 'transform, width, height',
         transitionDuration: `${WIDTH_TRANSITION_TIMINGS.shellResizeMs}ms`,
         transitionTimingFunction: 'cubic-bezier(0.22, 1, 0.36, 1)',
-        ...(layout.expanded ? { maxWidth: `${layout.maxWidth}px` } : { height: `${layout.height ?? 112}px` }),
+        ...(layout.expanded ? { maxWidth: `${layout.maxWidth}px` } : {}),
       }}
-      className={`fixed top-[58px] flex select-none pointer-events-auto transform-gpu bg-[#f3f4f6] dark:bg-[#1C1C1E] border border-gray-300 dark:border-white/10 corner-squircle overflow-hidden ${
-        layout.expanded
-          ? 'bottom-4 rounded-[24px] shadow-2xl flex-col select-text cursor-default'
-          : `rounded-[20px] group ${
-              isHovered ? 'shadow-xl border-blue-500/60' : 'shadow-md'
-            }`
-      }`}
+      className="fixed top-[58px] left-0 pointer-events-none"
     >
+      <motion.div
+        ref={(el) => {
+          if (dockDomRefs) dockDomRefs.card = el;
+        }}
+        initial={{ opacity: 0, scale: 0.97, y: -8 }}
+        animate={{
+          opacity: 1,
+          scale: 1,
+          y: 0,
+          transition: { duration: 0.22, delay: 0.1, ease: panelEase },
+        }}
+        exit={{
+          opacity: 0,
+          scale: 0.97,
+          y: -8,
+          transition: { duration: 0.16, ease: panelEase },
+        }}
+        data-dock-card="true"
+        data-dock-gliding={widthTransition?.isGliding ? 'true' : undefined}
+        data-prevent-canvas-wheel="true"
+        data-agent-target={layout.expanded ? 'images.panel' : 'images.collapsed'}
+        onMouseEnter={() => {
+          if (!layout.expanded) onMiniMouseEnter();
+        }}
+        onMouseMove={(e) => {
+          if (!layout.expanded) onMiniMouseMove(e);
+        }}
+        onMouseLeave={() => {
+          if (!layout.expanded) onMiniMouseLeave();
+        }}
+        onPointerDown={(e) => e.stopPropagation()}
+        onWheel={(e) => e.stopPropagation()}
+        className={`w-full h-full flex select-none pointer-events-auto bg-[#f3f4f6] dark:bg-[#1C1C1E] border border-gray-300 dark:border-white/10 corner-squircle overflow-hidden ${
+          layout.expanded
+            ? 'rounded-[24px] shadow-2xl flex-col select-text cursor-default'
+            : `rounded-[20px] group ${
+                isHovered ? 'shadow-xl border-blue-500/60' : 'shadow-md'
+              }`
+        }`}
+      >
       {!layout.expanded ? (
         <button
+          ref={(el) => {
+            if (dockDomRefs) dockDomRefs.miniContent = el;
+          }}
           type="button"
           onClick={(e) => {
             e.stopPropagation();
@@ -1359,7 +1860,7 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
             transition:
               widthTransition && widthTransition.fadeDurationMs > 0
                 ? `opacity ${widthTransition.fadeDurationMs}ms ease-out`
-                : undefined,
+                : 'none',
           }}
           className={`w-full h-full flex flex-col justify-center py-2.5 select-none overflow-hidden cursor-pointer ${
             layout.miniAlign === 'right'
@@ -1383,17 +1884,24 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
         </button>
       ) : !isExpandedContentMounted ? null : (
         <div
+          ref={(el) => {
+            if (dockDomRefs) dockDomRefs.expandedContent = el;
+          }}
           style={{
             opacity: widthTransition ? widthTransition.opacity : 1,
             visibility: widthTransition?.hidden ? 'hidden' : 'visible',
+            contentVisibility: widthTransition?.suspendSubtree ? 'hidden' : 'visible',
             pointerEvents:
-              widthTransition && (widthTransition.opacity < 1 || widthTransition.hidden)
+              widthTransition &&
+              (widthTransition.opacity < 1 ||
+                widthTransition.hidden ||
+                widthTransition.suspendSubtree)
                 ? 'none'
                 : undefined,
             transition:
               widthTransition && widthTransition.fadeDurationMs > 0
                 ? `opacity ${widthTransition.fadeDurationMs}ms ease-out`
-                : `opacity ${WIDTH_TRANSITION_TIMINGS.fadeInMs}ms ease-out`,
+                : 'none',
             ...(widthTransition?.frozenWidth != null
               ? {
                   width: `${widthTransition.frozenWidth}px`,
@@ -1426,7 +1934,7 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
                 {onToggleWideMode && (
                   <button
                     type="button"
-                    onClick={onToggleWideMode}
+                    onClick={handleWideModeToggleClick}
                     aria-label={isWideMode ? '恢复图片面板默认宽度' : '加宽图片面板'}
                     aria-pressed={isWideMode}
                     data-agent-target="images.widthToggle"
@@ -1447,7 +1955,7 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
 
                 <button
                   type="button"
-                  onClick={onCollapse}
+                  onClick={handleCollapseClick}
                   aria-label="收起图片面板"
                   data-agent-target="images.close"
                   className="p-1.5 rounded-xl corner-squircle text-gray-400 hover:text-gray-700 dark:hover:text-neutral-200 hover:bg-black/5 dark:hover:bg-white/10 transition-colors cursor-pointer"
@@ -1514,291 +2022,12 @@ export const AssetImageFeedPanel = React.memo(function AssetImageFeedPanel({
               !isFeedBodyMounted || !isFeedRevealed ? 'opacity-0 pointer-events-none' : 'opacity-100'
             }`}
           >
-            {!isFeedBodyMounted ? (
-              <div className="w-full flex-1 h-full" />
-            ) : viewMode === 'sections' ? (
-              displayedSections.length === 0 ? (
-                <div className="py-12 px-4 flex flex-col items-center justify-center text-center">
-                  <div className="w-16 h-12 rounded-2xl bg-gray-200/70 dark:bg-neutral-800 flex items-center justify-center mb-3">
-                    <ImageIcon className="w-6 h-6 text-gray-400 dark:text-neutral-500" />
-                  </div>
-                  <p className="text-xs font-bold text-gray-700 dark:text-neutral-200">
-                    暂无匹配的资产条目
-                  </p>
-                  <p className="text-[11px] text-gray-400 dark:text-neutral-500 mt-1">
-                    先在左侧提取或新建资产后，这里会以图片卡片流形式展示资产图。
-                  </p>
-                </div>
-              ) : (
-                <div className="flex flex-col gap-3">
-                  {batchedSections.map((section, sectionIndex) => {
-                    const meta = CATEGORY_META[section.category];
-                    const categoryMatches = !activeCategory || activeCategory === section.category;
-                    const isSectionActive =
-                      Boolean(activeAssetId) &&
-                      categoryMatches &&
-                      ((activeAssetId === section.assetId &&
-                        Boolean(activeAssetIsVersion) === Boolean(section.isVersion)) ||
-                        (!activeAssetIsVersion && section.parentId === activeAssetId));
-                    const sectionTargetId = buildAssetAgentTargetId(
-                      section.category,
-                      section.assetId,
-                      section.parentId
-                    );
-                    const boundCardIds = section.images
-                      .map((img) => img.cardId)
-                      .filter((id): id is string => Boolean(id));
-                    const isSectionAgentFocused = isAssetSectionAgentFocused(
-                      section,
-                      focusedTargetList,
-                      boundCardIds
-                    );
-                    const isDragTarget = dragOverSectionKey === section.key;
-                    const isGeneratingForSection = verifyingOrGeneratingAssetIds.includes(
-                      section.assetId
-                    );
-                    const displayTitle = section.parentName
-                      ? `${section.parentName} · ${section.name}`
-                      : section.name;
-
-                    // 0 bound images -> single-column image-first placeholder card
-                    if (section.images.length === 0) {
-                      return renderPlaceholderTile(
-                        section,
-                        isSectionActive,
-                        isSectionAgentFocused,
-                        isDragTarget,
-                        isGeneratingForSection
-                      );
-                    }
-
-                    // Exactly 1 bound entry:
-                    // If the bound entry has no live preview image yet (e.g. draft/error/missing card),
-                    // render the unified placeholder card style instead of a mismatched fallback box.
-                    if (section.images.length === 1 && !isGeneratingForSection) {
-                      const singleImg = section.images[0];
-                      const singlePreviewSrc = resolveEntryPreviewSrc(singleImg);
-                      const hasLivePreview = Boolean(
-                        singlePreviewSrc && imageLoadStateByUrl[singlePreviewSrc] !== 'error'
-                      );
-                      const isCardGenerating = singleImg.cardState === 'generating';
-                      if (!hasLivePreview) {
-                        return renderPlaceholderTile(
-                          section,
-                          isSectionActive,
-                          isSectionAgentFocused,
-                          isDragTarget,
-                          isCardGenerating,
-                          singleImg
-                        );
-                      }
-                      return renderImageTile(section, singleImg, {
-                        isStandaloneSingle: true,
-                        isActive: isSectionActive,
-                        isAgentFocused: isSectionAgentFocused,
-                        agentTargetId: sectionTargetId,
-                        isDragTarget,
-                        isGeneratingForSection,
-                        isEager: sectionIndex < 6,
-                      });
-                    }
-
-                    // 2+ bound images (or generating additional while holding existing image) -> single-column group
-                    const groupBorderMode = isDragTarget
-                      ? 'none'
-                      : resolveSelectionBorderMode({
-                          isUserSelected: isSectionActive,
-                          isAgentFocused: isSectionAgentFocused,
-                        });
-                    return (
-                      <div
-                        key={section.key}
-                        data-feed-section={section.key}
-                        data-feed-asset-id={section.assetId}
-                        data-agent-target={sectionTargetId}
-                        data-selection-border-mode={groupBorderMode}
-                        onDragOver={(e) => handleDragOver(e, section.key)}
-                        onDragLeave={(e) => handleDragLeave(e, section.key)}
-                        onDrop={(e) => handleDrop(e, section)}
-                        className={`relative rounded-[24px] corner-squircle p-2.5 transition-colors ${
-                          isDragTarget
-                            ? 'bg-blue-50/90 dark:bg-blue-950/40'
-                            : groupBorderMode === 'dual'
-                              ? 'bg-gradient-to-br from-blue-50/70 to-purple-50/70 dark:from-blue-950/30 dark:to-purple-950/30'
-                              : groupBorderMode === 'agent'
-                                ? 'bg-purple-50/70 dark:bg-purple-950/30'
-                                : groupBorderMode === 'user'
-                                  ? 'bg-blue-50/70 dark:bg-blue-950/30'
-                                  : 'bg-white/65 dark:bg-white/[0.03]'
-                        }`}
-                      >
-                        {isDragTarget || groupBorderMode !== 'none' ? (
-                          <div
-                            key="selection-overlay"
-                            aria-hidden
-                            className={`${!isDragTarget && groupBorderMode === 'dual' ? 'dual-selection-border ' : ''}absolute inset-0 pointer-events-none rounded-[24px] corner-squircle z-30 select-none`}
-                            style={getSelectionOverlayStyle(
-                              isDragTarget ? 'user' : (groupBorderMode as Exclude<SelectionBorderMode, 'none'>),
-                              '2px'
-                            )}
-                          />
-                        ) : (
-                          <div
-                            key="idle-border"
-                            aria-hidden
-                            className="absolute inset-0 pointer-events-none rounded-[24px] corner-squircle z-30 select-none border border-gray-200/80 dark:border-white/[0.07]"
-                          />
-                        )}
-                        <div className="flex items-center justify-between gap-2 mb-2 px-0.5">
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              onSelectSection(section);
-                            }}
-                            className="flex items-center gap-1.5 min-w-0 flex-1 text-left cursor-pointer group"
-                          >
-                            <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${meta.dotClass}`} />
-                            <span className="text-xs font-bold text-gray-900 dark:text-neutral-100 truncate group-hover:text-blue-600 dark:group-hover:text-blue-300 transition-colors">
-                              {displayTitle}
-                            </span>
-                            <span className="text-[11px] text-gray-400 dark:text-neutral-500 shrink-0 tabular-nums">
-                              {section.images.length} 张
-                            </span>
-                          </button>
-
-                          <div className="flex items-center gap-1 shrink-0">
-                            {onStartCanvasBind && (
-                              <button
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  onStartCanvasBind(section);
-                                }}
-                                aria-label={`为 ${displayTitle} 从画布绑定`}
-                                title="从画布绑定"
-                                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg text-[11px] font-medium text-gray-500 dark:text-neutral-400 hover:text-blue-600 dark:hover:text-blue-300 hover:bg-blue-50/80 dark:hover:bg-blue-950/40 transition-colors cursor-pointer whitespace-nowrap shrink-0"
-                              >
-                                <MousePointerClick className="w-3 h-3" />
-                                <span>从画布绑定</span>
-                              </button>
-                            )}
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                onOpenBindModal(section);
-                              }}
-                              aria-label={`为 ${displayTitle} 列表或本地上传绑定`}
-                              title="列表或本地上传绑定"
-                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg text-[11px] font-medium text-gray-500 dark:text-neutral-400 hover:text-blue-600 dark:hover:text-blue-300 hover:bg-blue-50/80 dark:hover:bg-blue-950/40 transition-colors cursor-pointer whitespace-nowrap shrink-0"
-                            >
-                              <ImagePlus className="w-3 h-3" />
-                              <span>列表/上传</span>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                onRequestAgentGenerate(section);
-                              }}
-                              disabled={isGeneratingForSection}
-                              aria-label={`为 ${displayTitle} 生成绑定`}
-                              title="生成绑定"
-                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg text-[11px] font-medium text-gray-500 dark:text-neutral-400 hover:text-purple-600 dark:hover:text-purple-300 hover:bg-purple-50/80 dark:hover:bg-purple-950/40 disabled:opacity-50 transition-colors cursor-pointer whitespace-nowrap shrink-0"
-                            >
-                              {isGeneratingForSection ? (
-                                <RefreshCw className="w-3 h-3 animate-spin text-purple-500" />
-                              ) : (
-                                <Sparkles className="w-3 h-3" />
-                              )}
-                              <span>{isGeneratingForSection ? '生成中' : '生成绑定'}</span>
-                            </button>
-                          </div>
-                        </div>
-
-                        <div className="flex flex-col gap-2.5">
-                          {section.images.map((img, imgIndex) =>
-                            renderImageTile(section, img, {
-                              isStandaloneSingle: false,
-                              showSectionTitle: false,
-                              isAgentFocused: Boolean(
-                                img.cardId && focusedTargetList.includes(img.cardId)
-                              ),
-                              isEager: sectionIndex < 4 && imgIndex < 2,
-                            })
-                          )}
-                          {isGeneratingForSection && (
-                            <div className="rounded-[24px] corner-squircle overflow-hidden border border-purple-300/60 dark:border-purple-500/40 bg-purple-50/70 dark:bg-purple-950/25 h-44 flex flex-col items-center justify-center gap-1.5 animate-pulse">
-                              <RefreshCw className="w-5 h-5 text-purple-500 animate-spin" />
-                              <span className="text-[11px] font-medium text-purple-600 dark:text-purple-300">
-                                正在生成...
-                              </span>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )
-            ) : displayedTimelineCards.length === 0 ? (
-              <div className="py-12 px-4 flex flex-col items-center justify-center text-center">
-                <div className="w-16 h-12 rounded-2xl corner-squircle bg-gray-200/70 dark:bg-neutral-800 flex items-center justify-center mb-3">
-                  <ImageIcon className="w-6 h-6 text-gray-400 dark:text-neutral-500" />
-                </div>
-                <p className="text-xs font-bold text-gray-700 dark:text-neutral-200">
-                  暂无已绑定的资产图
-                </p>
-                <p className="text-[11px] text-gray-400 dark:text-neutral-500 mt-1">
-                  切换回「按资产」视图可为任意占位图卡片绑定或生成资产图。
-                </p>
-              </div>
-            ) : (
-              <div className="flex flex-col gap-3">
-                {batchedTimelineCards.map((entry, entryIndex) => {
-                  const sec = sectionLookup.get(`${entry.category}:${entry.assetId}`) || {
-                    key: `${entry.category}:${entry.assetId}`,
-                    assetId: entry.assetId,
-                    parentId: entry.parentId,
-                    parentName: entry.parentName,
-                    name: entry.assetName,
-                    category: entry.category,
-                    isVersion: entry.isVersion,
-                    subtitle: '',
-                    images: [entry.image],
-                  };
-                  const timelineActive =
-                    Boolean(activeAssetId) &&
-                    (!activeCategory || activeCategory === entry.category) &&
-                    ((activeAssetId === entry.assetId &&
-                      Boolean(activeAssetIsVersion) === Boolean(entry.isVersion)) ||
-                      (!activeAssetIsVersion && entry.parentId === activeAssetId));
-                  const timelineSectionTargetId = buildAssetAgentTargetId(
-                    sec.category,
-                    sec.assetId,
-                    sec.parentId
-                  );
-                  const timelineAgentFocused = isAssetSectionAgentFocused(
-                    sec,
-                    focusedTargetList,
-                    entry.image.cardId ? [entry.image.cardId] : undefined
-                  );
-                  return renderImageTile(sec, entry.image, {
-                    isStandaloneSingle: false,
-                    showSectionTitle: true,
-                    isActive: timelineActive,
-                    isAgentFocused: timelineAgentFocused,
-                    agentTargetId: timelineSectionTargetId,
-                    isEager: entryIndex < 6,
-                  });
-                })}
-              </div>
-            )}
+            {memoizedFeedBody}
           </div>
         </div>
       )}
       <FullscreenImageLightbox image={lightboxImage} onClose={handleCloseLightbox} />
-    </motion.div>
+      </motion.div>
+    </div>
   );
 });

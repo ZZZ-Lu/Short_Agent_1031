@@ -36,19 +36,26 @@ import {
   shouldShowGenerationPromptPanel,
 } from '../utils/cardLayout';
 import { CardImageCanvas } from './CardImageCanvas';
-import { PromptCanvas } from './PromptCanvas';
-import { readyPromptPanels, mountedDomCardIds, getCardSurfaceRevision } from '../utils/promptSurfaceCache';
+import { readyPromptPanels, mountedDomCardIds } from '../utils/promptSurfaceCache';
 import { cardCornerStyle, CARD_PANEL_WIDTH, EMPTY_CARD_PATHS } from '../utils/cardLodAppearance';
 import { capDprToBudget } from '../utils/devicePixelBudget';
 import { getStandardReferencePreview, resolveReferencePreviewSource } from '../utils/referencePreview';
 import { referenceDisplayName, shortenReferenceMentions } from '../utils/referenceName';
-import { PromptPanelCanvas, type PanelControl } from './PromptPanelCanvas';
 import { CANVAS_IDLE_MS, scheduleCanvasSurface, scheduleOriginalImageRestore, canUpgradeCardDuringGesture, isCameraZoomingOut, CANVAS_HYBRID_POINTER_WAKE_EVENT, getCanvasLoadingMode, getHybridPointer } from '../utils/canvasPerformance';
 import { fullImageCache, originalImageCache, preloadAndDecodeImage, preloadCanvasImage, evictOriginalImageCache } from '../utils/imageTextureCache';
 import { resizeImageOffThread } from '../utils/imageResize';
 import { fastGetImageDimensions } from '../utils/imageHeader';
 import { ScriptProject } from '../types/script';
-import { generateImageThumbnail, generateVideoThumbnail, generateNativeVideoPoster, getOrLoadThumbImage, preloadThumbImage, thumbCache, MAX_THUMBNAIL_EDGE } from '../utils/thumbnail';
+import { generateImageThumbnail, generateVideoThumbnail, getOrLoadThumbImage, preloadThumbImage, thumbCache, MAX_THUMBNAIL_EDGE } from '../utils/thumbnail';
+import {
+  buildCompletedVideoCardPatch,
+  buildDemoFallbackPatch,
+  defaultVideoPosterFailureGuard,
+  isLikelyStaticImageUrl,
+  needsVideoAssetUpgrade,
+  prepareGeneratedVideoAssets,
+  resolveVideoCardCanvasImageProps,
+} from '../utils/videoAssetPipeline';
 import { captureLiveVideoFrame } from '../utils/videoFrameBus';
 import { executeVideoPauseTransition, type CapturedVideoPauseFrame } from '../utils/videoPauseTransition';
 import {
@@ -394,6 +401,10 @@ export interface CardData {
   prompt: string;
   imageUrl: string | null;
   isVideo?: boolean;
+  isText?: boolean;
+  textTitle?: string;
+  textContent?: string;
+  sourceAgentEventId?: string;
   fileData?: Blob;
   originalFileData?: Blob; // Up to 4K proxy
   trueOriginalFileData?: Blob; // The actual original file if > 4K
@@ -511,7 +522,7 @@ const ReferenceThumbItem = React.memo(function ReferenceThumbItem({
         );
       }}
     >
-      <div className="w-full h-full bg-gray-50 dark:bg-neutral-800/60 rounded-lg border border-gray-200 dark:border-neutral-700/60 flex items-center justify-center overflow-hidden hover:border-gray-300 dark:hover:border-neutral-500 transition-colors duration-150 shadow-xs relative translate-z-0 transform-gpu">
+      <div className="w-full h-full bg-gray-50 dark:bg-neutral-800/60 rounded-lg border border-gray-200 dark:border-neutral-700/60 flex items-center justify-center overflow-hidden hover:border-gray-300 dark:hover:border-neutral-500 transition-colors duration-150 shadow-xs relative">
         {/* @Mention Tag (Top Left) */}
         <button
           type="button"
@@ -3093,50 +3104,87 @@ export const GenerationCard = React.memo(function GenerationCard({
     thumbUrl?: string;
     posterUrl?: string;
   } | null>(null);
-  // Upgrade existing video cards through the shared loading schedule. Persist the
-  // native still separately so Nano continues to use its lightweight thumbnail.
+  // Upgrade legacy or generated video cards missing poster/LODs in a single guarded pass
+  // identical to the imported video card pipeline. Failed/non-video sources are circuit-broken
+  // so remounting across Nano<->DOM never triggers repeated 8-second hidden <video> timeouts.
   useEffect(() => {
-    if (!isVideo || !imageUrl || data.videoPosterUrl) return;
-    let cancelled = false;
-    const revision = videoPosterRevisionRef.current;
-    const cancelJob = scheduleCanvasSurface(() => {
-      void generateNativeVideoPoster(data.fileData || imageUrl, () => cancelled).then(poster => {
-        if (!cancelled && poster && revision === videoPosterRevisionRef.current) onUpdateRef.current(id, { videoPosterUrl: poster }, false);
-      }).catch(error => console.warn('[VideoPoster] Native poster generation failed', error));
-    }, { label: `video-poster:${id}` });
-    return () => { cancelled = true; cancelJob(); };
-  }, [id, isVideo, imageUrl, data.fileData, data.videoPosterUrl]);
-
-  // Automatically generate first-frame thumbnail for video cards when mediaUrl becomes available
-  useEffect(() => {
-    if (!isVideo || !imageUrl || data.thumbnailUrl || localThumbnailUrl) return;
-
-    let isMounted = true;
-    const cached = thumbCache.get(imageUrl) || thumbCache.get(id);
-    if (cached) {
-      setLocalThumbnailUrl(cached);
-      onUpdateRef.current(id, { thumbnailUrl: cached }, false);
+    if (!needsVideoAssetUpgrade({
+      isVideo,
+      state,
+      imageUrl,
+      fileData: data.fileData,
+      videoPosterUrl: data.videoPosterUrl,
+      thumbnailUrl: data.thumbnailUrl,
+      closeupThumbnailUrl: data.closeupThumbnailUrl,
+      fullDetailThumbnailUrl: data.fullDetailThumbnailUrl,
+      microLodThumbnailUrl: data.microLodThumbnailUrl,
+      blurPlaceholderUrl: data.blurPlaceholderUrl,
+    })) {
       return;
     }
 
-    void (async () => {
-      try {
-        const thumb = await generateVideoThumbnail(data.fileData || imageUrl, MAX_THUMBNAIL_EDGE);
-        if (thumb && isMounted) {
-          setLocalThumbnailUrl(thumb);
-          thumbCache.set(id, thumb);
-          thumbCache.set(imageUrl, thumb);
-          onUpdateRef.current(id, { thumbnailUrl: thumb }, false);
+    const sourceKey = imageUrl || (data.fileData ? `blob:${id}:${data.fileData.size}:${data.fileData.type}` : '');
+    if (!sourceKey) return;
+    if (!isLikelyStaticImageUrl(sourceKey) && !data.videoPosterUrl && defaultVideoPosterFailureGuard.shouldSkip(sourceKey)) {
+      return;
+    }
+
+    let cancelled = false;
+    const revision = videoPosterRevisionRef.current;
+    const cancelJob = scheduleCanvasSurface(() => {
+      void prepareGeneratedVideoAssets({
+        cardId: id,
+        mediaUrl: imageUrl,
+        fileData: data.fileData,
+        existingPosterUrl: data.videoPosterUrl,
+        downloadRemoteBlob: false,
+        isCancelled: () => cancelled,
+      }).then((assets) => {
+        if (cancelled || !assets || revision !== videoPosterRevisionRef.current) return;
+        if (assets.videoPosterUrl) {
+          setLocalVideoPosterUrl(assets.videoPosterUrl);
         }
-      } catch (err) {
-        console.warn(`[GenerationCard] Failed to auto-generate video thumbnail for card ${id}:`, err);
-      }
-    })();
+        if (assets.thumbnailUrl) {
+          setLocalThumbnailUrl(assets.thumbnailUrl);
+        }
+        const patch: Partial<CardData> = {};
+        if (assets.videoPosterUrl && !data.videoPosterUrl) patch.videoPosterUrl = assets.videoPosterUrl;
+        if (assets.thumbnailUrl && !data.thumbnailUrl) patch.thumbnailUrl = assets.thumbnailUrl;
+        if (assets.closeupThumbnailUrl && !data.closeupThumbnailUrl) patch.closeupThumbnailUrl = assets.closeupThumbnailUrl;
+        if (assets.fullDetailThumbnailUrl && !data.fullDetailThumbnailUrl) patch.fullDetailThumbnailUrl = assets.fullDetailThumbnailUrl;
+        if (assets.microLodThumbnailUrl && !data.microLodThumbnailUrl) patch.microLodThumbnailUrl = assets.microLodThumbnailUrl;
+        if (assets.blurPlaceholderUrl && !data.blurPlaceholderUrl) patch.blurPlaceholderUrl = assets.blurPlaceholderUrl;
+        if (assets.nativeWidth && !data.nativeWidth) patch.nativeWidth = assets.nativeWidth;
+        if (assets.nativeHeight && !data.nativeHeight) patch.nativeHeight = assets.nativeHeight;
+        if (assets.videoDuration && !data.videoDuration) patch.videoDuration = assets.videoDuration;
+        if (Object.keys(patch).length > 0) {
+          onUpdateRef.current(id, patch, false);
+        }
+      }).catch((error) => {
+        console.warn(`[VideoAssetUpgrade] Upgrade failed for card ${id}:`, error);
+      });
+    }, { label: `video-asset-upgrade:${id}` });
 
     return () => {
-      isMounted = false;
+      cancelled = true;
+      cancelJob();
     };
-  }, [isVideo, imageUrl, data.thumbnailUrl, localThumbnailUrl, id, data.fileData]);
+  }, [
+    id,
+    isVideo,
+    state,
+    imageUrl,
+    data.fileData,
+    data.videoPosterUrl,
+    data.thumbnailUrl,
+    data.closeupThumbnailUrl,
+    data.fullDetailThumbnailUrl,
+    data.microLodThumbnailUrl,
+    data.blurPlaceholderUrl,
+    data.nativeWidth,
+    data.nativeHeight,
+    data.videoDuration,
+  ]);
 
   // Local buffered prompt state for 0-latency typing (decouples typing from full canvas re-render)
   const referenceNames = data.referenceImages?.map(ref => ref.name || '').filter(Boolean) || (data.referenceImageName ? [data.referenceImageName] : []);
@@ -3275,9 +3323,6 @@ export const GenerationCard = React.memo(function GenerationCard({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [isPromptEditing, setIsPromptEditing] = useState(false);
   const [isPromptPanelHovered, setIsPromptPanelHovered] = useState(false);
-  const [nativePanelMounted, setNativePanelMounted] = useState(false);
-  const [promptBitmapReady, setPromptBitmapReady] = useState('');
-  const [panelBitmapReady, setPanelBitmapReady] = useState('');
   const [isReferenceFilePickerOpen, setIsReferenceFilePickerOpen] = useState(false);
   const [promptScrollTop, setPromptScrollTop] = useState(0);
   const promptCursorRef = useRef<number | null>(null);
@@ -4491,17 +4536,24 @@ export const GenerationCard = React.memo(function GenerationCard({
           return;
         }
         if (resResult.ok && result.success && result.mediaUrl) {
-          let thumb: string | undefined;
-          if (data.isVideo) {
+          const finalIsVideo = Boolean(result.isVideo ?? data.isVideo);
+          let preparedVideoAssets = null;
+          if (finalIsVideo) {
             try {
-              thumb = await generateVideoThumbnail(result.mediaUrl, MAX_THUMBNAIL_EDGE);
-              if (thumb) {
-                setLocalThumbnailUrl(thumb);
-                thumbCache.set(id, thumb);
-                thumbCache.set(result.mediaUrl, thumb);
+              defaultVideoPosterFailureGuard.clear(result.mediaUrl);
+              preparedVideoAssets = await prepareGeneratedVideoAssets({
+                cardId: id,
+                mediaUrl: result.mediaUrl,
+                downloadRemoteBlob: true,
+              });
+              if (preparedVideoAssets?.videoPosterUrl) {
+                setLocalVideoPosterUrl(preparedVideoAssets.videoPosterUrl);
+              }
+              if (preparedVideoAssets?.thumbnailUrl) {
+                setLocalThumbnailUrl(preparedVideoAssets.thumbnailUrl);
               }
             } catch (e) {
-              console.warn('Auto video thumb generation in handleGenerate error:', e);
+              console.warn('Auto video asset preparation in handleGenerate error:', e);
             }
           }
           const currentCompletedConfig: CardBaselineConfig = {
@@ -4518,16 +4570,27 @@ export const GenerationCard = React.memo(function GenerationCard({
           };
           baselineConfigRef.current = currentCompletedConfig;
           baselinePromptRef.current = promptToGen;
-          onUpdate(id, { 
-            imageUrl: result.mediaUrl,
-            isVideo: result.isVideo ?? data.isVideo,
-            ...(thumb ? { thumbnailUrl: thumb } : {}),
-            state: 'completed',
-            lastGeneratedPrompt: promptToGen,
-            baselineConfig: currentCompletedConfig,
-            mcpTaskId: result.taskIds?.[0],
-            generationError: undefined,
-          }, true);
+          if (finalIsVideo) {
+            onUpdate(id, buildCompletedVideoCardPatch({
+              mediaUrl: result.mediaUrl,
+              assets: preparedVideoAssets,
+              isVideo: true,
+              mcpTaskId: result.taskIds?.[0],
+              lastGeneratedPrompt: promptToGen,
+              baselineConfig: currentCompletedConfig,
+              markCompleted: true,
+            }), true);
+          } else {
+            onUpdate(id, { 
+              imageUrl: result.mediaUrl,
+              isVideo: false,
+              state: 'completed',
+              lastGeneratedPrompt: promptToGen,
+              baselineConfig: currentCompletedConfig,
+              mcpTaskId: result.taskIds?.[0],
+              generationError: undefined,
+            }, true);
+          }
           return;
         } else {
           const errMsg = result.error || '生成失败，请稍后重试';
@@ -4539,10 +4602,14 @@ export const GenerationCard = React.memo(function GenerationCard({
 
       // Fallback demo generation if no MCP token is configured yet
       setTimeout(() => {
-        onUpdate(id, { 
-          imageUrl: "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=800&auto=format&fit=crop",
-          state: 'completed'
-        }, true);
+        onUpdate(
+          id,
+          buildDemoFallbackPatch(
+            "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=800&auto=format&fit=crop",
+            Boolean(data.isVideo)
+          ),
+          true
+        );
       }, 2000);
     } catch (e: any) {
       console.error('Generation call error:', e);
@@ -4596,32 +4663,30 @@ export const GenerationCard = React.memo(function GenerationCard({
         return;
       }
       const result = parsed.data;
-      if (result.completed && result.mediaUrl) {
+      if ((result.completed && result.mediaUrl) || (!result.pending && !result.failed && result.mediaUrl)) {
         setVideoHasError(false);
         setVideoLoadError('');
-        onUpdateRef.current(id, {
-          imageUrl: result.mediaUrl,
+        defaultVideoPosterFailureGuard.clear(result.mediaUrl);
+        const preparedAssets = await prepareGeneratedVideoAssets({
+          cardId: id,
+          mediaUrl: result.mediaUrl,
+          downloadRemoteBlob: true,
+        }).catch(() => null);
+        if (preparedAssets?.videoPosterUrl) setLocalVideoPosterUrl(preparedAssets.videoPosterUrl);
+        if (preparedAssets?.thumbnailUrl) setLocalThumbnailUrl(preparedAssets.thumbnailUrl);
+        onUpdateRef.current(id, buildCompletedVideoCardPatch({
+          mediaUrl: result.mediaUrl,
+          assets: preparedAssets,
           isVideo: true,
-          state: 'completed',
           mcpTaskId: taskId,
-          generationError: undefined,
-        }, true);
+          markCompleted: true,
+        }), true);
       } else if (result.pending) {
         setVideoHasError(false);
         setVideoLoadError('');
       } else if (result.failed) {
         setVideoHasError(true);
         setVideoLoadError(result.error || '视频生成失败');
-      } else if (result.mediaUrl) {
-        setVideoHasError(false);
-        setVideoLoadError('');
-        onUpdateRef.current(id, {
-          imageUrl: result.mediaUrl,
-          isVideo: true,
-          state: 'completed',
-          mcpTaskId: taskId,
-          generationError: undefined,
-        }, true);
       } else {
         const errorDetail = result.error || '未获取到有效视频链接';
         setVideoHasError(true);
@@ -4955,10 +5020,6 @@ export const GenerationCard = React.memo(function GenerationCard({
     };
   }, [showAssetPicker, currentProject, assetFilter, assetSearch, allCards, resolveAssetReferenceMedia]);
 
-  const canvasCandidates = useMemo(() => (allCards || []).filter(c =>
-    c.id !== id && Boolean(c.imageUrl || c.originalImageUrl || c.thumbnailUrl)
-  ), [allCards, id]);
-
   // Normalized list of references for display
   const refList = data.referenceImages && data.referenceImages.length > 0
     ? data.referenceImages
@@ -4966,7 +5027,7 @@ export const GenerationCard = React.memo(function GenerationCard({
       ? [{ url: data.referenceImageUrl, name: data.referenceImageName, fileData: data.referenceImageFileData }]
       : [];
 
-  const previewReference = refList.find(reference => reference.url === hoveredRefUrl);
+  const previewReference = hoveredRefUrl ? refList.find(reference => reference.url === hoveredRefUrl) : undefined;
   const previewSource = previewReference ? resolveReferencePreviewSource(previewReference, allCards || []) : null;
   useEffect(() => {
     if (!hoveredRefUrl || !previewSource) return;
@@ -4982,8 +5043,9 @@ export const GenerationCard = React.memo(function GenerationCard({
   const previewDisplaySrc = referencePreviewImage?.referenceUrl === hoveredRefUrl
     ? referencePreviewImage.src : previewReference?.thumbnailUrl;
 
-  // All candidate references and assets (unfiltered for prompt highlighting and parsing)
+  // All candidate references and assets (gated so idle completed cards do zero work when prompt panel is hidden)
   const allMentionItems = useMemo(() => {
+    if (!shouldRenderBottomPanel) return [];
     const items: Array<{
       id: string;
       name: string;
@@ -5067,7 +5129,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     });
 
     return items;
-  }, [refList, currentProject, allCards, resolveAssetReferenceMedia]);
+  }, [shouldRenderBottomPanel, refList, currentProject, allCards, resolveAssetReferenceMedia]);
 
   // Filtered mention candidates strictly for the suggestion popup menu
   const filteredMentionCandidates = useMemo(() => {
@@ -5426,55 +5488,29 @@ export const GenerationCard = React.memo(function GenerationCard({
     ? selectedMcpModel.resolutions.map(option => (typeof option === 'object' ? option.label : option))
     : (data.isVideo ? ['720p', '1080p'] : ['1K', '2K', '4K']);
   const selectedModel = selectedMcpModel?.name || '选择模型';
-  // Proximity & attention-driven hydration: pre-hydrate to DOM when card is hovered (at normal zoom), selected, or near
   const isHighScale = currentScale > 1.8;
-  const useNativePromptPanel = (!isHighScale && isHovered) || isSelected || isPromptPanelHovered || isPromptEditing || Boolean(openMenu) || mentionMenuOpen ||
-    Boolean(hoveredRefUrl || activePreviewUrl || data.generationError) || isReferenceFilePickerOpen;
-  const enumParameters: McpSchemaParameter[] = data.isVideo ? [
-    {
-      name: 'duration',
-      title: '时长',
-      enum: selectedVideoModel?.durations || [5],
-      default: selectedVideoModel?.durations?.[0] || 5,
-    },
-    ...(selectedVideoModel?.supportAudio ? [{
-      name: 'enable_sound',
-      title: '声音',
-      enum: [true, false],
-      default: true,
-    }] : []),
-  ] : ('qualities' in selectedMcpModel && selectedMcpModel.qualities?.length ? [{
-    name: 'quality',
-    title: '画质',
-    enum: selectedMcpModel.qualities.map(option => option.value),
-    default: selectedMcpModel.qualities[0].value,
-  }] : []);
+  const enumParameters: McpSchemaParameter[] = shouldRenderBottomPanel
+    ? (data.isVideo ? [
+        {
+          name: 'duration',
+          title: '时长',
+          enum: selectedVideoModel?.durations || [5],
+          default: selectedVideoModel?.durations?.[0] || 5,
+        },
+        ...(selectedVideoModel?.supportAudio ? [{
+          name: 'enable_sound',
+          title: '声音',
+          enum: [true, false],
+          default: true,
+        }] : []),
+      ] : ('qualities' in selectedMcpModel && selectedMcpModel.qualities?.length ? [{
+        name: 'quality',
+        title: '画质',
+        enum: selectedMcpModel.qualities.map(option => option.value),
+        default: selectedMcpModel.qualities[0].value,
+      }] : []))
+    : [];
 
-  const panelControls: PanelControl[] = [
-    { key: 'mention', label: '引用', targetId: `mention-btn-${id}`, onClick: () => { setIsPromptEditing(true); setMentionMenuOpen(true); } },
-    { key: 'model', label: String(selectedModel), targetId: `model-btn-${id}`, onClick: () => setOpenMenu({ type: 'model', ownerId: 'user' }) },
-    ...enumParameters.map(param => {
-      const value = data.mcpParameters?.[param.name] ?? param.default ?? param.enum?.[0];
-      const label = param.name === 'quality'
-        ? ('qualities' in selectedMcpModel ? selectedMcpModel.qualities.find(option => option.value === value)?.label : undefined) || value
-        : param.name === 'duration' ? `${value}秒` : param.name === 'enable_sound' ? (value ? '有声' : '静音') : value;
-      return { key: param.name, label: String(label), targetId: `param-btn-${id}-${param.name}`, onClick: () => setOpenMenu({ type: 'param' as const, ownerId: param.name }) };
-    }),
-    { key: 'ratio', label: String(ratio), targetId: `ratio-btn-${id}`, onClick: () => setOpenMenu({ type: 'ratio', ownerId: 'user' }) },
-    { key: 'res', label: String(res), targetId: `res-btn-${id}`, onClick: () => setOpenMenu({ type: 'res', ownerId: 'user' }) },
-  ];
-  // Keep the last native frame until BOTH cached surfaces contain the current content.
-  const panelRenderKey = JSON.stringify([
-    localPrompt, promptScrollTop, refList.map(ref => [ref.thumbnailUrl || ref.url, ref.name]),
-    panelControls.map(control => [control.key, control.label]), state,
-    typeof document !== 'undefined' && document.documentElement.classList.contains('dark'),
-  ]);
-  const showNativePromptPanel = useNativePromptPanel || nativePanelMounted;
-  const surfaceRevision = getCardSurfaceRevision(
-    localPrompt === (data.prompt || '') && ratio === data.ratio && res === data.res
-      ? data : { ...data, prompt: localPrompt, ratio, res },
-    typeof document !== 'undefined' && document.documentElement.classList.contains('dark'),
-  );
   useLayoutEffect(() => {
     mountedDomCardIds.add(id);
     window.dispatchEvent(new CustomEvent('card-painted', { detail: { cardId: id } }));
@@ -5501,15 +5537,9 @@ export const GenerationCard = React.memo(function GenerationCard({
       window.dispatchEvent(new CustomEvent('card-painted', { detail: { cardId: id } }));
     };
   }, [id, shouldRenderBottomPanel]);
-  useEffect(() => {
-    if (useNativePromptPanel) setNativePanelMounted(true);
-    else if (promptBitmapReady === panelRenderKey && panelBitmapReady === panelRenderKey) {
-      setNativePanelMounted(false);
-    }
-  }, [useNativePromptPanel, promptBitmapReady, panelBitmapReady, panelRenderKey]);
   useLayoutEffect(() => {
-    if (showNativePromptPanel && mirrorRef.current) mirrorRef.current.scrollTop = promptScrollTop;
-  }, [showNativePromptPanel, promptScrollTop]);
+    if (shouldRenderBottomPanel && mirrorRef.current) mirrorRef.current.scrollTop = promptScrollTop;
+  }, [shouldRenderBottomPanel, promptScrollTop]);
   // Dynamic height calculation based on hovered reference image aspect ratio
   const previewLayout = getReferencePreviewLayout(localPrompt, previewDimensions);
   const textareaHeight = previewLayout.promptHeight;
@@ -5971,23 +6001,36 @@ export const GenerationCard = React.memo(function GenerationCard({
                 height: h,
               }}
             >
-              {/* Base: CardImageCanvas for idle/hover/poster rendering with multi-level LOD & 2K/4K support */}
-              <CardImageCanvas
-                cardId={id}
-                thumbnailUrl={effectiveThumbnailUrl}
-                blurPlaceholderUrl={data.blurPlaceholderUrl}
-                imageUrl={effectiveVideoPosterUrl || imageUrl}
-                originalImageUrl={effectiveVideoPosterUrl || data.originalImageUrl || data.trueOriginalImageUrl || imageUrl}
-                showOriginal={showOriginal}
-                width={w}
-                height={h}
-                dpr={dpr}
-                state={state}
-                isZooming={isZooming}
-                disableTransition={true}
-                onLoaded={handleImageLoaded}
-                className="squircle"
-              />
+              {/* Base: CardImageCanvas for idle/hover/poster rendering — never feeds raw video URLs into new Image() */}
+              {(() => {
+                const videoCanvasImageProps = resolveVideoCardCanvasImageProps({
+                  isVideo: true,
+                  imageUrl,
+                  originalImageUrl: data.originalImageUrl,
+                  trueOriginalImageUrl: data.trueOriginalImageUrl,
+                  effectiveVideoPosterUrl,
+                  effectiveThumbnailUrl,
+                  blurPlaceholderUrl: data.blurPlaceholderUrl,
+                });
+                return (
+                  <CardImageCanvas
+                    cardId={id}
+                    thumbnailUrl={videoCanvasImageProps.thumbnailUrl}
+                    blurPlaceholderUrl={videoCanvasImageProps.blurPlaceholderUrl}
+                    imageUrl={videoCanvasImageProps.imageUrl}
+                    originalImageUrl={videoCanvasImageProps.originalImageUrl}
+                    showOriginal={showOriginal}
+                    width={w}
+                    height={h}
+                    dpr={dpr}
+                    state={state}
+                    isZooming={isZooming}
+                    disableTransition={true}
+                    onLoaded={handleImageLoaded}
+                    className="squircle"
+                  />
+                );
+              })()}
 
               {/* Transient Video Player Overlay - stays mounted until paused thumbnail/poster is decoded and painted */}
               {showVideoPlayer && effectiveVideoSrc && effectiveVideoSrc.trim() !== '' && !videoHasError && (
@@ -6538,7 +6581,7 @@ export const GenerationCard = React.memo(function GenerationCard({
       <div 
         onPointerEnter={() => setIsPromptPanelHovered(true)}
         onPointerLeave={() => setIsPromptPanelHovered(false)}
-        className={`generation-card-bottom-panel absolute top-full left-0 mt-3 z-40 pointer-events-auto flex flex-col bg-gray-100 dark:bg-neutral-800 squircle p-4 gap-2 w-[480px] cursor-default self-start transform-gpu [&.drag-degraded]:!shadow-none [&.drag-degraded]:!backdrop-filter-none ${
+        className={`generation-card-bottom-panel absolute top-full left-0 mt-3 z-40 pointer-events-auto flex flex-col bg-gray-100 dark:bg-neutral-800 squircle !overflow-visible p-4 gap-2 w-[480px] cursor-default self-start transform-gpu [&.drag-degraded]:!shadow-none [&.drag-degraded]:!backdrop-filter-none ${
         isSelected 
           ? 'border border-gray-300 dark:border-neutral-600' 
           : 'border border-gray-200 dark:border-neutral-700 shadow-[0_1px_2px_rgba(0,0,0,0.06),0_0_1px_rgba(0,0,0,0.08)] dark:shadow-[0_1px_2px_rgba(0,0,0,0.35)] hover:border-gray-300 dark:hover:border-neutral-600'
@@ -6930,7 +6973,7 @@ export const GenerationCard = React.memo(function GenerationCard({
                 }
                 setMentionMenuOpen(prev => !prev);
               }}
-              className="flex items-center gap-1 text-[12px] font-medium text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 bg-blue-50 dark:bg-blue-950/40 hover:bg-blue-100 dark:hover:bg-blue-900/40 px-2 py-0.5 rounded-md transition-colors cursor-pointer"
+              className="shrink-0 whitespace-nowrap flex items-center gap-1 text-[12px] font-medium text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 bg-blue-50 dark:bg-blue-950/40 hover:bg-blue-100 dark:hover:bg-blue-900/40 px-2 py-0.5 rounded-md transition-colors cursor-pointer"
               title="在提示词中@参考图"
             >
               <span className="font-bold text-[13px]">@</span>
@@ -6961,9 +7004,10 @@ export const GenerationCard = React.memo(function GenerationCard({
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, y: 5 }}
                     transition={{ duration: 0.15 }}
-                    className="absolute bottom-[calc(100%+12px)] left-0 w-64 max-h-72 overflow-y-auto bg-gray-100 dark:bg-neutral-800 border border-gray-100 dark:border-[#404040] rounded-xl corner-squircle shadow-[0_8px_30px_rgb(0,0,0,0.12)] p-1.5 z-50 flex flex-col"
+                    data-prevent-canvas-wheel="true"
+                    className="absolute bottom-[calc(100%+12px)] left-0 w-64 max-h-80 overflow-hidden bg-gray-100 dark:bg-neutral-800 border border-gray-200/80 dark:border-[#404040] rounded-xl shadow-[0_8px_30px_rgb(0,0,0,0.12)] p-1.5 z-50 flex flex-col"
                   >
-                    <div className="flex items-center justify-between px-2 py-1 mb-1 border-b border-gray-200 dark:border-neutral-700 text-[10px] text-gray-500 dark:text-neutral-400 font-medium">
+                    <div className="shrink-0 flex items-center justify-between px-2.5 py-1.5 mb-1 border-b border-gray-200 dark:border-neutral-700 text-[11px] text-gray-500 dark:text-neutral-400 font-medium">
                       <span className="flex items-center gap-1.5">
                         {isMcpModelsDynamic ? `WorkRally MCP ${data.isVideo ? '视频' : '生图'}模型 (${mcpModels.length})` : `可用${data.isVideo ? '视频' : '生图'}模型`}
                         {isMcpModelsDynamic && (
@@ -6982,7 +7026,8 @@ export const GenerationCard = React.memo(function GenerationCard({
                         <RefreshCw className={`w-3 h-3 ${isMcpModelsLoading ? 'animate-spin text-blue-500' : ''}`} />
                       </button>
                     </div>
-                    {mcpModels.map(model => (
+                    <div className="flex-1 min-h-0 overflow-y-auto flex flex-col gap-1 pr-0.5">
+                      {mcpModels.map(model => (
                         <button
                           key={model.id || model.name}
                           type="button"
@@ -7000,21 +7045,22 @@ export const GenerationCard = React.memo(function GenerationCard({
                             }, true);
                             setOpenMenu(null);
                           }}
-                          className={`text-left px-3 py-2 rounded-lg corner-squircle text-[12px] font-medium transition-colors ${
-                            (model.id === data.mcpModel || model.name === data.mcpModel)
-                              ? 'bg-gray-100 dark:bg-neutral-700 text-gray-900 dark:text-white'
-                              : 'text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-700'
+                          className={`shrink-0 w-full text-left px-3 py-2.5 rounded-lg text-[12px] leading-5 font-medium transition-colors ${
+                            (model.id === selectedMcpModel?.id || model.id === data.mcpModel || model.name === data.mcpModel)
+                              ? 'bg-white dark:bg-neutral-700 text-gray-900 dark:text-white shadow-xs'
+                              : 'text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-700/70'
                           }`}
                           title={model.description || model.name}
                         >
-                          <div className="truncate font-semibold">{model.name}</div>
+                          <div className="truncate font-semibold leading-5">{model.name}</div>
                           {model.description && (
-                            <div className="text-[10px] text-gray-400 dark:text-neutral-400 truncate mt-0.5 font-normal">
+                            <div className="text-[11px] leading-4 text-gray-400 dark:text-neutral-400 truncate mt-0.5 font-normal">
                               {model.description}
                             </div>
                           )}
                         </button>
-                    ))}
+                      ))}
+                    </div>
                   </motion.div>
                 )}
               </AnimatePresence>
@@ -7050,31 +7096,36 @@ export const GenerationCard = React.memo(function GenerationCard({
                         animate={{ opacity: 1, y: 0 }}
                         exit={{ opacity: 0, y: 5 }}
                         transition={{ duration: 0.15 }}
-                        className="absolute bottom-[calc(100%+12px)] left-0 w-40 max-h-72 overflow-y-auto bg-gray-100 dark:bg-neutral-800 border border-gray-100 dark:border-[#404040] rounded-xl corner-squircle shadow-[0_8px_30px_rgb(0,0,0,0.12)] p-1.5 z-50 flex flex-col"
+                        data-prevent-canvas-wheel="true"
+                        className="absolute bottom-[calc(100%+12px)] left-0 w-40 max-h-80 overflow-hidden bg-gray-100 dark:bg-neutral-800 border border-gray-200/80 dark:border-[#404040] rounded-xl shadow-[0_8px_30px_rgb(0,0,0,0.12)] p-1.5 z-50 flex flex-col"
                       >
-                        <div className="px-3 py-1 text-[10px] text-gray-400 truncate">{param.title || param.name}</div>
-                        {param.enum?.map(option => (
-                          <button
-                            key={option}
-                            type="button"
-                            onClick={() => {
-                              onUpdate(id, {
-                                mcpParameters: {
-                                  ...(data.mcpParameters || {}),
-                                  [param.name]: option,
-                                },
-                              }, true);
-                              setOpenMenu(null);
-                            }}
-                            className={`text-left px-3 py-2 rounded-lg corner-squircle text-[12px] font-medium transition-colors ${option === currentValue ? 'bg-gray-100 dark:bg-neutral-700 text-gray-900 dark:text-white' : 'text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-700'}`}
-                          >
-                            {param.name === 'quality'
-                              ? ('qualities' in selectedMcpModel ? selectedMcpModel.qualities.find(item => item.value === option)?.label : undefined) || String(option)
-                              : param.name === 'duration' ? `${option}秒`
-                              : param.name === 'enable_sound' ? (option ? '有声' : '静音')
-                              : String(option)}
-                          </button>
-                        ))}
+                        <div className="shrink-0 px-3 py-1.5 mb-1 border-b border-gray-200 dark:border-neutral-700 text-[11px] text-gray-500 dark:text-neutral-400 font-medium truncate">
+                          {param.title || param.name}
+                        </div>
+                        <div className="flex-1 min-h-0 overflow-y-auto flex flex-col gap-1 pr-0.5">
+                          {param.enum?.map(option => (
+                            <button
+                              key={String(option)}
+                              type="button"
+                              onClick={() => {
+                                onUpdate(id, {
+                                  mcpParameters: {
+                                    ...(data.mcpParameters || {}),
+                                    [param.name]: option,
+                                  },
+                                }, true);
+                                setOpenMenu(null);
+                              }}
+                              className={`shrink-0 w-full text-left px-3 py-2 rounded-lg text-[12px] leading-5 font-medium transition-colors ${option === currentValue ? 'bg-white dark:bg-neutral-700 text-gray-900 dark:text-white shadow-xs' : 'text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-700/70'}`}
+                            >
+                              {param.name === 'quality'
+                                ? ('qualities' in selectedMcpModel ? selectedMcpModel.qualities.find(item => item.value === option)?.label : undefined) || String(option)
+                                : param.name === 'duration' ? `${option}秒`
+                                : param.name === 'enable_sound' ? (option ? '有声' : '静音')
+                                : String(option)}
+                            </button>
+                          ))}
+                        </div>
                       </motion.div>
                     )}
                   </AnimatePresence>
@@ -7104,14 +7155,15 @@ export const GenerationCard = React.memo(function GenerationCard({
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, y: 5 }}
                     transition={{ duration: 0.15 }}
-                    className="absolute bottom-[calc(100%+12px)] left-0 w-28 bg-gray-100 dark:bg-neutral-800 border border-gray-100 dark:border-[#404040] rounded-xl corner-squircle shadow-[0_8px_30px_rgb(0,0,0,0.12)] p-1.5 z-50 flex flex-col"
+                    data-prevent-canvas-wheel="true"
+                    className="absolute bottom-[calc(100%+12px)] left-0 w-28 max-h-72 overflow-y-auto bg-gray-100 dark:bg-neutral-800 border border-gray-200/80 dark:border-[#404040] rounded-xl shadow-[0_8px_30px_rgb(0,0,0,0.12)] p-1.5 z-50 flex flex-col gap-1"
                   >
                     {ratios.map(r => (
                       <button 
                         key={r}
                         data-agent-target={`ratio-option-${id}-${r}`}
                         onClick={() => { onUpdate(id, { ratio: r }, true); setOpenMenu(null); }}
-                        className={`text-left px-3 py-2 rounded-lg corner-squircle text-[13px] font-medium transition-colors ${r === ratio ? 'bg-gray-100 dark:bg-neutral-700 text-gray-900 dark:text-white' : 'text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-700'}`}
+                        className={`shrink-0 w-full text-left px-3 py-2 rounded-lg text-[13px] leading-5 font-medium transition-colors ${r === ratio ? 'bg-white dark:bg-neutral-700 text-gray-900 dark:text-white shadow-xs' : 'text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-700/70'}`}
                       >
                         {r}
                       </button>
@@ -7145,14 +7197,15 @@ export const GenerationCard = React.memo(function GenerationCard({
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, y: 5 }}
                     transition={{ duration: 0.15 }}
-                    className="absolute bottom-[calc(100%+12px)] left-0 w-24 bg-gray-100 dark:bg-neutral-800 border border-gray-100 dark:border-[#404040] rounded-xl corner-squircle shadow-[0_8px_30px_rgb(0,0,0,0.12)] p-1.5 z-50 flex flex-col"
+                    data-prevent-canvas-wheel="true"
+                    className="absolute bottom-[calc(100%+12px)] left-0 w-24 max-h-72 overflow-y-auto bg-gray-100 dark:bg-neutral-800 border border-gray-200/80 dark:border-[#404040] rounded-xl shadow-[0_8px_30px_rgb(0,0,0,0.12)] p-1.5 z-50 flex flex-col gap-1"
                   >
                     {resolutions.map(r => (
                       <button 
                         key={r}
                         data-agent-target={`res-option-${id}-${r}`}
                         onClick={() => { onUpdate(id, { res: r }, true); setOpenMenu(null); }}
-                        className={`text-left px-3 py-2 rounded-lg corner-squircle text-[13px] font-medium transition-colors ${r === res ? 'bg-gray-100 dark:bg-neutral-700 text-gray-900 dark:text-white' : 'text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-700'}`}
+                        className={`shrink-0 w-full text-left px-3 py-2 rounded-lg text-[13px] leading-5 font-medium transition-colors ${r === res ? 'bg-white dark:bg-neutral-700 text-gray-900 dark:text-white shadow-xs' : 'text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-700/70'}`}
                       >
                         {r}
                       </button>

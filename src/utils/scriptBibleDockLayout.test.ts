@@ -21,6 +21,7 @@ import {
   shouldMountScriptBiblePanelBody,
   shouldPersistImagesFeedScroll,
   shouldReapplyPendingImageScroll,
+  WIDTH_TRANSITION_TIMINGS,
 } from './scriptBibleDockLayout';
 
 test('computeScriptBibleDockLayout arranges all 3 expanded columns with identical width and no overlap at 1440px and 1600px', () => {
@@ -278,7 +279,8 @@ test('buildDockTransitionPlan & phase builders choreograph expand and collapse w
   const ePhase3Rev = buildDockTransitionPhase3Reveal(ePhase3Prep, 'script', 'expand');
   assert.equal(ePhase3Rev.script.opacity, 1);
 
-  // Expanding Script at 2000px ultra-wide while Images stays 480px (just shifts left) -> Images unaffected!
+  // Expanding Script at 2000px ultra-wide shifts both collapsed Assets and expanded Images ->
+  // both shifting siblings MUST hide content during shell glide to prevent layout/paint jank!
   const ultraCollapsed = computeScriptBibleDockLayout({
     isScriptExpanded: false,
     isAssetsExpanded: false,
@@ -292,8 +294,70 @@ test('buildDockTransitionPlan & phase builders choreograph expand and collapse w
     viewportWidth: 2000,
   });
   const ultraExpandPlan = buildDockTransitionPlan({ prevLayout: ultraCollapsed, nextLayout: ultraExpanded });
-  assert.deepEqual(ultraExpandPlan.actions, { script: 'expand', assets: 'none', images: 'none' });
-  assert.deepEqual(ultraExpandPlan.revealOrder, ['script']);
+  assert.deepEqual(ultraExpandPlan.actions, { script: 'expand', assets: 'move-mini', images: 'move' });
+  assert.deepEqual(ultraExpandPlan.revealOrder, ['images', 'assets', 'script']);
+
+  const uP1 = buildDockTransitionPhase1(ultraExpandPlan);
+  assert.equal(uP1.images.opacity, 0);
+  assert.equal(uP1.images.hidden, false);
+  assert.equal(uP1.images.mountExpandedContent, true);
+  assert.equal(uP1.assets.miniOpacity, 0);
+  assert.equal(uP1.assets.miniHidden, false);
+
+  const uP2 = buildDockTransitionPhase2(uP1, ultraExpandPlan);
+  assert.equal(uP2.images.hidden, true);
+  assert.equal(uP2.images.opacity, 0);
+  assert.equal(uP2.images.mountExpandedContent, true);
+  assert.equal(uP2.assets.miniHidden, true);
+  assert.equal(uP2.assets.miniOpacity, 0);
+
+  const uP3PrepImg = buildDockTransitionPhase3Prepare(uP2, 'images', 'move');
+  assert.equal(uP3PrepImg.images.hidden, false);
+  assert.equal(uP3PrepImg.images.opacity, 0);
+  const uP3RevImg = buildDockTransitionPhase3Reveal(uP3PrepImg, 'images', 'move');
+  assert.equal(uP3RevImg.images.opacity, 1);
+
+  const uP3PrepAssets = buildDockTransitionPhase3Prepare(uP3RevImg, 'assets', 'move-mini');
+  assert.equal(uP3PrepAssets.assets.miniHidden, false);
+  assert.equal(uP3PrepAssets.assets.miniOpacity, 0);
+  const uP3RevAssets = buildDockTransitionPhase3Reveal(uP3PrepAssets, 'assets', 'move-mini');
+  assert.equal(uP3RevAssets.assets.miniOpacity, 1);
+
+  // Collapsing Assets at 1920px: stationary Script stays visible ('none'), shifting Images hides ('move')
+  const wideAll3 = computeScriptBibleDockLayout({
+    isScriptExpanded: true,
+    isAssetsExpanded: true,
+    isImagesExpanded: true,
+    viewportWidth: 1920,
+  });
+  const wideAssetsCollapsed = computeScriptBibleDockLayout({
+    isScriptExpanded: true,
+    isAssetsExpanded: false,
+    isImagesExpanded: true,
+    viewportWidth: 1920,
+  });
+  const assetsCollapsePlan = buildDockTransitionPlan({ prevLayout: wideAll3, nextLayout: wideAssetsCollapsed });
+  assert.deepEqual(assetsCollapsePlan.actions, { script: 'none', assets: 'collapse', images: 'move' });
+  assert.deepEqual(assetsCollapsePlan.affectedPanels, { script: false, assets: true, images: true });
+  const acP2 = buildDockTransitionPhase2(buildDockTransitionPhase1(assetsCollapsePlan), assetsCollapsePlan);
+  assert.equal(acP2.script.hidden, false);
+  assert.equal(acP2.script.opacity, 1);
+  assert.equal(acP2.images.hidden, true);
+  assert.equal(acP2.images.opacity, 0);
+
+  // Collapsing Script at 1920px: both Assets and Images keep 480px width but shift left -> both hide ('move')
+  const wideScriptCollapsed = computeScriptBibleDockLayout({
+    isScriptExpanded: false,
+    isAssetsExpanded: true,
+    isImagesExpanded: true,
+    viewportWidth: 1920,
+  });
+  const wideScriptCollapsePlan = buildDockTransitionPlan({ prevLayout: wideAll3, nextLayout: wideScriptCollapsed });
+  assert.deepEqual(wideScriptCollapsePlan.actions, { script: 'collapse', assets: 'move', images: 'move' });
+  const wscP2 = buildDockTransitionPhase2(buildDockTransitionPhase1(wideScriptCollapsePlan), wideScriptCollapsePlan);
+  assert.equal(wscP2.assets.hidden, true);
+  assert.equal(wscP2.images.hidden, true);
+  assert.equal(wscP2.script.mountExpandedContent, false);
 
   // Expanding Images in wide mode unmounts expanded feed during shell resize and reveals only after reaching final 880px width
   const imgCollapsed = computeScriptBibleDockLayout({
@@ -622,4 +686,82 @@ test('computeProgressiveBatchCount steps smoothly across frames and bypasses bat
   assert.equal(computeProgressiveBatchCount({ totalCount: 25, currentCount: 22, initialBatchSize: 6, batchStep: 8 }), 25);
   assert.equal(computeProgressiveBatchCount({ totalCount: 40, currentCount: 0, forceAll: true }), 40);
 });
+
+test('trade-time-for-framerate choreography sets suspendSubtree and isGliding strictly during Phase 2 glide', () => {
+  // Verify generous timing budgets: pre-glide pause, post-glide safety buffer, and staggered reveal
+  assert.ok(WIDTH_TRANSITION_TIMINGS.fadeOutMs >= 90);
+  assert.ok(WIDTH_TRANSITION_TIMINGS.preGlidePauseMs >= 40);
+  assert.ok(WIDTH_TRANSITION_TIMINGS.shellResizeMs >= 240);
+  assert.ok(WIDTH_TRANSITION_TIMINGS.postGlideBufferMs >= 30);
+  assert.ok(WIDTH_TRANSITION_TIMINGS.revealStaggerMs >= 80);
+
+  // Idle state never suspends subtrees or marks shells gliding
+  const idle = createIdleWidthTransitionPanels();
+  for (const key of ['script', 'assets', 'images'] as const) {
+    assert.equal(idle[key].suspendSubtree, false);
+    assert.equal(idle[key].isGliding, false);
+  }
+
+  // Collapse Assets at 1920px: Script stationary ('none'), Assets collapses ('collapse'), Images shifts ('move')
+  const prev = computeScriptBibleDockLayout({
+    isScriptExpanded: true,
+    isAssetsExpanded: true,
+    isImagesExpanded: true,
+    viewportWidth: 1920,
+    viewportHeight: 900,
+  });
+  const next = computeScriptBibleDockLayout({
+    isScriptExpanded: true,
+    isAssetsExpanded: false,
+    isImagesExpanded: true,
+    viewportWidth: 1920,
+    viewportHeight: 900,
+  });
+  const plan = buildDockTransitionPlan({ prevLayout: prev, nextLayout: next });
+  assert.deepEqual(plan.actions, { script: 'none', assets: 'collapse', images: 'move' });
+
+  // Phase 1: fade-out only — no subtree suspension or gliding yet
+  const p1 = buildDockTransitionPhase1(plan);
+  assert.equal(p1.script.suspendSubtree, false);
+  assert.equal(p1.script.isGliding, false);
+  assert.equal(p1.assets.suspendSubtree, false);
+  assert.equal(p1.assets.isGliding, false);
+  assert.equal(p1.images.suspendSubtree, false);
+  assert.equal(p1.images.isGliding, false);
+
+  // Phase 2: shifting Images suspends subtree + glides; collapsing Assets unmounts + glides; stationary Script untouched
+  const p2 = buildDockTransitionPhase2(p1, plan);
+  assert.equal(p2.script.suspendSubtree, false);
+  assert.equal(p2.script.isGliding, false);
+  assert.equal(p2.script.hidden, false);
+  assert.equal(p2.assets.mountExpandedContent, false);
+  assert.equal(p2.assets.suspendSubtree, false);
+  assert.equal(p2.assets.isGliding, true);
+  assert.equal(p2.images.mountExpandedContent, true);
+  assert.equal(p2.images.hidden, true);
+  assert.equal(p2.images.suspendSubtree, true);
+  assert.equal(p2.images.isGliding, true);
+
+  // Phase 3 Prepare clears both suspendSubtree and isGliding at opacity 0 before Phase 3 Reveal fades in
+  const p3Prep = buildDockTransitionPhase3Prepare(p2, 'images', 'move');
+  assert.equal(p3Prep.images.suspendSubtree, false);
+  assert.equal(p3Prep.images.isGliding, false);
+  assert.equal(p3Prep.images.hidden, false);
+  assert.equal(p3Prep.images.opacity, 0);
+
+  const p3Rev = buildDockTransitionPhase3Reveal(p3Prep, 'images', 'move');
+  assert.equal(p3Rev.images.suspendSubtree, false);
+  assert.equal(p3Rev.images.isGliding, false);
+  assert.equal(p3Rev.images.opacity, 1);
+
+  const p3AssetsPrep = buildDockTransitionPhase3Prepare(p3Rev, 'assets', 'collapse');
+  assert.equal(p3AssetsPrep.assets.isGliding, false);
+  assert.equal(p3AssetsPrep.assets.miniHidden, false);
+  assert.equal(p3AssetsPrep.assets.miniOpacity, 0);
+
+  const p3AssetsRev = buildDockTransitionPhase3Reveal(p3AssetsPrep, 'assets', 'collapse');
+  assert.equal(p3AssetsRev.assets.isGliding, false);
+  assert.equal(p3AssetsRev.assets.miniOpacity, 1);
+});
+
 

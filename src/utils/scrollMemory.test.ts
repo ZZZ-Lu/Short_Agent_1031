@@ -4,14 +4,19 @@ import {
   SCRIPT_SCROLL_POSITIONS_KEY,
   buildLegacyImagesScrollStorageKey,
   buildScrollScopeKey,
+  computeImagesScrollAnchorFromLayout,
   evaluateScrollRestoreStep,
   isUserScrollKey,
+  normalizeImagesScrollAnchor,
+  readImagesScrollAnchorFromStorage,
   readScriptScrollAnchorFromStorage,
   readScrollOffsetFromStorage,
   resolveCodeMirrorTargetTopFromBlock,
+  resolveImagesTargetTopFromAnchor,
   resolveInitialPositionReady,
   resolveProjectScopedRawValue,
   shouldPersistPanelScroll,
+  writeImagesScrollAnchorToStorage,
   writeProjectScopedRawValue,
   writeScriptScrollAnchorToStorage,
   writeScrollOffsetToStorage,
@@ -518,3 +523,155 @@ test('resolveInitialPositionReady never marks inactive scopes ready and prevents
     true
   );
 });
+
+test('ImagesScrollAnchor storage supports legacy numeric values, JSON anchors, and viewMode isolation', () => {
+  const storage = createMemoryStorage({
+    [buildLegacyImagesScrollStorageKey('p1', 'sections')]: '520',
+  });
+
+  // Legacy numeric fallback works seamlessly
+  assert.deepEqual(readImagesScrollAnchorFromStorage(storage, 'p1', 'sections'), { top: 520 });
+  assert.equal(
+    readScrollOffsetFromStorage(storage, { kind: 'images', projectId: 'p1', viewMode: 'sections' }),
+    520
+  );
+
+  // Rich JSON anchor persists cleanly and stays readable via readScrollOffsetFromStorage
+  writeImagesScrollAnchorToStorage(storage, 'p1', 'sections', {
+    top: 1000,
+    anchorKey: 'tile:character:c3:img3',
+    offsetRatio: 0.25,
+    offsetPx: 114,
+    savedItemHeight: 456,
+    scrollRatio: 0.42,
+  });
+  assert.deepEqual(readImagesScrollAnchorFromStorage(storage, 'p1', 'sections'), {
+    top: 1000,
+    anchorKey: 'tile:character:c3:img3',
+    offsetRatio: 0.25,
+    offsetPx: 114,
+    savedItemHeight: 456,
+    scrollRatio: 0.42,
+  });
+  assert.equal(
+    readScrollOffsetFromStorage(storage, { kind: 'images', projectId: 'p1', viewMode: 'sections' }),
+    1000
+  );
+
+  // Timeline mode stays isolated from sections mode
+  assert.deepEqual(readImagesScrollAnchorFromStorage(storage, 'p1', 'timeline'), { top: 0 });
+  writeImagesScrollAnchorToStorage(storage, 'p1', 'timeline', {
+    top: 640,
+    anchorKey: 'tile:location:l1:img1',
+    offsetRatio: 0.5,
+    offsetPx: 150,
+    savedItemHeight: 300,
+  });
+  assert.equal(
+    readImagesScrollAnchorFromStorage(storage, 'p1', 'timeline').anchorKey,
+    'tile:location:l1:img1'
+  );
+  assert.equal(
+    readImagesScrollAnchorFromStorage(storage, 'p1', 'sections').anchorKey,
+    'tile:character:c3:img3'
+  );
+
+  // Malformed / negative values normalize safely
+  assert.deepEqual(normalizeImagesScrollAnchor({ top: -10, offsetRatio: 2, savedItemHeight: -5 }), {
+    top: 0,
+    offsetRatio: 1,
+  });
+});
+
+test('ImagesScrollAnchor preserves exact visual item and proportional offset across default <-> wide width reflows', () => {
+  // Default width (480px card -> ~456px inner width), gap 12px, top padding 12px
+  // Card 1: square (456px), Card 2: portrait 3:4 (608px), Card 3: placeholder h-48 (192px), Card 4: square (456px)
+  const defaultItems = [
+    { key: 'tile:character:c1:i1', top: 12, height: 456 },
+    { key: 'tile:character:c2:i2', top: 480, height: 608 },
+    { key: 'placeholder:character:c3', top: 1100, height: 192 },
+    { key: 'tile:character:c4:i4', top: 1304, height: 456 },
+  ];
+  const defaultMaxScroll = 1856 - 760; // 1096
+
+  // Wide width (880px card -> ~856px inner width), gap 12px, top padding 12px
+  // Card 1: square (856px), Card 2: portrait 3:4 (1141px), Card 3: placeholder h-60 (240px), Card 4: square (856px)
+  const wideItems = [
+    { key: 'tile:character:c1:i1', top: 12, height: 856 },
+    { key: 'tile:character:c2:i2', top: 880, height: 1141 },
+    { key: 'placeholder:character:c3', top: 2033, height: 240 },
+    { key: 'tile:character:c4:i4', top: 2285, height: 856 },
+  ];
+  const wideMaxScroll = 3237 - 760; // 2477
+
+  // Scenario 1: Mid-card scroll on Card 2 (50% through Card 2 -> scrollTop = 480 + 304 = 784)
+  const anchorMidCard2 = computeImagesScrollAnchorFromLayout({
+    scrollTop: 784,
+    maxScrollTop: defaultMaxScroll,
+    items: defaultItems,
+  });
+  assert.equal(anchorMidCard2.anchorKey, 'tile:character:c2:i2');
+  assert.equal(anchorMidCard2.offsetPx, 304);
+  assert.equal(anchorMidCard2.offsetRatio, 0.5);
+
+  // Switch default -> wide: should land at 50% through wide Card 2 (880 + 570.5 = 1451)
+  const wideTarget = resolveImagesTargetTopFromAnchor({
+    anchor: anchorMidCard2,
+    maxScrollTop: wideMaxScroll,
+    items: wideItems,
+  });
+  assert.equal(wideTarget, 1451);
+
+  // Switch wide -> default using same pristine anchor: exact 0px drift back to 784!
+  const restoredDefaultTarget = resolveImagesTargetTopFromAnchor({
+    anchor: anchorMidCard2,
+    maxScrollTop: defaultMaxScroll,
+    items: defaultItems,
+  });
+  assert.equal(restoredDefaultTarget, 784);
+
+  // Scenario 2: Viewport top sits in fixed 12px gap right above Card 2 (scrollTop = 474, 6px above Card 2)
+  const anchorGap = computeImagesScrollAnchorFromLayout({
+    scrollTop: 474,
+    maxScrollTop: defaultMaxScroll,
+    items: defaultItems,
+  });
+  assert.equal(anchorGap.anchorKey, 'tile:character:c2:i2');
+  assert.equal(anchorGap.offsetPx, -6);
+
+  // In wide mode, fixed 6px gap above Card 2 is preserved verbatim (880 - 6 = 874)
+  assert.equal(
+    resolveImagesTargetTopFromAnchor({
+      anchor: anchorGap,
+      maxScrollTop: wideMaxScroll,
+      items: wideItems,
+    }),
+    874
+  );
+
+  // Scenario 3: Scrolled deep in wide mode (mid Card 4) then narrowed -> clamps cleanly to defaultMaxScroll
+  const anchorDeepWide = computeImagesScrollAnchorFromLayout({
+    scrollTop: 2450,
+    maxScrollTop: wideMaxScroll,
+    items: wideItems,
+  });
+  assert.equal(anchorDeepWide.anchorKey, 'tile:character:c4:i4');
+  assert.equal(
+    resolveImagesTargetTopFromAnchor({
+      anchor: anchorDeepWide,
+      maxScrollTop: defaultMaxScroll,
+      items: defaultItems,
+    }),
+    defaultMaxScroll
+  );
+
+  // Scenario 4: Anchored card removed -> falls back gracefully to overall scrollRatio
+  const removedItems = wideItems.filter((item) => item.key !== 'tile:character:c2:i2');
+  const fallbackTarget = resolveImagesTargetTopFromAnchor({
+    anchor: anchorMidCard2,
+    maxScrollTop: 1500,
+    items: removedItems,
+  });
+  assert.equal(fallbackTarget, Math.round((784 / defaultMaxScroll) * 1500));
+});
+

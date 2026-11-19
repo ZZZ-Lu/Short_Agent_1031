@@ -575,7 +575,15 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
           apiKey: keyToUse
         };
       } else {
-        body = { sampleText: input, systemPrompt: activePrompt, modelType: activeModel, apiKey: keyToUse };
+        const agentFallbackModel = nodeModels.agentModel || 'deepseek-v4-flash';
+        body = {
+          sampleText: input,
+          systemPrompt: activePrompt,
+          modelType: activeModel,
+          apiKey: keyToUse,
+          agentModelType: agentFallbackModel,
+          agentApiKey: getKeyForModel(agentFallbackModel),
+        };
       }
 
       const response = await fetch(endpoint, {
@@ -592,12 +600,30 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
         data = unpadLandmarks(data, landmarkPadInfo);
       }
 
-      // Slice scenes if scenePattern exists
-      if (data.scenePattern && onUpdateProject && currentProject) {
-        import('../utils/slicer').then(({ sliceScriptIntoScenes }) => {
-          const newScenes = sliceScriptIntoScenes(currentProject.scriptText, data.scenePattern, data.flags || 'gim');
-          onUpdateProject({ scenes: newScenes });
-        }).catch(console.error);
+      // Persist TOC config & slice scenes when TOC parser node produces rules
+      if (selectedNode === 'toc_infer' && (data.scenePattern || data.tocPattern || Array.isArray(data.types)) && onUpdateProject && currentProject) {
+        Promise.all([import('../utils/slicer'), import('../utils/scriptToc')])
+          .then(([{ sliceScriptIntoScenes }, { computeScriptTocSignature, extractTocConfigFromResponse }]) => {
+            const sampleSignature = computeScriptTocSignature(currentProject.scriptText || '');
+            const nextTocConfig = extractTocConfigFromResponse(data, sampleSignature);
+            const newScenes = sliceScriptIntoScenes(
+              currentProject.scriptText,
+              nextTocConfig.scenePattern,
+              nextTocConfig.flags || 'gim',
+              {
+                tocPattern: nextTocConfig.tocPattern,
+                preferCustomOnly: nextTocConfig.confidence === 'ai',
+              }
+            );
+            try {
+              localStorage.setItem(`script_toc_config_${currentProject.id}`, JSON.stringify(nextTocConfig));
+              if (Array.isArray(nextTocConfig.patterns) && nextTocConfig.patterns.length > 0) {
+                localStorage.setItem(`script_toc_patterns_${currentProject.id}`, JSON.stringify(nextTocConfig.patterns));
+              }
+            } catch {}
+            onUpdateProject({ tocConfig: nextTocConfig, scenes: newScenes });
+          })
+          .catch(console.error);
       }
 
       const newLogs = [`[${activeDefinition.shortName}] 请求完成`, `[${activeDefinition.shortName}] 输出已解析`];

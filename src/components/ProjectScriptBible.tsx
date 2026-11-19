@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useMemo, useCallback } from 'react';
 import * as Diff from 'diff';
 import { motion, AnimatePresence } from 'motion/react';
 import { CODE_PIPELINE_PROMPTS } from '../constants/prompts';
@@ -98,9 +98,29 @@ const reconstructText = (blocks: { title: string, hash: string }[]) => {
   return blocks.map(b => store[b.hash] || '').join('');
 };
 
-import { ScriptProject, ScriptCharacter, ScriptLocation, ScriptProp, ScriptAssetVersion, ProvenanceStatus, ScriptAnnotation } from '../types/script';
-import { ScriptCodeEditor, ScriptCodeEditorRef } from './script/ScriptCodeEditor';
+import { ScriptProject, ScriptCharacter, ScriptLocation, ScriptProp, ScriptAssetVersion, ProvenanceStatus, ScriptAnnotation, ScriptTocConfig } from '../types/script';
+import { ScriptCodeEditor, ScriptCodeEditorRef, ScriptSelectionChange } from './script/ScriptCodeEditor';
+import { ScriptSelectionToolbar } from './script/ScriptSelectionToolbar';
+import { ScriptAnnotationModal } from './script/ScriptAnnotationModal';
+import {
+  deleteScriptAnnotation,
+  reconcileAnnotationsAfterTextChange,
+  upsertScriptAnnotation,
+} from '../utils/scriptAnnotations';
 import { assetExtractionService } from '../services/assetExtractionService';
+import {
+  TocItem,
+  buildTocAttemptKey,
+  computeScriptTocSignature,
+  createFallbackTocConfig,
+  extractTocConfigFromResponse,
+  hasReusableAiTocConfig,
+  hasValidTocPatterns,
+  parseTocItemsFromScript,
+  resolveTocModelRequestConfig,
+  resolveTocRecognitionState,
+  shouldTriggerModelTocInference,
+} from '../utils/scriptToc';
 import { calculateAssetProvenance, resolveVerifiedProvenance, AssetProvenanceItem, AssetProvenanceHighlightSpan } from '../utils/assetProvenance';
 import { getAssetIdentificationText, getVersionIdentificationText, mergeMultiVersionAssetList, itemToVersion } from '../utils/assetVersions';
 import { buildAssetAgentTargetId, parseAssetAgentTargetId } from '../utils/assetAgentTarget';
@@ -130,8 +150,16 @@ import {
   shouldForceExpandScriptOnRequestedViewChange,
   shouldMountScriptBiblePanelBody,
   WIDTH_TRANSITION_TIMINGS,
+  type DockPanelKey,
   type DockWidthTransitionPanels,
 } from '../utils/scriptBibleDockLayout';
+import {
+  applyDockPanelLayoutToShell,
+  applyDockPanelMetaToDom,
+  clearDockPanelDomOverrides,
+  createEmptyDockPanelDomRefs,
+  type DockPanelDomRefs,
+} from '../utils/dockDomChoreography';
 import { AssetImageFeedPanel } from './AssetImageFeedPanel';
 import {
   FullscreenImageLightbox,
@@ -211,6 +239,7 @@ interface ProjectScriptBibleProps {
   onRequestVerifyAssetProvenance?: (category: 'character' | 'location' | 'prop', item: any) => void;
   selectedAssetIds?: Set<string>;
   onSelectedAssetIdsChange?: (action: Set<string> | ((prev: Set<string>) => Set<string>)) => void;
+  lockedAgentSelection?: { start: number; end: number } | null;
 }
 
 type TabType = 'script' | 'assets' | 'universe' | 'cards';
@@ -549,7 +578,8 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
   generatingAssetIds = [],
   onRequestVerifyAssetProvenance,
   selectedAssetIds: propsSelectedAssetIds,
-  onSelectedAssetIdsChange
+  onSelectedAssetIdsChange,
+  lockedAgentSelection = null,
 }: ProjectScriptBibleProps) {
   const isTargetAgentFocused = useCallback((targetId: string) => {
     return agentFocusedTargetId === targetId || agentFocusedTargetIds.includes(targetId);
@@ -773,23 +803,64 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
   );
   const visualDockRef = useRef<DockVisualStateSnapshot>(visualDock);
   visualDockRef.current = visualDock;
+  const widthChoreographyTimersRef = useRef<number[]>([]);
+  const widthChoreographyRafsRef = useRef<number[]>([]);
+  const widthChoreographyActiveRef = useRef(false);
+  const dockPanelDomRefs = useRef<Record<DockPanelKey, DockPanelDomRefs>>({
+    script: createEmptyDockPanelDomRefs(),
+    assets: createEmptyDockPanelDomRefs(),
+    images: createEmptyDockPanelDomRefs(),
+  });
+  const choreographyDomMetaRef = useRef<DockWidthTransitionPanels | null>(null);
+  const choreographySuspendCollapseRef = useRef(false);
+  const activeShellVisualLayoutRef = useRef<ReturnType<typeof computeScriptBibleDockLayout> | null>(null);
+  const persistedDockRef = useRef<DockVisualStateSnapshot>({
+    scriptExpanded: isScriptExpanded,
+    sidePanel: activeSidePanel,
+    imagesExpanded: isImagesExpanded,
+    imagesWide: isImagesWide,
+  });
+  persistedDockRef.current = {
+    scriptExpanded: isScriptExpanded,
+    sidePanel: activeSidePanel,
+    imagesExpanded: isImagesExpanded,
+    imagesWide: isImagesWide,
+  };
   const intendedDockRef = useRef<DockVisualStateSnapshot>({
     scriptExpanded: isScriptExpanded,
     sidePanel: activeSidePanel,
     imagesExpanded: isImagesExpanded,
     imagesWide: isImagesWide,
   });
-  intendedDockRef.current = {
-    scriptExpanded: isScriptExpanded,
-    sidePanel: activeSidePanel,
-    imagesExpanded: isImagesExpanded,
-    imagesWide: isImagesWide,
-  };
-  const widthChoreographyTimersRef = useRef<number[]>([]);
-  const widthChoreographyRafsRef = useRef<number[]>([]);
-  const widthChoreographyActiveRef = useRef(false);
+  if (!widthChoreographyActiveRef.current) {
+    intendedDockRef.current = {
+      scriptExpanded: isScriptExpanded,
+      sidePanel: activeSidePanel,
+      imagesExpanded: isImagesExpanded,
+      imagesWide: isImagesWide,
+    };
+  }
 
-  const clearWidthChoreography = useCallback(() => {
+  const commitIntendedDockPersistence = useCallback(
+    (nextIntended: DockVisualStateSnapshot) => {
+      const currentPersisted = persistedDockRef.current;
+      if (nextIntended.scriptExpanded !== currentPersisted.scriptExpanded) {
+        setIsScriptExpanded(nextIntended.scriptExpanded);
+      }
+      if (nextIntended.sidePanel !== currentPersisted.sidePanel) {
+        setActiveSidePanel(nextIntended.sidePanel);
+      }
+      if (nextIntended.imagesExpanded !== currentPersisted.imagesExpanded) {
+        setIsImagesExpanded(nextIntended.imagesExpanded);
+      }
+      if (nextIntended.imagesWide !== currentPersisted.imagesWide) {
+        setIsImagesWide(nextIntended.imagesWide);
+      }
+    },
+    [setActiveSidePanel, setIsImagesExpanded, setIsImagesWide, setIsScriptExpanded]
+  );
+
+  const clearWidthChoreography = useCallback((resetDomOverrides: boolean = false) => {
     for (const timerId of widthChoreographyTimersRef.current) {
       window.clearTimeout(timerId);
     }
@@ -799,7 +870,27 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
     widthChoreographyTimersRef.current = [];
     widthChoreographyRafsRef.current = [];
     widthChoreographyActiveRef.current = false;
+    choreographyDomMetaRef.current = null;
+    choreographySuspendCollapseRef.current = false;
+    activeShellVisualLayoutRef.current = null;
+    if (resetDomOverrides) {
+      for (const key of ['script', 'assets', 'images'] as const) {
+        clearDockPanelDomOverrides(dockPanelDomRefs.current[key]);
+      }
+    }
   }, []);
+
+  // Re-apply active hidden-for-reveal styles synchronously BEFORE paint right after the single
+  // post-glide Stage 3A React commit so newly mounted expanded/mini DOM never flashes for 1 frame.
+  useLayoutEffect(() => {
+    const activeMeta = choreographyDomMetaRef.current;
+    if (!activeMeta) return;
+    for (const key of ['script', 'assets', 'images'] as const) {
+      applyDockPanelMetaToDom(dockPanelDomRefs.current[key], activeMeta[key], {
+        suspendHiddenExpanded: choreographySuspendCollapseRef.current,
+      });
+    }
+  });
 
   const setVisualDockState = useCallback(
     (pid: string | undefined, state: DockVisualStateSnapshot) => {
@@ -814,20 +905,25 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
 
   useEffect(() => {
     return () => {
-      clearWidthChoreography();
+      clearWidthChoreography(true);
     };
   }, [clearWidthChoreography]);
 
   useEffect(() => {
-    clearWidthChoreography();
+    clearWidthChoreography(true);
     setWidthTransitionPanels(createIdleWidthTransitionPanels());
   }, [currentProject?.id, clearWidthChoreography]);
 
-  const [viewportWidth, setViewportWidth] = useState<number>(() =>
-    typeof window !== 'undefined' ? window.innerWidth : 1440
-  );
+  const [viewportSize, setViewportSize] = useState<{ width: number; height: number }>(() => ({
+    width: typeof window !== 'undefined' ? window.innerWidth : 1440,
+    height: typeof window !== 'undefined' ? window.innerHeight : 900,
+  }));
+  const viewportWidth = viewportSize.width;
+  const viewportHeight = viewportSize.height;
   const viewportWidthRef = useRef(viewportWidth);
   viewportWidthRef.current = viewportWidth;
+  const viewportHeightRef = useRef(viewportHeight);
+  viewportHeightRef.current = viewportHeight;
   const isOpenRef = useRef(isOpen);
   isOpenRef.current = isOpen;
   const activeTabRef = useRef(activeTab);
@@ -835,7 +931,12 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    const handleResize = () => setViewportWidth(window.innerWidth);
+    const handleResize = () =>
+      setViewportSize((prev) =>
+        prev.width === window.innerWidth && prev.height === window.innerHeight
+          ? prev
+          : { width: window.innerWidth, height: window.innerHeight }
+      );
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
   }, []);
@@ -878,11 +979,15 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
 
   useEffect(() => {
     if (!isOpen || activeTab !== 'script') {
-      clearWidthChoreography();
+      const wasActive = widthChoreographyActiveRef.current;
+      clearWidthChoreography(true);
+      if (wasActive) {
+        commitIntendedDockPersistence(intendedDockRef.current);
+      }
       setVisualDockState(currentProjectRef.current?.id, intendedDockRef.current);
       setWidthTransitionPanels(createIdleWidthTransitionPanels());
     }
-  }, [isOpen, activeTab, clearWidthChoreography, setVisualDockState]);
+  }, [isOpen, activeTab, clearWidthChoreography, commitIntendedDockPersistence, setVisualDockState]);
 
   const applyDockTransition = useCallback(
     (patch: Partial<DockVisualStateSnapshot>) => {
@@ -892,100 +997,179 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
         ...currentIntended,
         ...patch,
       };
-
-      if (patch.scriptExpanded !== undefined && patch.scriptExpanded !== currentIntended.scriptExpanded) {
-        setIsScriptExpanded(patch.scriptExpanded);
-      }
-      if (patch.sidePanel !== undefined && patch.sidePanel !== currentIntended.sidePanel) {
-        setActiveSidePanel(patch.sidePanel);
-      }
-      if (patch.imagesExpanded !== undefined && patch.imagesExpanded !== currentIntended.imagesExpanded) {
-        setIsImagesExpanded(patch.imagesExpanded);
-      }
-      if (patch.imagesWide !== undefined && patch.imagesWide !== currentIntended.imagesWide) {
-        setIsImagesWide(patch.imagesWide);
-      }
       intendedDockRef.current = nextIntended;
 
       if (!isOpenRef.current || activeTabRef.current !== 'script') {
-        clearWidthChoreography();
+        clearWidthChoreography(true);
+        commitIntendedDockPersistence(nextIntended);
         setVisualDockState(pid, nextIntended);
         setWidthTransitionPanels(createIdleWidthTransitionPanels());
         return;
       }
 
-      clearWidthChoreography();
+      const prevShellLayout = activeShellVisualLayoutRef.current;
+      clearWidthChoreography(false);
 
       const currentVisual = visualDockRef.current;
-      const prevLayout = computeScriptBibleDockLayout({
-        isScriptExpanded: currentVisual.scriptExpanded,
-        isAssetsExpanded: currentVisual.sidePanel !== null,
-        isImagesExpanded: currentVisual.imagesExpanded,
-        isImagesWide: currentVisual.imagesWide,
-        viewportWidth: viewportWidthRef.current,
-        hoveredMiniPanel: null,
-        miniCardClientX: null,
-      });
+      const prevLayout =
+        prevShellLayout ||
+        computeScriptBibleDockLayout({
+          isScriptExpanded: currentVisual.scriptExpanded,
+          isAssetsExpanded: currentVisual.sidePanel !== null,
+          isImagesExpanded: currentVisual.imagesExpanded,
+          isImagesWide: currentVisual.imagesWide,
+          viewportWidth: viewportWidthRef.current,
+          viewportHeight: viewportHeightRef.current,
+          hoveredMiniPanel: null,
+          miniCardClientX: null,
+        });
       const nextLayout = computeScriptBibleDockLayout({
         isScriptExpanded: nextIntended.scriptExpanded,
         isAssetsExpanded: nextIntended.sidePanel !== null,
         isImagesExpanded: nextIntended.imagesExpanded,
         isImagesWide: nextIntended.imagesWide,
         viewportWidth: viewportWidthRef.current,
+        viewportHeight: viewportHeightRef.current,
         hoveredMiniPanel: null,
         miniCardClientX: null,
       });
 
       const plan = buildDockTransitionPlan({ prevLayout, nextLayout });
       if (!plan.hasAnyAffected) {
+        clearWidthChoreography(true);
+        commitIntendedDockPersistence(nextIntended);
         setVisualDockState(pid, nextIntended);
-        setWidthTransitionPanels(createIdleWidthTransitionPanels());
         return;
       }
 
       widthChoreographyActiveRef.current = true;
+      activeShellVisualLayoutRef.current = prevLayout;
 
-      // Phase 1: Fade out mini-cards (expanding) or lock inner pixel width & fade out (collapsing / resizing)
-      setWidthTransitionPanels(buildDockTransitionPhase1(plan));
+      // Stage 1 (0 React re-renders!): Pure compositor fade-out on affected inner content via DOM adapter
+      const phase1 = buildDockTransitionPhase1(plan);
+      choreographyDomMetaRef.current = phase1;
+      choreographySuspendCollapseRef.current = false;
+      for (const key of ['script', 'assets', 'images'] as const) {
+        if (plan.affectedPanels[key]) {
+          applyDockPanelMetaToDom(dockPanelDomRefs.current[key], phase1[key]);
+        }
+      }
 
-      // Phase 2: Hide inner subtrees / keep expanded content unmounted and glide ONLY outer shells
-      const resizeTimer = window.setTimeout(() => {
-        setWidthTransitionPanels((prev) => buildDockTransitionPhase2(prev, plan));
-        setVisualDockState(pid, nextIntended);
-      }, WIDTH_TRANSITION_TIMINGS.fadeOutMs);
-      widthChoreographyTimersRef.current.push(resizeTimer);
+      // Stage 2A (0 React re-renders! "用时间换帧数" pre-glide pause):
+      // Suspend/hide all affected inner subtrees via content-visibility: hidden and degrade shells
+      // while outer shells remain 100% STATIONARY. Wait for double-rAF + preGlidePauseMs AFTER
+      // Stage 2A commits so Blink guarantees empty shells are painted before Stage 2B glide begins.
+      const hideTimer = window.setTimeout(() => {
+        const phase2 = buildDockTransitionPhase2(phase1, plan);
+        choreographyDomMetaRef.current = phase2;
+        choreographySuspendCollapseRef.current = true;
+        for (const key of ['script', 'assets', 'images'] as const) {
+          if (plan.affectedPanels[key]) {
+            applyDockPanelMetaToDom(dockPanelDomRefs.current[key], phase2[key], {
+              suspendHiddenExpanded: true,
+            });
+          }
+        }
 
-      // Phase 3: Mount/unhide at opacity: 0 at final width so DOM + scroll layout settle, then rAF fade-in
-      const resizeEndMs = WIDTH_TRANSITION_TIMINGS.fadeOutMs + WIDTH_TRANSITION_TIMINGS.shellResizeMs;
-      plan.revealOrder.forEach((panelKey, index) => {
-        const action = plan.actions[panelKey];
-        const revealTimer = window.setTimeout(() => {
-          setWidthTransitionPanels((prev) => buildDockTransitionPhase3Prepare(prev, panelKey, action));
-          const rafId = requestAnimationFrame(() => {
-            setWidthTransitionPanels((prev) => buildDockTransitionPhase3Reveal(prev, panelKey, action));
+        const preGlideRaf1 = requestAnimationFrame(() => {
+          const preGlideRaf2 = requestAnimationFrame(() => {
+            const glideTimer = window.setTimeout(() => {
+              // Stage 2B (0 React re-renders!): Pure empty-shell glide via GPU translate3d + width/height
+              activeShellVisualLayoutRef.current = nextLayout;
+              for (const key of ['script', 'assets', 'images'] as const) {
+                applyDockPanelLayoutToShell(dockPanelDomRefs.current[key], nextLayout[key]);
+              }
+
+              // Stage 3A (THE SINGLE React commit, strictly AFTER all outer shells have 100% landed!):
+              // Commit visualDock + persisted state together while useLayoutEffect keeps all affected
+              // panels invisible at opacity: 0 + visibility: hidden (suspendSubtree: false so CodeMirror /
+              // scroll restoration never forces layout inside a content-visibility: hidden subtree).
+              const postGlideWaitMs =
+                WIDTH_TRANSITION_TIMINGS.shellResizeMs + WIDTH_TRANSITION_TIMINGS.postGlideBufferMs;
+              const commitTimer = window.setTimeout(() => {
+                const basePhase2 =
+                  choreographyDomMetaRef.current || buildDockTransitionPhase2(phase1, plan);
+                const postCommitHidden: DockWidthTransitionPanels = { ...basePhase2 };
+                for (const key of plan.revealOrder) {
+                  const action = plan.actions[key];
+                  if (action === 'expand') {
+                    postCommitHidden[key] = {
+                      ...basePhase2[key],
+                      frozenWidth: null,
+                      opacity: 0,
+                      hidden: true,
+                      suspendSubtree: false,
+                      isGliding: false,
+                      fadeDurationMs: 0,
+                      mountExpandedContent: true,
+                    };
+                  } else {
+                    postCommitHidden[key] = {
+                      ...basePhase2[key],
+                      frozenWidth: null,
+                      suspendSubtree: false,
+                      isGliding: false,
+                      fadeDurationMs: 0,
+                    };
+                  }
+                }
+                choreographyDomMetaRef.current = postCommitHidden;
+                choreographySuspendCollapseRef.current = false;
+                setVisualDockState(pid, nextIntended);
+                commitIntendedDockPersistence(nextIntended);
+
+                // Stage 3B (0 React re-renders!): Staggered one-by-one reveal via DOM adapter
+                const revealBaseDelayMs = 36;
+                plan.revealOrder.forEach((panelKey, index) => {
+                  const action = plan.actions[panelKey];
+                  const revealTimer = window.setTimeout(() => {
+                    const cur = choreographyDomMetaRef.current || createIdleWidthTransitionPanels();
+                    const prepared = buildDockTransitionPhase3Prepare(cur, panelKey, action);
+                    choreographyDomMetaRef.current = prepared;
+                    applyDockPanelMetaToDom(dockPanelDomRefs.current[panelKey], prepared[panelKey]);
+
+                    const raf1 = requestAnimationFrame(() => {
+                      const raf2 = requestAnimationFrame(() => {
+                        const latest = choreographyDomMetaRef.current;
+                        if (!latest) return;
+                        const revealed = buildDockTransitionPhase3Reveal(latest, panelKey, action);
+                        choreographyDomMetaRef.current = revealed;
+                        applyDockPanelMetaToDom(
+                          dockPanelDomRefs.current[panelKey],
+                          revealed[panelKey]
+                        );
+                      });
+                      widthChoreographyRafsRef.current.push(raf2);
+                    });
+                    widthChoreographyRafsRef.current.push(raf1);
+                  }, revealBaseDelayMs + index * WIDTH_TRANSITION_TIMINGS.revealStaggerMs);
+                  widthChoreographyTimersRef.current.push(revealTimer);
+                });
+
+                // Stage 4 (0 React re-renders!): Strip transient inline DOM overrides after all fade-ins settle
+                const settleDelayMs =
+                  revealBaseDelayMs +
+                  Math.max(0, plan.revealOrder.length - 1) * WIDTH_TRANSITION_TIMINGS.revealStaggerMs +
+                  WIDTH_TRANSITION_TIMINGS.fadeInMs +
+                  48;
+                const settleTimer = window.setTimeout(() => {
+                  clearWidthChoreography(true);
+                }, settleDelayMs);
+                widthChoreographyTimersRef.current.push(settleTimer);
+              }, postGlideWaitMs);
+              widthChoreographyTimersRef.current.push(commitTimer);
+            }, WIDTH_TRANSITION_TIMINGS.preGlidePauseMs);
+            widthChoreographyTimersRef.current.push(glideTimer);
           });
-          widthChoreographyRafsRef.current.push(rafId);
-        }, resizeEndMs + index * WIDTH_TRANSITION_TIMINGS.revealStaggerMs);
-        widthChoreographyTimersRef.current.push(revealTimer);
-      });
-
-      const settleMs =
-        resizeEndMs +
-        Math.max(0, plan.revealOrder.length - 1) * WIDTH_TRANSITION_TIMINGS.revealStaggerMs +
-        WIDTH_TRANSITION_TIMINGS.fadeInMs +
-        32;
-      const settleTimer = window.setTimeout(() => {
-        widthChoreographyActiveRef.current = false;
-        setWidthTransitionPanels(createIdleWidthTransitionPanels());
-      }, settleMs);
-      widthChoreographyTimersRef.current.push(settleTimer);
+          widthChoreographyRafsRef.current.push(preGlideRaf2);
+        });
+        widthChoreographyRafsRef.current.push(preGlideRaf1);
+      }, WIDTH_TRANSITION_TIMINGS.fadeOutMs);
+      widthChoreographyTimersRef.current.push(hideTimer);
     },
     [
       clearWidthChoreography,
-      setActiveSidePanel,
-      setIsImagesExpanded,
-      setIsImagesWide,
-      setIsScriptExpanded,
+      commitIntendedDockPersistence,
       setVisualDockState,
     ]
   );
@@ -1008,10 +1192,11 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
         isImagesExpanded: activeTab === 'script' && visualDock.imagesExpanded,
         isImagesWide: visualDock.imagesWide,
         viewportWidth,
+        viewportHeight,
         hoveredMiniPanel,
         miniCardClientX,
       }),
-    [visualDock, activeTab, viewportWidth, hoveredMiniPanel, miniCardClientX]
+    [visualDock, activeTab, viewportWidth, viewportHeight, hoveredMiniPanel, miniCardClientX]
   );
 
   const handleFocusCanvasCardFromFeed = useCallback(
@@ -1023,6 +1208,7 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
         isImagesExpanded: activeTab === 'script' && intendedDockRef.current.imagesExpanded,
         isImagesWide: intendedDockRef.current.imagesWide,
         viewportWidth,
+        viewportHeight,
         hoveredMiniPanel: null,
         miniCardClientX: null,
       });
@@ -1032,7 +1218,7 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
       );
       onFocusCanvasCard(cardId, occupiedLeftWidth);
     },
-    [onFocusCanvasCard, activeTab, viewportWidth]
+    [onFocusCanvasCard, activeTab, viewportWidth, viewportHeight]
   );
 
   const changeActiveTab = useCallback((tab: TabType) => {
@@ -1074,13 +1260,36 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
     writeValue: writeAssetFilterForProject,
   });
 
+  const isScriptChoreographyManaged =
+    widthChoreographyActiveRef.current ||
+    widthTransitionPanels.script.isGliding ||
+    widthTransitionPanels.script.hidden ||
+    widthTransitionPanels.script.suspendSubtree ||
+    widthTransitionPanels.script.opacity < 1 ||
+    widthTransitionPanels.script.miniHidden ||
+    widthTransitionPanels.script.miniOpacity < 1 ||
+    !widthTransitionPanels.script.mountExpandedContent;
+  const isAssetsChoreographyManaged =
+    widthChoreographyActiveRef.current ||
+    widthTransitionPanels.assets.isGliding ||
+    widthTransitionPanels.assets.hidden ||
+    widthTransitionPanels.assets.suspendSubtree ||
+    widthTransitionPanels.assets.opacity < 1 ||
+    widthTransitionPanels.assets.miniHidden ||
+    widthTransitionPanels.assets.miniOpacity < 1 ||
+    !widthTransitionPanels.assets.mountExpandedContent;
+
   const isScriptShellWidthTransitioning = useShellWidthTransitionGuard(
     dockLayout.script.width,
-    isOpen && activeTab === 'script' && visualDock.scriptExpanded
+    isOpen && activeTab === 'script' && visualDock.scriptExpanded,
+    WIDTH_TRANSITION_TIMINGS.shellResizeMs + 160,
+    isScriptChoreographyManaged
   );
   const isSidePanelShellWidthTransitioning = useShellWidthTransitionGuard(
     dockLayout.assets.width,
-    isOpen && activeTab === 'script' && visualDock.sidePanel !== null
+    isOpen && activeTab === 'script' && visualDock.sidePanel !== null,
+    WIDTH_TRANSITION_TIMINGS.shellResizeMs + 160,
+    isAssetsChoreographyManaged
   );
 
   const sidePanelContentRef = useRef<HTMLDivElement>(null);
@@ -1100,6 +1309,8 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
   const isSidePanelTransitioning =
     isSidePanelShellWidthTransitioning ||
     widthTransitionPanels.assets.hidden ||
+    widthTransitionPanels.assets.suspendSubtree ||
+    widthTransitionPanels.assets.isGliding ||
     widthTransitionPanels.assets.opacity < 1;
   const sidePanelContentVersion = `${assetFilter}:${currentProject.characters?.length || 0}:${currentProject.locations?.length || 0}:${currentProject.props?.length || 0}:${cards?.length || 0}`;
   const [isAnimationSettled, setIsAnimationSettled] = useState(false);
@@ -1124,7 +1335,7 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
       isOpenAnimationSettled: isSidePanelAnimationSettled,
       isPanelExpanded: visualDock.sidePanel !== null,
       mountExpandedContent: widthTransitionPanels.assets.mountExpandedContent,
-    }) && !widthTransitionPanels.assets.hidden,
+    }),
     isTransitioning: isSidePanelTransitioning,
     contentVersion: sidePanelContentVersion,
     maxWaitMs: 1600,
@@ -1174,7 +1385,8 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
   const typingTimerRef = useRef<NodeJS.Timeout | null>(null);
   const lastAssessedTextRef = useRef(currentProject?.scriptText || '');
   const [copiedId, setCopiedId] = useState<string | null>(null);
-  const [isScriptExpandSettled, setIsScriptExpandSettled] = useState<boolean>(() => isScriptExpanded);
+  const isScriptExpandSettled =
+    visualDock.scriptExpanded && widthTransitionPanels.script.mountExpandedContent;
   const [isExtractingAssets, setIsExtractingAssets] = useState(false);
   const [extractionFeedback, setExtractionFeedback] = useState<string | null>(null);
 
@@ -1620,23 +1832,50 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
 
   const handleOpenAssetContextMenu = useCallback((
     e: React.MouseEvent<HTMLDivElement>,
-    category: AssetContextCategory,
-    item: any,
-    parentItem?: any
+    _category: AssetContextCategory,
+    _item: any,
+    _parentItem?: any
   ) => {
+    // Prevent native context menu on right-button press (macOS/Linux);
+    // actual opening is triggered strictly on short right-click release via `mira-asset-contextmenu`.
     e.preventDefault();
-    // Allow contextmenu event to bubble up to App.tsx handleContextMenu so
-    // right-clicking an asset item summons the Agent cursor (Agent-only purple if unselected,
-    // or dual-color if user already selected it) without forcing user selection state.
-    setAssetContextMenu({
-      isOpen: true,
-      x: e.clientX,
-      y: e.clientY,
-      category,
-      item,
-      parentItem,
-    });
   }, []);
+
+  // Open AssetItemContextMenu strictly on short right-click release (and dismiss when Agent is summoned via long-press)
+  useEffect(() => {
+    const onShortAssetContextMenu = (ev: Event) => {
+      const customEv = ev as CustomEvent<{
+        clientX: number;
+        clientY: number;
+        agentTargetId?: string | null;
+      }>;
+      const detail = customEv.detail;
+      if (!detail || !detail.agentTargetId) return;
+      const parsed = parseAssetAgentTargetId(detail.agentTargetId);
+      if (!parsed) return;
+      const found = findAssetTargetById(parsed.category, parsed.itemId, parsed.parentId);
+      if (!found) return;
+      setAssetContextMenu({
+        isOpen: true,
+        x: detail.clientX,
+        y: detail.clientY,
+        category: parsed.category,
+        item: found.item,
+        parentItem: found.parentItem,
+      });
+    };
+
+    const onDismissContextMenus = () => {
+      setAssetContextMenu(null);
+    };
+
+    window.addEventListener('mira-asset-contextmenu', onShortAssetContextMenu);
+    window.addEventListener('mira-dismiss-contextmenus', onDismissContextMenus);
+    return () => {
+      window.removeEventListener('mira-asset-contextmenu', onShortAssetContextMenu);
+      window.removeEventListener('mira-dismiss-contextmenus', onDismissContextMenus);
+    };
+  }, [findAssetTargetById]);
 
   // Dismiss stale asset context menu if Agent focus moves to another target
   useEffect(() => {
@@ -2185,19 +2424,41 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
 
   const dropdownRef = useRef<HTMLDivElement>(null);
 
-  // Table of Contents (TOC) Dropdown state & parsing
-  const [inferredPatterns, setInferredPatterns] = useState<string[]>(() => {
-    if (Array.isArray(currentProject.tocConfig?.patterns) && currentProject.tocConfig!.patterns!.length > 0) {
-      return currentProject.tocConfig!.patterns!;
+  // Table of Contents (TOC) Dropdown state & model-first parsing
+  const loadStoredTocConfig = useCallback((project?: ScriptProject | null): ScriptTocConfig | null => {
+    if (project?.tocConfig && hasValidTocPatterns(project.tocConfig)) {
+      return project.tocConfig;
     }
+    if (!project?.id) return null;
     try {
-      const saved = localStorage.getItem(`script_toc_patterns_${currentProject.id}`);
-      return saved ? JSON.parse(saved) : [];
+      const savedConfig = localStorage.getItem(`script_toc_config_${project.id}`);
+      if (savedConfig) {
+        const parsed = JSON.parse(savedConfig);
+        if (parsed && typeof parsed === 'object' && hasValidTocPatterns(parsed)) {
+          return parsed as ScriptTocConfig;
+        }
+      }
+      const legacyPatterns = localStorage.getItem(`script_toc_patterns_${project.id}`);
+      if (legacyPatterns) {
+        const parsed = JSON.parse(legacyPatterns);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return { patterns: parsed, flags: 'gim' };
+        }
+      }
     } catch {
-      return [];
+      return null;
     }
-  });
+    return null;
+  }, []);
+
+  const [tocConfigState, setTocConfigState] = useState<ScriptTocConfig | null>(() =>
+    loadStoredTocConfig(currentProject)
+  );
   const [isInferringToc, setIsInferringToc] = useState(false);
+  const [tocAttemptVersion, setTocAttemptVersion] = useState(0);
+  const tocRequestSeqRef = useRef(0);
+  const tocAbortControllerRef = useRef<AbortController | null>(null);
+  const lastScriptLenForTocRef = useRef<number>((currentProject?.scriptText || '').length);
   const tocButtonRef = useRef<HTMLButtonElement>(null);
   const tocCardRef = useRef<HTMLDivElement>(null);
   const cardContainerRef = useRef<HTMLDivElement>(null);
@@ -2409,249 +2670,237 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
     onTocAtBottomChange(list.scrollTop + list.clientHeight >= list.scrollHeight - 2);
   }, [isTocOpen, onTocAtBottomChange]);
 
-  interface TocItem {
-    id: string;
-    title: string;
-    subTitle?: string;
-    lineNumber: number;
-    charIndex: number;
-    type: TocItemType;
-  }
+  const runModelTocInference = useCallback(
+    async (projectId: string, scriptTextSnapshot: string, force: boolean = false) => {
+      if (!scriptTextSnapshot || scriptTextSnapshot.trim().length < 20) return;
 
-  // Automatically infer TOC patterns in background when script content exists and no patterns stored yet
+      const sampleSignature = computeScriptTocSignature(scriptTextSnapshot);
+      const attemptKey = buildTocAttemptKey(projectId, scriptTextSnapshot);
+      if (!force && inferenceAttemptedRef.current.has(attemptKey)) return;
+
+      const reqSeq = ++tocRequestSeqRef.current;
+      tocAbortControllerRef.current?.abort();
+      const abortController = new AbortController();
+      tocAbortControllerRef.current = abortController;
+      const clientTimeoutId = setTimeout(() => abortController.abort(), 22000);
+
+      inferenceAttemptedRef.current.add(attemptKey);
+      setIsInferringToc(true);
+      setTocAttemptVersion((v) => v + 1);
+
+      try {
+        const sampleText = scriptTextSnapshot.slice(0, 4000);
+        const nodeModels = assetExtractionService.getNodeModels();
+        let customTocPrompt: string | undefined;
+        try {
+          const savedPrompts = localStorage.getItem('custom_node_prompts');
+          if (savedPrompts) {
+            const parsedPrompts = JSON.parse(savedPrompts);
+            if (typeof parsedPrompts?.tocInferSystemPrompt === 'string' && parsedPrompts.tocInferSystemPrompt.trim()) {
+              customTocPrompt = parsedPrompts.tocInferSystemPrompt;
+            }
+          }
+        } catch {}
+
+        const modelReq = resolveTocModelRequestConfig({
+          nodeModels,
+          legacyTocModel: localStorage.getItem('script_toc_infer_model'),
+          legacyAgentModel: localStorage.getItem('agentModel'),
+          keys: {
+            deepseekKey: localStorage.getItem('deepseek_api_key') || '',
+            qwenKey: localStorage.getItem('qwen_api_key') || '',
+            glmKey: localStorage.getItem('glm_api_key') || '',
+            arkKey: localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || '',
+            geminiKey: localStorage.getItem('gemini_api_key') || '',
+          },
+        });
+
+        const res = await fetch('/api/script-toc-pattern', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: abortController.signal,
+          body: JSON.stringify({
+            sampleText,
+            systemPrompt: customTocPrompt || CODE_PIPELINE_PROMPTS.tocInferSystemPrompt,
+            modelType: modelReq.modelType,
+            apiKey: modelReq.apiKey,
+            agentModelType: modelReq.agentModelType,
+            agentApiKey: modelReq.agentApiKey,
+            deepseekKey: modelReq.deepseekKey,
+          }),
+        });
+        if (!res.ok) throw new Error(`Automatic TOC inference failed (${res.status})`);
+        const data = await res.json();
+        if (reqSeq !== tocRequestSeqRef.current) {
+          inferenceAttemptedRef.current.delete(attemptKey);
+          return;
+        }
+
+        try {
+          localStorage.setItem('last_toc_infer_result', JSON.stringify(data, null, 2));
+        } catch {}
+
+        const nextTocConfig = extractTocConfigFromResponse(data, sampleSignature);
+        setTocConfigState(nextTocConfig);
+        try {
+          localStorage.setItem(`script_toc_config_${projectId}`, JSON.stringify(nextTocConfig));
+          if (Array.isArray(nextTocConfig.patterns) && nextTocConfig.patterns.length > 0) {
+            localStorage.setItem(`script_toc_patterns_${projectId}`, JSON.stringify(nextTocConfig.patterns));
+          }
+        } catch {}
+
+        import('../utils/slicer')
+          .then(({ sliceScriptIntoScenes }) => {
+            if (reqSeq !== tocRequestSeqRef.current) return;
+            const newScenes = sliceScriptIntoScenes(
+              scriptTextSnapshot,
+              nextTocConfig.scenePattern,
+              nextTocConfig.flags || 'gim',
+              {
+                tocPattern: nextTocConfig.tocPattern,
+                preferCustomOnly: nextTocConfig.confidence === 'ai',
+              }
+            );
+            onUpdateProject({
+              tocConfig: nextTocConfig,
+              scenes: newScenes,
+            });
+          })
+          .catch(console.error);
+      } catch {
+        if (reqSeq !== tocRequestSeqRef.current) {
+          inferenceAttemptedRef.current.delete(attemptKey);
+          return;
+        }
+        const fallbackConfig = createFallbackTocConfig('request_error', sampleSignature);
+        setTocConfigState(fallbackConfig);
+        try {
+          localStorage.setItem(`script_toc_config_${projectId}`, JSON.stringify(fallbackConfig));
+        } catch {}
+
+        import('../utils/slicer')
+          .then(({ sliceScriptIntoScenes }) => {
+            if (reqSeq !== tocRequestSeqRef.current) return;
+            const newScenes = sliceScriptIntoScenes(scriptTextSnapshot);
+            onUpdateProject({
+              tocConfig: fallbackConfig,
+              scenes: newScenes,
+            });
+          })
+          .catch(() => {});
+      } finally {
+        clearTimeout(clientTimeoutId);
+        if (tocAbortControllerRef.current === abortController) {
+          tocAbortControllerRef.current = null;
+        }
+        if (reqSeq === tocRequestSeqRef.current) {
+          setIsInferringToc(false);
+          setTocAttemptVersion((v) => v + 1);
+        }
+      }
+    },
+    [onUpdateProject]
+  );
+
+  // Immediately invoke model-node TOC recognition whenever script content lacks an AI-verified tocConfig.
+  // Only fall back to local heuristic script if the model node & agent are unavailable.
   useEffect(() => {
     if (!scriptDraft || scriptDraft.trim().length < 20) return;
 
-    // Ensure project.scenes is populated even if patterns were already loaded from cache
-    if (inferredPatterns.length > 0) {
-      if (!Array.isArray(currentProject.scenes) || currentProject.scenes.length === 0) {
+    const needsInference = shouldTriggerModelTocInference({
+      projectId: currentProject.id,
+      scriptText: scriptDraft,
+      tocConfig: tocConfigState,
+      attemptedKeys: inferenceAttemptedRef.current,
+    });
+
+    if (!needsInference) {
+      // Ensure project.scenes is populated if an AI/fallback tocConfig is already ready
+      if (
+        hasValidTocPatterns(tocConfigState) &&
+        (!Array.isArray(currentProject.scenes) || currentProject.scenes.length === 0)
+      ) {
         import('../utils/slicer')
           .then(({ sliceScriptIntoScenes }) => {
-            const scenePat = currentProject.tocConfig?.scenePattern || inferredPatterns[1];
-            const flags = currentProject.tocConfig?.flags || 'gim';
-            const newScenes = sliceScriptIntoScenes(scriptDraft, scenePat, flags);
+            const scenePat = tocConfigState?.scenePattern || tocConfigState?.patterns?.[1];
+            const flags = tocConfigState?.flags || 'gim';
+            const newScenes = sliceScriptIntoScenes(scriptDraft, scenePat, flags, {
+              tocPattern: tocConfigState?.tocPattern,
+              preferCustomOnly: tocConfigState?.confidence === 'ai',
+            });
             if (newScenes.length > 0) {
               onUpdateProject({ scenes: newScenes });
             }
           })
           .catch(() => {});
       }
+      lastScriptLenForTocRef.current = scriptDraft.length;
       return;
     }
 
-    const saved = localStorage.getItem(`script_toc_patterns_${currentProject.id}`);
-    if (saved && saved !== '[]') return;
+    const prevLen = lastScriptLenForTocRef.current;
+    const deltaLen = Math.abs(scriptDraft.length - prevLen);
+    lastScriptLenForTocRef.current = scriptDraft.length;
 
-    if (inferenceAttemptedRef.current.has(currentProject.id)) return;
+    // Immediate (0ms) on initial load, project switch, or bulk paste/import; short debounce only during live typing
+    const isInitialOrBulkChange =
+      !hasReusableAiTocConfig(tocConfigState, scriptDraft) &&
+      (prevLen === scriptDraft.length || prevLen < 20 || deltaLen >= 80);
 
-    let isMounted = true;
-    const autoInfer = async () => {
-      setIsInferringToc(true);
-      inferenceAttemptedRef.current.add(currentProject.id);
-      try {
-        const sampleText = scriptDraft.slice(0, 4000);
-        // Retrieve API credentials from settings
-        const agentModel = localStorage.getItem('agentModel') || 'deepseek-v4-flash';
-        const activeModel = localStorage.getItem('script_toc_infer_model') || agentModel;
-        
-        const deepseekKey = localStorage.getItem('deepseek_api_key') || '';
-        const qwenKey = localStorage.getItem('qwen_api_key') || '';
-        const glmKey = localStorage.getItem('glm_api_key') || '';
-        const arkKey = localStorage.getItem('ark_api_key') || localStorage.getItem('volcengine_api_key') || '';
-        
-        let apiKey = deepseekKey;
-        if (activeModel.includes('doubao') || activeModel.includes('seed-2-1') || activeModel.includes('seed-2.1') || activeModel.includes('ark') || activeModel.includes('volces')) {
-          apiKey = arkKey || deepseekKey || qwenKey;
-        } else if (activeModel.includes('qwen') || activeModel.includes('dashscope')) {
-          apiKey = qwenKey;
-        } else if (activeModel.includes('glm')) {
-          apiKey = glmKey;
-        }
-
-        const systemPrompt = CODE_PIPELINE_PROMPTS.tocInferSystemPrompt;
-
-        const res = await fetch('/api/script-toc-pattern', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ 
-            sampleText,
-            systemPrompt,
-            modelType: activeModel,
-            apiKey: apiKey,
-            deepseekKey: deepseekKey 
-          })
-        });
-        if (!res.ok) throw new Error("Automatic inference failed");
-        const data = await res.json();
-        if (!isMounted) return;
-
-        try {
-          localStorage.setItem('last_toc_infer_result', JSON.stringify(data, null, 2));
-        } catch (e) {}
-
-        let patterns: string[] = [];
-        if (data.tocPattern) patterns.push(data.tocPattern);
-        if (data.scenePattern) patterns.push(data.scenePattern);
-
-        if (patterns.length > 0) {
-          setInferredPatterns(patterns);
-          localStorage.setItem(`script_toc_patterns_${currentProject.id}`, JSON.stringify(patterns));
-        }
-
-        import('../utils/slicer').then(({ sliceScriptIntoScenes }) => {
-          if (!isMounted) return;
-          const newScenes = sliceScriptIntoScenes(scriptDraft, data.scenePattern, data.flags || 'gim');
-          onUpdateProject({
-            tocConfig: {
-              tocPattern: data.tocPattern,
-              scenePattern: data.scenePattern,
-              flags: data.flags || 'gim',
-              patterns,
-            },
-            scenes: newScenes,
-          });
-        }).catch(console.error);
-
-      } catch {
-        if (!isMounted) return;
-        const fallbackPatterns = [
-          "^【\\s*第?\\s*[0-9一二三四五六七八九十百千]+\\s*[集话回][^】]*】.*",
-          "^第\\s*[0-9一二三四五六七八九十百千]+\\s*[集话回].*",
-          "^\\d+\\s*[-—–]\\s*\\d+.*",
-          "^【\\s*(?:场|场景|场次)?\\s*[0-9一二三四五六七八九十百千]+[^】]*】.*",
-          "^第\\s*[0-9一二三四五六七八九十百千]+\\s*[场幕].*",
-          "^(?:EPISODE|EP|CHAPTER|SCENE)\\s*#?\\s*\\d+.*"
-        ];
-        setInferredPatterns(fallbackPatterns);
-        import('../utils/slicer').then(({ sliceScriptIntoScenes }) => {
-          if (!isMounted) return;
-          const newScenes = sliceScriptIntoScenes(scriptDraft);
-          onUpdateProject({
-            tocConfig: { patterns: fallbackPatterns, flags: 'gim' },
-            scenes: newScenes,
-          });
-        }).catch(() => {});
-      } finally {
-        if (isMounted) setIsInferringToc(false);
-      }
-    };
-
-    const timer = setTimeout(() => {
-      autoInfer();
-    }, 1500);
-
-    return () => {
-      isMounted = false;
-      clearTimeout(timer);
-    };
-  }, [currentProject.id, scriptDraft, inferredPatterns.length]);
-
-  const tocItems = useMemo<TocItem[]>(() => {
-    if (!scriptDraft || !scriptDraft.trim()) return [];
-    const lines = scriptDraft.split('\n');
-    const items: TocItem[] = [];
-    let charAccumulator = 0;
-
-    const builtinPatterns = [
-      "^【\\s*第?\\s*[0-9一二三四五六七八九十百千]+\\s*[集话回][^】]*】.*",
-      "^第\\s*[0-9一二三四五六七八九十百千]+\\s*[集话回].*",
-      "^\\d+\\s*[-—–]\\s*\\d+(?:\\s*(?:[日夜晨昏早晚内外景INTEXT.\\s].*)?|$)",
-      "^【\\s*(?:场|场景|场次)?\\s*[0-9一二三四五六七八九十百千]+[^】]*】.*",
-      "^第\\s*[0-9一二三四五六七八九十百千]+\\s*[场幕].*",
-      "^(?:EPISODE|EP|CHAPTER|SCENE)\\s*#?\\s*\\d+.*"
-    ];
-
-    const mergedPatternStrings = Array.from(new Set([...inferredPatterns, ...builtinPatterns]));
-    const activeRegexes: RegExp[] = [];
-    mergedPatternStrings.forEach(patternStr => {
-      try {
-        activeRegexes.push(new RegExp(patternStr, 'i'));
-      } catch (e) {
-        console.warn("Invalid regex pattern from AI:", patternStr);
-      }
-    });
-
-    if (activeRegexes.length === 0) return [];
-
-    const nextLineSceneMetaRx =
-      /^(?:[日夜晨昏早晚黄昏清晨白昼午夜]+[\s/·]+[内外]+景?|[内外]+景?[\s/·]+[日夜晨昏早晚黄昏清晨白昼午夜]+)(?:\s+.*)?$/;
-
-    lines.forEach((rawLine, index) => {
-      const trimmed = rawLine.trim();
-      if (!trimmed) {
-        charAccumulator += rawLine.length + 1;
-        return;
-      }
-
-      const isMatch = activeRegexes.some(rx => rx.test(trimmed));
-
-      if (isMatch) {
-        let title = trimmed;
-        const bracketMatch = trimmed.match(/^【(.+?)】(?:\s*(.*))?$/);
-        let subTitle: string | undefined;
-        if (bracketMatch) {
-          title = bracketMatch[1];
-          if (bracketMatch[2]) subTitle = bracketMatch[2];
-        } else if (trimmed.startsWith('#')) {
-          title = trimmed.replace(/^#+\s*/, '');
-        }
-
-        // If bare dash-scene header like "22-2" is followed by "日 内 布拉姆房间" on next line, attach as subTitle
-        if (!subTitle && /^\d+\s*[-—–]\s*\d+$/.test(title) && index + 1 < lines.length) {
-          const nextTrimmed = lines[index + 1].trim();
-          if (nextLineSceneMetaRx.test(nextTrimmed)) {
-            subTitle = nextTrimmed;
-          }
-        }
-
-        let type: TocItem['type'] = 'scene';
-        const isDashScene = /^\d+\s*[-—–]\s*\d+/.test(trimmed);
-        if (!isDashScene && /集|EPISODE|EP\b/i.test(trimmed)) {
-          type = 'episode';
-        } else if (isDashScene || /场|SCENE|EXT\.|INT\./i.test(trimmed)) {
-          type = 'scene';
-        } else if (/幕|章|回|CHAPTER|ACT/i.test(trimmed)) {
-          type = 'chapter';
-        } else if (/^#+\s/.test(rawLine)) {
-          type = 'heading';
-        } else {
-          type = /第\s*[0-9一二三四五六七八九十百千]+\s*[集话回]/.test(trimmed) ? 'episode' : 'scene';
-        }
-
-        items.push({
-          id: `toc-${index}-${charAccumulator}`,
-          title,
-          subTitle,
-          lineNumber: index + 1,
-          charIndex: charAccumulator,
-          type,
-        });
-      }
-      charAccumulator += rawLine.length + 1; // +1 for \n
-    });
-
-    // Fallback: If no explicit headings, generate section anchors every ~30 lines
-    if (items.length === 0 && lines.length > 3) {
-      const step = Math.max(20, Math.floor(lines.length / 6));
-      let acc = 0;
-      lines.forEach((line, idx) => {
-        if (idx % step === 0 || idx === 0) {
-          const preview = line.trim() || `第 ${idx + 1} 行`;
-          items.push({
-            id: `seg-${idx}`,
-            title: preview.length > 24 ? preview.slice(0, 24) + '...' : preview,
-            subTitle: `第 ${idx + 1} 行`,
-            lineNumber: idx + 1,
-            charIndex: acc,
-            type: 'segment',
-          });
-        }
-        acc += line.length + 1;
-      });
+    if (isInitialOrBulkChange) {
+      void runModelTocInference(currentProject.id, scriptDraft, false);
+      return;
     }
 
-    return items;
-  }, [scriptDraft, inferredPatterns]);
+    const timer = setTimeout(() => {
+      void runModelTocInference(currentProject.id, scriptDraft, false);
+    }, 500);
+
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [
+    currentProject.id,
+    currentProject.scenes,
+    scriptDraft,
+    tocConfigState,
+    runModelTocInference,
+    onUpdateProject,
+  ]);
+
+  const handleManualReinferToc = useCallback(
+    (e: React.MouseEvent<HTMLButtonElement>) => {
+      e.stopPropagation();
+      if (!scriptDraft || scriptDraft.trim().length < 20 || isInferringToc) return;
+      const attemptKey = buildTocAttemptKey(currentProject.id, scriptDraft);
+      inferenceAttemptedRef.current.delete(attemptKey);
+      void runModelTocInference(currentProject.id, scriptDraft, true);
+    },
+    [currentProject.id, isInferringToc, runModelTocInference, scriptDraft]
+  );
+
+  const tocRecognitionState = useMemo(
+    () =>
+      resolveTocRecognitionState({
+        projectId: currentProject.id,
+        scriptText: scriptDraft,
+        tocConfig: tocConfigState,
+        isInferring: isInferringToc,
+        attemptedKeys: inferenceAttemptedRef.current,
+      }),
+    [currentProject.id, scriptDraft, tocConfigState, isInferringToc, tocAttemptVersion]
+  );
+
+  const isTocResolving = isInferringToc || tocRecognitionState === 'pending';
+
+  const tocItems = useMemo<TocItem[]>(
+    () =>
+      parseTocItemsFromScript(scriptDraft, {
+        state: tocRecognitionState,
+        tocConfig: tocConfigState,
+      }),
+    [scriptDraft, tocRecognitionState, tocConfigState]
+  );
 
 
 
@@ -3041,17 +3290,16 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
       }
     }
 
-    if (Array.isArray(currentProject?.tocConfig?.patterns) && currentProject.tocConfig!.patterns!.length > 0) {
-      setInferredPatterns(currentProject.tocConfig!.patterns!);
-      return;
+    if (didProjectChange) {
+      tocRequestSeqRef.current += 1;
+      tocAbortControllerRef.current?.abort();
+      tocAbortControllerRef.current = null;
+      setIsInferringToc(false);
+      lastScriptLenForTocRef.current = (currentProject?.scriptText || '').length;
     }
-    try {
-      const saved = localStorage.getItem(`script_toc_patterns_${currentProject.id}`);
-      setInferredPatterns(saved ? JSON.parse(saved) : []);
-    } catch {
-      setInferredPatterns([]);
-    }
-  }, [currentProject]);
+
+    setTocConfigState(loadStoredTocConfig(currentProject));
+  }, [currentProject, loadStoredTocConfig]);
 
   // Separate Card animation from CodeMirror rendering
   useEffect(() => {
@@ -3198,13 +3446,6 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
     ]
   );
 
-  // Keep Script expand settled state aligned with visual shell expansion & mountExpandedContent
-  useEffect(() => {
-    setIsScriptExpandSettled(
-      visualDock.scriptExpanded && widthTransitionPanels.script.mountExpandedContent
-    );
-  }, [visualDock.scriptExpanded, widthTransitionPanels.script.mountExpandedContent]);
-
   const scriptScrollSpec = useMemo(
     () => ({
       kind: 'script' as const,
@@ -3230,6 +3471,8 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
   const isScriptTransitioning =
     isScriptShellWidthTransitioning ||
     widthTransitionPanels.script.hidden ||
+    widthTransitionPanels.script.suspendSubtree ||
+    widthTransitionPanels.script.isGliding ||
     widthTransitionPanels.script.opacity < 1;
 
   const isScriptReadyToMount =
@@ -3238,8 +3481,7 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
     isOpen &&
     activeTab === 'script' &&
     visualDock.scriptExpanded &&
-    widthTransitionPanels.script.mountExpandedContent &&
-    !widthTransitionPanels.script.hidden;
+    widthTransitionPanels.script.mountExpandedContent;
 
   const scriptScrollMemory = useUnifiedPanelScrollMemory({
     scopeKey: scriptScopeKey,
@@ -3281,6 +3523,38 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
       scriptScrollMemory.handleScrollEvent(top);
     },
     [scriptScrollMemory.handleScrollEvent]
+  );
+
+  // Stable memoized props for React.memo(AssetImageFeedPanel) so unrelated dock ticks never force feed re-renders
+  const handleImagesMiniMouseEnter = useCallback(
+    () => handleMiniCardMouseEnter('images'),
+    [handleMiniCardMouseEnter]
+  );
+  const handleImagesMiniMouseMove = useCallback(
+    (e: React.MouseEvent) => handleMiniCardMouseMove(e, 'images'),
+    [handleMiniCardMouseMove]
+  );
+  const handleImagesMiniMouseLeave = useCallback(
+    () => handleMiniCardMouseLeave('images'),
+    [handleMiniCardMouseLeave]
+  );
+  const handleExpandImagesPanel = useCallback(() => {
+    setHoveredMiniPanel((prev) => (prev === 'images' ? null : prev));
+    applyDockTransition({ imagesExpanded: true });
+  }, [applyDockTransition]);
+  const handleCollapseImagesPanel = useCallback(() => {
+    setHoveredMiniPanel((prev) => (prev === 'images' ? null : prev));
+    applyDockTransition({ imagesExpanded: false });
+  }, [applyDockTransition]);
+  const handleDropLocalFileOnFeed = useCallback(
+    (section: AssetImageFeedSection, file: File) => {
+      void handleDropLocalFileOnFeedSection(section, file);
+    },
+    [handleDropLocalFileOnFeedSection]
+  );
+  const verifyingOrGeneratingAssetIds = useMemo(
+    () => [...verifyingAssetIds, ...generatingAssetIds],
+    [verifyingAssetIds, generatingAssetIds]
   );
 
   // Click outside to close project dropdown menu
@@ -3467,6 +3741,72 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
     }
   }, [autoSaveEnabled]);
 
+  const [activeEditorSelection, setActiveEditorSelection] = useState<ScriptSelectionChange | null>(null);
+  const [annotationModalState, setAnnotationModalState] = useState<{
+    isOpen: boolean;
+    from: number;
+    to: number;
+    selectedText: string;
+    existingAnnotation: ScriptAnnotation | null;
+  } | null>(null);
+
+  useEffect(() => {
+    setActiveEditorSelection(null);
+    setAnnotationModalState(null);
+  }, [currentProject.id]);
+
+  const handleOpenAddAnnotation = useCallback((selection: ScriptSelectionChange) => {
+    setAnnotationModalState({
+      isOpen: true,
+      from: selection.start,
+      to: selection.end,
+      selectedText: selection.text,
+      existingAnnotation: null,
+    });
+  }, []);
+
+  const handleOpenEditAnnotation = useCallback((annotation: ScriptAnnotation) => {
+    const fallbackText =
+      (typeof annotation.meta?.selectedText === 'string' && annotation.meta.selectedText) ||
+      (currentProjectRef.current?.scriptText || '').slice(annotation.from, annotation.to) ||
+      annotation.name ||
+      '';
+    setAnnotationModalState({
+      isOpen: true,
+      from: annotation.from,
+      to: annotation.to,
+      selectedText: fallbackText,
+      existingAnnotation: annotation,
+    });
+  }, []);
+
+  const handleSaveAnnotation = useCallback((noteText: string, badgeText: string) => {
+    if (!annotationModalState) return;
+    const nextAnnotations = upsertScriptAnnotation(currentProjectRef.current?.annotations, {
+      id: annotationModalState.existingAnnotation?.id,
+      from: annotationModalState.from,
+      to: annotationModalState.to,
+      selectedText: annotationModalState.selectedText,
+      noteText,
+      badgeText,
+    });
+    onUpdateProject({ annotations: nextAnnotations });
+    editorRef.current?.setSelection(annotationModalState.to, annotationModalState.to);
+    setActiveEditorSelection(null);
+    onSelectionChange(null);
+    setAnnotationModalState(null);
+  }, [annotationModalState, onSelectionChange, onUpdateProject]);
+
+  const handleDeleteAnnotation = useCallback((annotationId: string) => {
+    const nextAnnotations = deleteScriptAnnotation(currentProjectRef.current?.annotations, annotationId);
+    onUpdateProject({ annotations: nextAnnotations });
+    setAnnotationModalState(null);
+  }, [onUpdateProject]);
+
+  const getEditorSelectionRect = useCallback(() => {
+    return editorRef.current?.getSelectionRect() ?? null;
+  }, []);
+
   const editorAnnotations = useMemo<ScriptAnnotation[]>(() => {
     const list: ScriptAnnotation[] = [];
 
@@ -3508,8 +3848,47 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
       });
     }
 
+    // 3. Persistent user script annotations (attach click handler in render layer only)
+    if (Array.isArray(currentProject.annotations) && currentProject.annotations.length > 0) {
+      currentProject.annotations.forEach((ann) => {
+        if (!ann || ann.to <= ann.from) return;
+        const isActiveEditing = annotationModalState?.isOpen && annotationModalState.existingAnnotation?.id === ann.id;
+        list.push({
+          ...ann,
+          category: 'annotation',
+          active: Boolean(isActiveEditing),
+          badgeText: ann.badgeText || '标注',
+          colorVariant: 'amber',
+          onClick: () => {
+            handleOpenEditAnnotation(ann);
+          },
+        });
+      });
+    }
+
+    // 4. Temporary locked Agent selection highlight (ephemeral UI decoration, never persisted)
+    if (lockedAgentSelection && lockedAgentSelection.end > lockedAgentSelection.start) {
+      list.push({
+        id: '__agent_locked_selection__',
+        from: lockedAgentSelection.start,
+        to: lockedAgentSelection.end,
+        category: 'agent-selection',
+        active: true,
+        colorVariant: 'purple',
+      });
+    }
+
     return list;
-  }, [searchMatches, safeMatchIndex, activeMultiHighlightSpans, activeProvenanceTargetChar]);
+  }, [
+    searchMatches,
+    safeMatchIndex,
+    activeMultiHighlightSpans,
+    activeProvenanceTargetChar,
+    currentProject.annotations,
+    annotationModalState,
+    handleOpenEditAnnotation,
+    lockedAgentSelection,
+  ]);
 
   const handleScriptTextChange = useCallback((val: string) => {
     setScriptDraft(val);
@@ -3517,7 +3896,15 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
       setActiveMultiHighlightSpans([]);
       setActiveProvenanceTargetChar(null);
     }
-    onUpdateProject({ scriptText: val });
+    const reconciledAnnotations = reconcileAnnotationsAfterTextChange(
+      currentProjectRef.current?.annotations,
+      val
+    );
+    if (reconciledAnnotations) {
+      onUpdateProject({ scriptText: val, annotations: reconciledAnnotations });
+    } else {
+      onUpdateProject({ scriptText: val });
+    }
 
     const cursorOffset = editorRef.current?.getSelection().start || 0;
     const scene = updateSceneIndicator(val, cursorOffset);
@@ -3537,6 +3924,384 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
     }
     setEditingProjectId(null);
   };
+
+  const handleAssetRowClickRef = useRef(handleAssetRowClick);
+  handleAssetRowClickRef.current = handleAssetRowClick;
+
+  // Decouple heavy assets list VDOM construction from dock layout/visual state so collapsing
+  // or expanding sibling cards (剧本正文 / 图片) skips ~480ms of React element reconstruction.
+  const memoizedAssetsListContent = useMemo(
+    () => (
+      <div className="flex flex-col gap-1.5">
+        {(assetFilter === 'all' || assetFilter === 'characters') &&
+          batchedCharacters.map((char) => {
+            const isSelected = selectedAssetIds.has(char.id);
+            const isHighlightActive =
+              activeAssetHighlight?.id === char.id && !activeAssetHighlight?.isVersion;
+            const charTargetId = buildAssetAgentTargetId('character', char.id);
+            const isAgentFocused = isTargetAgentFocused(charTargetId);
+            const charBorderMode = resolveSelectionBorderMode({
+              isUserSelected: isSelected || isHighlightActive,
+              isAgentFocused,
+            });
+            const identText = getAssetIdentificationText('character', char);
+            const versions: ScriptAssetVersion[] = Array.isArray(char.versions)
+              ? char.versions
+              : [];
+            const hasMultipleVersions = versions.length > 1;
+            const isCollapsed = collapsedMultiVersionIds.has(char.id);
+            return (
+              <div key={char.id} className="flex flex-col">
+                <div
+                  data-asset-item="true"
+                  data-asset-version="false"
+                  data-asset-id={char.id}
+                  data-agent-target={charTargetId}
+                  data-selection-border-mode={charBorderMode}
+                  onClick={(e) => handleAssetRowClickRef.current(char.id, 'character', char, e)}
+                  onContextMenu={(e) => {
+                    handleOpenAssetContextMenu(e, 'character', char);
+                  }}
+                  className={`w-full relative px-2.5 py-2.5 rounded-xl corner-squircle transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none active:scale-[0.985] active:brightness-95 ${getAssetRowBorderClasses(charBorderMode, false)}`}
+                >
+                  {renderAssetRowSelectionBorderOverlay(charBorderMode, false)}
+                  <div className="flex items-center gap-2 min-w-0 w-full flex-1 pr-1">
+                    <div className="w-4 h-4 flex items-center justify-center shrink-0">
+                      <div className="text-blue-500 flex items-center justify-center">
+                        <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
+                          <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z" />
+                        </svg>
+                      </div>
+                    </div>
+                    <span className="text-xs font-bold shrink-0 max-w-[180px] truncate" title={char.name}>
+                      {char.name}
+                    </span>
+                    <span
+                      className="text-[11px] text-gray-400 dark:text-neutral-400 truncate min-w-0 flex-1"
+                      title={identText}
+                    >
+                      {identText}
+                    </span>
+                    {renderAssetThumbBadge('character', char)}
+                    {hasMultipleVersions && (
+                      <button
+                        type="button"
+                        onClick={(e) => toggleMultiVersionCollapse(char.id, e)}
+                        className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-blue-500/10 text-blue-600 dark:text-blue-300 hover:bg-blue-500/20 shrink-0 transition-colors"
+                        title={isCollapsed ? '展开多版本二级列表' : '收起多版本二级列表'}
+                      >
+                        <span>{versions.length}版本</span>
+                        <ChevronDown
+                          className={`w-3 h-3 transition-transform ${isCollapsed ? '-rotate-90' : ''}`}
+                        />
+                      </button>
+                    )}
+                  </div>
+                </div>
+                {hasMultipleVersions && !isCollapsed && (
+                  <div className="ml-4 pl-2.5 border-l border-gray-200/80 dark:border-neutral-700/80 flex flex-col gap-1 mt-1 mb-1.5">
+                    {versions.map((ver) => {
+                      const verHighlight =
+                        activeAssetHighlight?.id === ver.id && Boolean(activeAssetHighlight?.isVersion);
+                      const verTargetId = buildAssetAgentTargetId('character', ver.id, char.id);
+                      const verFocused = isTargetAgentFocused(verTargetId);
+                      const verBorderMode = resolveSelectionBorderMode({
+                        isUserSelected: verHighlight,
+                        isAgentFocused: verFocused,
+                      });
+                      const verIdent = getVersionIdentificationText('character', ver);
+                      return (
+                        <div
+                          key={ver.id}
+                          data-asset-item="true"
+                          data-asset-version="true"
+                          data-asset-id={ver.id}
+                          data-agent-target={verTargetId}
+                          data-selection-border-mode={verBorderMode}
+                          onClick={(e) =>
+                            handleAssetRowClickRef.current(ver.id, 'character', ver, e, false, char.name)
+                          }
+                          onContextMenu={(e) => {
+                            handleOpenAssetContextMenu(e, 'character', ver, char);
+                          }}
+                          className={`w-full relative px-2 py-1.5 rounded-lg transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none ${getAssetRowBorderClasses(verBorderMode, true)}`}
+                        >
+                          {renderAssetRowSelectionBorderOverlay(verBorderMode, true)}
+                          <div className="flex items-center gap-1.5 min-w-0 w-full flex-1 pr-1">
+                            <span className="w-1.5 h-1.5 rounded-full bg-blue-400/80 shrink-0" />
+                            <span
+                              className="text-[11px] font-bold shrink-0 truncate max-w-[120px]"
+                              title={ver.name}
+                            >
+                              {ver.name}
+                            </span>
+                            <span
+                              className="text-[11px] text-gray-400 dark:text-neutral-400 truncate min-w-0 flex-1"
+                              title={verIdent}
+                            >
+                              {verIdent}
+                            </span>
+                            {renderAssetThumbBadge('character', ver, char)}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+
+        {(assetFilter === 'all' || assetFilter === 'locations') &&
+          batchedLocations.map((loc) => {
+            const isSelected = selectedAssetIds.has(loc.id);
+            const isHighlightActive =
+              activeAssetHighlight?.id === loc.id && !activeAssetHighlight?.isVersion;
+            const locTargetId = buildAssetAgentTargetId('location', loc.id);
+            const isAgentFocused = isTargetAgentFocused(locTargetId);
+            const locBorderMode = resolveSelectionBorderMode({
+              isUserSelected: isSelected || isHighlightActive,
+              isAgentFocused,
+            });
+            const identText = getAssetIdentificationText('location', loc);
+            const versions: ScriptAssetVersion[] = Array.isArray(loc.versions) ? loc.versions : [];
+            const hasMultipleVersions = versions.length > 1;
+            const isCollapsed = collapsedMultiVersionIds.has(loc.id);
+            return (
+              <div key={loc.id} className="flex flex-col">
+                <div
+                  data-asset-item="true"
+                  data-asset-version="false"
+                  data-asset-id={loc.id}
+                  data-agent-target={locTargetId}
+                  data-selection-border-mode={locBorderMode}
+                  onClick={(e) => handleAssetRowClickRef.current(loc.id, 'location', loc, e)}
+                  onContextMenu={(e) => {
+                    handleOpenAssetContextMenu(e, 'location', loc);
+                  }}
+                  className={`w-full relative px-2.5 py-2.5 rounded-xl corner-squircle transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none active:scale-[0.985] active:brightness-95 ${getAssetRowBorderClasses(locBorderMode, false)}`}
+                >
+                  {renderAssetRowSelectionBorderOverlay(locBorderMode, false)}
+                  <div className="flex items-center gap-2 min-w-0 w-full flex-1 pr-1">
+                    <div className="w-4 h-4 flex items-center justify-center shrink-0">
+                      <div className="text-emerald-500 flex items-center justify-center">
+                        <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
+                          <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z" />
+                        </svg>
+                      </div>
+                    </div>
+                    <span className="text-xs font-bold shrink-0 max-w-[180px] truncate" title={loc.name}>
+                      {loc.name}
+                    </span>
+                    <span
+                      className="text-[11px] text-gray-400 dark:text-neutral-400 truncate min-w-0 flex-1"
+                      title={identText}
+                    >
+                      {identText}
+                    </span>
+                    {renderAssetThumbBadge('location', loc)}
+                    {hasMultipleVersions && (
+                      <button
+                        type="button"
+                        onClick={(e) => toggleMultiVersionCollapse(loc.id, e)}
+                        className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-emerald-500/10 text-emerald-600 dark:text-emerald-300 hover:bg-emerald-500/20 shrink-0 transition-colors"
+                        title={isCollapsed ? '展开日景/夜景版本列表' : '收起日景/夜景版本列表'}
+                      >
+                        <span>{versions.length}版本</span>
+                        <ChevronDown
+                          className={`w-3 h-3 transition-transform ${isCollapsed ? '-rotate-90' : ''}`}
+                        />
+                      </button>
+                    )}
+                  </div>
+                </div>
+                {hasMultipleVersions && !isCollapsed && (
+                  <div className="ml-4 pl-2.5 border-l border-gray-200/80 dark:border-neutral-700/80 flex flex-col gap-1 mt-1 mb-1.5">
+                    {versions.map((ver) => {
+                      const verHighlight =
+                        activeAssetHighlight?.id === ver.id && Boolean(activeAssetHighlight?.isVersion);
+                      const verTargetId = buildAssetAgentTargetId('location', ver.id, loc.id);
+                      const verFocused = isTargetAgentFocused(verTargetId);
+                      const verBorderMode = resolveSelectionBorderMode({
+                        isUserSelected: verHighlight,
+                        isAgentFocused: verFocused,
+                      });
+                      const verIdent = getVersionIdentificationText('location', ver);
+                      return (
+                        <div
+                          key={ver.id}
+                          data-asset-item="true"
+                          data-asset-version="true"
+                          data-asset-id={ver.id}
+                          data-agent-target={verTargetId}
+                          data-selection-border-mode={verBorderMode}
+                          onClick={(e) =>
+                            handleAssetRowClickRef.current(ver.id, 'location', ver, e, false, loc.name)
+                          }
+                          onContextMenu={(e) => {
+                            handleOpenAssetContextMenu(e, 'location', ver, loc);
+                          }}
+                          className={`w-full relative px-2 py-1.5 rounded-lg transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none ${getAssetRowBorderClasses(verBorderMode, true)}`}
+                        >
+                          {renderAssetRowSelectionBorderOverlay(verBorderMode, true)}
+                          <div className="flex items-center gap-1.5 min-w-0 w-full flex-1 pr-1">
+                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400/80 shrink-0" />
+                            <span
+                              className="text-[11px] font-bold shrink-0 truncate max-w-[120px]"
+                              title={ver.name}
+                            >
+                              {ver.name}
+                            </span>
+                            <span
+                              className="text-[11px] text-gray-400 dark:text-neutral-400 truncate min-w-0 flex-1"
+                              title={verIdent}
+                            >
+                              {verIdent}
+                            </span>
+                            {renderAssetThumbBadge('location', ver, loc)}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+
+        {(assetFilter === 'all' || assetFilter === 'props') &&
+          batchedProps.map((prop) => {
+            const isSelected = selectedAssetIds.has(prop.id);
+            const isHighlightActive =
+              activeAssetHighlight?.id === prop.id && !activeAssetHighlight?.isVersion;
+            const propTargetId = buildAssetAgentTargetId('prop', prop.id);
+            const isAgentFocused = isTargetAgentFocused(propTargetId);
+            const propBorderMode = resolveSelectionBorderMode({
+              isUserSelected: isSelected || isHighlightActive,
+              isAgentFocused,
+            });
+            const identText = getAssetIdentificationText('prop', prop);
+            const versions: ScriptAssetVersion[] = Array.isArray(prop.versions) ? prop.versions : [];
+            const hasMultipleVersions = versions.length > 1;
+            const isCollapsed = collapsedMultiVersionIds.has(prop.id);
+            return (
+              <div key={prop.id} className="flex flex-col">
+                <div
+                  data-asset-item="true"
+                  data-asset-version="false"
+                  data-asset-id={prop.id}
+                  data-agent-target={propTargetId}
+                  data-selection-border-mode={propBorderMode}
+                  onClick={(e) => handleAssetRowClickRef.current(prop.id, 'prop', prop, e)}
+                  onContextMenu={(e) => {
+                    handleOpenAssetContextMenu(e, 'prop', prop);
+                  }}
+                  className={`w-full relative px-2.5 py-2.5 rounded-xl corner-squircle transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none active:scale-[0.985] active:brightness-95 ${getAssetRowBorderClasses(propBorderMode, false)}`}
+                >
+                  {renderAssetRowSelectionBorderOverlay(propBorderMode, false)}
+                  <div className="flex items-center gap-2 min-w-0 w-full flex-1 pr-1">
+                    <div className="w-4 h-4 flex items-center justify-center shrink-0">
+                      <div className="text-amber-500 flex items-center justify-center">
+                        <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
+                          <path d="M21 16.5c0 .38-.21.71-.53.88l-7.9 4.44c-.16.09-.34.14-.57.14s-.41-.05-.57-.14l-7.9-4.44A1.003 1.003 0 013 16.5v-9c0-.38.21-.71.53-.88l7.9-4.44c.16-.09.34-.14.57-.14s.41.05.57.14l7.9 4.44c.32.17.53.5.53.88v9zM12 4.15L6.04 7.5 12 10.85 17.96 7.5 12 4.15zM5 15.91l6 3.38v-6.72L5 9.19v6.72zm14 0v-6.72l-6 3.38v6.72l6-3.38z" />
+                        </svg>
+                      </div>
+                    </div>
+                    <span className="text-xs font-bold shrink-0 max-w-[180px] truncate" title={prop.name}>
+                      {prop.name}
+                    </span>
+                    <span
+                      className="text-[11px] text-gray-400 dark:text-neutral-400 truncate min-w-0 flex-1"
+                      title={identText}
+                    >
+                      {identText}
+                    </span>
+                    {renderAssetThumbBadge('prop', prop)}
+                    {hasMultipleVersions && (
+                      <button
+                        type="button"
+                        onClick={(e) => toggleMultiVersionCollapse(prop.id, e)}
+                        className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-amber-500/10 text-amber-600 dark:text-amber-300 hover:bg-amber-500/20 shrink-0 transition-colors"
+                        title={isCollapsed ? '展开多版本二级列表' : '收起多版本二级列表'}
+                      >
+                        <span>{versions.length}版本</span>
+                        <ChevronDown
+                          className={`w-3 h-3 transition-transform ${isCollapsed ? '-rotate-90' : ''}`}
+                        />
+                      </button>
+                    )}
+                  </div>
+                </div>
+                {hasMultipleVersions && !isCollapsed && (
+                  <div className="ml-4 pl-2.5 border-l border-gray-200/80 dark:border-neutral-700/80 flex flex-col gap-1 mt-1 mb-1.5">
+                    {versions.map((ver) => {
+                      const verHighlight =
+                        activeAssetHighlight?.id === ver.id && Boolean(activeAssetHighlight?.isVersion);
+                      const verTargetId = buildAssetAgentTargetId('prop', ver.id, prop.id);
+                      const verFocused = isTargetAgentFocused(verTargetId);
+                      const verBorderMode = resolveSelectionBorderMode({
+                        isUserSelected: verHighlight,
+                        isAgentFocused: verFocused,
+                      });
+                      const verIdent = getVersionIdentificationText('prop', ver);
+                      return (
+                        <div
+                          key={ver.id}
+                          data-asset-item="true"
+                          data-asset-version="true"
+                          data-asset-id={ver.id}
+                          data-agent-target={verTargetId}
+                          data-selection-border-mode={verBorderMode}
+                          onClick={(e) =>
+                            handleAssetRowClickRef.current(ver.id, 'prop', ver, e, false, prop.name)
+                          }
+                          onContextMenu={(e) => {
+                            handleOpenAssetContextMenu(e, 'prop', ver, prop);
+                          }}
+                          className={`w-full relative px-2 py-1.5 rounded-lg transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none ${getAssetRowBorderClasses(verBorderMode, true)}`}
+                        >
+                          {renderAssetRowSelectionBorderOverlay(verBorderMode, true)}
+                          <div className="flex items-center gap-1.5 min-w-0 w-full flex-1 pr-1">
+                            <span className="w-1.5 h-1.5 rounded-full bg-amber-400/80 shrink-0" />
+                            <span
+                              className="text-[11px] font-bold shrink-0 truncate max-w-[120px]"
+                              title={ver.name}
+                            >
+                              {ver.name}
+                            </span>
+                            <span
+                              className="text-[11px] text-gray-400 dark:text-neutral-400 truncate min-w-0 flex-1"
+                              title={verIdent}
+                            >
+                              {verIdent}
+                            </span>
+                            {renderAssetThumbBadge('prop', ver, prop)}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+      </div>
+    ),
+    [
+      assetFilter,
+      batchedCharacters,
+      batchedLocations,
+      batchedProps,
+      selectedAssetIds,
+      activeAssetHighlight,
+      isTargetAgentFocused,
+      collapsedMultiVersionIds,
+      handleOpenAssetContextMenu,
+      renderAssetRowSelectionBorderOverlay,
+      renderAssetThumbBadge,
+      toggleMultiVersionCollapse,
+    ]
+  );
 
   return (
     <>
@@ -3777,13 +4542,38 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
       <AnimatePresence>
         {isOpen && (
           <>
+            <div
+              ref={(el) => {
+                dockPanelDomRefs.current.script.shell = el;
+              }}
+              data-dock-shell="true"
+              data-dock-gliding={widthTransitionPanels.script.isGliding ? 'true' : undefined}
+              style={{
+                transform: `translate3d(${dockLayout.script.left}px, 0, 0)`,
+                width: `${dockLayout.script.width}px`,
+                height: `${dockLayout.script.height}px`,
+                zIndex: dockLayout.script.zIndex,
+                willChange: widthTransitionPanels.script.isGliding ? 'transform' : undefined,
+                transitionProperty: 'transform, width, height',
+                transitionDuration: `${WIDTH_TRANSITION_TIMINGS.shellResizeMs}ms`,
+                transitionTimingFunction: 'cubic-bezier(0.22, 1, 0.36, 1)',
+                ...(dockLayout.script.expanded
+                  ? { maxWidth: `${dockLayout.script.maxWidth}px` }
+                  : {}),
+              }}
+              className="fixed top-[58px] left-0 pointer-events-none"
+            >
             <motion.div
-            ref={cardContainerRef}
+            ref={(el) => {
+              cardContainerRef.current = el;
+              dockPanelDomRefs.current.script.card = el;
+            }}
             variants={leftCardVariants}
             initial="hidden"
             animate="visible"
             exit="exit"
             data-dock-card="true"
+            data-dock-gliding={widthTransitionPanels.script.isGliding ? 'true' : undefined}
             data-prevent-canvas-wheel="true"
             data-agent-target={visualDock.scriptExpanded ? 'script.panel' : 'script.collapsed'}
             onMouseEnter={() => {
@@ -3795,20 +4585,9 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
             onMouseLeave={() => {
               if (!visualDock.scriptExpanded) handleMiniCardMouseLeave('script');
             }}
-            style={{
-              left: `${dockLayout.script.left}px`,
-              width: `${dockLayout.script.width}px`,
-              zIndex: dockLayout.script.zIndex,
-              transitionProperty: 'left, width, height, box-shadow',
-              transitionDuration: `${WIDTH_TRANSITION_TIMINGS.shellResizeMs}ms`,
-              transitionTimingFunction: 'cubic-bezier(0.22, 1, 0.36, 1)',
-              ...(dockLayout.script.expanded
-                ? { maxWidth: `${dockLayout.script.maxWidth}px` }
-                : { height: `${dockLayout.script.height ?? 112}px` }),
-            }}
-            className={`fixed top-[58px] flex pointer-events-auto transform-gpu bg-[#f3f4f6] dark:bg-[#1C1C1E] border corner-squircle overflow-hidden ${
+            className={`w-full h-full flex pointer-events-auto bg-[#f3f4f6] dark:bg-[#1C1C1E] border corner-squircle overflow-hidden ${
               visualDock.scriptExpanded
-                ? `bottom-4 flex-col select-text rounded-[24px] shadow-2xl ${
+                ? `flex-col select-text rounded-[24px] shadow-2xl ${
                     agentFocusedTargetId === 'script.text' || agentFocusedTargetId === 'script.panel'
                       ? 'border-purple-500/80 ring-2 ring-purple-500/50'
                       : 'border-gray-300 dark:border-white/10'
@@ -3824,6 +4603,9 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
           >
             {!visualDock.scriptExpanded ? (
               <button
+                ref={(el) => {
+                  dockPanelDomRefs.current.script.miniContent = el;
+                }}
                 type="button"
                 onClick={(e) => {
                   e.stopPropagation();
@@ -3842,7 +4624,7 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
                   transition:
                     widthTransitionPanels.script.fadeDurationMs > 0
                       ? `opacity ${widthTransitionPanels.script.fadeDurationMs}ms ease-out`
-                      : undefined,
+                      : 'none',
                 }}
                 className={`w-full h-full flex flex-col justify-center py-2.5 select-none overflow-hidden cursor-pointer ${
                   dockLayout.script.miniAlign === 'right'
@@ -3866,17 +4648,23 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
               </button>
             ) : !widthTransitionPanels.script.mountExpandedContent ? null : (
             <div
+              ref={(el) => {
+                dockPanelDomRefs.current.script.expandedContent = el;
+              }}
               style={{
                 opacity: widthTransitionPanels.script.opacity,
                 visibility: widthTransitionPanels.script.hidden ? 'hidden' : 'visible',
+                contentVisibility: widthTransitionPanels.script.suspendSubtree ? 'hidden' : 'visible',
                 pointerEvents:
-                  widthTransitionPanels.script.opacity < 1 || widthTransitionPanels.script.hidden
+                  widthTransitionPanels.script.opacity < 1 ||
+                  widthTransitionPanels.script.hidden ||
+                  widthTransitionPanels.script.suspendSubtree
                     ? 'none'
                     : undefined,
                 transition:
                   widthTransitionPanels.script.fadeDurationMs > 0
                     ? `opacity ${widthTransitionPanels.script.fadeDurationMs}ms ease-out`
-                    : undefined,
+                    : 'none',
                 ...(widthTransitionPanels.script.frozenWidth != null
                   ? {
                       width: `${widthTransitionPanels.script.frozenWidth}px`,
@@ -3944,12 +4732,12 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
                               : 'text-gray-600 dark:text-neutral-400 hover:text-gray-900 dark:hover:text-white'
                           }`}
                         >
-                          {isInferringToc ? (
+                          {isTocResolving ? (
                             <RefreshCw className="w-3.5 h-3.5 animate-spin" />
                           ) : (
                             <span>目录</span>
                           )}
-                          {!isInferringToc && tocItems.length > 0 && (
+                          {!isTocResolving && tocItems.length > 0 && (
                             <span className="px-1.5 py-0.5 rounded-full corner-squircle text-[10px] bg-blue-100/80 dark:bg-blue-900/40 text-blue-600 dark:text-blue-300 font-medium">
                               {tocItems.length}
                             </span>
@@ -4551,6 +5339,7 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
                           }
                         }}
                         onSelectionChange={(selection) => {
+                          setActiveEditorSelection(selection);
                           if (selection) {
                             updateSceneIndicator(scriptDraft, selection.start);
                             onSelectionChange(selection);
@@ -4596,6 +5385,21 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
                         transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
                         className="absolute left-2.5 top-2.5 bottom-2.5 w-72 bg-white/95 dark:bg-neutral-800/95 backdrop-blur-md border border-gray-200/90 dark:border-[#404040] rounded-2xl corner-squircle shadow-xl z-30 flex flex-col overflow-hidden text-xs"
                       >
+                        <div className="flex items-center justify-between px-3 py-2 border-b border-gray-100 dark:border-neutral-700/70 shrink-0">
+                          <span className="text-[11px] font-semibold text-gray-600 dark:text-neutral-300">
+                            剧本目录
+                          </span>
+                          <button
+                            type="button"
+                            onClick={handleManualReinferToc}
+                            disabled={isTocResolving || !scriptDraft || scriptDraft.trim().length < 20}
+                            aria-label="使用模型节点重新识别目录"
+                            title="使用模型节点重新识别目录"
+                            className="p-1 rounded-lg text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50/70 dark:hover:bg-blue-950/60 disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer"
+                          >
+                            <RefreshCw className={`w-3.5 h-3.5 ${isTocResolving ? 'animate-spin' : ''}`} />
+                          </button>
+                        </div>
                         <div
                           ref={tocListRef}
                           data-agent-target="script.toc.list"
@@ -4603,7 +5407,7 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
                           onScroll={handleTocListScroll}
                           className="flex-1 overflow-y-auto p-1.5 space-y-0.5"
                         >
-                          {isInferringToc ? (
+                          {isTocResolving ? (
                             <div className="py-8 text-center text-blue-500 dark:text-blue-400 space-y-2">
                               <div className="w-5 h-5 border-2 border-blue-500/30 border-t-blue-500 rounded-full animate-spin mx-auto mb-2" />
                               <p className="text-[11px] font-medium">AI 正在智能解析目录结构...</p>
@@ -5203,15 +6007,41 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
             </div>
             )}
       </motion.div>
+            </div>
 
         {/* 卡片二: 独立侧边栏面板 Card (单一实体容器，打开时左侧卡片先出右侧后出，关闭时右侧卡片先消失左侧后收回) */}
         {activeTab === 'script' && (
+          <div
+            ref={(el) => {
+              dockPanelDomRefs.current.assets.shell = el;
+            }}
+            data-dock-shell="true"
+            data-dock-gliding={widthTransitionPanels.assets.isGliding ? 'true' : undefined}
+            style={{
+              transform: `translate3d(${dockLayout.assets.left}px, 0, 0)`,
+              width: `${dockLayout.assets.width}px`,
+              height: `${dockLayout.assets.height}px`,
+              zIndex: dockLayout.assets.zIndex,
+              willChange: widthTransitionPanels.assets.isGliding ? 'transform' : undefined,
+              transitionProperty: 'transform, width, height',
+              transitionDuration: `${WIDTH_TRANSITION_TIMINGS.shellResizeMs}ms`,
+              transitionTimingFunction: 'cubic-bezier(0.22, 1, 0.36, 1)',
+              ...(dockLayout.assets.expanded
+                ? { maxWidth: `${dockLayout.assets.maxWidth}px` }
+                : {}),
+            }}
+            className="fixed top-[58px] left-0 pointer-events-none"
+          >
           <motion.div
+            ref={(el) => {
+              dockPanelDomRefs.current.assets.card = el;
+            }}
             variants={rightCardVariants}
             initial="hidden"
             animate="visible"
             exit="exit"
             data-dock-card="true"
+            data-dock-gliding={widthTransitionPanels.assets.isGliding ? 'true' : undefined}
             data-prevent-canvas-wheel="true"
             data-agent-target={visualDock.sidePanel !== null ? 'assets.panel.container' : 'assets.collapsed'}
             onMouseEnter={() => {
@@ -5223,20 +6053,9 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
             onMouseLeave={() => {
               if (visualDock.sidePanel === null) handleMiniCardMouseLeave('assets');
             }}
-            style={{
-              left: `${dockLayout.assets.left}px`,
-              width: `${dockLayout.assets.width}px`,
-              zIndex: dockLayout.assets.zIndex,
-              transitionProperty: 'left, width, height, box-shadow',
-              transitionDuration: `${WIDTH_TRANSITION_TIMINGS.shellResizeMs}ms`,
-              transitionTimingFunction: 'cubic-bezier(0.22, 1, 0.36, 1)',
-              ...(dockLayout.assets.expanded
-                ? { maxWidth: `${dockLayout.assets.maxWidth}px` }
-                : { height: `${dockLayout.assets.height ?? 112}px` }),
-            }}
-            className={`fixed top-[58px] flex select-none pointer-events-auto transform-gpu bg-[#f3f4f6] dark:bg-[#1C1C1E] border border-gray-300 dark:border-white/10 corner-squircle overflow-hidden ${
+            className={`w-full h-full flex select-none pointer-events-auto bg-[#f3f4f6] dark:bg-[#1C1C1E] border border-gray-300 dark:border-white/10 corner-squircle overflow-hidden ${
               visualDock.sidePanel !== null
-                ? 'bottom-4 rounded-[24px] shadow-2xl flex-col select-text cursor-default'
+                ? 'rounded-[24px] shadow-2xl flex-col select-text cursor-default'
                 : `rounded-[20px] group ${
                     hoveredMiniPanel === 'assets'
                       ? 'shadow-xl border-blue-500/60'
@@ -5249,6 +6068,9 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
             {visualDock.sidePanel === null ? (
               /* 折叠状态: 0.5倍微缩实心卡片内部 */
               <button
+                ref={(el) => {
+                  dockPanelDomRefs.current.assets.miniContent = el;
+                }}
                 type="button"
                 onClick={(e) => {
                   e.stopPropagation();
@@ -5270,7 +6092,7 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
                   transition:
                     widthTransitionPanels.assets.fadeDurationMs > 0
                       ? `opacity ${widthTransitionPanels.assets.fadeDurationMs}ms ease-out`
-                      : undefined,
+                      : 'none',
                 }}
                 className={`w-full h-full flex flex-col justify-center py-2.5 select-none overflow-hidden cursor-pointer ${
                   dockLayout.assets.miniAlign === 'right'
@@ -5296,17 +6118,23 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
             ) : !widthTransitionPanels.assets.mountExpandedContent ? null : (
               /* 展开状态: 完整独立大卡片内部 */
               <div
+                ref={(el) => {
+                  dockPanelDomRefs.current.assets.expandedContent = el;
+                }}
                 style={{
                   opacity: widthTransitionPanels.assets.opacity,
                   visibility: widthTransitionPanels.assets.hidden ? 'hidden' : 'visible',
+                  contentVisibility: widthTransitionPanels.assets.suspendSubtree ? 'hidden' : 'visible',
                   pointerEvents:
-                    widthTransitionPanels.assets.opacity < 1 || widthTransitionPanels.assets.hidden
+                    widthTransitionPanels.assets.opacity < 1 ||
+                    widthTransitionPanels.assets.hidden ||
+                    widthTransitionPanels.assets.suspendSubtree
                       ? 'none'
                       : undefined,
                   transition:
                     widthTransitionPanels.assets.fadeDurationMs > 0
                       ? `opacity ${widthTransitionPanels.assets.fadeDurationMs}ms ease-out`
-                      : undefined,
+                      : 'none',
                   ...(widthTransitionPanels.assets.frozenWidth != null
                     ? {
                         width: `${widthTransitionPanels.assets.frozenWidth}px`,
@@ -5465,292 +6293,7 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
                         </button>
                       </div>
                     ) : (
-                      <div className="flex flex-col gap-1.5">
-                        {(assetFilter === 'all' || assetFilter === 'characters') && batchedCharacters.map((char) => {
-                          const isSelected = selectedAssetIds.has(char.id);
-                          const isHighlightActive = activeAssetHighlight?.id === char.id && !activeAssetHighlight?.isVersion;
-                          const charTargetId = buildAssetAgentTargetId('character', char.id);
-                          const isAgentFocused = isTargetAgentFocused(charTargetId);
-                          const charBorderMode = resolveSelectionBorderMode({
-                            isUserSelected: isSelected || isHighlightActive,
-                            isAgentFocused,
-                          });
-                          const identText = getAssetIdentificationText('character', char);
-                          const versions: ScriptAssetVersion[] = Array.isArray(char.versions) ? char.versions : [];
-                          const hasMultipleVersions = versions.length > 1;
-                          const isCollapsed = collapsedMultiVersionIds.has(char.id);
-                          return (
-                            <div key={char.id} className="flex flex-col">
-                              <div
-                                data-asset-item="true"
-                                data-asset-version="false"
-                                data-asset-id={char.id}
-                                data-agent-target={charTargetId}
-                                data-selection-border-mode={charBorderMode}
-                                onClick={(e) => handleAssetRowClick(char.id, 'character', char, e)}
-                                onContextMenu={(e) => {
-                                  handleOpenAssetContextMenu(e, 'character', char);
-                                }}
-                                className={`w-full relative px-2.5 py-2.5 rounded-xl corner-squircle transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none active:scale-[0.985] active:brightness-95 ${getAssetRowBorderClasses(charBorderMode, false)}`}
-                              >
-                                {renderAssetRowSelectionBorderOverlay(charBorderMode, false)}
-                                <div className="flex items-center gap-2 min-w-0 w-full flex-1 pr-1">
-                                  <div className="w-4 h-4 flex items-center justify-center shrink-0">
-                                    
-                                      <div className="text-blue-500 flex items-center justify-center">
-                                        <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
-                                          <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/>
-                                        </svg>
-                                      </div>
-                                    
-                                  </div>
-                                  <span className="text-xs font-bold shrink-0 max-w-[180px] truncate" title={char.name}>{char.name}</span>
-                                  <span className="text-[11px] text-gray-400 dark:text-neutral-400 truncate min-w-0 flex-1" title={identText}>{identText}</span>
-                                  {renderAssetThumbBadge('character', char)}
-                                  {hasMultipleVersions && (
-                                    <button
-                                      type="button"
-                                      onClick={(e) => toggleMultiVersionCollapse(char.id, e)}
-                                      className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-blue-500/10 text-blue-600 dark:text-blue-300 hover:bg-blue-500/20 shrink-0 transition-colors"
-                                      title={isCollapsed ? '展开多版本二级列表' : '收起多版本二级列表'}
-                                    >
-                                      <span>{versions.length}版本</span>
-                                      <ChevronDown className={`w-3 h-3 transition-transform ${isCollapsed ? '-rotate-90' : ''}`} />
-                                    </button>
-                                  )}
-                                </div>
-                              </div>
-                              {hasMultipleVersions && !isCollapsed && (
-                                <div className="ml-4 pl-2.5 border-l border-gray-200/80 dark:border-neutral-700/80 flex flex-col gap-1 mt-1 mb-1.5">
-                                  {versions.map((ver) => {
-                                    const verHighlight = activeAssetHighlight?.id === ver.id && Boolean(activeAssetHighlight?.isVersion);
-                                    const verTargetId = buildAssetAgentTargetId('character', ver.id, char.id);
-                                    const verFocused = isTargetAgentFocused(verTargetId);
-                                    const verBorderMode = resolveSelectionBorderMode({
-                                      isUserSelected: verHighlight,
-                                      isAgentFocused: verFocused,
-                                    });
-                                    const verIdent = getVersionIdentificationText('character', ver);
-                                    return (
-                                      <div
-                                        key={ver.id}
-                                        data-asset-item="true"
-                                      data-asset-version="true"
-                                      data-asset-id={ver.id}
-                                      data-agent-target={verTargetId}
-                                      data-selection-border-mode={verBorderMode}
-                                      onClick={(e) => handleAssetRowClick(ver.id, 'character', ver, e, false, char.name)}
-                                      onContextMenu={(e) => {
-                                          handleOpenAssetContextMenu(e, 'character', ver, char);
-                                        }}
-                                        className={`w-full relative px-2 py-1.5 rounded-lg transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none ${getAssetRowBorderClasses(verBorderMode, true)}`}
-                                      >
-                                        {renderAssetRowSelectionBorderOverlay(verBorderMode, true)}
-                                        <div className="flex items-center gap-1.5 min-w-0 w-full flex-1 pr-1">
-                                          <span className="w-1.5 h-1.5 rounded-full bg-blue-400/80 shrink-0" />
-                                          <span className="text-[11px] font-bold shrink-0 truncate max-w-[120px]" title={ver.name}>{ver.name}</span>
-                                          <span className="text-[11px] text-gray-400 dark:text-neutral-400 truncate min-w-0 flex-1" title={verIdent}>{verIdent}</span>
-                                          {renderAssetThumbBadge('character', ver, char)}
-                                        </div>
-                                      </div>
-                                    );
-                                  })}
-                                </div>
-                              )}
-                            </div>
-                          );
-                        })}
-
-                        {(assetFilter === 'all' || assetFilter === 'locations') && batchedLocations.map((loc) => {
-                          const isSelected = selectedAssetIds.has(loc.id);
-                          const isHighlightActive = activeAssetHighlight?.id === loc.id && !activeAssetHighlight?.isVersion;
-                          const locTargetId = buildAssetAgentTargetId('location', loc.id);
-                          const isAgentFocused = isTargetAgentFocused(locTargetId);
-                          const locBorderMode = resolveSelectionBorderMode({
-                            isUserSelected: isSelected || isHighlightActive,
-                            isAgentFocused,
-                          });
-                          const identText = getAssetIdentificationText('location', loc);
-                          const versions: ScriptAssetVersion[] = Array.isArray(loc.versions) ? loc.versions : [];
-                          const hasMultipleVersions = versions.length > 1;
-                          const isCollapsed = collapsedMultiVersionIds.has(loc.id);
-                          return (
-                            <div key={loc.id} className="flex flex-col">
-                              <div
-                                data-asset-item="true"
-                                data-asset-version="false"
-                                data-asset-id={loc.id}
-                                data-agent-target={locTargetId}
-                                data-selection-border-mode={locBorderMode}
-                                onClick={(e) => handleAssetRowClick(loc.id, 'location', loc, e)}
-                                onContextMenu={(e) => {
-                                  handleOpenAssetContextMenu(e, 'location', loc);
-                                }}
-                                className={`w-full relative px-2.5 py-2.5 rounded-xl corner-squircle transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none active:scale-[0.985] active:brightness-95 ${getAssetRowBorderClasses(locBorderMode, false)}`}
-                              >
-                                {renderAssetRowSelectionBorderOverlay(locBorderMode, false)}
-                                <div className="flex items-center gap-2 min-w-0 w-full flex-1 pr-1">
-                                  <div className="w-4 h-4 flex items-center justify-center shrink-0">
-                                    
-                                      <div className="text-emerald-500 flex items-center justify-center">
-                                        <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
-                                          <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/>
-                                        </svg>
-                                      </div>
-                                    
-                                  </div>
-                                  <span className="text-xs font-bold shrink-0 max-w-[180px] truncate" title={loc.name}>{loc.name}</span>
-                                  <span className="text-[11px] text-gray-400 dark:text-neutral-400 truncate min-w-0 flex-1" title={identText}>{identText}</span>
-                                  {renderAssetThumbBadge('location', loc)}
-                                  {hasMultipleVersions && (
-                                    <button
-                                      type="button"
-                                      onClick={(e) => toggleMultiVersionCollapse(loc.id, e)}
-                                      className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-emerald-500/10 text-emerald-600 dark:text-emerald-300 hover:bg-emerald-500/20 shrink-0 transition-colors"
-                                      title={isCollapsed ? '展开日景/夜景版本列表' : '收起日景/夜景版本列表'}
-                                    >
-                                      <span>{versions.length}版本</span>
-                                      <ChevronDown className={`w-3 h-3 transition-transform ${isCollapsed ? '-rotate-90' : ''}`} />
-                                    </button>
-                                  )}
-                                </div>
-                              </div>
-                              {hasMultipleVersions && !isCollapsed && (
-                                <div className="ml-4 pl-2.5 border-l border-gray-200/80 dark:border-neutral-700/80 flex flex-col gap-1 mt-1 mb-1.5">
-                                  {versions.map((ver) => {
-                                    const verHighlight = activeAssetHighlight?.id === ver.id && Boolean(activeAssetHighlight?.isVersion);
-                                    const verTargetId = buildAssetAgentTargetId('location', ver.id, loc.id);
-                                    const verFocused = isTargetAgentFocused(verTargetId);
-                                    const verBorderMode = resolveSelectionBorderMode({
-                                      isUserSelected: verHighlight,
-                                      isAgentFocused: verFocused,
-                                    });
-                                    const verIdent = getVersionIdentificationText('location', ver);
-                                    return (
-                                      <div
-                                        key={ver.id}
-                                        data-asset-item="true"
-                                      data-asset-version="true"
-                                      data-asset-id={ver.id}
-                                      data-agent-target={verTargetId}
-                                      data-selection-border-mode={verBorderMode}
-                                      onClick={(e) => handleAssetRowClick(ver.id, 'location', ver, e, false, loc.name)}
-                                      onContextMenu={(e) => {
-                                          handleOpenAssetContextMenu(e, 'location', ver, loc);
-                                        }}
-                                        className={`w-full relative px-2 py-1.5 rounded-lg transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none ${getAssetRowBorderClasses(verBorderMode, true)}`}
-                                      >
-                                        {renderAssetRowSelectionBorderOverlay(verBorderMode, true)}
-                                        <div className="flex items-center gap-1.5 min-w-0 w-full flex-1 pr-1">
-                                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400/80 shrink-0" />
-                                          <span className="text-[11px] font-bold shrink-0 truncate max-w-[120px]" title={ver.name}>{ver.name}</span>
-                                          <span className="text-[11px] text-gray-400 dark:text-neutral-400 truncate min-w-0 flex-1" title={verIdent}>{verIdent}</span>
-                                          {renderAssetThumbBadge('location', ver, loc)}
-                                        </div>
-                                      </div>
-                                    );
-                                  })}
-                                </div>
-                              )}
-                            </div>
-                          );
-                        })}
-
-                        {(assetFilter === 'all' || assetFilter === 'props') && batchedProps.map((prop) => {
-                          const isSelected = selectedAssetIds.has(prop.id);
-                          const isHighlightActive = activeAssetHighlight?.id === prop.id && !activeAssetHighlight?.isVersion;
-                          const propTargetId = buildAssetAgentTargetId('prop', prop.id);
-                          const isAgentFocused = isTargetAgentFocused(propTargetId);
-                          const propBorderMode = resolveSelectionBorderMode({
-                            isUserSelected: isSelected || isHighlightActive,
-                            isAgentFocused,
-                          });
-                          const identText = getAssetIdentificationText('prop', prop);
-                          const versions: ScriptAssetVersion[] = Array.isArray(prop.versions) ? prop.versions : [];
-                          const hasMultipleVersions = versions.length > 1;
-                          const isCollapsed = collapsedMultiVersionIds.has(prop.id);
-                          return (
-                            <div key={prop.id} className="flex flex-col">
-                              <div
-                                data-asset-item="true"
-                                data-asset-version="false"
-                                data-asset-id={prop.id}
-                                data-agent-target={propTargetId}
-                                data-selection-border-mode={propBorderMode}
-                                onClick={(e) => handleAssetRowClick(prop.id, 'prop', prop, e)}
-                                onContextMenu={(e) => {
-                                  handleOpenAssetContextMenu(e, 'prop', prop);
-                                }}
-                                className={`w-full relative px-2.5 py-2.5 rounded-xl corner-squircle transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none active:scale-[0.985] active:brightness-95 ${getAssetRowBorderClasses(propBorderMode, false)}`}
-                              >
-                                {renderAssetRowSelectionBorderOverlay(propBorderMode, false)}
-                                <div className="flex items-center gap-2 min-w-0 w-full flex-1 pr-1">
-                                  <div className="w-4 h-4 flex items-center justify-center shrink-0">
-                                    
-                                      <div className="text-amber-500 flex items-center justify-center">
-                                        <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
-                                          <path d="M21 16.5c0 .38-.21.71-.53.88l-7.9 4.44c-.16.09-.34.14-.57.14s-.41-.05-.57-.14l-7.9-4.44A1.003 1.003 0 013 16.5v-9c0-.38.21-.71.53-.88l7.9-4.44c.16-.09.34-.14.57-.14s.41.05.57.14l7.9 4.44c.32.17.53.5.53.88v9zM12 4.15L6.04 7.5 12 10.85 17.96 7.5 12 4.15zM5 15.91l6 3.38v-6.72L5 9.19v6.72zm14 0v-6.72l-6 3.38v6.72l6-3.38z"/>
-                                        </svg>
-                                      </div>
-                                    
-                                  </div>
-                                  <span className="text-xs font-bold shrink-0 max-w-[180px] truncate" title={prop.name}>{prop.name}</span>
-                                  <span className="text-[11px] text-gray-400 dark:text-neutral-400 truncate min-w-0 flex-1" title={identText}>{identText}</span>
-                                  {renderAssetThumbBadge('prop', prop)}
-                                  {hasMultipleVersions && (
-                                    <button
-                                      type="button"
-                                      onClick={(e) => toggleMultiVersionCollapse(prop.id, e)}
-                                      className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-amber-500/10 text-amber-600 dark:text-amber-300 hover:bg-amber-500/20 shrink-0 transition-colors"
-                                      title={isCollapsed ? '展开多版本二级列表' : '收起多版本二级列表'}
-                                    >
-                                      <span>{versions.length}版本</span>
-                                      <ChevronDown className={`w-3 h-3 transition-transform ${isCollapsed ? '-rotate-90' : ''}`} />
-                                    </button>
-                                  )}
-                                </div>
-                              </div>
-                              {hasMultipleVersions && !isCollapsed && (
-                                <div className="ml-4 pl-2.5 border-l border-gray-200/80 dark:border-neutral-700/80 flex flex-col gap-1 mt-1 mb-1.5">
-                                  {versions.map((ver) => {
-                                    const verHighlight = activeAssetHighlight?.id === ver.id && Boolean(activeAssetHighlight?.isVersion);
-                                    const verTargetId = buildAssetAgentTargetId('prop', ver.id, prop.id);
-                                    const verFocused = isTargetAgentFocused(verTargetId);
-                                    const verBorderMode = resolveSelectionBorderMode({
-                                      isUserSelected: verHighlight,
-                                      isAgentFocused: verFocused,
-                                    });
-                                    const verIdent = getVersionIdentificationText('prop', ver);
-                                    return (
-                                      <div
-                                        key={ver.id}
-                                        data-asset-item="true"
-                                      data-asset-version="true"
-                                      data-asset-id={ver.id}
-                                      data-agent-target={verTargetId}
-                                      data-selection-border-mode={verBorderMode}
-                                      onClick={(e) => handleAssetRowClick(ver.id, 'prop', ver, e, false, prop.name)}
-                                      onContextMenu={(e) => {
-                                          handleOpenAssetContextMenu(e, 'prop', ver, prop);
-                                        }}
-                                        className={`w-full relative px-2 py-1.5 rounded-lg transition-all duration-150 cursor-pointer group flex items-center justify-between gap-2 select-none ${getAssetRowBorderClasses(verBorderMode, true)}`}
-                                      >
-                                        {renderAssetRowSelectionBorderOverlay(verBorderMode, true)}
-                                        <div className="flex items-center gap-1.5 min-w-0 w-full flex-1 pr-1">
-                                          <span className="w-1.5 h-1.5 rounded-full bg-amber-400/80 shrink-0" />
-                                          <span className="text-[11px] font-bold shrink-0 truncate max-w-[120px]" title={ver.name}>{ver.name}</span>
-                                          <span className="text-[11px] text-gray-400 dark:text-neutral-400 truncate min-w-0 flex-1" title={verIdent}>{verIdent}</span>
-                                          {renderAssetThumbBadge('prop', ver, prop)}
-                                        </div>
-                                      </div>
-                                    );
-                                  })}
-                                </div>
-                              )}
-                            </div>
-                          );
-                        })}
-                      </div>
+                      memoizedAssetsListContent
                     )}
                   </div>
                 )}
@@ -5804,6 +6347,7 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
                 </div>
               )}
             </motion.div>
+          </div>
           )}
 
           {/* 卡片三: 右侧图片面板 Card */}
@@ -5820,20 +6364,16 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
               activeAssetIsVersion={Boolean(activeAssetHighlight?.isVersion)}
               activeCategory={activeAssetHighlight?.category ?? null}
               isHovered={hoveredMiniPanel === 'images'}
-              onMiniMouseEnter={() => handleMiniCardMouseEnter('images')}
-              onMiniMouseMove={(e) => handleMiniCardMouseMove(e, 'images')}
-              onMiniMouseLeave={() => handleMiniCardMouseLeave('images')}
-              onExpand={() => {
-                setHoveredMiniPanel((prev) => (prev === 'images' ? null : prev));
-                applyDockTransition({ imagesExpanded: true });
-              }}
-              onCollapse={() => {
-                setHoveredMiniPanel((prev) => (prev === 'images' ? null : prev));
-                applyDockTransition({ imagesExpanded: false });
-              }}
+              onMiniMouseEnter={handleImagesMiniMouseEnter}
+              onMiniMouseMove={handleImagesMiniMouseMove}
+              onMiniMouseLeave={handleImagesMiniMouseLeave}
+              onExpand={handleExpandImagesPanel}
+              onCollapse={handleCollapseImagesPanel}
               isWideMode={visualDock.imagesWide}
               onToggleWideMode={handleToggleImagesWide}
               widthTransition={widthTransitionPanels.images}
+              dockDomRefs={dockPanelDomRefs.current.images}
+              dockChoreographyActiveRef={widthChoreographyActiveRef}
               onSelectSection={handleSelectFeedSection}
               onStartCanvasBind={onStartCanvasAssetBind ? handleStartCanvasBindFromSection : undefined}
               onOpenBindModal={handleOpenBindModalFromSection}
@@ -5843,11 +6383,9 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
               onFocusCanvasCard={onFocusCanvasCard ? handleFocusCanvasCardFromFeed : undefined}
               agentFocusedTargetId={agentFocusedTargetId}
               agentFocusedTargetIds={agentFocusedTargetIds}
-              onDropLocalFile={(section, file) => {
-                void handleDropLocalFileOnFeedSection(section, file);
-              }}
+              onDropLocalFile={handleDropLocalFileOnFeed}
               focusFeedAssetKey={focusFeedAssetKey}
-              verifyingOrGeneratingAssetIds={[...verifyingAssetIds, ...generatingAssetIds]}
+              verifyingOrGeneratingAssetIds={verifyingOrGeneratingAssetIds}
             />
           )}
           </>
@@ -6306,7 +6844,7 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
           itemName={assetContextMenu.item?.name}
           parentName={assetContextMenu.parentItem?.name}
           isVersion={Boolean(assetContextMenu.parentItem)}
-          cascadeBelowAgentHud={!isAgentSleeping}
+          cascadeBelowAgentHud={false}
           onAction={(action: AssetContextMenuActionId) => {
             const { category, item, parentItem } = assetContextMenu;
             if (action === 'add-version' && !parentItem) {
@@ -6354,6 +6892,26 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
           />
         </div>
       )}
+      <ScriptSelectionToolbar
+        selection={activeEditorSelection}
+        getAnchorRect={getEditorSelectionRect}
+        hidden={
+          !isOpen ||
+          !isScriptExpanded ||
+          Boolean(previewVersionId) ||
+          Boolean(lockedAgentSelection) ||
+          Boolean(annotationModalState?.isOpen)
+        }
+        onAddAnnotation={handleOpenAddAnnotation}
+      />
+      <ScriptAnnotationModal
+        isOpen={Boolean(annotationModalState?.isOpen)}
+        selectedText={annotationModalState?.selectedText || ''}
+        existingAnnotation={annotationModalState?.existingAnnotation || null}
+        onClose={() => setAnnotationModalState(null)}
+        onSave={handleSaveAnnotation}
+        onDelete={handleDeleteAnnotation}
+      />
       <FullscreenImageLightbox
         image={detailModalLightboxImage}
         onClose={() => setDetailModalLightboxImage(null)}

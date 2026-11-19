@@ -180,6 +180,281 @@ export function resolveCodeMirrorTargetTopFromBlock(params: {
   return Math.max(0, Math.round(blockTop + adjustedOffset));
 }
 
+export interface ImagesScrollAnchor {
+  top: number;
+  anchorKey?: string;
+  offsetRatio?: number;
+  offsetPx?: number;
+  offsetAfterItemBottomPx?: number;
+  savedItemHeight?: number;
+  scrollRatio?: number;
+}
+
+export interface ImagesFeedAnchorItemLayout {
+  key: string;
+  top: number;
+  height: number;
+}
+
+export function normalizeImagesScrollAnchor(entry: unknown): ImagesScrollAnchor {
+  if (typeof entry === 'object' && entry !== null) {
+    const obj = entry as {
+      top?: unknown;
+      anchorKey?: unknown;
+      offsetRatio?: unknown;
+      offsetPx?: unknown;
+      offsetAfterItemBottomPx?: unknown;
+      savedItemHeight?: unknown;
+      scrollRatio?: unknown;
+    };
+    const top = normalizeScrollOffset(obj.top);
+    const anchorKey =
+      typeof obj.anchorKey === 'string' && obj.anchorKey.trim().length > 0
+        ? obj.anchorKey
+        : undefined;
+    const offsetRatio =
+      typeof obj.offsetRatio === 'number' && Number.isFinite(obj.offsetRatio)
+        ? Math.min(1, Math.max(0, obj.offsetRatio))
+        : undefined;
+    const offsetPx =
+      typeof obj.offsetPx === 'number' && Number.isFinite(obj.offsetPx)
+        ? Math.round(obj.offsetPx)
+        : undefined;
+    const offsetAfterItemBottomPx =
+      typeof obj.offsetAfterItemBottomPx === 'number' &&
+      Number.isFinite(obj.offsetAfterItemBottomPx) &&
+      obj.offsetAfterItemBottomPx >= 0
+        ? Math.round(obj.offsetAfterItemBottomPx)
+        : undefined;
+    const savedItemHeight =
+      typeof obj.savedItemHeight === 'number' &&
+      Number.isFinite(obj.savedItemHeight) &&
+      obj.savedItemHeight > 0
+        ? Math.round(obj.savedItemHeight)
+        : undefined;
+    const scrollRatio =
+      typeof obj.scrollRatio === 'number' && Number.isFinite(obj.scrollRatio)
+        ? Math.min(1, Math.max(0, obj.scrollRatio))
+        : undefined;
+    return {
+      top,
+      ...(anchorKey !== undefined ? { anchorKey } : {}),
+      ...(offsetRatio !== undefined ? { offsetRatio } : {}),
+      ...(offsetPx !== undefined ? { offsetPx } : {}),
+      ...(offsetAfterItemBottomPx !== undefined ? { offsetAfterItemBottomPx } : {}),
+      ...(savedItemHeight !== undefined ? { savedItemHeight } : {}),
+      ...(scrollRatio !== undefined ? { scrollRatio } : {}),
+    };
+  }
+  return { top: normalizeScrollOffset(entry) };
+}
+
+function parseRawImagesScrollAnchor(raw: string | null): ImagesScrollAnchor | null {
+  if (raw === null) return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return { top: 0 };
+  if (trimmed.startsWith('{')) {
+    try {
+      return normalizeImagesScrollAnchor(JSON.parse(trimmed));
+    } catch {
+      return { top: 0 };
+    }
+  }
+  return { top: normalizeScrollOffset(trimmed) };
+}
+
+export function readImagesScrollAnchorFromStorage(
+  storage: StorageReadLike | null | undefined,
+  projectId: string,
+  viewMode: ImagesViewModeKey
+): ImagesScrollAnchor {
+  if (!storage) return { top: 0 };
+  const pid = projectId || 'default';
+  try {
+    const primary = parseRawImagesScrollAnchor(
+      storage.getItem(buildImagesScrollStorageKey(pid, viewMode))
+    );
+    if (primary !== null) {
+      return primary;
+    }
+    const legacy = parseRawImagesScrollAnchor(
+      storage.getItem(buildLegacyImagesScrollStorageKey(pid, viewMode))
+    );
+    return legacy ?? { top: 0 };
+  } catch {
+    return { top: 0 };
+  }
+}
+
+export function writeImagesScrollAnchorToStorage(
+  storage: StorageWriteLike | null | undefined,
+  projectId: string,
+  viewMode: ImagesViewModeKey,
+  anchor: ImagesScrollAnchor
+): void {
+  if (!storage) return;
+  const pid = projectId || 'default';
+  const normalized = normalizeImagesScrollAnchor(anchor);
+  try {
+    const storageKey = buildImagesScrollStorageKey(pid, viewMode);
+    if (normalized.top <= 0 && !normalized.anchorKey) {
+      storage.setItem(storageKey, '0');
+      return;
+    }
+    if (normalized.anchorKey !== undefined || normalized.scrollRatio !== undefined) {
+      storage.setItem(storageKey, JSON.stringify(normalized));
+      return;
+    }
+    storage.setItem(storageKey, String(normalized.top));
+  } catch {
+    // Ignore storage quota/security errors safely
+  }
+}
+
+/**
+ * Pure vertical anchor capture for the asset image feed.
+ * Anchors the viewport top edge to the intersecting item's proportional offset (`offsetRatio`),
+ * or to a fixed pixel gap above the next item (`offsetPx < 0`) so toggling default/wide widths
+ * preserves the exact visual viewing position across height reflows.
+ */
+export function computeImagesScrollAnchorFromLayout(params: {
+  scrollTop: number;
+  maxScrollTop: number;
+  items: ImagesFeedAnchorItemLayout[];
+}): ImagesScrollAnchor {
+  const safeTop = normalizeScrollOffset(params.scrollTop);
+  const safeMaxScroll = normalizeScrollOffset(params.maxScrollTop);
+  if (safeTop <= 0) {
+    return { top: 0 };
+  }
+
+  const scrollRatio =
+    safeMaxScroll > 0 ? Math.min(1, Math.max(0, safeTop / safeMaxScroll)) : undefined;
+
+  const validItems = params.items
+    .filter(
+      (item) =>
+        typeof item.key === 'string' &&
+        item.key.length > 0 &&
+        Number.isFinite(item.top) &&
+        Number.isFinite(item.height) &&
+        item.height > 0
+    )
+    .slice()
+    .sort((a, b) => a.top - b.top);
+
+  if (validItems.length === 0) {
+    return {
+      top: safeTop,
+      ...(scrollRatio !== undefined ? { scrollRatio } : {}),
+    };
+  }
+
+  // 1. Viewport top intersects an item directly
+  for (let i = 0; i < validItems.length; i += 1) {
+    const item = validItems[i];
+    if (safeTop >= item.top && safeTop < item.top + item.height) {
+      const rawOffset = safeTop - item.top;
+      const offsetRatio = Math.min(0.999999, Math.max(0, rawOffset / item.height));
+      return {
+        top: safeTop,
+        anchorKey: item.key,
+        offsetRatio,
+        offsetPx: Math.round(rawOffset),
+        savedItemHeight: Math.round(item.height),
+        ...(scrollRatio !== undefined ? { scrollRatio } : {}),
+      };
+    }
+  }
+
+  // 2. Viewport top sits in a fixed-height gap or section header directly above the next item
+  const nextItem = validItems.find((item) => item.top > safeTop);
+  if (nextItem) {
+    return {
+      top: safeTop,
+      anchorKey: nextItem.key,
+      offsetPx: Math.round(safeTop - nextItem.top),
+      savedItemHeight: Math.round(nextItem.height),
+      ...(scrollRatio !== undefined ? { scrollRatio } : {}),
+    };
+  }
+
+  // 3. Viewport top sits in bottom padding below the final item
+  const lastItem = validItems[validItems.length - 1];
+  return {
+    top: safeTop,
+    anchorKey: lastItem.key,
+    offsetAfterItemBottomPx: Math.max(0, Math.round(safeTop - (lastItem.top + lastItem.height))),
+    savedItemHeight: Math.round(lastItem.height),
+    ...(scrollRatio !== undefined ? { scrollRatio } : {}),
+  };
+}
+
+/**
+ * Pure vertical target resolution for the asset image feed.
+ * Resolves the saved ImagesScrollAnchor against the current layout geometry (after width change,
+ * expand, or reload) and returns the target scrollTop clamped to `[0, maxScrollTop]`.
+ */
+export function resolveImagesTargetTopFromAnchor(params: {
+  anchor: ImagesScrollAnchor;
+  maxScrollTop: number;
+  items: ImagesFeedAnchorItemLayout[];
+}): number {
+  const anchor = normalizeImagesScrollAnchor(params.anchor);
+  const safeFallback = normalizeScrollOffset(anchor.top);
+  const safeMaxScroll = Math.max(
+    0,
+    Number.isFinite(params.maxScrollTop) ? Math.round(params.maxScrollTop) : 0
+  );
+
+  if (safeFallback <= 0 && !anchor.anchorKey) {
+    return 0;
+  }
+
+  const clampTarget = (value: number): number => {
+    const rounded = Math.max(0, Math.round(value));
+    return safeMaxScroll > 0 ? Math.min(safeMaxScroll, rounded) : 0;
+  };
+
+  const matchedItem = anchor.anchorKey
+    ? params.items.find(
+        (item) =>
+          item.key === anchor.anchorKey &&
+          Number.isFinite(item.top) &&
+          Number.isFinite(item.height) &&
+          item.height > 0
+      )
+    : undefined;
+
+  if (matchedItem) {
+    let rawTarget: number;
+    if (typeof anchor.offsetAfterItemBottomPx === 'number') {
+      rawTarget = matchedItem.top + matchedItem.height + anchor.offsetAfterItemBottomPx;
+    } else if (typeof anchor.offsetPx === 'number' && anchor.offsetPx < 0) {
+      rawTarget = matchedItem.top + anchor.offsetPx;
+    } else if (
+      typeof anchor.savedItemHeight === 'number' &&
+      Math.abs(matchedItem.height - anchor.savedItemHeight) <= 2 &&
+      typeof anchor.offsetPx === 'number'
+    ) {
+      rawTarget = matchedItem.top + anchor.offsetPx;
+    } else if (typeof anchor.offsetRatio === 'number') {
+      rawTarget = matchedItem.top + anchor.offsetRatio * matchedItem.height;
+    } else if (typeof anchor.offsetPx === 'number') {
+      rawTarget = matchedItem.top + anchor.offsetPx;
+    } else {
+      rawTarget = matchedItem.top;
+    }
+    return clampTarget(rawTarget);
+  }
+
+  if (typeof anchor.scrollRatio === 'number' && safeMaxScroll > 0) {
+    return clampTarget(anchor.scrollRatio * safeMaxScroll);
+  }
+
+  return safeMaxScroll > 0 ? Math.min(safeMaxScroll, safeFallback) : safeFallback;
+}
+
 export function resolveInitialPositionReady(params: {
   isActiveAndVisible: boolean;
   isFilteredView: boolean;
@@ -213,11 +488,7 @@ export function readScrollOffsetFromStorage(
     if (spec.kind === 'sidePanel') {
       return normalizeScrollOffset(storage.getItem(buildSidePanelScrollStorageKey(pid, spec.subKey)));
     }
-    const primary = storage.getItem(buildImagesScrollStorageKey(pid, spec.viewMode));
-    if (primary !== null) {
-      return normalizeScrollOffset(primary);
-    }
-    return normalizeScrollOffset(storage.getItem(buildLegacyImagesScrollStorageKey(pid, spec.viewMode)));
+    return readImagesScrollAnchorFromStorage(storage, pid, spec.viewMode).top;
   } catch {
     return 0;
   }

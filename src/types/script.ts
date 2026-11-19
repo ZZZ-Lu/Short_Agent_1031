@@ -1,6 +1,13 @@
 export type ProvenanceStatus = 'unverified' | 'verifying' | 'verified' | 'stale';
 
-export type ScriptAnnotationCategory = 'character' | 'location' | 'prop' | 'provenance' | 'search';
+export type ScriptAnnotationCategory =
+  | 'character'
+  | 'location'
+  | 'prop'
+  | 'provenance'
+  | 'search'
+  | 'annotation'
+  | 'agent-selection';
 
 export interface ScriptAnnotation {
   id: string;
@@ -147,11 +154,24 @@ export interface SceneChunk {
   paragraphs?: ScriptParagraph[];
 }
 
+export interface ScriptTocPatternTypeRule {
+  regex: string;
+  type: 'episode' | 'scene' | 'chapter' | 'heading' | string;
+}
+
+export type ScriptTocConfidence = 'ai' | 'heuristic' | 'fallback';
+
 export interface ScriptTocConfig {
   tocPattern?: string;
   scenePattern?: string;
   flags?: string;
   patterns?: string[];
+  types?: ScriptTocPatternTypeRule[];
+  patternDescription?: string;
+  confidence?: ScriptTocConfidence;
+  fallbackReason?: string;
+  modelUsed?: string;
+  sampleSignature?: string;
 }
 
 export type ExtractionModelType = 
@@ -241,6 +261,7 @@ export interface ScriptProject {
   // NEW: Scene-based backend storage
   sceneItems?: SceneItem[]; // Strict scene separation
   activeMilestoneId?: string;
+  annotations?: ScriptAnnotation[];
 }
 
 export type SceneChangeType = 

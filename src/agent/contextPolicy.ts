@@ -21,8 +21,8 @@ export const TOOL_CATEGORIES: Record<string, ToolCategoryDefinition> = {
   script: {
     id: 'script',
     label: '剧本工具箱',
-    description: '读取分集目录、分页读取剧本正文、搜索关键词',
-    tools: ['script.directory', 'script.read', 'script.search'],
+    description: '读取分集目录、编辑目录条目（重命名/增删/拆分/合并/调整顺序）、分页读取剧本正文、搜索关键词',
+    tools: ['script.directory', 'script.editDirectory', 'script.read', 'script.search'],
     promptId: 'script',
   },
   asset: {
@@ -71,7 +71,7 @@ const CATEGORY_ALIASES: Record<string, string> = {
 };
 
 export const PROMPT_MODULES: Record<string, { label: string; content: string }> = {
-  script: { label: '剧本读取与分析', content: '按集数 -> 场次 -> 段落三层结构读取、检索与分析剧本数据。' },
+  script: { label: '剧本读取、分析与目录编辑', content: '按集数 -> 场次 -> 段落三层结构读取、检索与分析剧本数据，并支持编辑分集/场次目录条目。' },
   assets: { label: '项目资产', content: '查询、创建、更新角色/场景/道具资产，维护多版本造型与画面出处锚点。' },
   image: { label: '图像生成与卡片', content: '查看卡片属性、空间标注元素，执行生图或复刻衍生。' },
   ui: { label: '页面观察与操作', content: '观察当前可见界面结构、查询操作指南或执行鼠标交互。' },
@@ -513,6 +513,15 @@ export function summarizeToolOutputForStateNode(
         })
       : [];
     return `返回 ${epCount} 集共 ${totalScenes} 场/${totalParas} 段${epParts.length > 0 ? ` (${epParts.join('；')})` : ''}`;
+  }
+
+  if (toolName === 'script.editDirectory') {
+    const applied = typeof out.appliedCount === 'number' ? out.appliedCount : (Array.isArray(out.changes) ? out.changes.length : 0);
+    const details = Array.isArray(out.changes)
+      ? out.changes.slice(0, 5).map((c: any) => c?.detail || `${c?.action || 'edit'}:${c?.newTitle || c?.previousTitle || '?'}`).join('；')
+      : '';
+    const stats = `当前共 ${out.totalEpisodes ?? '?'} 集 / ${out.totalScenes ?? '?'} 场`;
+    return `已落盘编辑目录 ${applied} 项${details ? ` [${details}]` : ''}（${stats}）`;
   }
 
   if (toolName === 'script.search') {

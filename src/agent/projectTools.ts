@@ -6,6 +6,7 @@ import {
   RECOMMENDED_BATCH_MAX_CHARS,
   buildBatchCharLimitAdvice,
 } from './scriptTools';
+import { applyScriptDirectoryEdit } from './scriptDirectoryEditor';
 import {
   searchProvenanceCandidates,
   computeScriptSignature,
@@ -165,7 +166,9 @@ export function executeProjectReadTool(name: string, args: Record<string, unknow
       episode: rawEpisode as any,
       query: typeof args.query === 'string' ? args.query : undefined,
       scenePattern: project.tocConfig?.scenePattern,
+      tocPattern: project.tocConfig?.tocPattern,
       flags: project.tocConfig?.flags,
+      preferCustomOnly: project.tocConfig?.confidence === 'ai',
       precomputedScenes: Array.isArray(project.scenes) ? project.scenes : undefined,
     });
     const offset = pageNumber(args.offset, 0, Number.MAX_SAFE_INTEGER);
@@ -1693,3 +1696,44 @@ export function executeProjectAssetMutation(
 
   throw new Error(`未知资产操作工具：${name}`);
 }
+
+export function executeProjectScriptMutation(
+  name: string,
+  args: Record<string, unknown>,
+  project?: ProjectData
+): ProjectAssetMutationResult {
+  if (!project) {
+    throw new Error('当前没有打开的项目。');
+  }
+
+  if (name === 'script.editDirectory') {
+    const editRes = applyScriptDirectoryEdit(project.scriptText || '', args, {
+      scenePattern: project.tocConfig?.scenePattern,
+      flags: project.tocConfig?.flags,
+      precomputedScenes: Array.isArray(project.scenes) ? project.scenes : undefined,
+    });
+
+    return {
+      updatedProject: {
+        scriptText: editRes.scriptText,
+        scenes: editRes.scenes,
+      },
+      output: {
+        success: true,
+        projectId: project.id,
+        source: 'project',
+        appliedCount: editRes.appliedCount,
+        changes: editRes.changes,
+        totalEpisodes: editRes.totalEpisodes,
+        totalScenes: editRes.totalScenes,
+        totalParagraphs: editRes.totalParagraphs,
+        totalChars: editRes.totalChars,
+        affectedEpisodes: editRes.affectedEpisodes,
+        message: editRes.message,
+      },
+    };
+  }
+
+  throw new Error(`未知剧本写入工具：${name}`);
+}
+

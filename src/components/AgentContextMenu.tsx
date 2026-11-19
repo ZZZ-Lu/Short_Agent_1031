@@ -1,5 +1,5 @@
 import React, { useEffect } from 'react';
-import { Sparkles, Image as ImageIcon, Trash2, Wand2, Video } from 'lucide-react';
+import { Sparkles, Image as ImageIcon, Trash2, Wand2, Video, FileText, Maximize2, Copy, PlusSquare } from 'lucide-react';
 import { motion } from 'motion/react';
 import type { CardData } from './GenerationCard';
 
@@ -22,7 +22,7 @@ export function AgentContextMenu({
   x,
   y,
   targetId,
-  targetCard: _targetCard,
+  targetCard,
   onClose,
   onAction,
 }: AgentContextMenuProps) {
@@ -40,10 +40,12 @@ export function AgentContextMenu({
   // Viewport clamping
   const menuWidth = 260;
   const clampedX = typeof window !== 'undefined' ? Math.max(12, Math.min(x, window.innerWidth - menuWidth - 20)) : x;
-  const clampedY = typeof window !== 'undefined' ? Math.max(12, Math.min(y, window.innerHeight - 155)) : y;
+  const clampedY = typeof window !== 'undefined' ? Math.max(12, Math.min(y, window.innerHeight - 195)) : y;
+  const isTargetTextCard = Boolean(targetCard?.isText);
 
   return (
     <div
+      data-agent-context-menu="true"
       className="fixed z-[100] flex flex-col gap-2 pointer-events-auto select-none"
       style={{ top: clampedY, left: clampedX }}
       onPointerDown={e => e.stopPropagation()} // Prevent canvas drag
@@ -60,16 +62,26 @@ export function AgentContextMenu({
         {/* Quick Actions */}
         <div className="p-1.5 flex flex-col">
           {targetId ? (
-            <>
-              <ActionButton icon={<Wand2 size={14} />} label="生成变体" onClick={() => { onAction('variant', targetId); onClose(); }} />
-              <ActionButton icon={<Video size={14} />} label="以此图生视频" onClick={() => { onAction('video_from_card', targetId); onClose(); }} />
-              <ActionButton icon={<ImageIcon size={14} />} label="设为参考图" onClick={() => { onAction('reference', targetId); onClose(); }} />
-              <ActionButton icon={<Trash2 size={14} />} label="删除卡片" destructive onClick={() => { onAction('delete', targetId); onClose(); }} />
-            </>
+            isTargetTextCard ? (
+              <>
+                <ActionButton icon={<Maximize2 size={14} />} label="放大阅读" onClick={() => { onAction('preview_text_card', targetId); onClose(); }} />
+                <ActionButton icon={<PlusSquare size={14} />} label="创建文本副本" onClick={() => { onAction('fork_text_card', targetId); onClose(); }} />
+                <ActionButton icon={<Copy size={14} />} label="复制全文" onClick={() => { onAction('copy_text_card', targetId); onClose(); }} />
+                <ActionButton icon={<Trash2 size={14} />} label="删除卡片" destructive onClick={() => { onAction('delete', targetId); onClose(); }} />
+              </>
+            ) : (
+              <>
+                <ActionButton icon={<Wand2 size={14} />} label="生成变体" onClick={() => { onAction('variant', targetId); onClose(); }} />
+                <ActionButton icon={<Video size={14} />} label="以此图生视频" onClick={() => { onAction('video_from_card', targetId); onClose(); }} />
+                <ActionButton icon={<ImageIcon size={14} />} label="设为参考图" onClick={() => { onAction('reference', targetId); onClose(); }} />
+                <ActionButton icon={<Trash2 size={14} />} label="删除卡片" destructive onClick={() => { onAction('delete', targetId); onClose(); }} />
+              </>
+            )
           ) : (
             <>
               <ActionButton icon={<Sparkles size={14} />} label="新建生图卡片" onClick={() => { onAction('new_card', null); onClose(); }} />
               <ActionButton icon={<Video size={14} />} label="新建生视频卡片" onClick={() => { onAction('new_video_card', null); onClose(); }} />
+              <ActionButton icon={<FileText size={14} />} label="新建文本卡片" onClick={() => { onAction('new_text_card', null); onClose(); }} />
               <ActionButton icon={<Trash2 size={14} />} label="清理画布" destructive onClick={() => { onAction('clear', null); onClose(); }} />
             </>
           )}

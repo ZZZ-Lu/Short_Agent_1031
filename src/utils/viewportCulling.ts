@@ -22,6 +22,7 @@ export interface CardBounds {
   originalFileData?: unknown;
   trueOriginalFileData?: unknown;
   isVideo?: boolean;
+  isText?: boolean;
   state?: string;
   generationError?: string | null;
 }
@@ -41,6 +42,9 @@ export interface CanvasViewport {
  */
 export function getCardDimensions(card: CardBounds): { width: number; height: number } {
   const dim = getCardSize(card);
+  if (card.isText) {
+    return { width: dim.width, height: dim.height };
+  }
   const isGenerationCard = !card.fileName && !card.isAsset;
   const includePanelBounds = isGenerationCard && shouldShowGenerationPromptPanel({
     isAssetCard: false,

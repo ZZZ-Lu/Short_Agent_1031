@@ -3,6 +3,7 @@ import { getNanoLodThreshold } from '../utils/viewportCulling';
 import { getCanvasLoadingMode, isHybridCardNear, subscribeCanvasLoadingMode, CANVAS_HYBRID_POINTER_WAKE_EVENT } from '../utils/canvasPerformance';
 import React, { useCallback, useRef, useState, useSyncExternalStore } from 'react';
 import { GenerationCard } from './GenerationCard';
+import { TextCard } from './TextCard';
 
 // Renderer-local admission state, separate from serializable card/project data.
 export function createCardMountStore() {
@@ -26,8 +27,16 @@ export function createCardMountStore() {
     },
   };
 }
-export const ProgressiveGenerationCard = React.memo(function ProgressiveGenerationCard({ mountStore, ...props }:
-  React.ComponentProps<typeof GenerationCard> & { mountStore: ReturnType<typeof createCardMountStore> }) {
+export const ProgressiveGenerationCard = React.memo(function ProgressiveGenerationCard({
+  mountStore,
+  onForkTextCard,
+  onOpenTextPreview,
+  ...props
+}: React.ComponentProps<typeof GenerationCard> & {
+  mountStore: ReturnType<typeof createCardMountStore>;
+  onForkTextCard?: (sourceCardId: string) => void;
+  onOpenTextPreview?: (cardId: string) => void;
+}) {
   const id = props.data.id;
   const isSelected = Boolean(props.isSelected);
   // Only newly created cards bypass the deferred global LOD state. Existing cards
@@ -67,5 +76,28 @@ export const ProgressiveGenerationCard = React.memo(function ProgressiveGenerati
   }, [id, isSelected, mountStore]);
   const mounted = useSyncExternalStore(subscribe, snapshot, snapshot);
   if (useDomLod && mounted) admittedDom.current = true;
-  return (admittedDom.current || useDomLod) && mounted ? <GenerationCard {...props} /> : null;
+  if (!((admittedDom.current || useDomLod) && mounted)) return null;
+  if (props.data.isText) {
+    return (
+      <TextCard
+        data={props.data}
+        scale={props.scale}
+        tx={props.tx}
+        ty={props.ty}
+        isSelected={props.isSelected}
+        isSingleSelected={props.isSingleSelected}
+        isAgentTarget={props.isAgentTarget}
+        agentFocusRole={props.agentFocusRole}
+        allCards={props.allCards}
+        onSelect={props.onSelect}
+        onDragEnd={props.onDragEnd}
+        onDelete={props.onDelete}
+        onUpdate={props.onUpdate}
+        onForkTextCard={onForkTextCard}
+        onOpenPreview={onOpenTextPreview}
+        onHover={props.onHover}
+      />
+    );
+  }
+  return <GenerationCard {...props} />;
 });

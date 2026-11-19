@@ -16,7 +16,8 @@ import { normalizeScrollOffset } from '../utils/scriptBibleDockLayout';
 export function useShellWidthTransitionGuard(
   panelWidth: number,
   isExpanded: boolean,
-  durationMs: number = WIDTH_TRANSITION_TIMINGS.shellResizeMs + 160
+  durationMs: number = WIDTH_TRANSITION_TIMINGS.shellResizeMs + 160,
+  isExternallyManaged: boolean = false
 ): boolean {
   const prevRef = useRef<{ width: number; expanded: boolean }>({
     width: panelWidth,
@@ -26,16 +27,19 @@ export function useShellWidthTransitionGuard(
   const timerRef = useRef<number | null>(null);
 
   const widthChangedThisRender =
+    !isExternallyManaged &&
     isExpanded &&
     (prevRef.current.width !== panelWidth || !prevRef.current.expanded);
 
   useLayoutEffect(() => {
     const prev = prevRef.current;
     const expandedWidthTransition =
-      isExpanded && (prev.width !== panelWidth || !prev.expanded);
+      !isExternallyManaged &&
+      isExpanded &&
+      (prev.width !== panelWidth || !prev.expanded);
     prevRef.current = { width: panelWidth, expanded: isExpanded };
 
-    if (!isExpanded) {
+    if (!isExpanded || isExternallyManaged) {
       if (timerRef.current !== null) {
         window.clearTimeout(timerRef.current);
         timerRef.current = null;
@@ -54,7 +58,7 @@ export function useShellWidthTransitionGuard(
         setIsTransitioning(false);
       }, durationMs);
     }
-  }, [panelWidth, isExpanded, durationMs]);
+  }, [panelWidth, isExpanded, durationMs, isExternallyManaged]);
 
   useEffect(() => {
     return () => {
@@ -78,6 +82,7 @@ export interface UseUnifiedPanelScrollMemoryOptions {
   isTransitioning?: boolean;
   isFilteredView?: boolean;
   contentVersion?: string | number;
+  realignSignal?: string | number;
   maxWaitMs?: number;
   attachSignal?: unknown;
   onUserScroll?: (top: number) => void;
@@ -88,6 +93,8 @@ export interface UseUnifiedPanelScrollMemoryResult {
   cancelPendingRestore: () => void;
   handleScrollEvent: (scrollTop?: number) => void;
   reapplyPendingRestore: () => void;
+  flushScrollMemory: () => void;
+  captureCurrentScrollMemory: () => void;
 }
 
 interface DirtyWriteRecord {
@@ -125,6 +132,7 @@ export function useUnifiedPanelScrollMemory({
   isTransitioning = false,
   isFilteredView = false,
   contentVersion,
+  realignSignal,
   maxWaitMs = 2600,
   attachSignal,
   onUserScroll,
@@ -150,6 +158,8 @@ export function useUnifiedPanelScrollMemory({
   filteredRef.current = isFilteredView;
   const scopeKeyRef = useRef(scopeKey);
   scopeKeyRef.current = scopeKey;
+  const realignSignalRef = useRef(realignSignal);
+  realignSignalRef.current = realignSignal;
   const maxWaitMsRef = useRef(maxWaitMs);
   maxWaitMsRef.current = maxWaitMs;
 
@@ -189,6 +199,25 @@ export function useUnifiedPanelScrollMemory({
       dirty.write(dirty.top, dirty.metadata);
     }
   }, []);
+
+  const captureCurrentScrollMemory = useCallback(() => {
+    flushDirtyWrite();
+    if (
+      !activeRef.current ||
+      filteredRef.current ||
+      transitioningRef.current ||
+      pendingRestoreRef.current
+    ) {
+      return;
+    }
+    const el = getElRef.current();
+    if (!el || el.clientHeight <= 0) {
+      return;
+    }
+    const top = normalizeScrollOffset(el.scrollTop);
+    const metadata = captureMetadataRef.current?.(top, el);
+    writeRef.current(top, metadata);
+  }, [flushDirtyWrite]);
 
   const stopRestoreLoop = useCallback(() => {
     if (loopRafRef.current !== null) {
@@ -472,11 +501,49 @@ export function useUnifiedPanelScrollMemory({
     el.addEventListener('keydown', handleKeyDown, { passive: true });
 
     // Observe both the scroll container and its inner content wrapper for async size growth
+    // and late width reflows (e.g. CSS width transition finishing or window resize).
+    let lastObservedClientWidth = el.clientWidth;
     let resizeObserver: ResizeObserver | null = null;
     if (typeof ResizeObserver !== 'undefined') {
       resizeObserver = new ResizeObserver(() => {
         if (pendingRestoreRef.current?.scopeKey === scopeKey) {
           stepRestore();
+          lastObservedClientWidth = el.clientWidth;
+          return;
+        }
+        const nextWidth = el.clientWidth;
+        const widthChanged =
+          nextWidth > 0 &&
+          lastObservedClientWidth > 0 &&
+          Math.abs(nextWidth - lastObservedClientWidth) >= 2;
+        if (nextWidth > 0) {
+          lastObservedClientWidth = nextWidth;
+        }
+        if (
+          widthChanged &&
+          realignSignalRef.current !== undefined &&
+          !transitioningRef.current &&
+          !dirtyWriteRef.current &&
+          activeRef.current &&
+          !filteredRef.current
+        ) {
+          const rawTargetTop = normalizeScrollOffset(readRef.current());
+          const targetTop = resolveCurrentTargetTop(rawTargetTop);
+          const maxScrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+          if (
+            (rawTargetTop > 0 || targetTop > 0) &&
+            Math.abs(el.scrollTop - Math.min(targetTop, maxScrollTop)) > 2
+          ) {
+            pendingRestoreRef.current = {
+              scopeKey,
+              rawTargetTop: rawTargetTop > 0 ? rawTargetTop : targetTop,
+              targetTop,
+              startedAtMs: performance.now(),
+              stablePasses: 0,
+            };
+            applyProgrammaticScrollTop(el, targetTop);
+            stepRestore();
+          }
         }
       });
       resizeObserver.observe(el);
@@ -512,12 +579,18 @@ export function useUnifiedPanelScrollMemory({
   ]);
 
   const prevTransitioningRef = useRef(isTransitioning);
+  const prevScopeKeyRef = useRef(scopeKey);
+  const prevRealignSignalRef = useRef(realignSignal);
 
   // Flush pre-transition user scroll cleanly on transition start, and re-align if
-  // browser clamping or text re-wrapping moved target offset while transitioning.
+  // browser clamping, text re-wrapping, or width/layout reflow moved the target offset.
   useEffect(() => {
     const wasTransitioning = prevTransitioningRef.current;
+    const prevScopeKey = prevScopeKeyRef.current;
+    const prevRealignSignal = prevRealignSignalRef.current;
     prevTransitioningRef.current = isTransitioning;
+    prevScopeKeyRef.current = scopeKey;
+    prevRealignSignalRef.current = realignSignal;
 
     if (!isActiveAndVisible || isFilteredView) return;
 
@@ -527,17 +600,30 @@ export function useUnifiedPanelScrollMemory({
     }
 
     if (!isTransitioning) {
+      const realignSignalChanged =
+        realignSignal !== undefined &&
+        prevScopeKey === scopeKey &&
+        prevRealignSignal !== realignSignal;
+
+      if (realignSignalChanged && dirtyWriteRef.current?.scopeKey === scopeKey) {
+        flushDirtyWrite();
+      }
+
       if (pendingRestoreRef.current?.scopeKey === scopeKey) {
         stepRestore();
         return;
       }
-      if (wasTransitioning && !dirtyWriteRef.current) {
+
+      if ((wasTransitioning || realignSignalChanged) && !dirtyWriteRef.current) {
         const el = getElRef.current();
         if (!el) return;
         const rawTargetTop = normalizeScrollOffset(readRef.current());
         const targetTop = resolveCurrentTargetTop(rawTargetTop);
         const maxScrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
-        if (targetTop > 0 && Math.abs(el.scrollTop - Math.min(targetTop, maxScrollTop)) > 2) {
+        if (
+          (rawTargetTop > 0 || targetTop > 0) &&
+          Math.abs(el.scrollTop - Math.min(targetTop, maxScrollTop)) > 2
+        ) {
           pendingRestoreRef.current = {
             scopeKey,
             rawTargetTop: rawTargetTop > 0 ? rawTargetTop : targetTop,
@@ -556,6 +642,7 @@ export function useUnifiedPanelScrollMemory({
     isFilteredView,
     isTransitioning,
     contentVersion,
+    realignSignal,
     applyProgrammaticScrollTop,
     flushDirtyWrite,
     resolveCurrentTargetTop,
@@ -577,5 +664,7 @@ export function useUnifiedPanelScrollMemory({
     cancelPendingRestore,
     handleScrollEvent,
     reapplyPendingRestore,
+    flushScrollMemory: flushDirtyWrite,
+    captureCurrentScrollMemory,
   };
 }
