@@ -1,6 +1,14 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef } from 'react';
 import { MotionValue } from 'motion/react';
 import { CardData, getCardSize } from './GenerationCard';
+import {
+  computeLineageSegment,
+  isSameLineageSegment,
+  resolveLiveCardPosition,
+  type LineageSegment,
+  type LiveDragDelta,
+  type LiveNanoDragDelta,
+} from '../utils/lineageGeometry';
 
 export interface CanvasLineageOverlayProps {
   cards: CardData[];
@@ -14,38 +22,10 @@ interface LineageConnection {
   target: CardData;
 }
 
-/**
- * Calculates the exact intersection point where the ray from (cx, cy)
- * towards (targetX, targetY) exits the rectangular boundary.
- */
-function getRectBorderIntersection(
-  rectX: number,
-  rectY: number,
-  width: number,
-  height: number,
-  targetX: number,
-  targetY: number
-): { x: number; y: number } {
-  const cx = rectX + width / 2;
-  const cy = rectY + height / 2;
-  const dx = targetX - cx;
-  const dy = targetY - cy;
-
-  if (Math.abs(dx) < 0.001 && Math.abs(dy) < 0.001) {
-    return { x: cx, y: cy };
-  }
-
-  const hw = width / 2;
-  const hh = height / 2;
-
-  const sx = Math.abs(dx) > 0.001 ? hw / Math.abs(dx) : Infinity;
-  const sy = Math.abs(dy) > 0.001 ? hh / Math.abs(dy) : Infinity;
-  const s = Math.min(sx, sy);
-
-  return {
-    x: cx + dx * s,
-    y: cy + dy * s,
-  };
+interface ConnectionSvgRefs {
+  line: SVGLineElement | null;
+  startDot: SVGCircleElement | null;
+  endDot: SVGCircleElement | null;
 }
 
 export const CanvasLineageOverlay: React.FC<CanvasLineageOverlayProps> = React.memo(function CanvasLineageOverlay({
@@ -53,63 +33,9 @@ export const CanvasLineageOverlay: React.FC<CanvasLineageOverlayProps> = React.m
   selectedCardIds,
   scale,
 }) {
-  // Real-time drag synchronization (0-latency tracking)
-  const [, setDragEpoch] = useState(0);
-
-  useEffect(() => {
-    let rafId: number | null = null;
-    const triggerUpdate = () => {
-      if (rafId === null) {
-        rafId = requestAnimationFrame(() => {
-          rafId = null;
-          setDragEpoch(n => (n + 1) % 1000000);
-        });
-      }
-    };
-
-    window.addEventListener('card-drag-move', triggerUpdate);
-    window.addEventListener('nano-dragging', triggerUpdate);
-
-    return () => {
-      window.removeEventListener('card-drag-move', triggerUpdate);
-      window.removeEventListener('nano-dragging', triggerUpdate);
-      if (rafId !== null) cancelAnimationFrame(rafId);
-    };
-  }, []);
-
-  const svgRef = useRef<SVGSVGElement | null>(null);
-
-  useEffect(() => {
-    if (!scale) return;
-    let rafId: number | null = null;
-    const syncScaleToSvg = () => {
-      const svg = svgRef.current;
-      if (!svg) return;
-      const safeScale = Math.max(scale.get() || 1, 0.001);
-      const sw = (1.5 / safeScale).toString();
-      const r = (3.5 / safeScale).toString();
-      const lines = svg.querySelectorAll('line');
-      for (let i = 0; i < lines.length; i++) {
-        lines[i].setAttribute('stroke-width', sw);
-      }
-      const circles = svg.querySelectorAll('circle');
-      for (let i = 0; i < circles.length; i++) {
-        circles[i].setAttribute('r', r);
-      }
-    };
-    const unsub = scale.on('change', () => {
-      if (rafId === null) {
-        rafId = requestAnimationFrame(() => {
-          rafId = null;
-          syncScaleToSvg();
-        });
-      }
-    });
-    return () => {
-      unsub();
-      if (rafId !== null) cancelAnimationFrame(rafId);
-    };
-  }, [scale]);
+  const nodeMapRef = useRef<Map<string, ConnectionSvgRefs>>(new Map());
+  const lastSegmentMapRef = useRef<Map<string, LineageSegment>>(new Map());
+  const lastScaleRef = useRef<number | null>(null);
 
   // ONLY render when cards are actively selected
   const activeSelectedSet = useMemo(() => new Set(selectedCardIds), [selectedCardIds]);
@@ -231,37 +157,173 @@ export const CanvasLineageOverlay: React.FC<CanvasLineageOverlayProps> = React.m
     return Array.from(connMap.values());
   }, [cards, activeSelectedSet, selectedCardIds]);
 
+  const connectionsRef = useRef(connections);
+  connectionsRef.current = connections;
+  const activeSelectedSetRef = useRef(activeSelectedSet);
+  activeSelectedSetRef.current = activeSelectedSet;
+
+  // Keep cached SVG segment coords aligned whenever React commits new connections or card positions
+  useLayoutEffect(() => {
+    const activeIds = new Set<string>();
+    const domDelta = (window as any).__dragDelta as LiveDragDelta | null | undefined;
+    const nanoDelta = (window as any).__nanoDragging as LiveNanoDragDelta | null | undefined;
+
+    for (let i = 0; i < connections.length; i++) {
+      const conn = connections[i];
+      activeIds.add(conn.id);
+      const srcDim = getCardSize(conn.source);
+      const tgtDim = getCardSize(conn.target);
+      const srcPos = resolveLiveCardPosition(conn.source, activeSelectedSet, domDelta, nanoDelta);
+      const tgtPos = resolveLiveCardPosition(conn.target, activeSelectedSet, domDelta, nanoDelta);
+      const seg = computeLineageSegment(
+        { x: srcPos.x, y: srcPos.y, width: srcDim.width, height: srcDim.height },
+        { x: tgtPos.x, y: tgtPos.y, width: tgtDim.width, height: tgtDim.height }
+      );
+      lastSegmentMapRef.current.set(conn.id, seg);
+    }
+
+    lastSegmentMapRef.current.forEach((_seg, existingId) => {
+      if (!activeIds.has(existingId)) {
+        lastSegmentMapRef.current.delete(existingId);
+        nodeMapRef.current.delete(existingId);
+      }
+    });
+  }, [connections, activeSelectedSet]);
+
+  // Zero-React-Render live drag synchronization: patch only changed SVG attributes in a single coalesced rAF
+  useEffect(() => {
+    if (connections.length === 0) return;
+    let rafId: number | null = null;
+
+    const patchSvgGeometry = () => {
+      const list = connectionsRef.current;
+      if (list.length === 0) return;
+      const selected = activeSelectedSetRef.current;
+      const domDelta = (window as any).__dragDelta as LiveDragDelta | null | undefined;
+      const nanoDelta = (window as any).__nanoDragging as LiveNanoDragDelta | null | undefined;
+
+      for (let i = 0; i < list.length; i++) {
+        const conn = list[i];
+        const refs = nodeMapRef.current.get(conn.id);
+        if (!refs) continue;
+
+        const srcDim = getCardSize(conn.source);
+        const tgtDim = getCardSize(conn.target);
+        const srcPos = resolveLiveCardPosition(conn.source, selected, domDelta, nanoDelta);
+        const tgtPos = resolveLiveCardPosition(conn.target, selected, domDelta, nanoDelta);
+
+        const seg = computeLineageSegment(
+          { x: srcPos.x, y: srcPos.y, width: srcDim.width, height: srcDim.height },
+          { x: tgtPos.x, y: tgtPos.y, width: tgtDim.width, height: tgtDim.height }
+        );
+
+        if (isSameLineageSegment(lastSegmentMapRef.current.get(conn.id), seg)) {
+          continue;
+        }
+        lastSegmentMapRef.current.set(conn.id, seg);
+
+        const x1 = String(seg.x1);
+        const y1 = String(seg.y1);
+        const x2 = String(seg.x2);
+        const y2 = String(seg.y2);
+
+        if (refs.line) {
+          refs.line.setAttribute('x1', x1);
+          refs.line.setAttribute('y1', y1);
+          refs.line.setAttribute('x2', x2);
+          refs.line.setAttribute('y2', y2);
+        }
+        if (refs.startDot) {
+          refs.startDot.setAttribute('cx', x1);
+          refs.startDot.setAttribute('cy', y1);
+        }
+        if (refs.endDot) {
+          refs.endDot.setAttribute('cx', x2);
+          refs.endDot.setAttribute('cy', y2);
+        }
+      }
+    };
+
+    const schedulePatch = () => {
+      if (rafId === null) {
+        rafId = requestAnimationFrame(() => {
+          rafId = null;
+          patchSvgGeometry();
+        });
+      }
+    };
+
+    window.addEventListener('card-drag-move', schedulePatch);
+    window.addEventListener('nano-dragging', schedulePatch);
+
+    return () => {
+      window.removeEventListener('card-drag-move', schedulePatch);
+      window.removeEventListener('nano-dragging', schedulePatch);
+      if (rafId !== null) cancelAnimationFrame(rafId);
+    };
+  }, [connections.length > 0]);
+
+  // Zero-React-Render scale-invariant stroke & dot sizing via direct ref iteration
+  useEffect(() => {
+    if (!scale || connections.length === 0) return;
+    let rafId: number | null = null;
+    const syncScaleToSvg = () => {
+      const safeScale = Math.max(scale.get() || 1, 0.001);
+      if (lastScaleRef.current !== null && Math.abs(lastScaleRef.current - safeScale) < 0.0005) {
+        return;
+      }
+      lastScaleRef.current = safeScale;
+      const sw = (1.5 / safeScale).toString();
+      const r = (3.5 / safeScale).toString();
+      nodeMapRef.current.forEach(refs => {
+        if (refs.line) refs.line.setAttribute('stroke-width', sw);
+        if (refs.startDot) refs.startDot.setAttribute('r', r);
+        if (refs.endDot) refs.endDot.setAttribute('r', r);
+      });
+    };
+    const unsub = scale.on('change', () => {
+      if (rafId === null) {
+        rafId = requestAnimationFrame(() => {
+          rafId = null;
+          syncScaleToSvg();
+        });
+      }
+    });
+    return () => {
+      unsub();
+      if (rafId !== null) cancelAnimationFrame(rafId);
+    };
+  }, [scale, connections.length > 0]);
+
   if (connections.length === 0) return null;
-
-  // Real-time coordinate resolver considering active drag deltas
-  const getLiveCardPos = (c: CardData) => {
-    // 1. DOM Card Drag Delta
-    const domDelta = (window as any).__dragDelta;
-    if (domDelta) {
-      if (domDelta.draggingCardId === c.id || (activeSelectedSet.has(c.id) && activeSelectedSet.has(domDelta.draggingCardId))) {
-        return { x: c.x + domDelta.dx, y: c.y + domDelta.dy };
-      }
-    }
-
-    // 2. Nano-Canvas Drag Delta
-    const nanoDelta = (window as any).__nanoDragging;
-    if (nanoDelta) {
-      if (nanoDelta.cardId === c.id || (activeSelectedSet.has(c.id) && activeSelectedSet.has(nanoDelta.cardId))) {
-        return { x: c.x + nanoDelta.dx, y: c.y + nanoDelta.dy };
-      }
-    }
-
-    return { x: c.x, y: c.y };
-  };
 
   const BLUE_COLOR = '#3b82f6';
   const safeScale = Math.max((scale ? scale.get() : 1) || 1, 0.001);
+  lastScaleRef.current = safeScale;
   const strokeWidth = 1.5 / safeScale;
   const dotRadius = 3.5 / safeScale;
+  const domDelta = (window as any).__dragDelta as LiveDragDelta | null | undefined;
+  const nanoDelta = (window as any).__nanoDragging as LiveNanoDragDelta | null | undefined;
+
+  const registerRef = (
+    connId: string,
+    field: keyof ConnectionSvgRefs,
+    el: SVGLineElement | SVGCircleElement | null
+  ) => {
+    let entry = nodeMapRef.current.get(connId);
+    if (!entry) {
+      if (!el) return;
+      entry = { line: null, startDot: null, endDot: null };
+      nodeMapRef.current.set(connId, entry);
+    }
+    entry[field] = el as any;
+    if (!entry.line && !entry.startDot && !entry.endDot) {
+      nodeMapRef.current.delete(connId);
+    }
+  };
 
   return (
     <svg
-      ref={svgRef}
       className="absolute inset-0 pointer-events-none overflow-visible z-[6]"
       style={{ width: 1, height: 1 }}
     >
@@ -270,61 +332,41 @@ export const CanvasLineageOverlay: React.FC<CanvasLineageOverlayProps> = React.m
         const srcDim = getCardSize(source);
         const tgtDim = getCardSize(target);
 
-        const srcPos = getLiveCardPos(source);
-        const tgtPos = getLiveCardPos(target);
+        const srcPos = resolveLiveCardPosition(source, activeSelectedSet, domDelta, nanoDelta);
+        const tgtPos = resolveLiveCardPosition(target, activeSelectedSet, domDelta, nanoDelta);
 
-        const srcCenter = {
-          x: srcPos.x + srcDim.width / 2,
-          y: srcPos.y + srcDim.height / 2,
-        };
-        const tgtCenter = {
-          x: tgtPos.x + tgtDim.width / 2,
-          y: tgtPos.y + tgtDim.height / 2,
-        };
-
-        // Exact boundary entry and exit points on the card boxes
-        const startPoint = getRectBorderIntersection(
-          srcPos.x,
-          srcPos.y,
-          srcDim.width,
-          srcDim.height,
-          tgtCenter.x,
-          tgtCenter.y
-        );
-
-        const endPoint = getRectBorderIntersection(
-          tgtPos.x,
-          tgtPos.y,
-          tgtDim.width,
-          tgtDim.height,
-          srcCenter.x,
-          srcCenter.y
+        const seg = computeLineageSegment(
+          { x: srcPos.x, y: srcPos.y, width: srcDim.width, height: srcDim.height },
+          { x: tgtPos.x, y: tgtPos.y, width: tgtDim.width, height: tgtDim.height }
         );
 
         return (
           <g key={conn.id}>
             {/* Pure Clean Blue Straight Line (Scale Invariant) */}
             <line
-              x1={startPoint.x}
-              y1={startPoint.y}
-              x2={endPoint.x}
-              y2={endPoint.y}
+              ref={el => registerRef(conn.id, 'line', el)}
+              x1={seg.x1}
+              y1={seg.y1}
+              x2={seg.x2}
+              y2={seg.y2}
               stroke={BLUE_COLOR}
               strokeWidth={strokeWidth}
             />
 
             {/* Start Circular Dot (Scale Invariant) */}
             <circle
-              cx={startPoint.x}
-              cy={startPoint.y}
+              ref={el => registerRef(conn.id, 'startDot', el)}
+              cx={seg.x1}
+              cy={seg.y1}
               r={dotRadius}
               fill={BLUE_COLOR}
             />
 
             {/* End Circular Dot (Scale Invariant) */}
             <circle
-              cx={endPoint.x}
-              cy={endPoint.y}
+              ref={el => registerRef(conn.id, 'endDot', el)}
+              cx={seg.x2}
+              cy={seg.y2}
               r={dotRadius}
               fill={BLUE_COLOR}
             />

@@ -475,6 +475,62 @@ export function shouldDeferOriginalTierDowngrade(
   return Boolean(isGestureActive || isZoomingOut || isTweenZooming);
 }
 
+/**
+ * Defers tearing down 4K original textures for cards that shift outside the viewport
+ * during active camera gestures, zoom-outs, or programmatic tweens (e.g. cursor-anchored
+ * zoom-out while still >= 200%), avoiding synchronous 4K canvas redraws mid-motion.
+ */
+export function shouldDeferOffscreenOriginalDowngrade(
+  isGestureActive: boolean,
+  isZoomingOut: boolean,
+  isTweenZooming: boolean
+): boolean {
+  return Boolean(isGestureActive || isZoomingOut || isTweenZooming);
+}
+
+export interface CardCanvasGestureRedrawCheck {
+  isGestureActive: boolean;
+  hasPaintedFrame: boolean;
+  sameCardAndImage: boolean;
+  sameDimensions: boolean;
+  hasBackingStore: boolean;
+  isGenerating: boolean;
+  hasActiveTransition: boolean;
+  isUpgradingToOriginal: boolean;
+}
+
+/**
+ * Skips redundant synchronous canvas clear/draw passes during active camera gestures
+ * (such as crossing 200% downward or flipping smoothing quality) when the card already
+ * has a valid painted bitmap for the same media and dimensions.
+ */
+export function shouldSkipCardCanvasGestureRedraw(
+  params: CardCanvasGestureRedrawCheck
+): boolean {
+  if (!params.isGestureActive) return false;
+  if (!params.hasPaintedFrame || !params.hasBackingStore) return false;
+  if (!params.sameCardAndImage || !params.sameDimensions) return false;
+  if (params.isGenerating || params.hasActiveTransition) return false;
+  if (params.isUpgradingToOriginal) return false;
+  return true;
+}
+
+/**
+ * Thresholds CSS outline/padding updates on selected cards during continuous zoom
+ * so tiny sub-pixel deltas at >200% scale do not trigger per-frame paint invalidation.
+ */
+export function shouldSyncOutlineWidth(
+  prevWidthPx: number | null,
+  nextWidthPx: number,
+  minDeltaPx: number = 0.15
+): boolean {
+  if (!Number.isFinite(nextWidthPx)) return false;
+  if (prevWidthPx === null || !Number.isFinite(prevWidthPx)) return true;
+  if (nextWidthPx === 0 && prevWidthPx !== 0) return true;
+  if (prevWidthPx === 0 && nextWidthPx !== 0) return true;
+  return Math.abs(nextWidthPx - prevWidthPx) >= minDeltaPx;
+}
+
 export interface NanoCanvasRenderQuality {
   dprCap: number;
   imageSmoothingQuality: 'low' | 'high';

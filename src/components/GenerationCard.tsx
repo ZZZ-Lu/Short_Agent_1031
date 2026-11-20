@@ -26,7 +26,13 @@ import {
   Copy,
   Link2
 } from 'lucide-react';
-import { isCardIntersectingRectangle, quantizeCardScaleTier } from '../utils/viewportCulling';
+import {
+  isCardIntersectingRectangle,
+  quantizeCardScaleTier,
+  shouldDeferOriginalTierDowngrade,
+  shouldDeferOffscreenOriginalDowngrade,
+  shouldSyncOutlineWidth,
+} from '../utils/viewportCulling';
 import {
   getBottomPanelHeight,
   getPromptAreaHeight,
@@ -41,7 +47,19 @@ import { cardCornerStyle, CARD_PANEL_WIDTH, EMPTY_CARD_PATHS } from '../utils/ca
 import { capDprToBudget } from '../utils/devicePixelBudget';
 import { getStandardReferencePreview, resolveReferencePreviewSource } from '../utils/referencePreview';
 import { referenceDisplayName, shortenReferenceMentions } from '../utils/referenceName';
-import { CANVAS_IDLE_MS, scheduleCanvasSurface, scheduleOriginalImageRestore, canUpgradeCardDuringGesture, isCameraZoomingOut, CANVAS_HYBRID_POINTER_WAKE_EVENT, getCanvasLoadingMode, getHybridPointer } from '../utils/canvasPerformance';
+import {
+  CANVAS_IDLE_MS,
+  scheduleCanvasSurface,
+  scheduleOriginalImageRestore,
+  scheduleOriginalImageDowngrade,
+  cancelOriginalImageDowngrade,
+  canUpgradeCardDuringGesture,
+  isCameraZoomingOut,
+  isCameraTweenZooming,
+  CANVAS_HYBRID_POINTER_WAKE_EVENT,
+  getCanvasLoadingMode,
+  getHybridPointer,
+} from '../utils/canvasPerformance';
 import { fullImageCache, originalImageCache, preloadAndDecodeImage, preloadCanvasImage, evictOriginalImageCache } from '../utils/imageTextureCache';
 import { resizeImageOffThread } from '../utils/imageResize';
 import { fastGetImageDimensions } from '../utils/imageHeader';
@@ -2490,6 +2508,7 @@ export const GenerationCard = React.memo(function GenerationCard({
   const floatingToolbarRef = useRef<HTMLDivElement | null>(null);
   const dualSelectionBorderRef = useRef<HTMLDivElement | null>(null);
 
+  // @LOCK-START:generation-card-scale-and-outline
   useEffect(() => {
     const syncScaleTier = () => {
       if ((isZooming || isCameraGestureActive()) && !canUpgradeCardDuringGesture(id)) return;
@@ -2515,23 +2534,56 @@ export const GenerationCard = React.memo(function GenerationCard({
       if (cardBodyRef.current) cardBodyRef.current.style.outlineWidth = '0px';
       return;
     }
-    const syncOutlineWidth = (rawScale: number) => {
-      const safeScale = Math.max(rawScale || 1, 0.001);
+    let rafId: number | null = null;
+    let lastOutlinePx: number | null = null;
+    let lastDualPaddingPx: number | null = null;
+
+    const applyOutlineWidth = (force: boolean) => {
+      const safeScale = Math.max(scale.get() || 1, 0.001);
       if (cardBodyRef.current) {
-        if (pickerSelectionIndex && pickerSelectionIndex > 0) {
-          cardBodyRef.current.style.outlineWidth = `${4 / safeScale}px`;
-        } else if (isAgentTarget && isSelected) {
-          cardBodyRef.current.style.outlineWidth = '0px';
-        } else {
-          cardBodyRef.current.style.outlineWidth = `${2 / safeScale}px`;
+        const nextOutlinePx =
+          pickerSelectionIndex && pickerSelectionIndex > 0
+            ? 4 / safeScale
+            : isAgentTarget && isSelected
+              ? 0
+              : 2 / safeScale;
+        if (force || shouldSyncOutlineWidth(lastOutlinePx, nextOutlinePx)) {
+          lastOutlinePx = nextOutlinePx;
+          cardBodyRef.current.style.outlineWidth = `${nextOutlinePx}px`;
         }
       }
       if (dualSelectionBorderRef.current && isAgentTarget && isSelected) {
-        dualSelectionBorderRef.current.style.padding = `${2 / safeScale}px`;
+        const nextPaddingPx = 2 / safeScale;
+        if (force || shouldSyncOutlineWidth(lastDualPaddingPx, nextPaddingPx)) {
+          lastDualPaddingPx = nextPaddingPx;
+          dualSelectionBorderRef.current.style.padding = `${nextPaddingPx}px`;
+        }
       }
     };
-    syncOutlineWidth(scale.get());
-    return scale.on('change', syncOutlineWidth);
+
+    const scheduleSync = () => {
+      if (rafId !== null) return;
+      rafId = requestAnimationFrame(() => {
+        rafId = null;
+        applyOutlineWidth(false);
+      });
+    };
+    const handleRestored = () => {
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      applyOutlineWidth(true);
+    };
+
+    applyOutlineWidth(true);
+    const unsubScale = scale.on('change', scheduleSync);
+    window.addEventListener('canvas-styles-restored', handleRestored);
+    return () => {
+      unsubScale();
+      window.removeEventListener('canvas-styles-restored', handleRestored);
+      if (rafId !== null) cancelAnimationFrame(rafId);
+    };
   }, [scale, needsSelectionOutline, pickerSelectionIndex, isAgentTarget, isSelected]);
 
   useEffect(() => {
@@ -2552,6 +2604,7 @@ export const GenerationCard = React.memo(function GenerationCard({
       window.removeEventListener(CANVAS_HYBRID_POINTER_WAKE_EVENT, syncToolbarScale);
     };
   }, [scale, isSelected, isZooming, id]);
+  // @LOCK-END:generation-card-scale-and-outline
 
   // Track whether the card itself has finished loading & painting
   const [isCardLoaded, setIsCardLoaded] = useState(() => {
@@ -3842,6 +3895,7 @@ export const GenerationCard = React.memo(function GenerationCard({
     return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
   };
 
+  // @LOCK-START:generation-card-original-4k
   // Scale tracking for original high-resolution image swap (only active at extreme zoom > 2.0)
   const [showOriginal, setShowOriginal] = useState(false);
   const showOriginalRef = useRef(showOriginal);
@@ -3860,6 +3914,37 @@ export const GenerationCard = React.memo(function GenerationCard({
       cancelRestore = null;
     };
 
+    const requestPacedDowngrade = () => {
+      if (!showOriginalRef.current) return;
+      scheduleOriginalImageDowngrade(id, () => {
+        const latestScale = scale.get();
+        if (
+          shouldDeferOriginalTierDowngrade(
+            latestScale,
+            isCameraGestureActive(),
+            isCameraZoomingOut(),
+            isCameraTweenZooming()
+          )
+        ) {
+          return;
+        }
+        const latestData = dataRef.current;
+        const latestViewport = {
+          viewportWidth: window.innerWidth,
+          viewportHeight: window.innerHeight,
+          scale: latestScale,
+          tx: tx.get(),
+          ty: ty.get(),
+        };
+        const stillNeedsOriginal =
+          latestScale >= 2.0 && isCardIntersectingRectangle(latestData, latestViewport);
+        if (!stillNeedsOriginal && showOriginalRef.current) {
+          showOriginalRef.current = false;
+          setShowOriginal(false);
+        }
+      });
+    };
+
     const evaluateOriginalImage = () => {
       const workspace = document.getElementById('canvas-workspace');
       const isPanningOrDragging =
@@ -3876,10 +3961,17 @@ export const GenerationCard = React.memo(function GenerationCard({
       const s = scale.get();
       if (s < 2.0) {
         cancelPendingRestore();
-        if (showOriginalRef.current) {
-          showOriginalRef.current = false;
-          setShowOriginal(false);
+        if (
+          shouldDeferOriginalTierDowngrade(
+            s,
+            isCameraGestureActive(),
+            isCameraZoomingOut(),
+            isCameraTweenZooming()
+          )
+        ) {
+          return;
         }
+        requestPacedDowngrade();
         return;
       }
 
@@ -3891,6 +3983,7 @@ export const GenerationCard = React.memo(function GenerationCard({
         ty: ty.get()
       };
       if (isCardIntersectingRectangle(currentData, vp)) {
+        cancelOriginalImageDowngrade(id);
         const originalUrl = currentData.originalImageUrl || currentData.trueOriginalImageUrl || currentData.imageUrl;
         if (!originalUrl) return;
         if ((showOriginalRef.current && loadedOriginalUrlRef.current === originalUrl) || cancelRestore) return;
@@ -3922,10 +4015,16 @@ export const GenerationCard = React.memo(function GenerationCard({
         cancelRestore = queuedRestore;
       } else {
         cancelPendingRestore();
-        if (showOriginalRef.current) {
-          showOriginalRef.current = false;
-          setShowOriginal(false);
+        if (
+          shouldDeferOffscreenOriginalDowngrade(
+            isCameraGestureActive(),
+            isCameraZoomingOut(),
+            isCameraTweenZooming()
+          )
+        ) {
+          return;
         }
+        requestPacedDowngrade();
       }
     };
 
@@ -3934,16 +4033,25 @@ export const GenerationCard = React.memo(function GenerationCard({
       const hasImage = Boolean(currentData.originalImageUrl || currentData.trueOriginalImageUrl || currentData.imageUrl);
       if (!hasImage) return;
 
-      if (scale.get() < 2.0) {
-        if (showOriginalRef.current) {
-          showOriginalRef.current = false;
-          setShowOriginal(false);
-        }
+      const s = scale.get();
+      if (s < 2.0) {
         cancelPendingRestore();
         clearTimeout(timeout);
+        if (
+          shouldDeferOriginalTierDowngrade(
+            s,
+            isCameraGestureActive(),
+            isCameraZoomingOut(),
+            isCameraTweenZooming()
+          )
+        ) {
+          return;
+        }
+        requestPacedDowngrade();
         return;
       }
 
+      cancelOriginalImageDowngrade(id);
       const originalUrl = currentData.originalImageUrl || currentData.trueOriginalImageUrl || currentData.imageUrl;
       if (showOriginalRef.current && loadedOriginalUrlRef.current === originalUrl) {
         return;
@@ -3969,18 +4077,35 @@ export const GenerationCard = React.memo(function GenerationCard({
 
       const s = scale.get();
       if (s < 2.0) {
-        if (showOriginalRef.current) {
-          showOriginalRef.current = false;
-          setShowOriginal(false);
-        }
         cancelPendingRestore();
         clearTimeout(timeout);
+        if (
+          shouldDeferOriginalTierDowngrade(
+            s,
+            isCameraGestureActive(),
+            isCameraZoomingOut(),
+            isCameraTweenZooming()
+          )
+        ) {
+          return;
+        }
+        requestPacedDowngrade();
         return;
       }
 
-      // If already displaying the current 4K original image, only downgrade if panned outside the viewport.
+      // If already displaying the current 4K original image, defer offscreen downgrades while
+      // camera motion is active so zooming out / panning at >200% never redraws 4K canvases mid-gesture.
       const originalUrl = currentData.originalImageUrl || currentData.trueOriginalImageUrl || currentData.imageUrl;
       if (showOriginalRef.current && loadedOriginalUrlRef.current === originalUrl) {
+        if (
+          shouldDeferOffscreenOriginalDowngrade(
+            isCameraGestureActive(),
+            isCameraZoomingOut(),
+            isCameraTweenZooming()
+          )
+        ) {
+          return;
+        }
         const vp = {
           viewportWidth: window.innerWidth,
           viewportHeight: window.innerHeight,
@@ -3989,8 +4114,7 @@ export const GenerationCard = React.memo(function GenerationCard({
           ty: ty.get(),
         };
         if (!isCardIntersectingRectangle(currentData, vp)) {
-          showOriginalRef.current = false;
-          setShowOriginal(false);
+          requestPacedDowngrade();
         }
         return;
       }
@@ -4054,6 +4178,7 @@ export const GenerationCard = React.memo(function GenerationCard({
 
     return () => {
       cancelPendingRestore();
+      cancelOriginalImageDowngrade(id);
       unsubScale();
       unsubTx();
       unsubTy();
@@ -4063,6 +4188,7 @@ export const GenerationCard = React.memo(function GenerationCard({
       window.removeEventListener(CANVAS_HYBRID_POINTER_WAKE_EVENT, onHybridWake);
     };
   }, [scale, tx, ty, data.originalImageUrl, id]);
+  // @LOCK-END:generation-card-original-4k
 
   const screenDpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
   const { width: w, height: h } = getCardSize(data);

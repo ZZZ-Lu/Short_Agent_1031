@@ -26,7 +26,10 @@ import { AgentArchitecturePanel } from './AgentArchitecturePanel';
 import { ToolManagementPanel } from './ToolManagementPanel';
 import { AgentRuntimeTracePanel } from './AgentRuntimeTracePanel';
 import { PromptEditorPanel } from './PromptEditorPanel';
+import { LocalStoragePanel } from './LocalStoragePanel';
 import type { AgentRuntimeTrace } from '../agent/debugTrace';
+import type { RestoreFolderResult } from '../storage/localFolderMirror';
+import type { ImportArchiveResult } from '../storage/backupArchive';
 import {
   DEFAULT_NODE_MODELS,
   DEFAULT_NODE_PROMPTS,
@@ -44,14 +47,18 @@ import { createSquareLetterboxImage, createVerticalWidescreenSlices, unpadLandma
 interface SettingsPageProps {
   onClose: () => void;
   currentProject?: ScriptProject;
+  projects?: ScriptProject[];
   onUpdateProject?: (updated: ScriptProject) => void;
+  onApplyRestoredProjects?: (result: RestoreFolderResult | ImportArchiveResult) => void;
+  onNotify?: (message: string, tone?: 'success' | 'error' | 'info') => void;
+  initialSection?: SettingsSection;
   agentRuntimeTraces?: AgentRuntimeTrace[];
 }
 
 type NodeKey = 'toc_infer' | 'data_viewer' | 'change_assess' | 'state_node' | 'json_adapter' | 'subject_landmarks';
 type ResultTab = 'json' | 'logs';
 type CenterTab = 'source' | 'input' | 'prompt' | 'payload';
-type SettingsSection = 'debug' | 'runtime' | 'architecture' | 'tools' | 'prompt';
+export type SettingsSection = 'debug' | 'runtime' | 'architecture' | 'tools' | 'prompt' | 'storage';
 
 interface NodeDefinition {
   key: NodeKey;
@@ -204,10 +211,19 @@ const parseModelInput = (value: string) => {
   return { systemPrompt: null, userPrompt: value };
 };
 
-export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProject, onUpdateProject, agentRuntimeTraces = [] }) => {
+export const SettingsPage: React.FC<SettingsPageProps> = ({
+  onClose,
+  currentProject,
+  projects = [],
+  onUpdateProject,
+  onApplyRestoredProjects,
+  onNotify,
+  initialSection = 'debug',
+  agentRuntimeTraces = [],
+}) => {
   const loadingMode = useSyncExternalStore(subscribeCanvasLoadingMode, getCanvasLoadingMode);
   const [selectedNode, setSelectedNode] = useState<NodeKey>('toc_infer');
-  const [settingsSection, setSettingsSection] = useState<SettingsSection>('debug');
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>(initialSection);
   const [centerTab, setCenterTab] = useState<CenterTab>('input');
   const [resultTab, setResultTab] = useState<ResultTab>('json');
   const [nodePrompts, setNodePrompts] = useState<NodePromptConfig>(() => ({ ...DEFAULT_NODE_PROMPTS }));
@@ -705,6 +721,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
           <button onClick={() => setSettingsSection('tools')} className={`h-7 rounded-md px-3 text-xs transition ${settingsSection === 'tools' ? 'bg-gray-100 font-medium text-slate-900 shadow-sm dark:bg-white/10 dark:text-white' : 'text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'}`}>工具管理</button>
           <button onClick={() => setSettingsSection('architecture')} className={`h-7 rounded-md px-3 text-xs transition ${settingsSection === 'architecture' ? 'bg-gray-100 font-medium text-slate-900 shadow-sm dark:bg-white/10 dark:text-white' : 'text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'}`}>Agent 架构</button>
           <button onClick={() => setSettingsSection('prompt')} className={`h-7 rounded-md px-3 text-xs transition ${settingsSection === 'prompt' ? 'bg-gray-100 font-medium text-slate-900 shadow-sm dark:bg-white/10 dark:text-white' : 'text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'}`}>主循环 Prompt</button>
+          <button onClick={() => setSettingsSection('storage')} className={`h-7 rounded-md px-3 text-xs transition ${settingsSection === 'storage' ? 'bg-gray-100 font-medium text-slate-900 shadow-sm dark:bg-white/10 dark:text-white' : 'text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'}`}>本地存储</button>
         </nav>
         <div className="ml-auto flex items-center gap-2">
           {/* Canvas Batch Loading Mode Toggle Button */}
@@ -761,7 +778,13 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ onClose, currentProj
       </header>
 
       <main className={settingsSection === 'debug' ? 'grid min-h-0 flex-1 grid-cols-[220px_minmax(360px,0.95fr)_minmax(420px,1.25fr)]' : 'flex min-h-0 flex-1'}>
-        {settingsSection === 'architecture' ? <AgentArchitecturePanel /> : settingsSection === 'prompt' ? <PromptEditorPanel /> : settingsSection === 'tools' ? <ToolManagementPanel /> : settingsSection === 'runtime' ? <AgentRuntimeTracePanel traces={agentRuntimeTraces} /> : <>
+        {settingsSection === 'storage' ? (
+          <LocalStoragePanel
+            projects={projects.length > 0 ? projects : currentProject ? [currentProject] : []}
+            onApplyRestoredProjects={(result) => onApplyRestoredProjects?.(result)}
+            onNotify={onNotify}
+          />
+        ) : settingsSection === 'architecture' ? <AgentArchitecturePanel /> : settingsSection === 'prompt' ? <PromptEditorPanel /> : settingsSection === 'tools' ? <ToolManagementPanel /> : settingsSection === 'runtime' ? <AgentRuntimeTracePanel traces={agentRuntimeTraces} /> : <>
         <aside className="overflow-y-auto border-r border-slate-200 bg-gray-100 p-3 dark:border-white/10 dark:bg-[#121214]">
           <p className="mb-2 px-2 text-[10px] font-semibold uppercase tracking-[.16em] text-slate-400">Nodes</p>
           <div className="space-y-1">

@@ -160,6 +160,24 @@ export class CardCodec {
       else this.strings.set(value, id);
     }
   }
+  /**
+   * Releases strong references to already-uploaded Blob / large string payloads from `this.resources`.
+   * Uploaded IDs remain tracked in `this.uploaded` and live Blob references remain in the `this.blobs` WeakMap,
+   * so unchanged blobs are still never re-uploaded while bulk imports avoid unbounded memory growth.
+   */
+  releaseUploadedPayloads(ids?: Iterable<string>) {
+    if (ids) {
+      for (const id of ids) {
+        if (this.uploaded.has(id)) {
+          this.resources.delete(id);
+        }
+      }
+      return;
+    }
+    for (const id of this.uploaded) {
+      this.resources.delete(id);
+    }
+  }
   decode(value: any): any {
     if (!value || typeof value !== 'object') return value;
     if (typeof value[marker] === 'string') {

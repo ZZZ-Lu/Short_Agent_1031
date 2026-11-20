@@ -6,7 +6,11 @@ import { getCappedDpr } from '../utils/devicePixelBudget';
 import React, { useEffect, useRef } from 'react';
 import { readyPromptPanels, mountedDomCardIds } from '../utils/promptSurfaceCache';
 import { cardOutline, strokeCardOutline, drawEmptyCardIcon, isStandardCardLod } from '../utils/cardLodAppearance';
-import type { LodFrame } from '../utils/lodHandoff';
+import {
+  isDomCardVisibleForHandoff,
+  shouldBlockNanoHandoffForCard,
+  type LodFrame,
+} from '../utils/lodHandoff';
 import { MotionValue } from 'motion/react';
 import { CardData, getCardSize } from './GenerationCard';
 import {
@@ -491,6 +495,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
 
     const currentScale = scale.get();
     const workspace = typeof document !== 'undefined' ? document.getElementById('canvas-workspace') : null;
+    const isDomNanoRetired = workspace?.getAttribute('data-nano-retired') === 'true';
     const isGestureActive = Boolean(
       (window as any).__nanoDragging ||
       isCameraTweenZooming() ||
@@ -677,18 +682,26 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       });
     };
 
-    // Fast-path skip when >= threshold and every visible card is already mounted & painted in DOM
+    // Fast-path skip when every visible card is already visibly rendered by the DOM layer.
     const renderedSetForFastPath = renderedIdsRef.current;
     const paintedSetForFastPath = typeof window !== 'undefined' ? (window as any).__paintedCardIds : null;
     const needsCanvasCard = (card: CardData) => {
-      if (currentScale < threshold) return true;
       const isDomMounted = Boolean(
         domCardsActiveRef.current &&
         (renderedSetForFastPath?.has(card.id) || mountedDomCardIds.has(card.id))
       );
       const isPainted = Boolean(paintedSetForFastPath?.has(card.id));
       const panelReady = !expectsBottomPanel(card) || readyPromptPanels.has(card.id);
-      return !(isDomMounted && isPainted && panelReady);
+      return !isDomCardVisibleForHandoff({
+        scale: currentScale,
+        threshold,
+        domCardsActive: domCardsActiveRef.current,
+        domNanoRetired: isDomNanoRetired,
+        isGestureActive,
+        isMounted: isDomMounted,
+        isPainted,
+        panelReady,
+      });
     };
     const anyCardToDraw = unselectedCards.some(needsCanvasCard) || selectedCards.some(needsCanvasCard);
     if (!anyCardToDraw) {
@@ -699,6 +712,15 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
         }
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         hasDrawnContentRef.current = false;
+      }
+      if (
+        nanoHandoffReady &&
+        currentScale < threshold &&
+        unselectedCards.length === 0 &&
+        selectedCards.length === 0 &&
+        onReadyRef.current
+      ) {
+        onReadyRef.current({ scale: currentScale, tx: currentTx, ty: currentTy });
       }
       return;
     }
@@ -756,7 +778,16 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       const paintedSet = typeof window !== 'undefined' ? (window as any).__paintedCardIds : null;
       const isPainted = Boolean(paintedSet?.has(card.id));
       const panelReady = !expectsBottomPanel(card) || readyPromptPanels.has(card.id);
-      const isCardReadyInDom = currentScale >= getNanoLodThreshold() && Boolean(isDomMounted && isPainted && panelReady);
+      const isCardReadyInDom = isDomCardVisibleForHandoff({
+        scale: currentScale,
+        threshold,
+        domCardsActive: domCardsActiveRef.current,
+        domNanoRetired: isDomNanoRetired,
+        isGestureActive,
+        isMounted: isDomMounted,
+        isPainted,
+        panelReady,
+      });
 
       if (isCardReadyInDom) {
         return;
@@ -765,9 +796,9 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       ctx.save();
 
 
-      // If we are in High LOD (scale >= threshold), and the card is currently being dragged in DOM,
+      // If we are in High LOD (scale >= threshold) with visible DOM cards, and the card is currently being dragged in DOM,
       // skip rendering it on the canvas completely so that we don't leave any "ghost" behind.
-      if (currentScale >= getNanoLodThreshold()) {
+      if (currentScale >= threshold && !isDomNanoRetired) {
         const isDragging = (window as any).isDraggingCard;
         const draggingCardId = (window as any).draggingCardId;
         if (isDragging && draggingCardId) {
@@ -839,6 +870,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       let imgWidth = liveFrame ? liveFrame.width : 0;
       let imgHeight = liveFrame ? liveFrame.height : 0;
 
+      let isImagePendingOrDeferred = false;
       if (!drawSourceImg) {
         const fullKey = card.isVideo ? card.videoPosterUrl : card.imageUrl;
         const cachedRawThumb = fullKey
@@ -870,15 +902,9 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
             drawSourceImg = full;
             imgWidth = full.naturalWidth;
             imgHeight = full.naturalHeight;
-          } else if (currentScale < getNanoLodThreshold() && domCardsActiveRef.current && isPainted && renderedSet?.has(card.id)) {
+          } else {
             const pending = thumbImageCache.get(thumbUrl);
-            if (pending && !pending.complete) {
-              // Leave the old DOM image visible until this replacement is ready.
-              nanoHandoffReady = false;
-              if (useRoundedOutline) ctx.restore();
-              ctx.restore();
-              return;
-            }
+            isImagePendingOrDeferred = Boolean(pending && !pending.complete);
           }
         } else if (card.imageUrl && fullImageCache.has(card.imageUrl)) {
           const cached = fullImageCache.get(card.imageUrl);
@@ -886,11 +912,35 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
             drawSourceImg = cached;
             imgWidth = cached.naturalWidth;
             imgHeight = cached.naturalHeight;
+          } else {
+            isImagePendingOrDeferred = deferColdRaw;
           }
+        } else {
+          isImagePendingOrDeferred = Boolean(deferColdRaw || (hasMedia && !card.isVideo));
         }
       }
 
       const hasValidSourceImg = Boolean(drawSourceImg && imgWidth > 0 && imgHeight > 0);
+      if (
+        shouldBlockNanoHandoffForCard({
+          scale: currentScale,
+          threshold,
+          domCardsActive: domCardsActiveRef.current,
+          domNanoRetired: isDomNanoRetired,
+          isDomCardMountedAndPainted: Boolean(isDomMounted && isPainted),
+          isTextCard: Boolean(card.isText),
+          hasMedia,
+          isGenerating,
+          hasReadyImageSource: hasValidSourceImg,
+          isImagePendingOrDeferred,
+        })
+      ) {
+        // Leave the already-painted DOM image visible until this replacement is ready.
+        nanoHandoffReady = false;
+        if (useRoundedOutline) ctx.restore();
+        ctx.restore();
+        return;
+      }
       const reveal = hasValidSourceImg ? mediaRevealProgress(card.id) : 0;
 
       // 2. Solid Base Fill or Nano LOD Skeleton Screen (only when image does not yet fully cover the card)
@@ -1041,7 +1091,11 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
 
       // 3b. Bottom Panel Skeleton Color Block for Generation Cards in 2D Canvas Mode
       const showBottomPanel = expectsBottomPanel(card);
-      const isBottomPanelReadyInDom = currentScale >= getNanoLodThreshold() && Boolean(isDomMounted && panelReady);
+      const isBottomPanelReadyInDom =
+        !isDomNanoRetired &&
+        domCardsActiveRef.current &&
+        currentScale >= threshold &&
+        Boolean(isDomMounted && panelReady);
       if (showBottomPanel && !isBottomPanelReadyInDom) {
         drawCardBottomPanel(
           ctx,
@@ -1174,14 +1228,21 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
 
     let animating = false;
     const renderWithEntry = (card: CardData) => {
-      if (currentScale >= threshold) {
+      if (currentScale >= threshold && !isDomNanoRetired) {
         const isDomMounted = Boolean(
           domCardsActiveRef.current &&
           (renderedIdsRef.current?.has(card.id) || mountedDomCardIds.has(card.id))
         );
-        const domReady = Boolean(isDomMounted &&
-          (window as any).__paintedCardIds?.has(card.id) &&
-          (!expectsBottomPanel(card) || readyPromptPanels.has(card.id)));
+        const domReady = isDomCardVisibleForHandoff({
+          scale: currentScale,
+          threshold,
+          domCardsActive: domCardsActiveRef.current,
+          domNanoRetired: isDomNanoRetired,
+          isGestureActive,
+          isMounted: isDomMounted,
+          isPainted: Boolean((window as any).__paintedCardIds?.has(card.id)),
+          panelReady: !expectsBottomPanel(card) || readyPromptPanels.has(card.id),
+        });
         if (waitForEntryDom(card.id, domReady)) return;
       }
       const entry = cardEntryFrame(card.id, performance.now(), false, selectedIds.includes(card.id));

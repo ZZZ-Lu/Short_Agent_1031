@@ -2067,6 +2067,7 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
   };
 
   const handleContainerMouseDown = (e: React.MouseEvent<HTMLDivElement>, containerRef: React.RefObject<HTMLDivElement | null>) => {
+    if (e.button !== 0) return;
     const target = e.target as HTMLElement;
     if (target.closest('[data-asset-item="true"]') || target.closest('button') || target.closest('input')) {
       return;
@@ -2076,6 +2077,7 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
     const rect = container.getBoundingClientRect();
     const startX = e.clientX - rect.left + container.scrollLeft;
     const startY = e.clientY - rect.top + container.scrollTop;
+    const baseSelectedIds: string[] = e.shiftKey || e.ctrlKey || e.metaKey ? Array.from<string>(selectedAssetIds) : [];
 
     setBoxSelection({
       startX,
@@ -2090,36 +2092,36 @@ export const ProjectScriptBible = React.memo(function ProjectScriptBible({
     const onMouseMove = (moveEvent: MouseEvent) => {
       const curX = moveEvent.clientX - rect.left + container.scrollLeft;
       const curY = moveEvent.clientY - rect.top + container.scrollTop;
+      const dx = Math.abs(curX - startX);
+      const dy = Math.abs(curY - startY);
+      const isDragging = didDrag || dx > 5 || dy > 5;
+
+      if (isDragging) {
+        didDrag = true;
+        const boxLeft = Math.min(startX, curX);
+        const boxRight = Math.max(startX, curX);
+        const boxTop = Math.min(startY, curY);
+        const boxBottom = Math.max(startY, curY);
+
+        const assetRows = container.querySelectorAll('[data-asset-item="true"]');
+        const newlySelected = new Set<string>(baseSelectedIds);
+        assetRows.forEach(row => {
+          const rowRect = row.getBoundingClientRect();
+          const rLeft = rowRect.left - rect.left + container.scrollLeft;
+          const rRight = rowRect.right - rect.left + container.scrollLeft;
+          const rTop = rowRect.top - rect.top + container.scrollTop;
+          const rBottom = rowRect.bottom - rect.top + container.scrollTop;
+
+          if (!(rRight < boxLeft || rLeft > boxRight || rBottom < boxTop || rTop > boxBottom)) {
+            const assetId = row.getAttribute('data-asset-id') || parseAssetAgentTargetId(row.getAttribute('data-agent-target'))?.itemId;
+            if (assetId) newlySelected.add(assetId);
+          }
+        });
+        setSelectedAssetIds(newlySelected);
+      }
+
       setBoxSelection(prev => {
         if (!prev) return null;
-        const dx = Math.abs(curX - prev.startX);
-        const dy = Math.abs(curY - prev.startY);
-        const isDragging = prev.isDragging || dx > 5 || dy > 5;
-
-        if (isDragging) {
-          didDrag = true;
-          const boxLeft = Math.min(prev.startX, curX);
-          const boxRight = Math.max(prev.startX, curX);
-          const boxTop = Math.min(prev.startY, curY);
-          const boxBottom = Math.max(prev.startY, curY);
-
-          const assetRows = container.querySelectorAll('[data-asset-item="true"]');
-          const newlySelected = new Set<string>(e.shiftKey || e.ctrlKey || e.metaKey ? selectedAssetIds : []);
-          assetRows.forEach(row => {
-            const rowRect = row.getBoundingClientRect();
-            const rLeft = rowRect.left - rect.left + container.scrollLeft;
-            const rRight = rowRect.right - rect.left + container.scrollLeft;
-            const rTop = rowRect.top - rect.top + container.scrollTop;
-            const rBottom = rowRect.bottom - rect.top + container.scrollTop;
-
-            if (!(rRight < boxLeft || rLeft > boxRight || rBottom < boxTop || rTop > boxBottom)) {
-              const assetId = row.getAttribute('data-asset-id') || parseAssetAgentTargetId(row.getAttribute('data-agent-target'))?.itemId;
-              if (assetId) newlySelected.add(assetId);
-            }
-          });
-          setSelectedAssetIds(newlySelected);
-        }
-
         return {
           ...prev,
           currentX: curX,

@@ -90,6 +90,7 @@
   transition-timing-function: ease-in-out !important;
 }
 
+/* @LOCK-START:css-canvas-gesture-degradation */
 /* 4K Performance & Intent-Driven Lazy Degradation:
    Aggressively strip heavy DOM rendering and expensive CSS effects during active zooming/panning for Asset Cards & Generation Cards */
 #canvas-workspace[data-middle-pan="true"],
@@ -158,6 +159,19 @@ body[data-middle-pan="true"] [data-dock-card="true"] > * {
   filter: none !important;
   backdrop-filter: none !important;
   transition: none !important;
+}
+
+/* Intent-Driven Lazy Degradation for superellipse clip masks on zoomed cards:
+   At >200% zoom, 3 nested corner-shape:squircle masks span millions of screen pixels per card
+   and force Skia to re-rasterize superellipse clip paths on every scale step.
+   Swap to fast native rounded-rect clip during gestures and restore squircle cleanly at idle. */
+#canvas-workspace[data-zooming="true"] .squircle,
+#canvas-workspace[data-panning="true"] .squircle,
+#canvas-workspace[data-gesture="true"] .squircle,
+#canvas-workspace[data-zooming="true"] .corner-squircle,
+#canvas-workspace[data-panning="true"] .corner-squircle,
+#canvas-workspace[data-gesture="true"] .corner-squircle {
+  corner-shape: round !important;
 }
 
 /* GPU Raster Texture Scaling during Canvas gestures (Zoom / Pan / Drag):
@@ -260,6 +274,7 @@ body[data-middle-pan="true"] [data-dock-card="true"] > * {
 #canvas-workspace[data-nano-retired="true"] .card-selection-scaler {
   will-change: auto !important;
 }
+/* @LOCK-END:css-canvas-gesture-degradation */
 
 /* Smooth LOD switch fade-in effect for tags when transitioning from Micro/Nano to Standard LOD */
 #canvas-workspace[data-zooming="true"][data-lod-fade="true"] .card-header-tag,
@@ -318,6 +333,7 @@ body[data-lightbox-open="true"] .animate-agent-float {
   animation-play-state: paused !important;
 }
 
+/* @LOCK-START:css-canvas-gpu-layers */
 /* GPU Hardware Acceleration & Layer Promotion:
    Forces GPU rasterization, texture promotion, and zero main-thread CPU repaints for all canvas renderers and cards */
 canvas,
@@ -336,6 +352,7 @@ canvas,
 #canvas-workspace[data-gesture="true"] .card-selection-scaler {
   will-change: transform;
 }
+/* @LOCK-END:css-canvas-gpu-layers */
 
 /* Card shadow layers (counterparts live in GenerationCard.tsx).
    The blur is rasterized once into dedicated EMPTY elements, so no filter ever wraps the

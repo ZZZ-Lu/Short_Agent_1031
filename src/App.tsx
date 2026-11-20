@@ -1,7 +1,7 @@
 import { EntryBlurOverlay } from './components/EntryBlurOverlay';
 import { executeProjectReadTool, executeProjectAssetMutation, executeProjectScriptMutation } from './agent/projectTools';
 import { registerCardEntries, requestCardEntries, stageCardEntry, startCardEntry, startMediaReveal, mediaRevealProgress, MEDIA_REVEAL_MS, CARD_ENTRY_MS, isNewCardAwaitingLod } from './utils/cardEntrance';
-import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useRef, useState, useEffect, useCallback, useMemo, useSyncExternalStore } from 'react';
 import { AgentCursor, buildDynamicSelectionPrompt, HudContextMessage } from './components/AgentCursor';
 import {
   AgentCoordinateSpace,
@@ -59,19 +59,35 @@ import { fastGetImageDimensions } from './utils/imageHeader';
 import { resizeImageOffThread, resizeImageWithMetaOffThread } from './utils/imageResize';
 import { yieldToMain } from './utils/yieldToMain';
 import { getOrLoadCanvasImage, evictOriginalImageCache } from './utils/imageTextureCache';
-import { getCardWorldBounds, isCardIntersectingRectangle, getLodMountQuota, getLodUnmountQuota, UNMOUNT_TARGET_DURATION_MS, pickZoomOutUnmountBatch, getNanoLodThreshold, CARD_DENSITY_HIGH_THRESHOLD, HIGH_RENDER_WEIGHT_THRESHOLD, calculateTotalRenderWeight, FRAME_BUDGET_MS } from './utils/viewportCulling';
+import { getCardWorldBounds, isCardIntersectingRectangle, getLodMountQuota, getLodUnmountQuota, UNMOUNT_TARGET_DURATION_MS, pickZoomOutUnmountBatch, getNanoLodThreshold, CARD_DENSITY_HIGH_THRESHOLD, HIGH_RENDER_WEIGHT_THRESHOLD, calculateTotalRenderWeight, FRAME_BUDGET_MS, formatZoomHudState } from './utils/viewportCulling';
 import { getHybridPointer, setHybridProximityProvider, isHybridCardNear, CANVAS_IDLE_MS, scheduleCanvasSurface, canLoadDuringCameraGesture, subscribeCanvasLoadingMode, getCanvasLoadingMode, CANVAS_HYBRID_POINTER_WAKE_EVENT, setCameraZoomingOut, isCameraZoomingOut, setCameraTweenZooming } from './utils/canvasPerformance';
 import { isCanvasOverlayControlTarget, shouldPassThroughCanvasCardMiddleButton } from './utils/canvasPointerPassThrough';
 import { readyPromptPanels } from './utils/promptSurfaceCache';
 import { createCardMountStore, ProgressiveGenerationCard } from './components/ProgressiveGenerationCard';
-import { canRetireDomForNano, type LodFrame } from './utils/lodHandoff';
+import { canRetireDomForNano, resolveNanoReadyAction, type LodFrame } from './utils/lodHandoff';
 import { buildCardQuadTree, QuadTree, BoundingBox } from './utils/quadTree';
 import { hasCardMedia, shouldShowGenerationPromptPanel } from './utils/cardLayout';
 import { createSquareLetterboxImage, createVerticalWidescreenSlices, unpadLandmarks } from './utils/squareImageLetterbox';
 import { cropBoundingBoxFromImage } from './utils/imageCropper';
-import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X, MousePointerClick, Video, ArrowUp, ChevronDown, ChevronUp, RotateCcw, Star, ImagePlus } from 'lucide-react';
-import { loadCards, saveCards, deleteCardsForProject, requestPersistence, loadAgentTraces, saveAgentTraces, hasPendingCardSaves, subscribeCardSync, synchronizeCards } from './db';
-import { SettingsPage } from './components/SettingsPage';
+import { Plus, Minus, Undo2, Redo2, Bot, Sun, Moon, Settings, RefreshCw, Sparkles, Send, X, MousePointerClick, Video, ArrowUp, ChevronDown, ChevronUp, RotateCcw, Star, ImagePlus, FolderSync } from 'lucide-react';
+import { loadCards, saveCards, deleteCardsForProject, listStoredCardProjects, requestPersistence, loadAgentTraces, saveAgentTraces, hasPendingCardSaves, subscribeCardSync, subscribeLocalCardCommit, synchronizeCards } from './db';
+import {
+  loadProjectsFromLocalStorage,
+  saveProjectsToLocalStorage,
+  loadProjectsMetaFromIndexedDB,
+  saveProjectsMetaToIndexedDB,
+  reconcileProjectsWithStoredHeads,
+} from './storage/projectMeta';
+import { localFolderMirror, type RestoreFolderResult } from './storage/localFolderMirror';
+import type { ImportArchiveResult } from './storage/backupArchive';
+import {
+  BATCH_IMPORT_COMMIT_INTERVAL,
+  BATCH_IMPORT_SKIP_ENTRANCE_THRESHOLD,
+  checkStorageQuotaForImport,
+  isQuotaError,
+  recoverInterruptedImportCard,
+} from './utils/batchImportPolicy';
+import { SettingsPage, type SettingsSection } from './components/SettingsPage';
 import { getDrafts, saveDraft, deleteDraft } from './utils/draftDb';
 import { McpKeyButton } from './components/McpKeyButton';
 import { ProjectScriptBible } from './components/ProjectScriptBible';
@@ -415,6 +431,7 @@ const getClosestAspectRatio = (width: number, height: number): '1:1' | '3:4' | '
   return closestRatio;
 };
 
+// @LOCK-START:app-zoom-hud
 // Isolated Zoom Indicator HUD: Subscribes to tScale without triggering App root re-renders
 const ZoomControlGroup: React.FC<{
   tScale: any;
@@ -424,15 +441,40 @@ const ZoomControlGroup: React.FC<{
   onZoomOut: () => void;
   onZoomReset: () => void;
 }> = React.memo(({ tScale, isOverviewMode, isScriptPanelOpen, onZoomIn, onZoomOut, onZoomReset }) => {
-  const [scaleVal, setScaleVal] = useState(() => tScale.get());
+  const initialHud = formatZoomHudState(tScale.get());
+  const labelRef = useRef<HTMLSpanElement | null>(null);
+  const pctRef = useRef<HTMLSpanElement | null>(null);
+  const zoomInBtnRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     let rafId: number | null = null;
+    let lastPct = -1;
+    let lastLabel = '';
+    let lastDisabled: boolean | null = null;
+
+    const applyHud = (s: number) => {
+      const hud = formatZoomHudState(s);
+      if (labelRef.current && hud.label !== lastLabel) {
+        labelRef.current.textContent = hud.label;
+        labelRef.current.className = hud.colorClass;
+        lastLabel = hud.label;
+      }
+      if (pctRef.current && hud.pct !== lastPct) {
+        pctRef.current.textContent = `${hud.pct}%`;
+        lastPct = hud.pct;
+      }
+      if (zoomInBtnRef.current && hud.zoomInDisabled !== lastDisabled) {
+        zoomInBtnRef.current.disabled = hud.zoomInDisabled;
+        lastDisabled = hud.zoomInDisabled;
+      }
+    };
+
+    applyHud(tScale.get());
     const unsub = tScale.on('change', (s: number) => {
       if (rafId === null) {
         rafId = requestAnimationFrame(() => {
           rafId = null;
-          setScaleVal(s);
+          applyHud(tScale.get());
         });
       }
     });
@@ -440,24 +482,7 @@ const ZoomControlGroup: React.FC<{
       unsub();
       if (rafId !== null) cancelAnimationFrame(rafId);
     };
-  }, [tScale]);
-
-  const pct = Math.round(scaleVal * 100);
-  let text = "";
-  let colorClass = "";
-  if (pct < 40) {
-    text = "远景";
-    colorClass = "text-blue-500 dark:text-blue-400";
-  } else if (pct < 100) {
-    text = "中景";
-    colorClass = "text-emerald-500 dark:text-emerald-400";
-  } else if (pct < 200) {
-    text = "近景";
-    colorClass = "text-amber-500 dark:text-amber-400";
-  } else {
-    text = "特写";
-    colorClass = "text-rose-500 dark:text-rose-400";
-  }
+  }, [tScale, isOverviewMode]);
 
   return (
     <motion.div
@@ -489,15 +514,16 @@ const ZoomControlGroup: React.FC<{
           </span>
         ) : (
           <>
-            <span className={colorClass}>{text}</span>
-            <span>{pct}%</span>
+            <span ref={labelRef} className={initialHud.colorClass}>{initialHud.label}</span>
+            <span ref={pctRef}>{initialHud.pct}%</span>
           </>
         )}
       </button>
 
       <button
+        ref={zoomInBtnRef}
         onClick={onZoomIn}
-        disabled={scaleVal >= 4.99}
+        disabled={initialHud.zoomInDisabled}
         className="p-1.5 rounded-xl corner-squircle hover:bg-gray-200 dark:hover:bg-neutral-700 disabled:opacity-40 transition-colors"
         title="放大"
       >
@@ -506,6 +532,7 @@ const ZoomControlGroup: React.FC<{
     </motion.div>
   );
 });
+// @LOCK-END:app-zoom-hud
 
 export default function App() {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -581,6 +608,12 @@ export default function App() {
   });
 
   const [showSettings, setShowSettings] = useState(false);
+  const [settingsInitialSection, setSettingsInitialSection] = useState<SettingsSection>('debug');
+  const [storageReloadNonce, setStorageReloadNonce] = useState(0);
+  const folderMirrorSnapshot = useSyncExternalStore(
+    localFolderMirror.subscribe,
+    localFolderMirror.getSnapshot
+  );
   const showSettingsRef = useRef(showSettings);
   useEffect(() => {
     showSettingsRef.current = showSettings;
@@ -699,35 +732,18 @@ export default function App() {
   }, [isDarkMode]);
 
   // Projects & Script Bible State
+  const initialProjectsLoadRef = useRef<ReturnType<typeof loadProjectsFromLocalStorage> | null>(null);
+  if (initialProjectsLoadRef.current === null) {
+    initialProjectsLoadRef.current = loadProjectsFromLocalStorage(
+      typeof window !== 'undefined' ? window.localStorage : null
+    );
+  }
+  const hasHydratedProjectsRef = useRef(false);
   const [projects, setProjects] = useState<ScriptProject[]>(() => {
-    if (typeof window !== 'undefined') {
-      const saved = localStorage.getItem('script_projects');
-      if (saved) {
-        try {
-          const parsed = JSON.parse(saved);
-          // Filter out legacy sample project if present
-          const filtered = Array.isArray(parsed) 
-            ? parsed.filter((p: ScriptProject) => p && p.id !== 'proj_blackstone_night' && p.name !== '黑石之夜')
-            : [];
-          if (filtered.length > 0) {
-            return filtered.map((p: Partial<ScriptProject>) => ({
-              ...DEFAULT_PROJECT,
-              ...p,
-              characters: Array.isArray(p.characters) ? p.characters.filter(Boolean) : [],
-              locations: Array.isArray(p.locations) ? p.locations.filter(Boolean) : [],
-              props: Array.isArray(p.props) ? p.props.filter(Boolean) : [],
-              scenes: Array.isArray(p.scenes) ? p.scenes.filter(Boolean) : [],
-              scriptText: typeof p.scriptText === 'string' ? p.scriptText : '',
-              universe: { ...DEFAULT_PROJECT.universe, ...(p.universe || {}) },
-            }));
-          }
-        } catch (e) {
-          console.error('Failed to parse saved projects', e);
-        }
-      }
-    }
-    return [DEFAULT_PROJECT];
+    return initialProjectsLoadRef.current?.projects ?? [DEFAULT_PROJECT];
   });
+  const projectsRef = useRef(projects);
+  projectsRef.current = projects;
 
   const [currentProjectId, setCurrentProjectId] = useState<string>(() => {
     if (typeof window !== 'undefined') {
@@ -900,24 +916,166 @@ export default function App() {
     setRequestedTocItemId(null);
   }, []);
 
-  // Sync projects to localStorage
+  // Hydrate project list from IndexedDB mirror and recover any orphaned card projects in InfiniteCanvasIncrementalDB
   useEffect(() => {
-    localStorage.setItem('script_projects', JSON.stringify(projects));
+    let cancelled = false;
+    const hydrateAndRecoverProjects = async () => {
+      try {
+        const [metaRes, headsRes] = await Promise.allSettled([
+          loadProjectsMetaFromIndexedDB(),
+          listStoredCardProjects(),
+        ]);
+        if (cancelled) return;
+
+        const idbMetaProjects = metaRes.status === 'fulfilled' ? metaRes.value : null;
+        const storedCardHeads = headsRes.status === 'fulfilled' ? headsRes.value : [];
+        const idbReadFailed = metaRes.status === 'rejected' || headsRes.status === 'rejected';
+        const localStatus = initialProjectsLoadRef.current?.status || 'empty';
+
+        const reconciled = reconcileProjectsWithStoredHeads({
+          currentProjects: projectsRef.current,
+          currentProjectId: currentProjectIdRef.current,
+          localLoadStatus: localStatus,
+          idbMetaProjects,
+          storedCardHeads,
+          storage: typeof window !== 'undefined' ? window.localStorage : null,
+        });
+
+        hasHydratedProjectsRef.current = true;
+
+        const hasRecovered =
+          reconciled.restoredFromIdbMeta || reconciled.recoveredProjectIds.length > 0;
+
+        if (hasRecovered) {
+          projectsRef.current = reconciled.projects;
+          setProjects(reconciled.projects);
+        }
+
+        // Never overwrite stored metadata with default fallback if IndexedDB reads failed.
+        const safeToPersistMeta = !idbReadFailed || localStatus === 'ok' || hasRecovered;
+        if (safeToPersistMeta) {
+          if (typeof window !== 'undefined') {
+            saveProjectsToLocalStorage(window.localStorage, reconciled.projects);
+          }
+          saveProjectsMetaToIndexedDB(reconciled.projects).catch((err) => {
+            console.warn('Failed to mirror project metadata to IndexedDB:', err);
+          });
+        }
+
+        if (
+          reconciled.recommendedProjectId &&
+          reconciled.recommendedProjectId !== currentProjectIdRef.current
+        ) {
+          dirtySaveRef.current = null;
+          loadedProjectIdRef.current = null;
+          setIsLoading(true);
+          setCurrentProjectId(reconciled.recommendedProjectId);
+        }
+
+        if (reconciled.recoveredProjectIds.length > 0) {
+          showToastNotice(
+            `已从本地数据库自动找回 ${reconciled.recoveredProjectIds.length} 个项目`,
+            { id: 'project-recovery-status', dotColor: 'bg-emerald-500', duration: 6000 }
+          );
+        } else if (reconciled.restoredFromIdbMeta) {
+          showToastNotice('已从本地备份恢复项目列表', {
+            id: 'project-recovery-status',
+            dotColor: 'bg-emerald-500',
+            duration: 5000,
+          });
+        }
+      } catch (err) {
+        console.error('Failed to hydrate/recover projects:', err);
+        hasHydratedProjectsRef.current = true;
+      }
+    };
+    void hydrateAndRecoverProjects();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Initialize local disk folder mirror & subscribe to local card commits
+  useEffect(() => {
+    void localFolderMirror.initialize();
+    const unsubscribeCommit = subscribeLocalCardCommit((projectId) => {
+      localFolderMirror.enqueueProjectSync(projectId, projectsRef.current);
+    });
+    return () => {
+      unsubscribeCommit();
+    };
+  }, []);
+
+  const handleApplyRestoredProjects = useCallback(
+    (result: RestoreFolderResult | ImportArchiveResult) => {
+      const nextProjects =
+        Array.isArray(result.projects) && result.projects.length > 0
+          ? result.projects
+          : [DEFAULT_PROJECT];
+
+      projectsRef.current = nextProjects;
+      setProjects(nextProjects);
+      if (typeof window !== 'undefined') {
+        saveProjectsToLocalStorage(window.localStorage, nextProjects);
+      }
+      saveProjectsMetaToIndexedDB(nextProjects).catch((err) => {
+        console.warn('Failed to save restored project metadata to IndexedDB:', err);
+      });
+
+      const currentExists = nextProjects.some((p) => p.id === currentProjectIdRef.current);
+      const bestNonDefault = nextProjects.find((p) => p.id !== DEFAULT_PROJECT.id);
+      const targetProjectId =
+        currentExists && currentProjectIdRef.current !== DEFAULT_PROJECT.id
+          ? currentProjectIdRef.current
+          : bestNonDefault?.id || nextProjects[0].id;
+
+      dirtySaveRef.current = null;
+      loadedProjectIdRef.current = null;
+      setIsLoading(true);
+      if (targetProjectId !== currentProjectIdRef.current) {
+        setCurrentProjectId(targetProjectId);
+      }
+      setStorageReloadNonce((n) => n + 1);
+    },
+    []
+  );
+
+  // Sync projects safely to localStorage + IndexedDB mirror + optional local disk folder
+  useEffect(() => {
+    if (!hasHydratedProjectsRef.current) return;
+    if (typeof window !== 'undefined') {
+      const result = saveProjectsToLocalStorage(window.localStorage, projects);
+      if (!result.ok) {
+        console.warn('localStorage script_projects write failed; relying on IndexedDB mirror', result.error);
+      }
+    }
+    saveProjectsMetaToIndexedDB(projects).catch((err) => {
+      console.warn('Failed to mirror project metadata to IndexedDB:', err);
+    });
+    localFolderMirror.enqueueProjectsMetaSync(projects);
   }, [projects]);
 
   useEffect(() => {
-    localStorage.setItem('current_project_id', currentProjectId);
-    if (currentProjectId) {
-      const saved = localStorage.getItem(`task_panel_collapsed_${currentProjectId}`);
-      if (saved !== null) {
-        setIsTaskPanelCollapsed(saved === 'true');
+    try {
+      localStorage.setItem('current_project_id', currentProjectId);
+      if (currentProjectId) {
+        const saved = localStorage.getItem(`task_panel_collapsed_${currentProjectId}`);
+        if (saved !== null) {
+          setIsTaskPanelCollapsed(saved === 'true');
+        }
       }
+    } catch (err) {
+      console.warn('Failed to persist current_project_id:', err);
     }
   }, [currentProjectId]);
 
   useEffect(() => {
     if (!currentProjectId) return;
-    localStorage.setItem(`task_panel_collapsed_${currentProjectId}`, String(isTaskPanelCollapsed));
+    try {
+      localStorage.setItem(`task_panel_collapsed_${currentProjectId}`, String(isTaskPanelCollapsed));
+    } catch (err) {
+      console.warn('Failed to persist task_panel_collapsed:', err);
+    }
   }, [currentProjectId, isTaskPanelCollapsed]);
 
   const handleRenameProject = (projectId: string, newName: string) => {
@@ -3185,13 +3343,35 @@ export default function App() {
     };
   }, []);
 
+  const activeImportBatchesRef = useRef(0);
+
   const importFilesToCanvas = useCallback(async (
-    files: File[], 
-    targetClientX?: number, 
-    targetClientY?: number, 
+    files: File[],
+    targetClientX?: number,
+    targetClientY?: number,
     sourceLabel: string = 'Imported'
   ) => {
     if (!files || files.length === 0) return;
+
+    const mediaFiles = files.filter((file) => {
+      if (!file || typeof file.type !== 'string') return false;
+      return file.type.startsWith('image/') || file.type.startsWith('video/');
+    });
+    if (mediaFiles.length === 0) return;
+
+    // Pre-check browser storage budget before creating blobs or writing cards
+    const quotaCheck = await checkStorageQuotaForImport(mediaFiles);
+    if (!quotaCheck.ok) {
+      showToastNotice(quotaCheck.reason || '浏览器剩余存储空间不足，请分批导入。', {
+        id: 'batch-import-status',
+        dotColor: 'bg-red-500',
+        duration: 8000,
+      });
+      return;
+    }
+
+    const targetProjectId = currentProjectIdRef.current;
+    if (!targetProjectId) return;
 
     const rect = containerRef.current?.getBoundingClientRect();
 
@@ -3218,95 +3398,6 @@ export default function App() {
     const dropCanvasX = (dropClientX - tx.get()) / tScale.get();
     const dropCanvasY = (dropClientY - ty.get()) / tScale.get();
 
-    // Step 1: Ultra-fast header parsing (<1ms per image) to get true aspect ratio immediately
-    const cardInitPromises = files.map(async (file, index) => {
-      const isImage = file.type.startsWith('image/');
-      const isVideo = file.type.startsWith('video/');
-      if (!isImage && !isVideo) return null;
-
-      const fileUrl = URL.createObjectURL(file);
-      let width = 0;
-      let height = 0;
-
-      try {
-        if (isImage) {
-          const dims = await fastGetImageDimensions(file);
-          width = dims.width;
-          height = dims.height;
-        } else if (isVideo) {
-          const dims = await getVideoDimensions(fileUrl);
-          width = dims.width;
-          height = dims.height;
-        }
-      } catch (err) {
-        console.warn('Fast dimensions parsing failed, fallback:', err);
-      }
-
-      // Preserve natural aspect ratio and scale to standard visual area
-      const ratio = getClosestAspectRatio(width, height);
-      let customWidth: number | undefined;
-      let customHeight: number | undefined;
-      if (width > 0 && height > 0) {
-        const TARGET_AREA = 230400; // 480x480 standard equivalent
-        const scaleFactor = Math.sqrt(TARGET_AREA / (width * height));
-        customWidth = Math.round(width * scaleFactor);
-        customHeight = Math.round(height * scaleFactor);
-      }
-
-      const dim = customWidth && customHeight ? { width: customWidth, height: customHeight } : CARD_DIMENSIONS[ratio];
-      const newId = Math.random().toString(36).substring(2, 11);
-      const offset = index * 40;
-
-      // Card is created immediately at the exact aspect ratio with the image visible!
-      // Initial state is 'idle': clean and unencumbered during the entrance animation.
-      // Attach binary file blob directly to avoid fetch(blobUrl) in CardCodec during debounced project sync.
-      const initialCard: CardData = {
-        id: newId,
-        x: dropCanvasX - dim.width / 2 + offset,
-        y: dropCanvasY - dim.height / 2 + offset,
-        state: 'generating',
-        ratio: ratio,
-        res: '2K',
-        prompt: `${sourceLabel} ${isVideo ? 'video' : 'image'}: ${file.name || 'unnamed'}`,
-        imageUrl: undefined,
-        // Keep the raw file available for recovery, but don't decode/draw the full source on the
-        // canvas thread. The card shows its import placeholder until a small preview is ready.
-        fileData: file,
-        isVideo: isVideo,
-        customWidth: customWidth,
-        customHeight: customHeight,
-        fileName: file.name || 'unnamed',
-        nativeWidth: width,
-        nativeHeight: height,
-      };
-
-      return {
-        card: initialCard,
-        file,
-        fileUrl,
-        isImage,
-        isVideo,
-        width,
-        height,
-      };
-    });
-
-    const parsedItems = (await Promise.all(cardInitPromises)).filter(Boolean) as {
-      card: CardData;
-      file: File;
-      fileUrl: string;
-      isImage: boolean;
-      isVideo: boolean;
-      width: number;
-      height: number;
-    }[];
-    if (parsedItems.length === 0) return;
-
-    const newCardIds: string[] = [];
-
-    // Resolve each image's import work before mounting it with its entrance animation.
-    // This keeps expensive resize/thumbnail work out of the animation window and avoids
-    // starting several cards' entrance animations while later files are still processing.
     const waitForCardEntrance = (cardId: string): Promise<void> => new Promise(resolve => {
       let finished = false;
       let timeout: ReturnType<typeof setTimeout>;
@@ -3325,168 +3416,334 @@ export default function App() {
       timeout = setTimeout(cleanup, CARD_ENTRY_MS + 80);
     });
 
-    for (const item of parsedItems) {
-      const { file, fileUrl, isImage, isVideo, width, height, card } = item;
-      stageCardEntry(currentProjectId, {
-        id: card.id,
-        x: card.x,
-        y: card.y,
-        width: card.customWidth || CARD_DIMENSIONS[card.ratio].width,
-        height: card.customHeight || CARD_DIMENSIONS[card.ratio].height,
-      });
-      setRenderedCardIds(prev => new Set([...prev, card.id]));
-      setVisibleCardIdSet(prev => new Set([...prev, card.id]));
-      newCardIds.push(card.id);
-      setSelectedCardIds([...newCardIds]);
-      setCards(prev => [...prev, card], false);
+    const isLargeBatch = mediaFiles.length >= BATCH_IMPORT_SKIP_ENTRANCE_THRESHOLD;
+    const showProgressToast = mediaFiles.length >= 3;
+    const newCardIds: string[] = [];
+    const committedCardIds = new Set<string>();
+    const uncommittedCardIds: string[] = [];
+    const failedFiles: string[] = [];
+    let completedSinceLastSave = 0;
+    let quotaStopped = false;
 
-      // Let React paint the card in its opening pose before doing image work.
-      await yieldToMain();
-      let processedFile: Blob = file;
-      let originalFileData: Blob | undefined;
-      let trueOriginalFileData: Blob | undefined;
-      let originalImageUrl: string | undefined;
-      let trueOriginalImageUrl: string | undefined;
-      let realWidth = width;
-      let realHeight = height;
-
-      if (isImage) {
-        try {
-          const resized1200 = await compressAndResizeImageWithMeta(file, 1200, 0.85, true);
-          processedFile = resized1200.blob;
-          if (resized1200.width > 0 && resized1200.height > 0) {
-            realWidth = resized1200.width;
-            realHeight = resized1200.height;
-          }
-          const maxTextureDim = 4096;
-          if (realWidth > maxTextureDim || realHeight > maxTextureDim) {
-            trueOriginalFileData = file;
-            trueOriginalImageUrl = fileUrl;
-            const proxy4k = resized1200.blob4k || (await compressAndResizeImage(file, maxTextureDim, 0.9));
-            originalFileData = proxy4k;
-            originalImageUrl = URL.createObjectURL(proxy4k);
-          } else {
-            originalFileData = file;
-            originalImageUrl = fileUrl;
-          }
-        } catch (err) {
-          console.error('Failed to process imported image; keeping original file', err);
-          processedFile = file;
-          originalFileData = file;
-          originalImageUrl = fileUrl;
-          if (realWidth > 4096 || realHeight > 4096) {
-            trueOriginalFileData = file;
-            trueOriginalImageUrl = fileUrl;
-          }
-        }
-      }
-
-      const processedFileUrl = URL.createObjectURL(processedFile);
-      let thumbnailUrl: string | undefined;
-      let blurPlaceholderUrl: string | undefined;
-      let microLodThumbnailUrl: string | undefined;
-      let fullDetailThumbnailUrl: string | undefined;
-      let closeupThumbnailUrl: string | undefined;
-      let videoPosterUrl: string | undefined;
+    const commitCheckpoint = async (forceFinal: boolean): Promise<boolean> => {
+      if (currentProjectIdRef.current !== targetProjectId) return false;
+      if (loadedProjectIdRef.current !== targetProjectId) return false;
+      if (!forceFinal && completedSinceLastSave < BATCH_IMPORT_COMMIT_INTERVAL) return true;
+      if (completedSinceLastSave === 0) return true;
+      const snapshot = cardsRef.current;
       try {
-        if (isVideo) {
-          videoPosterUrl = await generateNativeVideoPoster(processedFile);
+        await saveCards(snapshot, targetProjectId);
+        for (const id of uncommittedCardIds) committedCardIds.add(id);
+        uncommittedCardIds.length = 0;
+        completedSinceLastSave = 0;
+        if (currentProjectIdRef.current === targetProjectId && cardsRef.current === snapshot) {
+          dirtySaveRef.current = null;
+        }
+        return true;
+      } catch (saveErr) {
+        console.error('Batch import checkpoint save failed:', saveErr);
+        if (isQuotaError(saveErr)) {
+          quotaStopped = true;
+          if (uncommittedCardIds.length > 0) {
+            const dropSet = new Set(uncommittedCardIds);
+            const nextCards = cardsRef.current.filter(c => !dropSet.has(c.id));
+            cardsRef.current = nextCards;
+            setCards(nextCards, false);
+            for (let i = newCardIds.length - 1; i >= 0; i--) {
+              if (dropSet.has(newCardIds[i])) newCardIds.splice(i, 1);
+            }
+            uncommittedCardIds.length = 0;
+            completedSinceLastSave = 0;
+          }
+          return false;
+        }
+        // Non-quota transient save failure: keep cards in memory so next checkpoint / auto-save can retry
+        return true;
+      }
+    };
+
+    activeImportBatchesRef.current += 1;
+    try {
+      for (let index = 0; index < mediaFiles.length; index++) {
+        if (currentProjectIdRef.current !== targetProjectId) break;
+        const file = mediaFiles[index];
+        const isImage = file.type.startsWith('image/');
+        const isVideo = file.type.startsWith('video/');
+        let cardIdForCleanup: string | null = null;
+        let fileUrlForCleanup: string | null = null;
+
+        if (showProgressToast) {
+          showToastNotice(
+            `正在导入 ${index + 1}/${mediaFiles.length}：${file.name || '未命名文件'}`,
+            { id: 'batch-import-status', dotColor: 'bg-blue-500', duration: 0 }
+          );
+        }
+
+        try {
+          const fileUrl = URL.createObjectURL(file);
+          fileUrlForCleanup = fileUrl;
+          let width = 0;
+          let height = 0;
+
+          try {
+            if (isImage) {
+              const dims = await fastGetImageDimensions(file);
+              width = dims.width;
+              height = dims.height;
+            } else if (isVideo) {
+              const dims = await getVideoDimensions(fileUrl);
+              width = dims.width;
+              height = dims.height;
+            }
+          } catch (err) {
+            console.warn('Fast dimensions parsing failed, fallback:', err);
+          }
+
+          if (currentProjectIdRef.current !== targetProjectId) {
+            try { URL.revokeObjectURL(fileUrl); } catch {}
+            break;
+          }
+
+          const ratio = getClosestAspectRatio(width, height);
+          let customWidth: number | undefined;
+          let customHeight: number | undefined;
+          if (width > 0 && height > 0) {
+            const TARGET_AREA = 230400; // 480x480 standard equivalent
+            const scaleFactor = Math.sqrt(TARGET_AREA / (width * height));
+            customWidth = Math.round(width * scaleFactor);
+            customHeight = Math.round(height * scaleFactor);
+          }
+
+          const dim = customWidth && customHeight ? { width: customWidth, height: customHeight } : CARD_DIMENSIONS[ratio];
+          const newId = Math.random().toString(36).substring(2, 11);
+          cardIdForCleanup = newId;
+          const offset = index * 40;
+
+          const card: CardData = {
+            id: newId,
+            x: dropCanvasX - dim.width / 2 + offset,
+            y: dropCanvasY - dim.height / 2 + offset,
+            state: 'generating',
+            ratio: ratio,
+            res: '2K',
+            prompt: `${sourceLabel} ${isVideo ? 'video' : 'image'}: ${file.name || 'unnamed'}`,
+            imageUrl: undefined,
+            fileData: file,
+            isVideo: isVideo,
+            customWidth: customWidth,
+            customHeight: customHeight,
+            fileName: file.name || 'unnamed',
+            nativeWidth: width,
+            nativeHeight: height,
+          };
+
+          stageCardEntry(targetProjectId, {
+            id: card.id,
+            x: card.x,
+            y: card.y,
+            width: card.customWidth || CARD_DIMENSIONS[card.ratio].width,
+            height: card.customHeight || CARD_DIMENSIONS[card.ratio].height,
+          });
+          setRenderedCardIds(prev => new Set([...prev, card.id]));
+          setVisibleCardIdSet(prev => new Set([...prev, card.id]));
+          newCardIds.push(card.id);
+          setSelectedCardIds([...newCardIds]);
+          cardsRef.current = [...cardsRef.current, card];
+          setCards(prev => [...prev, card], false);
+
+          // Let React paint the card in its opening pose before doing image work.
           await yieldToMain();
-          const posterBlob = await fetch(videoPosterUrl).then(response => response.blob());
-          closeupThumbnailUrl = await generateImportThumbnail(posterBlob, 256);
-          thumbnailUrl = closeupThumbnailUrl;
-          await warmCanvasImage(closeupThumbnailUrl);
-          startMediaReveal(card.id);
-          // Paint a tiny poster first so the card does not upload a video frame and animate
-          // in the same frame. Keep the import overlay until all video assets are ready.
-          setCards(prev => prev.map(existing => existing.id === card.id ? {
-            ...existing, imageUrl: closeupThumbnailUrl, thumbnailUrl,
-            fileData: processedFile, isVideo: false,
-          } : existing), false);
-          await yieldToMain();
-          await yieldToMain();
-          microLodThumbnailUrl = await generateImportThumbnail(posterBlob, 64);
-          await yieldToMain();
-          // Pre-baked gaussian blurred placeholder (64px, blur 4px) for beautiful zero-cost placeholder
-          blurPlaceholderUrl = await generateImportThumbnail(posterBlob, 64, 4);
-          await yieldToMain();
-          fullDetailThumbnailUrl = await generateImportThumbnail(posterBlob, 128);
-        } else {
-          await yieldToMain();
-          closeupThumbnailUrl = await generateImportThumbnail(processedFile, 256);
-          thumbnailUrl = closeupThumbnailUrl;
-          await warmCanvasImage(closeupThumbnailUrl);
-          startMediaReveal(card.id);
-          // Show the small preview under the import indicator while the other LODs load.
-          setCards(prev => prev.map(existing => existing.id === card.id ? {
-            ...existing, imageUrl: closeupThumbnailUrl, thumbnailUrl,
+          let processedFile: Blob = file;
+          let originalFileData: Blob | undefined;
+          let trueOriginalFileData: Blob | undefined;
+          let originalImageUrl: string | undefined;
+          let trueOriginalImageUrl: string | undefined;
+          let realWidth = width;
+          let realHeight = height;
+
+          if (isImage) {
+            try {
+              const resized1200 = await compressAndResizeImageWithMeta(file, 1200, 0.85, true);
+              processedFile = resized1200.blob;
+              if (resized1200.width > 0 && resized1200.height > 0) {
+                realWidth = resized1200.width;
+                realHeight = resized1200.height;
+              }
+              const maxTextureDim = 4096;
+              if (realWidth > maxTextureDim || realHeight > maxTextureDim) {
+                trueOriginalFileData = file;
+                trueOriginalImageUrl = fileUrl;
+                const proxy4k = resized1200.blob4k || (await compressAndResizeImage(file, maxTextureDim, 0.9));
+                originalFileData = proxy4k;
+                originalImageUrl = URL.createObjectURL(proxy4k);
+              } else {
+                originalFileData = file;
+                originalImageUrl = fileUrl;
+              }
+            } catch (err) {
+              console.error('Failed to process imported image; keeping original file', err);
+              processedFile = file;
+              originalFileData = file;
+              originalImageUrl = fileUrl;
+              if (realWidth > 4096 || realHeight > 4096) {
+                trueOriginalFileData = file;
+                trueOriginalImageUrl = fileUrl;
+              }
+            }
+          }
+
+          const processedFileUrl = URL.createObjectURL(processedFile);
+          let thumbnailUrl: string | undefined;
+          let blurPlaceholderUrl: string | undefined;
+          let microLodThumbnailUrl: string | undefined;
+          let fullDetailThumbnailUrl: string | undefined;
+          let closeupThumbnailUrl: string | undefined;
+          let videoPosterUrl: string | undefined;
+          try {
+            if (isVideo) {
+              videoPosterUrl = await generateNativeVideoPoster(processedFile);
+              await yieldToMain();
+              const posterBlob = await fetch(videoPosterUrl).then(response => response.blob());
+              closeupThumbnailUrl = await generateImportThumbnail(posterBlob, 256);
+              thumbnailUrl = closeupThumbnailUrl;
+              await warmCanvasImage(closeupThumbnailUrl);
+              startMediaReveal(card.id);
+              setCards(prev => prev.map(existing => existing.id === card.id ? {
+                ...existing, imageUrl: closeupThumbnailUrl, thumbnailUrl,
+                fileData: processedFile, isVideo: false,
+              } : existing), false);
+              await yieldToMain();
+              microLodThumbnailUrl = await generateImportThumbnail(posterBlob, 64);
+              await yieldToMain();
+              blurPlaceholderUrl = await generateImportThumbnail(posterBlob, 64, 4);
+              await yieldToMain();
+              fullDetailThumbnailUrl = await generateImportThumbnail(posterBlob, 128);
+            } else {
+              await yieldToMain();
+              closeupThumbnailUrl = await generateImportThumbnail(processedFile, 256);
+              thumbnailUrl = closeupThumbnailUrl;
+              await warmCanvasImage(closeupThumbnailUrl);
+              startMediaReveal(card.id);
+              setCards(prev => prev.map(existing => existing.id === card.id ? {
+                ...existing, imageUrl: closeupThumbnailUrl, thumbnailUrl,
+                fileData: processedFile,
+                nativeWidth: realWidth,
+                nativeHeight: realHeight,
+              } : existing), false);
+              await yieldToMain();
+              microLodThumbnailUrl = await generateImportThumbnail(processedFile, 64);
+              await yieldToMain();
+              blurPlaceholderUrl = await generateImportThumbnail(processedFile, 64, 4);
+              await yieldToMain();
+              fullDetailThumbnailUrl = await generateImportThumbnail(processedFile, 128);
+            }
+          } catch (thumbErr) {
+            console.warn('Could not pre-generate thumbnail on import:', thumbErr);
+          }
+
+          if (currentProjectIdRef.current !== targetProjectId) break;
+
+          const importingCard: CardData = {
+            ...card,
+            state: 'generating',
+            imageUrl: processedFileUrl,
             fileData: processedFile,
+            originalFileData,
+            trueOriginalFileData,
+            originalImageUrl,
+            trueOriginalImageUrl,
+            thumbnailUrl,
+            blurPlaceholderUrl,
+            microLodThumbnailUrl,
+            fullDetailThumbnailUrl,
+            closeupThumbnailUrl,
+            videoPosterUrl,
             nativeWidth: realWidth,
             nativeHeight: realHeight,
-          } : existing), false);
+          };
+
+          const warmTargetUrl = isVideo ? (videoPosterUrl || closeupThumbnailUrl) : processedFileUrl;
+          if (warmTargetUrl) {
+            await warmCanvasImage(warmTargetUrl);
+          }
+          if (!isVideo && originalImageUrl && tScale.get() >= 2 && originalImageUrl !== processedFileUrl) {
+            await warmCanvasImage(originalImageUrl, 'original');
+          }
           await yieldToMain();
+          startMediaReveal(card.id);
+          if (!isLargeBatch) {
+            const remainingReveal = (1 - mediaRevealProgress(card.id)) * MEDIA_REVEAL_MS;
+            if (remainingReveal > 0 && closeupThumbnailUrl) await new Promise(resolve => setTimeout(resolve, remainingReveal));
+          }
+          setCards(prev => prev.map(existing => existing.id === card.id ? importingCard : existing), false);
           await yieldToMain();
-          microLodThumbnailUrl = await generateImportThumbnail(processedFile, 64);
-          await yieldToMain();
-          // Pre-baked gaussian blurred placeholder (64px, blur 4px) for beautiful zero-cost placeholder
-          blurPlaceholderUrl = await generateImportThumbnail(processedFile, 64, 4);
-          await yieldToMain();
-          fullDetailThumbnailUrl = await generateImportThumbnail(processedFile, 128);
+          if (!isLargeBatch && !closeupThumbnailUrl) {
+            const remainingFallbackReveal = (1 - mediaRevealProgress(card.id)) * MEDIA_REVEAL_MS;
+            if (remainingFallbackReveal > 0) await new Promise(resolve => setTimeout(resolve, remainingFallbackReveal));
+          }
+
+          const completedCard: CardData = { ...importingCard, state: 'completed' };
+          const entranceComplete = isLargeBatch ? null : waitForCardEntrance(card.id);
+          cardsRef.current = cardsRef.current.map(existing => existing.id === card.id ? completedCard : existing);
+          setCards(prev => prev.map(existing => existing.id === card.id ? completedCard : existing), false);
+          startCardEntry(card.id);
+          window.dispatchEvent(new CustomEvent('card-entry-start', { detail: { cardId: card.id } }));
+          if (entranceComplete) {
+            await entranceComplete;
+          }
+
+          uncommittedCardIds.push(card.id);
+          completedSinceLastSave += 1;
+          const okToContinue = await commitCheckpoint(false);
+          if (!okToContinue) break;
+        } catch (fileErr) {
+          console.error(`Failed to import file "${file.name || 'unnamed'}":`, fileErr);
+          failedFiles.push(file.name || '未命名文件');
+          if (cardIdForCleanup) {
+            const failedId = cardIdForCleanup;
+            const idx = newCardIds.indexOf(failedId);
+            if (idx >= 0) newCardIds.splice(idx, 1);
+            cardsRef.current = cardsRef.current.filter(existing => existing.id !== failedId);
+            setCards(prev => prev.filter(existing => existing.id !== failedId), false);
+          }
+          if (fileUrlForCleanup) {
+            try { URL.revokeObjectURL(fileUrlForCleanup); } catch {}
+          }
+          if (isQuotaError(fileErr)) {
+            quotaStopped = true;
+            break;
+          }
         }
-      } catch (thumbErr) {
-        console.warn('Could not pre-generate thumbnail on import:', thumbErr);
       }
 
-      const importingCard: CardData = {
-        ...card,
-        state: 'generating',
-        imageUrl: processedFileUrl,
-        fileData: processedFile,
-        originalFileData,
-        trueOriginalFileData,
-        originalImageUrl,
-        trueOriginalImageUrl,
-        thumbnailUrl,
-        blurPlaceholderUrl,
-        microLodThumbnailUrl,
-        fullDetailThumbnailUrl,
-        closeupThumbnailUrl,
-        videoPosterUrl,
-        nativeWidth: realWidth,
-        nativeHeight: realHeight,
-      };
-
-      // Decode the full proxy into the same canvas image cache before exposing it to React.
-      // Its first canvas draw then happens while the card is still held and marked importing.
-      const warmTargetUrl = isVideo ? (videoPosterUrl || closeupThumbnailUrl) : processedFileUrl;
-      if (warmTargetUrl) {
-        await warmCanvasImage(warmTargetUrl);
-      }
-      if (!isVideo && originalImageUrl && tScale.get() >= 2 && originalImageUrl !== processedFileUrl) {
-        await warmCanvasImage(originalImageUrl, 'original');
-      }
-      await yieldToMain();
-      startMediaReveal(card.id);
-      const remainingReveal = (1 - mediaRevealProgress(card.id)) * MEDIA_REVEAL_MS;
-      if (remainingReveal > 0 && closeupThumbnailUrl) await new Promise(resolve => setTimeout(resolve, remainingReveal));
-      setCards(prev => prev.map(existing => existing.id === card.id ? importingCard : existing), false);
-      await yieldToMain();
-      await yieldToMain();
-      if (!closeupThumbnailUrl) {
-        const remainingFallbackReveal = (1 - mediaRevealProgress(card.id)) * MEDIA_REVEAL_MS;
-        if (remainingFallbackReveal > 0) await new Promise(resolve => setTimeout(resolve, remainingFallbackReveal));
+      if (!quotaStopped && completedSinceLastSave > 0) {
+        await commitCheckpoint(true);
       }
 
-      // Finish import and let the canvas paint the ready image before the entrance animation.
-      const entranceComplete = waitForCardEntrance(card.id);
-      setCards(prev => prev.map(existing => existing.id === card.id ? { ...existing, state: 'completed' } : existing), false);
-      startCardEntry(card.id);
-      window.dispatchEvent(new CustomEvent('card-entry-start', { detail: { cardId: card.id } }));
-      await entranceComplete;
+      if (currentProjectIdRef.current === targetProjectId) {
+        setSelectedCardIds(newCardIds);
+      }
+
+      if (quotaStopped) {
+        showToastNotice(
+          `浏览器存储空间不足，已安全保存前 ${committedCardIds.size} 个素材并停止剩余导入`,
+          { id: 'batch-import-status', dotColor: 'bg-red-500', duration: 8000 }
+        );
+      } else if (failedFiles.length > 0) {
+        showToastNotice(
+          `导入完成：成功 ${newCardIds.length} 个，失败 ${failedFiles.length} 个`,
+          { id: 'batch-import-status', dotColor: 'bg-amber-500', duration: 6000 }
+        );
+      } else if (showProgressToast && newCardIds.length > 0) {
+        showToastNotice(`已成功导入 ${newCardIds.length} 个素材`, {
+          id: 'batch-import-status',
+          dotColor: 'bg-emerald-500',
+          duration: 3000,
+        });
+      }
+    } finally {
+      activeImportBatchesRef.current = Math.max(0, activeImportBatchesRef.current - 1);
     }
-
-    // Keep the whole imported batch selected once the serial import-and-entrance pass ends.
-    setSelectedCardIds(newCardIds);
   }, [tx, ty, tScale]);
 
   const handleDrop = useCallback(async (e: React.DragEvent) => {
@@ -4007,13 +4264,13 @@ export default function App() {
             if (typeof savedPos === 'number' && savedPos !== card.currentTime) {
               updates.currentTime = savedPos;
             }
-            if (Object.keys(updates).length === 0) {
-              return card;
-            }
-            return {
-              ...card,
-              ...updates
-            };
+            const mergedCard = Object.keys(updates).length === 0
+              ? card
+              : {
+                  ...card,
+                  ...updates
+                };
+            return recoverInterruptedImportCard(mergedCard);
           });
           setHistory({ past: [], present: processedSaved, future: [] });
           loadedProjectIdRef.current = currentProjectId;
@@ -4247,7 +4504,7 @@ export default function App() {
     };
     fetchProjectCards();
     return () => { mounted = false; };
-  }, [currentProjectId]);
+  }, [currentProjectId, storageReloadNonce]);
 
   // Debounce incremental saves; bound continuous edits and cancel stale project callbacks.
   useEffect(() => {
@@ -4257,7 +4514,7 @@ export default function App() {
     const schedule = () => { clearTimeout(timer); timer = setTimeout(sync, 300); };
     const sync = async () => {
       if (cancelled) return;
-      if (busy || isUserPointerDownRef.current || isDraggingCanvasRef.current || isZoomingRef.current) { schedule(); return; }
+      if (busy || activeImportBatchesRef.current > 0 || isUserPointerDownRef.current || isDraggingCanvasRef.current || isZoomingRef.current) { schedule(); return; }
       const snapshot = cardsRef.current;
       busy = true;
       try {
@@ -4292,6 +4549,11 @@ export default function App() {
       saveCardsTimerRef.current = setTimeout(() => {
         const doSave = async () => {
           if (cancelled || loadedProjectIdRef.current !== currentProjectId || currentProjectIdRef.current !== currentProjectId) return;
+          if (activeImportBatchesRef.current > 0) {
+            // Defer auto-save during active bulk import; importFilesToCanvas checkpoints every few completed files.
+            saveCardsTimerRef.current = setTimeout(doSave, 500);
+            return;
+          }
           if ((isUserPointerDownRef.current || (window as any).isDraggingCard || isDraggingCanvasRef.current || isZoomingRef.current)
               && Date.now() - (dirtySaveRef.current?.since || Date.now()) < 2000) {
             // Postpone save if user is actively interacting with the canvas/cards
@@ -4329,12 +4591,12 @@ export default function App() {
   // Flush on backgrounding. Unload cannot guarantee async completion; warn while dirty.
   useEffect(() => {
     const flushOnHide = () => {
-      if (currentProjectId && loadedProjectIdRef.current === currentProjectId) {
+      if (currentProjectId && loadedProjectIdRef.current === currentProjectId && activeImportBatchesRef.current === 0) {
         saveCards(cardsRef.current, currentProjectId).catch(error => console.error(error));
       }
     };
     const handleBeforeUnload = (event: BeforeUnloadEvent) => {
-      if (dirtySaveRef.current || hasPendingCardSaves()) {
+      if (dirtySaveRef.current || hasPendingCardSaves() || activeImportBatchesRef.current > 0) {
         flushOnHide();
         event.preventDefault();
         event.returnValue = '';
@@ -5227,25 +5489,29 @@ export default function App() {
     if (ws) ws.removeAttribute('data-lod-fade');
   }, []);
 
+  // @LOCK-START:app-lod-handoff
   const lastReadyNanoFrameRef = useRef<LodFrame | null>(null);
   const handleNanoCanvasReady = useCallback((frame: LodFrame) => {
     lastReadyNanoFrameRef.current = frame;
-    if ((isNanoLod || tScale.get() < getNanoLodThreshold()) &&
-        canRetireDomForNano(frame, { scale: tScale.get(), tx: tx.get(), ty: ty.get() })) {
-      const workspace = document.getElementById('canvas-workspace');
-      const activeZoomOrTween = Boolean(
-        isZoomingRef.current ||
-        isTweenZoomingRef.current ||
-        isZoomAnimationActiveRef.current ||
-        workspace?.getAttribute('data-zooming') === 'true'
-      );
-      if (activeZoomOrTween) {
-        if (workspace && workspace.getAttribute('data-nano-retired') !== 'true') {
-          workspace.setAttribute('data-nano-retired', 'true');
-        }
-      } else {
-        startProgressiveDomUnmountRef.current();
+    if (!(isNanoLod || tScale.get() < getNanoLodThreshold())) return;
+    const workspace = document.getElementById('canvas-workspace');
+    const activeZoomOrTween = Boolean(
+      isZoomingRef.current ||
+      isTweenZoomingRef.current ||
+      isZoomAnimationActiveRef.current ||
+      workspace?.getAttribute('data-zooming') === 'true'
+    );
+    const action = resolveNanoReadyAction({
+      frame,
+      camera: { scale: tScale.get(), tx: tx.get(), ty: ty.get() },
+      isActiveZoomOrTween: activeZoomOrTween,
+    });
+    if (action === 'css-retire') {
+      if (workspace && workspace.getAttribute('data-nano-retired') !== 'true') {
+        workspace.setAttribute('data-nano-retired', 'true');
       }
+    } else if (action === 'progressive-unmount') {
+      startProgressiveDomUnmountRef.current();
     }
   }, [isNanoLod, tScale, tx, ty]);
 
@@ -5273,7 +5539,6 @@ export default function App() {
 
   useEffect(() => {
     let prevScale = tScale.get();
-    let prevDomMicro: boolean | null = null;
     const unsub = tScale.on('change', (s) => {
       if (Math.abs(s - prevScale) > 0.0001) {
         setCameraZoomingOut(s < prevScale);
@@ -5296,17 +5561,24 @@ export default function App() {
       const isLazyGesture = getCanvasLoadingMode() === 'lazy' && isActiveGesture;
       const deferLodTransition = isTweenZoomingRef.current || isZoomAnimationActiveRef.current || isLazyGesture || (isActiveGesture && isMicro);
 
-      if (workspace && prevDomMicro !== isMicro) {
+      if (workspace) {
+        const hasDomMicro = workspace.getAttribute('data-scale-micro') === 'true';
         if (isMicro) {
-          prevDomMicro = true;
-          workspace.setAttribute('data-scale-micro', 'true');
-          workspace.setAttribute('data-scale-nano', 'true');
+          if (!hasDomMicro) {
+            workspace.setAttribute('data-scale-micro', 'true');
+            workspace.setAttribute('data-scale-nano', 'true');
+          }
         } else if (!deferLodTransition) {
-          prevDomMicro = false;
           abortProgressiveDomUnmount();
-          workspace.removeAttribute('data-scale-micro');
-          workspace.removeAttribute('data-scale-nano');
-          workspace.removeAttribute('data-nano-retired');
+          if (hasDomMicro || workspace.hasAttribute('data-scale-nano') || workspace.hasAttribute('data-nano-retired')) {
+            workspace.removeAttribute('data-scale-micro');
+            workspace.removeAttribute('data-scale-nano');
+            workspace.removeAttribute('data-nano-retired');
+          }
+        } else {
+          // Stop any in-flight progressive DOM unmount once scale crosses back above threshold,
+          // while keeping data-nano-retired intact for NanoLodCanvas until idle restore in lazy mode.
+          abortProgressiveDomUnmount();
         }
       }
 
@@ -5422,6 +5694,7 @@ export default function App() {
 
   startProgressiveDomUnmountRef.current = startProgressiveDomUnmount;
   useEffect(() => abortProgressiveDomUnmount, [abortProgressiveDomUnmount]);
+  // @LOCK-END:app-lod-handoff
 
   const handleCardDrag = useCallback((id: string, dx: number, dy: number) => {
     // No-op. Real-time dragging is now fully handled in DOM by GenerationCard.tsx (Master-Slave architecture).
@@ -9001,6 +9274,7 @@ export default function App() {
   const hasActivatedPanRef = useRef(false);
   const panStartPointerRef = useRef({ x: 0, y: 0 });
 
+  // @LOCK-START:app-restore-canvas-styles
   const lastCameraChangeRef = useRef(0);
   // Intent-driven lazy restoration logic
   const restoreCanvasStyles = useCallback(() => {
@@ -9133,6 +9407,7 @@ export default function App() {
       clearTimeout(zoomTimeoutRef.current);
     };
   }, [tx, ty, tScale, restoreCanvasStyles]);
+  // @LOCK-END:app-restore-canvas-styles
 
   const resetOverviewPrompt = useCallback(() => {
     wheelZoomOutAccumulatorRef.current = 0;
@@ -9555,6 +9830,7 @@ export default function App() {
     const container = containerRef.current;
     if (!container) return;
 
+    // @LOCK-START:app-wheel-zoom
     const handleWheel = (e: WheelEvent) => {
       // If settings page is currently open, never zoom canvas and let settings page scroll naturally
       if (showSettingsRef.current) {
@@ -9568,13 +9844,13 @@ export default function App() {
         const closestInput = target.closest('textarea, input, select') as HTMLElement | null;
         const isFocusedInput = closestInput && document.activeElement === closestInput;
         const closestTextCard = target.closest('[data-card-kind="text"]') as HTMLElement | null;
-        const isUnselectedTextCard =
+        const isTextCardAllowingCanvasWheel =
           closestTextCard !== null &&
-          closestTextCard.getAttribute('data-selected') !== 'true' &&
-          !target.closest('[data-prevent-canvas-wheel]');
+          !target.closest('[data-prevent-canvas-wheel]') &&
+          (closestTextCard.getAttribute('data-selected') !== 'true' || e.ctrlKey || e.metaKey);
 
         const isInsideOverlay =
-          !isUnselectedTextCard &&
+          !isTextCardAllowingCanvasWheel &&
           target.closest(
             '[data-prevent-canvas-wheel], [data-modal], aside, .overflow-y-auto, .overflow-x-auto, .overflow-auto, [role="dialog"]'
           );
@@ -9732,6 +10008,7 @@ export default function App() {
       container.removeEventListener('gestureend', preventGesture);
       container.removeEventListener('wheel', handleWheel);
     };
+    // @LOCK-END:app-wheel-zoom
   }, [tx, ty, tScale, restoreCanvasStyles, releaseScreenCursorsIfOutsideDock]);
 
   const clearMiddlePanPointerTransparency = useCallback(() => {
@@ -10715,9 +10992,43 @@ export default function App() {
 
       {/* Top Right Controls */}
       <div className="fixed top-4 right-4 z-50 flex items-center gap-2">
+        {folderMirrorSnapshot.status === 'needs-permission' && folderMirrorSnapshot.folderName && (
+          <button
+            type="button"
+            onClick={() => {
+              void localFolderMirror
+                .requestPermissionAndResume(projectsRef.current)
+                .then((ok) => {
+                  if (ok) {
+                    showToastNotice(`已恢复本地文件夹「${folderMirrorSnapshot.folderName}」同步`, {
+                      id: 'local-folder-sync',
+                      dotColor: 'bg-emerald-500',
+                      duration: 4000,
+                    });
+                  }
+                })
+                .catch((err) => {
+                  showToastNotice(err instanceof Error ? err.message : '恢复本地同步失败', {
+                    id: 'local-folder-sync',
+                    dotColor: 'bg-red-500',
+                    duration: 5000,
+                  });
+                });
+            }}
+            onPointerDown={e => e.stopPropagation()}
+            className="h-[36px] px-3 rounded-2xl corner-squircle bg-amber-50 dark:bg-amber-950/70 border border-amber-300 dark:border-amber-500/50 shadow-md flex items-center gap-1.5 text-xs font-medium text-amber-800 dark:text-amber-200 hover:bg-amber-100 dark:hover:bg-amber-900/70 transition-colors"
+            title={`点击重新授权本地文件夹「${folderMirrorSnapshot.folderName}」自动直存`}
+          >
+            <FolderSync className="w-3.5 h-3.5" />
+            <span>恢复本地同步</span>
+          </button>
+        )}
         <McpKeyButton />
         <button
-          onClick={() => setShowSettings(true)}
+          onClick={() => {
+            setSettingsInitialSection('debug');
+            setShowSettings(true);
+          }}
           onPointerDown={e => e.stopPropagation()}
           className="w-[36px] h-[36px] rounded-2xl corner-squircle bg-gray-100 dark:bg-neutral-800 border border-gray-300 dark:border-[#404040]/80 shadow-md flex items-center justify-center text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-700 transition-colors"
           title="后台配置"
@@ -10746,7 +11057,22 @@ export default function App() {
           <SettingsPage 
             onClose={() => setShowSettings(false)} 
             currentProject={currentProject}
+            projects={projects}
             onUpdateProject={handleUpdateCurrentProject}
+            onApplyRestoredProjects={handleApplyRestoredProjects}
+            initialSection={settingsInitialSection}
+            onNotify={(message, tone) => {
+              showToastNotice(message, {
+                id: 'local-folder-sync',
+                dotColor:
+                  tone === 'error'
+                    ? 'bg-red-500'
+                    : tone === 'success'
+                      ? 'bg-emerald-500'
+                      : 'bg-violet-500',
+                duration: 5000,
+              });
+            }}
             agentRuntimeTraces={agentRuntimeTraces}
           />
         )}

@@ -14,6 +14,9 @@ import {
   formatFpsHudBadge,
   shouldPreserveCardCanvasBackingStore,
   shouldDeferOriginalTierDowngrade,
+  shouldDeferOffscreenOriginalDowngrade,
+  shouldSkipCardCanvasGestureRedraw,
+  shouldSyncOutlineWidth,
   computeNanoCanvasRenderQuality,
   areStringArraysEqual,
   computeCardCanvasTargetDpr,
@@ -391,6 +394,44 @@ test('canRunHybridSurface always permits downgrade cleanup jobs regardless of po
     setCanvasLoadingMode('immediate');
     (globalThis as any).window = prevWin;
   }
+});
+
+test('shouldDeferOffscreenOriginalDowngrade defers 4K teardown during gesture, zoom-out, or tween', () => {
+  assert.equal(shouldDeferOffscreenOriginalDowngrade(true, false, false), true);
+  assert.equal(shouldDeferOffscreenOriginalDowngrade(false, true, false), true);
+  assert.equal(shouldDeferOffscreenOriginalDowngrade(false, false, true), true);
+  assert.equal(shouldDeferOffscreenOriginalDowngrade(false, false, false), false);
+});
+
+test('shouldSkipCardCanvasGestureRedraw skips redundant 4K redraws mid-gesture while allowing first paint, media swaps, and upgrades', () => {
+  const base = {
+    isGestureActive: true,
+    hasPaintedFrame: true,
+    sameCardAndImage: true,
+    sameDimensions: true,
+    hasBackingStore: true,
+    isGenerating: false,
+    hasActiveTransition: false,
+    isUpgradingToOriginal: false,
+  };
+
+  assert.equal(shouldSkipCardCanvasGestureRedraw(base), true);
+  assert.equal(shouldSkipCardCanvasGestureRedraw({ ...base, isGestureActive: false }), false);
+  assert.equal(shouldSkipCardCanvasGestureRedraw({ ...base, hasPaintedFrame: false }), false);
+  assert.equal(shouldSkipCardCanvasGestureRedraw({ ...base, hasBackingStore: false }), false);
+  assert.equal(shouldSkipCardCanvasGestureRedraw({ ...base, sameCardAndImage: false }), false);
+  assert.equal(shouldSkipCardCanvasGestureRedraw({ ...base, sameDimensions: false }), false);
+  assert.equal(shouldSkipCardCanvasGestureRedraw({ ...base, isGenerating: true }), false);
+  assert.equal(shouldSkipCardCanvasGestureRedraw({ ...base, hasActiveTransition: true }), false);
+  assert.equal(shouldSkipCardCanvasGestureRedraw({ ...base, isUpgradingToOriginal: true }), false);
+});
+
+test('shouldSyncOutlineWidth thresholds sub-pixel zoom jitter at >200% while snapping 0 transitions', () => {
+  assert.equal(shouldSyncOutlineWidth(null, 0.67), true);
+  assert.equal(shouldSyncOutlineWidth(2 / 3.0, 2 / 2.7), false);
+  assert.equal(shouldSyncOutlineWidth(2 / 3.0, 2 / 2.0), true);
+  assert.equal(shouldSyncOutlineWidth(0.05, 0), true);
+  assert.equal(shouldSyncOutlineWidth(0, 0.05), true);
 });
 
 

@@ -18,6 +18,9 @@ export class CardRepository {
   onCommit?: (project: string) => void;
   constructor(private rpc: Transport) {}
   hasPending() { return [...this.sessions.values()].some(s => s.pending || s.running || s.failed); }
+  listProjectHeads(): Promise<Array<{ key: string; projectId: string; cardCount: number; revision: number; deleted: boolean; source: 'incremental' | 'legacy' }>> {
+    return this.rpc('listProjectHeads');
+  }
   load(project: string): Promise<CardData[] | null> {
     const existing = this.loading.get(project);
     if (existing) return existing;
@@ -46,6 +49,7 @@ export class CardRepository {
         signatures.set(card.id, JSON.stringify(card.data));
         if (i % 16 === 15) await yieldTask();
       }
+      this.codec.releaseUploadedPayloads(ids);
     }
     this.sessions.set(project, {
       revision: stored?.head.revision || 0, deleted: !!stored?.head.deleted,
@@ -108,6 +112,7 @@ export class CardRepository {
           const batch = resources.slice(i, i + 4);
           await this.rpc('assets', batch);
           this.codec.accept(batch);
+          this.codec.releaseUploadedPayloads(batch.map(r => r.id));
           await yieldTask();
         }
         if (changes.length || removed.length || orderChanged || session.revision === 0) {
@@ -181,6 +186,7 @@ export class CardRepository {
         ? session.refs.get(record.id)! : this.codec.decode(record.data));
       if (i % 16 === 15) await yieldTask();
     }
+    this.codec.releaseUploadedPayloads(ids);
     if (!stillCurrent() || session.running || session.pending || session.revision !== revision || session.failed) return null;
     session.needsSync = false;
     session.revision = stored.head.revision;
@@ -205,5 +211,62 @@ export class CardRepository {
     if (session.failed || session.pending) throw new Error('仍有未保存更改，不能覆盖恢复');
     await this.rpc('restore', project, session.revision);
     return this.load(project);
+  }
+  async readEncodedProject(project: string): Promise<{ head: { generation: string; revision: number; order: string[]; deleted?: boolean }; cards: EncodedCard[] } | null> {
+    const session = this.sessions.get(project);
+    if (session?.running) await session.running;
+    return this.rpc('load', project);
+  }
+  async getEncodedAssets(ids: string[]): Promise<Resource[]> {
+    const unique = [...new Set(ids)];
+    const out: Resource[] = [];
+    for (let i = 0; i < unique.length; i += 8) {
+      const batch: Resource[] = await this.rpc('getAssets', unique.slice(i, i + 8));
+      out.push(...batch);
+      if (i + 8 < unique.length) await yieldTask();
+    }
+    return out;
+  }
+  async importEncodedProject(
+    project: string,
+    cards: EncodedCard[],
+    order: string[],
+    resources: Resource[]
+  ): Promise<{ generation: string; revision: number; order: string[] }> {
+    const session = this.sessions.get(project);
+    if (session?.running) await session.running;
+    // Upload assets in bounded batches of 4 before staging cards.
+    for (let i = 0; i < resources.length; i += 4) {
+      const batch = resources.slice(i, i + 4);
+      await this.rpc('assets', batch);
+      await yieldTask();
+    }
+    const token = crypto.randomUUID();
+    try {
+      let batch: EncodedCard[] = [];
+      let bytes = 0;
+      for (const card of cards) {
+        const size = JSON.stringify(card.data).length * 2;
+        if (batch.length && (batch.length >= 16 || bytes + size > 128 * 1024)) {
+          await this.rpc('stage', token, batch);
+          await yieldTask();
+          batch = [];
+          bytes = 0;
+        }
+        batch.push(card);
+        bytes += size;
+      }
+      if (batch.length) {
+        await this.rpc('stage', token, batch);
+      }
+      const head = await this.rpc('importStagedProject', project, token, order);
+      // Drop cached session so the next load decodes freshly imported records and assets.
+      this.sessions.delete(project);
+      this.onCommit?.(project);
+      return head;
+    } catch (error) {
+      await this.rpc('discard', token).catch(() => {});
+      throw error;
+    }
   }
 }

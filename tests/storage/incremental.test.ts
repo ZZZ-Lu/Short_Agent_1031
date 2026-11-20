@@ -5,6 +5,21 @@ import { StorageBackend } from '../../src/storage/backend';
 import { CardRepository } from '../../src/storage/repository';
 import { CardCodec } from '../../src/storage/codec';
 import { getVideoThumbnailDimensions } from '../../src/utils/thumbnail';
+import {
+  loadProjectsFromLocalStorage,
+  saveProjectsToLocalStorage,
+  saveProjectsMetaToIndexedDB,
+  loadProjectsMetaFromIndexedDB,
+  reconcileProjectsWithStoredHeads,
+  PROJECTS_LOCAL_STORAGE_KEY,
+  PROJECTS_CORRUPT_BACKUP_KEY,
+} from '../../src/storage/projectMeta';
+import {
+  checkStorageQuotaForImport,
+  isQuotaError,
+  recoverInterruptedImportCard,
+} from '../../src/utils/batchImportPolicy';
+import { DEFAULT_PROJECT } from '../../src/types/script';
 
 test('native video posters retain source dimensions and survive storage separately from Nano thumbnails', async () => {
   assert.deepEqual(getVideoThumbnailDimensions(3840, 2160, 0), { width: 3840, height: 2160 });
@@ -284,3 +299,139 @@ test('unchanged sync checks only head, with no full load or assets', async () =>
   assert.equal(await repo.synchronize('p',cards,()=>true),cards);
   assert.deepEqual(calls.map(c=>c.method),['getHead']);
 });
+
+test('listProjectHeads discovers incremental and unmigrated legacy projects while flagging deleted ones', async () => {
+  await seedLegacy('cards_proj_legacy_1', [card('l1'), card('l2')]);
+  const { repo } = harness();
+  await repo.save([card('a'), card('b'), card('c')], 'cards_proj_main');
+  await repo.save([card('d')], 'cards_proj_deleted');
+  await repo.remove('cards_proj_deleted');
+
+  const heads = await repo.listProjectHeads();
+  const byId = new Map(heads.map((h) => [h.projectId, h]));
+  assert.equal(byId.get('proj_main')?.cardCount, 3);
+  assert.equal(byId.get('proj_main')?.deleted, false);
+  assert.equal(byId.get('proj_main')?.source, 'incremental');
+  assert.equal(byId.get('proj_deleted')?.deleted, true);
+  assert.equal(byId.get('proj_legacy_1')?.cardCount, 2);
+  assert.equal(byId.get('proj_legacy_1')?.source, 'legacy');
+});
+
+test('CardCodec releases strong payload references after upload while keeping deduplication intact', async () => {
+  const { repo, calls } = harness();
+  const blob = new Blob(['large-image-bytes'], { type: 'image/png' });
+  const c1 = card('img1', { fileData: blob, originalFileData: blob });
+  await repo.save([c1], 'cards_proj_mem');
+
+  // Codec should no longer hold a strong payload map entry for the uploaded blob
+  const codec = (repo as any).codec as CardCodec;
+  assert.equal((codec as any).resources.size, 0);
+
+  // Subsequent metadata-only edit should NOT re-upload the same Blob
+  calls.length = 0;
+  await repo.save([{ ...c1, x: 120 }], 'cards_proj_mem');
+  assert.equal(calls.filter((c) => c.method === 'assets').length, 0);
+});
+
+test('projectMeta backs up corrupt localStorage, compacts on quota error, mirrors to IndexedDB, and recovers orphaned 69-card project', async () => {
+  const store = new Map<string, string>();
+  const mockStorage: Pick<Storage, 'getItem' | 'setItem'> = {
+    getItem: (k) => (store.has(k) ? store.get(k)! : null),
+    setItem: (k, v) => { store.set(k, v); },
+  };
+
+  // 1. Corrupt JSON triggers backup
+  store.set(PROJECTS_LOCAL_STORAGE_KEY, '{corrupt-json');
+  const loadedCorrupt = loadProjectsFromLocalStorage(mockStorage);
+  assert.equal(loadedCorrupt.status, 'corrupt');
+  assert.equal(store.get(PROJECTS_CORRUPT_BACKUP_KEY), '{corrupt-json');
+
+  // 2. Quota-limited storage strips oversized data: URLs instead of throwing
+  const quotaStorage: Pick<Storage, 'setItem'> = {
+    setItem: (_k, v) => {
+      if (v.length > 20_000) throw new DOMException('QuotaExceededError', 'QuotaExceededError');
+      store.set(_k, v);
+    },
+  };
+  const hugeDataUrl = 'data:image/png;base64,' + 'A'.repeat(40_000);
+  const saveRes = saveProjectsToLocalStorage(quotaStorage, [
+    { ...DEFAULT_PROJECT, id: 'proj_big', name: 'Big', characters: [{ id: 'c1', name: 'Hero', imageUrl: hugeDataUrl } as any] },
+  ]);
+  assert.equal(saveRes.ok, true);
+  assert.equal(saveRes.stripped, true);
+  assert.ok(!store.get(PROJECTS_LOCAL_STORAGE_KEY)!.includes(hugeDataUrl));
+
+  // 3. IndexedDB metadata mirror round-trip
+  const mirroredProjects = [{ ...DEFAULT_PROJECT, id: 'proj_meta_1', name: '电影项目A' }];
+  await saveProjectsMetaToIndexedDB(mirroredProjects);
+  const loadedMirror = await loadProjectsMetaFromIndexedDB();
+  assert.equal(loadedMirror?.[0]?.id, 'proj_meta_1');
+  assert.equal(loadedMirror?.[0]?.name, '电影项目A');
+
+  // 4. Reconciling orphaned IndexedDB 69-card project + script snapshot reconstruction
+  store.set('script_scene_store', JSON.stringify({ h1: '第一场 雨夜\n', h2: '第二场 黎明' }));
+  store.set('script_versions_proj_1794973206000', JSON.stringify([{ id: 'v1', blocks: [{ hash: 'h1' }, { hash: 'h2' }] }]));
+  store.set('script_toc_config_proj_1794973206000', JSON.stringify({ rule: 'scene' }));
+
+  const reconciled = reconcileProjectsWithStoredHeads({
+    currentProjects: [DEFAULT_PROJECT],
+    currentProjectId: DEFAULT_PROJECT.id,
+    localLoadStatus: 'ok',
+    idbMetaProjects: null,
+    storedCardHeads: [
+      { key: 'cards_proj_genshin', projectId: 'proj_genshin', cardCount: 1, revision: 1, deleted: false, source: 'incremental' },
+      { key: 'cards_proj_1793755479000', projectId: 'proj_1793755479000', cardCount: 1, revision: 1, deleted: false, source: 'incremental' },
+      { key: 'cards_proj_1794973206000', projectId: 'proj_1794973206000', cardCount: 69, revision: 522, deleted: false, source: 'incremental' },
+      { key: 'cards_proj_deleted_x', projectId: 'proj_deleted_x', cardCount: 10, revision: 5, deleted: true, source: 'incremental' },
+    ],
+    storage: mockStorage,
+  });
+
+  assert.deepEqual(reconciled.recoveredProjectIds, ['proj_1794973206000', 'proj_1793755479000']);
+  assert.equal(reconciled.recommendedProjectId, 'proj_1794973206000');
+  assert.equal(reconciled.projects[0].id, 'proj_1794973206000');
+  assert.equal(reconciled.projects[0].scriptText, '第一场 雨夜\n第二场 黎明');
+  assert.equal((reconciled.projects[0] as any).tocConfig?.rule, 'scene');
+  assert.ok(!reconciled.projects.some((p) => p.id === 'proj_deleted_x'));
+});
+
+test('batchImportPolicy blocks quota-exceeding batches and recovers interrupted local-import cards only', async () => {
+  const bigBatch = Array.from({ length: 40 }, (_, i) => ({
+    name: `img_${i}.png`,
+    size: 5 * 1024 * 1024, // 5MB each -> ~440MB estimated
+    type: 'image/png',
+  }));
+  const blocked = await checkStorageQuotaForImport(bigBatch, async () => ({
+    usage: 200 * 1024 * 1024,
+    quota: 300 * 1024 * 1024, // only 100MB remaining
+  }));
+  assert.equal(blocked.ok, false);
+  assert.ok(blocked.reason && blocked.reason.includes('不足'));
+
+  const allowed = await checkStorageQuotaForImport(bigBatch.slice(0, 2), async () => ({
+    usage: 50 * 1024 * 1024,
+    quota: 2 * 1024 * 1024 * 1024, // 2GB quota
+  }));
+  assert.equal(allowed.ok, true);
+
+  assert.equal(isQuotaError(new DOMException('Storage full', 'QuotaExceededError')), true);
+  assert.equal(isQuotaError(new Error('network timeout')), false);
+
+  // Local-import card with media recovers to completed; without media recovers to draft
+  const stuckWithMedia = recoverInterruptedImportCard(
+    card('imp1', { state: 'generating', prompt: 'Dropped local image: a.png', imageUrl: 'blob:ok' })
+  );
+  assert.equal(stuckWithMedia.state, 'completed');
+
+  const stuckEmpty = recoverInterruptedImportCard(
+    card('imp2', { state: 'generating', prompt: 'Dropped local image: b.png', imageUrl: null })
+  );
+  assert.equal(stuckEmpty.state, 'draft');
+
+  // Real MCP generation card stays untouched
+  const mcpGenerating = recoverInterruptedImportCard(
+    card('gen1', { state: 'generating', prompt: 'Dropped local image: fake', mcpTaskId: 'task_123' })
+  );
+  assert.equal(mcpGenerating.state, 'generating');
+});
+

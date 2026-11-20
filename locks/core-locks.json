@@ -1,0 +1,234 @@
+{
+  "version": 1,
+  "algorithm": "sha256",
+  "files": {
+    "scripts/core-lock.mjs": {
+      "group": "lock-guard",
+      "sha256": "7a3a102d48efe67aa47957a132fa6c646f25791d5a9258359388057229a60b97"
+    },
+    "src/utils/lodHandoff.ts": {
+      "group": "canvas-core",
+      "sha256": "7a9ead404a30b43bcb371c4c5ff6c4d459778e72a63a5d7bd9ec06f2494d7ffd"
+    },
+    "src/utils/canvasPerformance.ts": {
+      "group": "canvas-core",
+      "sha256": "5ec679de7c625a5962149d83d3412f75422df62d6c3e18fdd2b877ceddca7461"
+    },
+    "src/utils/canvasRecoveryPolicy.ts": {
+      "group": "canvas-core",
+      "sha256": "4e043f9cdaf28933eddc7b8d75bf4dde17d85f68ee52a96242a59c82679256c2"
+    },
+    "src/utils/viewportCulling.ts": {
+      "group": "canvas-core",
+      "sha256": "214ac56dd23791c3fb64935b0806247daf0e742cd81764032cb4184ea11ba7c2"
+    },
+    "src/utils/quadTree.ts": {
+      "group": "canvas-core",
+      "sha256": "a859b69d0a14572176437b630103b15b796fedf436777d55771eec34df5a7792"
+    },
+    "src/utils/devicePixelBudget.ts": {
+      "group": "canvas-core",
+      "sha256": "82145c2ff4f011b5205db31c0d1127b42a7d9c7b096c4afe5897c24f21a42c5b"
+    },
+    "src/utils/cardLodAppearance.ts": {
+      "group": "canvas-core",
+      "sha256": "1b74959e9039cb3e92c49011a7a872770a1ca0f52e20bdd0c7ee1297b2d166e9"
+    },
+    "src/utils/promptSurfaceCache.ts": {
+      "group": "canvas-core",
+      "sha256": "e470bde781c0d8013e4eb53b21b9000feab961ba6d8a84cedee2ad0f4f55046f"
+    },
+    "src/components/CardImageCanvas.tsx": {
+      "group": "canvas-core",
+      "sha256": "2aa6d2d248ce9fc1343ab9fa014ba4443e0a17e48a022142dbba4e223158bb90"
+    },
+    "src/components/NanoLodCanvas.tsx": {
+      "group": "canvas-core",
+      "sha256": "d0379f95ce4ca6795f9bd99e94390fc4b7d62adb2a830cd9e3372ad605c15674"
+    },
+    "src/components/CanvasGridBackground.tsx": {
+      "group": "canvas-core",
+      "sha256": "5fcf139764040ec1e136c5acec0c6728aec3a183d2800a3ae00085cf336e7fd4"
+    },
+    "src/components/ProgressiveGenerationCard.tsx": {
+      "group": "canvas-core",
+      "sha256": "67cbb0e933e9f0aeb85b963ddf27d4c3747bee64757dbfa75336c6c10f9392e3"
+    },
+    "src/db.ts": {
+      "group": "storage-core",
+      "sha256": "5c185e47bf4495aba58dc2f7973c818c68f1e6b3d7f304b661c9d0dd282f8433"
+    },
+    "src/utils/draftDb.ts": {
+      "group": "storage-core",
+      "sha256": "2bfd47f55b457e9d0b71ecea32ca5f06fd1b9165aeb6bf5069c71e8c68b93c1b"
+    },
+    "src/storage/storage.worker.ts": {
+      "group": "storage-core",
+      "sha256": "9ca20554cf2c066396d7fc2d8177944a9806585d31657a5c8764f98a8ceb9045"
+    },
+    "src/storage/backend.ts": {
+      "group": "storage-core",
+      "sha256": "56991a34ab15c6d243c879317b6d1a6348693a1818d95e61b81541e791076270"
+    },
+    "src/storage/repository.ts": {
+      "group": "storage-core",
+      "sha256": "cc7fdfb267fb643707bbb78f8c99e498367e93e3b5a22dbc092a5d670810256e"
+    },
+    "src/storage/client.ts": {
+      "group": "storage-core",
+      "sha256": "ae95c1e46e3d8c77bd8ec2a74342d1968316e86d65211e77dd0c91cf67698d2d"
+    },
+    "src/storage/codec.ts": {
+      "group": "storage-core",
+      "sha256": "b77df1bf64fc8b93cf8dce9d7deb74a7faf5234f4c508160caf3b540075ea439"
+    },
+    "src/storage/merge.ts": {
+      "group": "storage-core",
+      "sha256": "515afdfead6ae1a28950308c0f8eff9885343da92d25ea034ec91244912d7b4e"
+    },
+    "src/storage/projectMeta.ts": {
+      "group": "storage-core",
+      "sha256": "3ef39ceea35c125242b59160f08027923325008172a7075876574b779c4a6f45"
+    },
+    "src/storage/localFolderMirror.ts": {
+      "group": "storage-core",
+      "sha256": "a358a0924fc3cb263b340aebac42fe5efe73d5e57ccdf5f0db93248f10489396"
+    },
+    "src/storage/backupArchive.ts": {
+      "group": "storage-core",
+      "sha256": "31dec1f10446c1f0a349979a7bdcde08dbbe0ef15801480f17f321f2815ca616"
+    },
+    "src/utils/imageTextureCache.ts": {
+      "group": "media-pipeline",
+      "sha256": "d34bcc6cccd6bf27560021ae2b938f52a65bb53c2bb9f5a47d2769f9c8df37e4"
+    },
+    "src/utils/thumbnail.ts": {
+      "group": "media-pipeline",
+      "sha256": "b524165afc7fd871eee3f3ad152323b39395837ee6552a0fe451edb836ca19a5"
+    },
+    "src/utils/imageHeader.ts": {
+      "group": "media-pipeline",
+      "sha256": "c33a41f1fba64ceb2c705e1b8f40927415bbaf7bbd7da32876fe0a3270a3d6e2"
+    },
+    "src/utils/imageResize.ts": {
+      "group": "media-pipeline",
+      "sha256": "0a223f1e43168f8a0b60c34651a6c3f5be4aa3aab5a74d41281e4e81f2ccca5a"
+    },
+    "src/utils/imageResize.worker.ts": {
+      "group": "media-pipeline",
+      "sha256": "4aee5bee264f334caad32d2805c64eb37c18d6e2b4efb4d76ad4f235418318d0"
+    },
+    "src/workers/imageProcessor.worker.ts": {
+      "group": "media-pipeline",
+      "sha256": "acf3807ff5e2cb63742660f2397a56dc9b03be07a60accfeb6234630b0c46531"
+    },
+    "src/utils/gpuImageProcessor.ts": {
+      "group": "media-pipeline",
+      "sha256": "26e8d75c1d59f59089a4e7d5693a607ce3e59cec7503fa6c15f34a18e1bd1cfa"
+    },
+    "src/utils/yieldToMain.ts": {
+      "group": "media-pipeline",
+      "sha256": "d62c2b16f798196202147e93876865e32bf1dad09cfe9c5f0609df28e663d9ff"
+    },
+    "src/utils/videoAssetPipeline.ts": {
+      "group": "media-pipeline",
+      "sha256": "471ae8571aa048ec267ca77309bbdece2dcf14243df7ec099a6135469e6dca03"
+    },
+    "src/utils/videoFrameBus.ts": {
+      "group": "media-pipeline",
+      "sha256": "3aad7bb80764e6e564c0764bc4f73da748def84cacc13240a10976dc36821e72"
+    },
+    "src/utils/videoPauseTransition.ts": {
+      "group": "media-pipeline",
+      "sha256": "a310c0152248df882c81ea0e12675ea1e811c0aa564e59fa0cf8d3491c93efe2"
+    },
+    "src/utils/videoProgress.ts": {
+      "group": "media-pipeline",
+      "sha256": "780f1eed1eacf9dacaa7a471bd62a61469f6133feff3a02f87bff21c19bc4a6a"
+    },
+    "src/utils/canvasCameraFocus.ts": {
+      "group": "geometry-interaction",
+      "sha256": "53a6eaed17795074de914df4f05553aac20f2492bd5499545a59809d01d7ab58"
+    },
+    "src/utils/canvasPointerPassThrough.ts": {
+      "group": "geometry-interaction",
+      "sha256": "2dccd37936ffaac9f0281d51e38ee4424b97f850399f25975639ed444e9ae75a"
+    },
+    "src/utils/lineageGeometry.ts": {
+      "group": "geometry-interaction",
+      "sha256": "dfc5d31a9855d1f78cee4841263f4015f11221308b57fb55d54fc6318334751e"
+    },
+    "src/utils/rightClickGesture.ts": {
+      "group": "geometry-interaction",
+      "sha256": "b702f50c197b0aa8f941abc2a3e287f0e26a67cded988ea27a6efe2c76113fc6"
+    },
+    "src/utils/imageLightboxTransform.ts": {
+      "group": "geometry-interaction",
+      "sha256": "165c9fc512dcb863939c933c594ef6f6fffa5f2079516a922bfb7aa98184d4b9"
+    },
+    "src/utils/dockDomChoreography.ts": {
+      "group": "geometry-interaction",
+      "sha256": "f9c98febe832ea7c08968e8a3eb587287c615f3c917e9c00d69e969aaded125f"
+    },
+    "src/utils/scriptBibleDockLayout.ts": {
+      "group": "geometry-interaction",
+      "sha256": "6dce59d26fc99da2d442ab32fda52dc9034670f81a31eb00095c64aad7b90edc"
+    }
+  },
+  "regions": {
+    "src/components/GenerationCard.tsx#generation-card-scale-and-outline": {
+      "group": "canvas-core",
+      "path": "src/components/GenerationCard.tsx",
+      "region": "generation-card-scale-and-outline",
+      "sha256": "7a0bde8cb0003621c3db6971c51fd6e08803ca1ed9f41bdb63abb32341c6ce32"
+    },
+    "src/components/GenerationCard.tsx#generation-card-original-4k": {
+      "group": "canvas-core",
+      "path": "src/components/GenerationCard.tsx",
+      "region": "generation-card-original-4k",
+      "sha256": "68f5640bd8f31a5702bd29dcdf578ff348c63add2bc86183b4a782a9e108e618"
+    },
+    "src/components/TextCard.tsx#text-card-outline-sync": {
+      "group": "canvas-core",
+      "path": "src/components/TextCard.tsx",
+      "region": "text-card-outline-sync",
+      "sha256": "ae34714bd329f8c04e52405963ff390c5ad19af7d5c68b347b720db560a99eae"
+    },
+    "src/App.tsx#app-zoom-hud": {
+      "group": "canvas-core",
+      "path": "src/App.tsx",
+      "region": "app-zoom-hud",
+      "sha256": "812ca8c703be430a33c791091a9fe9d12f5fdee1fd2b3f5aa3f5cf873bda3a72"
+    },
+    "src/App.tsx#app-lod-handoff": {
+      "group": "canvas-core",
+      "path": "src/App.tsx",
+      "region": "app-lod-handoff",
+      "sha256": "3d3705469692edf33e86821c5ff8a03882b8eb3aa42e48c44a2b741c41602fb5"
+    },
+    "src/App.tsx#app-restore-canvas-styles": {
+      "group": "canvas-core",
+      "path": "src/App.tsx",
+      "region": "app-restore-canvas-styles",
+      "sha256": "4a167de9f6a42f6395b1952161468601b2aa39c5343c4dd531eafe2a3eb3f090"
+    },
+    "src/App.tsx#app-wheel-zoom": {
+      "group": "canvas-core",
+      "path": "src/App.tsx",
+      "region": "app-wheel-zoom",
+      "sha256": "cdd9d8c1d8ec90f176935fec5fa3103635ada4b7349924f0ab23c4ceea01e3ab"
+    },
+    "src/index.css#css-canvas-gesture-degradation": {
+      "group": "canvas-core",
+      "path": "src/index.css",
+      "region": "css-canvas-gesture-degradation",
+      "sha256": "99aad4206d5496fefc6a643ff8362bb040869cda15c6031d355df67bc449ad98"
+    },
+    "src/index.css#css-canvas-gpu-layers": {
+      "group": "canvas-core",
+      "path": "src/index.css",
+      "region": "css-canvas-gpu-layers",
+      "sha256": "7e09f5a92176caf14ef9703f3793a248dd60299017189988e6c803fbfd681d7b"
+    }
+  }
+}

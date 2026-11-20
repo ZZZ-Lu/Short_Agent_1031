@@ -118,3 +118,27 @@ Agent 自主选择工具，Runtime 不按任务标题编排固定步骤，也不
 卡片保存已通过 `src/db.ts` 接入 Worker 增量存储；禁止恢复整项目全量 put、删库重建或读取失败后保存默认数据。
 保持卡片及嵌套对象不可变更新；保存成功必须等事务完成。完成修改运行 `npm run test:storage`、`npm run lint` 和 `npm run build`。
 旧 workspace 仅是迁移时备份，不能当成新格式的最新数据回退。
+
+## 🔒 核心基础代码锁定约束（Core Lock，禁止未经授权修改）
+
+以下 4 组基础底座代码已通过 SHA-256 指纹锁（`locks/core-locks.json` + `scripts/core-lock.mjs`）接入 `npm run lint` 与 `npm run build` 强校验。**除非用户明确要求解锁并点名修改特定基础模块，否则任何 Agent 与开发者禁止修改这些文件、锁定区间或锁文件本身：**
+
+1. **画布缩放、LOD 与 60fps 渲染内核（`canvas-core`）**：
+   - 整文件锁定：`src/utils/lodHandoff.ts`、`src/utils/canvasPerformance.ts`、`src/utils/canvasRecoveryPolicy.ts`、`src/utils/viewportCulling.ts`、`src/utils/quadTree.ts`、`src/utils/devicePixelBudget.ts`、`src/utils/cardLodAppearance.ts`、`src/utils/promptSurfaceCache.ts`、`src/components/CardImageCanvas.tsx`、`src/components/NanoLodCanvas.tsx`、`src/components/CanvasGridBackground.tsx`、`src/components/ProgressiveGenerationCard.tsx`
+   - 关键区间锁定（`@LOCK-START` ~ `@LOCK-END`，区间外业务代码可正常迭代）：
+     - `src/components/GenerationCard.tsx`（`generation-card-scale-and-outline`、`generation-card-original-4k`）
+     - `src/components/TextCard.tsx`（`text-card-outline-sync`）
+     - `src/App.tsx`（`app-zoom-hud`、`app-lod-handoff`、`app-restore-canvas-styles`、`app-wheel-zoom`）
+     - `src/index.css`（`css-canvas-gesture-degradation`、`css-canvas-gpu-layers`）
+2. **增量存储、本地直存与备份恢复层（`storage-core`）**：
+   - 整文件锁定：`src/db.ts`、`src/utils/draftDb.ts` 及 `src/storage/` 全部 9 个文件（`storage.worker.ts`、`backend.ts`、`repository.ts`、`client.ts`、`codec.ts`、`merge.ts`、`projectMeta.ts`、`localFolderMirror.ts`、`backupArchive.ts`）
+3. **图片/视频纹理与离屏处理管线（`media-pipeline`）**：
+   - 整文件锁定：`src/utils/imageTextureCache.ts`、`src/utils/thumbnail.ts`、`src/utils/imageHeader.ts`、`src/utils/imageResize.ts`、`src/utils/imageResize.worker.ts`、`src/workers/imageProcessor.worker.ts`、`src/utils/gpuImageProcessor.ts`、`src/utils/yieldToMain.ts`、`src/utils/videoAssetPipeline.ts`、`src/utils/videoFrameBus.ts`、`src/utils/videoPauseTransition.ts`、`src/utils/videoProgress.ts`
+4. **纯几何与底层交互工具（`geometry-interaction`）**：
+   - 整文件锁定：`src/utils/canvasCameraFocus.ts`、`src/utils/canvasPointerPassThrough.ts`、`src/utils/lineageGeometry.ts`、`src/utils/rightClickGesture.ts`、`src/utils/imageLightboxTransform.ts`、`src/utils/dockDomChoreography.ts`、`src/utils/scriptBibleDockLayout.ts`
+5. **锁机制自身（`lock-guard`）**：`scripts/core-lock.mjs`
+
+### 强制执行规则
+- 严禁在未获用户明确同意的情况下运行 `node scripts/core-lock.mjs update --confirm-unlock` 或编辑 `locks/core-locks.json`、`scripts/core-lock.mjs` 来绕过校验。
+- 如果用户明确要求修改某个锁定模块：改动完成后必须按范围跑通对应回归测试（`npm run test:canvas` / `npm run test:storage` / `npm run test:locks`），再更新锁指纹并向用户汇报变更的锁定项。
+

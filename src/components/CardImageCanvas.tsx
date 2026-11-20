@@ -5,7 +5,11 @@ import {
 } from '../utils/imageTextureCache';
 import { getOrLoadThumbImage, thumbCache, thumbImageCache } from '../utils/thumbnail';
 import { cardOutline } from '../utils/cardLodAppearance';
-import { shouldPreserveCardCanvasBackingStore, computeCardCanvasTargetDpr } from '../utils/viewportCulling';
+import {
+  shouldPreserveCardCanvasBackingStore,
+  computeCardCanvasTargetDpr,
+  shouldSkipCardCanvasGestureRedraw,
+} from '../utils/viewportCulling';
 import { canUpgradeCardDuringGesture, CANVAS_HYBRID_POINTER_WAKE_EVENT } from '../utils/canvasPerformance';
 
 export interface CardImageCanvasProps {
@@ -64,6 +68,13 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
   const isFadingOriginalRef = useRef<boolean>(false);
   const needsRestoreRedrawRef = useRef<boolean>(false);
   const lastDrawKeyRef = useRef<string | null>(null);
+  const lastPaintedMetaRef = useRef<{
+    cardId?: string;
+    imageUrl?: string | null;
+    width: number;
+    height: number;
+    effectiveShowOriginal: boolean;
+  } | null>(null);
 
   // Keep latest props in refs to avoid re-binding callbacks
   const propsRef = useRef({
@@ -301,6 +312,24 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
       return;
     }
 
+    const prevMeta = lastPaintedMetaRef.current;
+    if (
+      shouldSkipCardCanvasGestureRedraw({
+        isGestureActive,
+        hasPaintedFrame: lastDrawKeyRef.current !== null && prevMeta !== null,
+        sameCardAndImage: Boolean(prevMeta && prevMeta.cardId === cardId && prevMeta.imageUrl === imageUrl),
+        sameDimensions: Boolean(prevMeta && prevMeta.width === w && prevMeta.height === h),
+        hasBackingStore: canvas.width > 0 && canvas.height > 0,
+        isGenerating,
+        hasActiveTransition: Boolean(transitionRef.current),
+        isUpgradingToOriginal: Boolean(origImgReady && !prevMeta?.effectiveShowOriginal),
+      })
+    ) {
+      ensurePaintedRegistered();
+      needsRestoreRedrawRef.current = true;
+      return;
+    }
+
     const backingScaleX = canvas.width / w;
     const backingScaleY = canvas.height / h;
 
@@ -385,7 +414,24 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
 
     ensurePaintedRegistered();
 
+    // Once an opaque bitmap covers the canvas, clear CSS background-image so the compositor
+    // does not blend an extra image layer behind an alpha:true 4K canvas on every zoom frame.
+    if ((origImgReady || fullImgReady) && !transitionRef.current && !isGenerating) {
+      if (canvas.style.backgroundImage !== 'none') {
+        canvas.style.backgroundImage = 'none';
+      }
+    }
+
     lastDrawKeyRef.current = transitionRef.current ? null : drawKey;
+    lastPaintedMetaRef.current = transitionRef.current
+      ? null
+      : {
+          cardId,
+          imageUrl,
+          width: w,
+          height: h,
+          effectiveShowOriginal: Boolean(origImgReady),
+        };
     needsRestoreRedrawRef.current = Boolean(
       useLowSmoothing ||
       !isPainted ||
@@ -424,6 +470,7 @@ export const CardImageCanvas: React.FC<CardImageCanvasProps> = React.memo(functi
   useEffect(() => {
     return () => {
       lastDrawKeyRef.current = null;
+      lastPaintedMetaRef.current = null;
       if (paintedNoticeFrameRef.current !== null) {
         cancelAnimationFrame(paintedNoticeFrameRef.current);
         paintedNoticeFrameRef.current = null;

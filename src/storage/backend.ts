@@ -32,6 +32,64 @@ export class StorageBackend {
     try { return await this.commit(project, revision, changes, removed, order, baselineOrder); }
     finally { this.staged.delete(token); }
   }
+  async importStagedProject(project: string, token: string, order: string[]) {
+    const cards = this.staged.get(token) || [];
+    try {
+      validate(cards);
+      if (new Set(order).size !== order.length) throw new Error('导入卡片顺序重复');
+      const cardIds = new Set(cards.map(c => c.id));
+      if (cardIds.size !== order.length || order.some(id => !cardIds.has(id))) {
+        throw new Error('导入卡片清单不一致');
+      }
+      const db = await this.open();
+      // Verify every referenced asset is already committed in assets store before staging cards.
+      const assetIds = [...new Set(cards.flatMap(c => Array.isArray(c.resources) ? c.resources : []))];
+      if (assetIds.length > 0) {
+        const checkTx = db.transaction('assets', 'readonly');
+        const assetStore = checkTx.objectStore('assets');
+        const counts = await Promise.all(assetIds.map(id => request(assetStore.count(id))));
+        if (counts.some(count => !count)) throw new Error('导入媒体尚未保存，取消项目恢复');
+      }
+      const generation = crypto.randomUUID();
+      // Write imported cards into an invisible staging generation in bounded batches of 16.
+      for (let i = 0; i < cards.length; i += 16) {
+        const batch = cards.slice(i, i + 16);
+        const tx = db.transaction('cards', 'readwrite');
+        const done = completed(tx);
+        try {
+          const store = tx.objectStore('cards');
+          for (const card of batch) store.put(card, [project, generation, card.id]);
+          await done;
+        } catch (error) {
+          try { tx.abort(); } catch {}
+          await done.catch(() => {});
+          throw error;
+        }
+      }
+      // Atomically publish the imported generation head and record a reversible history entry.
+      const tx = db.transaction(['projects', 'history'], 'readwrite');
+      const done = completed(tx);
+      try {
+        const heads = tx.objectStore('projects');
+        const old: Head | undefined = await request(heads.get(project));
+        const next: Head = { generation, revision: (old?.revision || 0) + 1, order };
+        tx.objectStore('history').put(
+          { previousHead: old || null, before: [], added: order, imported: true, at: Date.now() },
+          [project, next.revision]
+        );
+        if (next.revision > 50) tx.objectStore('history').delete([project, next.revision - 50]);
+        heads.put(next, project);
+        await done;
+        return next;
+      } catch (error) {
+        try { tx.abort(); } catch {}
+        await done.catch(() => {});
+        throw error;
+      }
+    } finally {
+      this.staged.delete(token);
+    }
+  }
   private connection?: Promise<IDBDatabase>;
   private open() {
     return this.connection ||= new Promise((resolve, reject) => {
@@ -135,6 +193,78 @@ export class StorageBackend {
     await done;
   }
   async getHead(project: string) { return this.head(project); }
+  async listProjectHeads(): Promise<Array<{ key: string; projectId: string; cardCount: number; revision: number; deleted: boolean; source: 'incremental' | 'legacy' }>> {
+    const db = await this.open();
+    const seen = new Set<string>();
+    const results: Array<{ key: string; projectId: string; cardCount: number; revision: number; deleted: boolean; source: 'incremental' | 'legacy' }> = [];
+
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction('projects', 'readonly');
+      const req = tx.objectStore('projects').openCursor();
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (!cursor) { resolve(); return; }
+        const key = String(cursor.key);
+        const head = cursor.value as Head | undefined;
+        if (key.startsWith('cards_') && head && typeof head === 'object') {
+          seen.add(key);
+          results.push({
+            key,
+            projectId: key.slice(6),
+            cardCount: Array.isArray(head.order) ? head.order.length : 0,
+            revision: typeof head.revision === 'number' ? head.revision : 0,
+            deleted: Boolean(head.deleted),
+            source: 'incremental',
+          });
+        }
+        cursor.continue();
+      };
+      req.onerror = () => reject(req.error);
+    });
+
+    // Read-only scan of legacy backup DB for any unmigrated project keys not yet present in incremental DB.
+    try {
+      const legacyDb = await new Promise<IDBDatabase | null>((resolve) => {
+        const req = indexedDB.open('InfiniteCanvasDB');
+        req.onerror = () => resolve(null);
+        req.onsuccess = () => resolve(req.result);
+      });
+      if (legacyDb) {
+        try {
+          if (legacyDb.objectStoreNames.contains('workspace')) {
+            await new Promise<void>((resolve) => {
+              const tx = legacyDb.transaction('workspace', 'readonly');
+              const req = tx.objectStore('workspace').openCursor();
+              req.onsuccess = () => {
+                const cursor = req.result;
+                if (!cursor) { resolve(); return; }
+                const key = String(cursor.key);
+                if (key.startsWith('cards_') && !seen.has(key) && Array.isArray(cursor.value)) {
+                  seen.add(key);
+                  results.push({
+                    key,
+                    projectId: key.slice(6),
+                    cardCount: cursor.value.length,
+                    revision: 0,
+                    deleted: false,
+                    source: 'legacy',
+                  });
+                }
+                cursor.continue();
+              };
+              req.onerror = () => resolve();
+            });
+          }
+        } finally {
+          legacyDb.close();
+        }
+      }
+    } catch {
+      // Legacy DB lookup is best-effort only.
+    }
+
+    return results;
+  }
   async load(project: string): Promise<{ head: Head; cards: EncodedCard[] } | null> {
     let head = await this.head(project);
     if (!head) { await this.migrate(project); head = await this.head(project); }

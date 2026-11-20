@@ -15,6 +15,7 @@ import { cardCornerStyle } from '../utils/cardLodAppearance';
 import { mountedDomCardIds } from '../utils/promptSurfaceCache';
 import { cardEntryFrame } from '../utils/cardEntrance';
 import { shouldTextCardCaptureWheel } from '../utils/textCard';
+import { shouldSyncOutlineWidth } from '../utils/viewportCulling';
 
 export interface TextCardProps {
   data: CardData;
@@ -64,6 +65,8 @@ export const TextCard: React.FC<TextCardProps> = React.memo(function TextCard({
   const [entryFrame, setEntryFrame] = useState(() => cardEntryFrame(id));
 
   const cardRef = useRef<HTMLDivElement>(null);
+  const cardBodyRef = useRef<HTMLDivElement>(null);
+  const dualSelectionBorderRef = useRef<HTMLDivElement>(null);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const isDraggingRef = useRef(false);
@@ -73,6 +76,61 @@ export const TextCard: React.FC<TextCardProps> = React.memo(function TextCard({
   const posRef = useRef({ x, y });
   const slaveNodesRef = useRef<Array<{ el: HTMLElement; initialX: number; initialY: number }>>([]);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // @LOCK-START:text-card-outline-sync
+  const needsSelectionOutline = Boolean(isSelected || isAgentTarget);
+  useEffect(() => {
+    if (!needsSelectionOutline) {
+      if (cardBodyRef.current) cardBodyRef.current.style.outlineWidth = '0px';
+      return;
+    }
+    let rafId: number | null = null;
+    let lastOutlinePx: number | null = null;
+    let lastDualPaddingPx: number | null = null;
+
+    const applyOutlineWidth = (force: boolean) => {
+      const safeScale = Math.max(scale.get() || 1, 0.001);
+      if (cardBodyRef.current) {
+        const nextOutlinePx = isAgentTarget && isSelected ? 0 : 2 / safeScale;
+        if (force || shouldSyncOutlineWidth(lastOutlinePx, nextOutlinePx)) {
+          lastOutlinePx = nextOutlinePx;
+          cardBodyRef.current.style.outlineWidth = `${nextOutlinePx}px`;
+        }
+      }
+      if (dualSelectionBorderRef.current && isAgentTarget && isSelected) {
+        const nextPaddingPx = 2 / safeScale;
+        if (force || shouldSyncOutlineWidth(lastDualPaddingPx, nextPaddingPx)) {
+          lastDualPaddingPx = nextPaddingPx;
+          dualSelectionBorderRef.current.style.padding = `${nextPaddingPx}px`;
+        }
+      }
+    };
+
+    const scheduleSync = () => {
+      if (rafId !== null) return;
+      rafId = requestAnimationFrame(() => {
+        rafId = null;
+        applyOutlineWidth(false);
+      });
+    };
+    const handleRestored = () => {
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      applyOutlineWidth(true);
+    };
+
+    applyOutlineWidth(true);
+    const unsubScale = scale.on('change', scheduleSync);
+    window.addEventListener('canvas-styles-restored', handleRestored);
+    return () => {
+      unsubScale();
+      window.removeEventListener('canvas-styles-restored', handleRestored);
+      if (rafId !== null) cancelAnimationFrame(rafId);
+    };
+  }, [scale, needsSelectionOutline, isAgentTarget, isSelected]);
+  // @LOCK-END:text-card-outline-sync
 
   useEffect(() => {
     if (!isEditing) {
@@ -200,6 +258,9 @@ export const TextCard: React.FC<TextCardProps> = React.memo(function TextCard({
         slaveNodesRef.current = [];
       }
 
+      let prevEffectiveDx = 0;
+      let prevEffectiveDy = 0;
+
       const handleWindowMove = (moveEvent: PointerEvent) => {
         if (!isDraggingRef.current) return;
         const currentScale = scale.get() || 1;
@@ -221,12 +282,26 @@ export const TextCard: React.FC<TextCardProps> = React.memo(function TextCard({
 
         if (!didApplyDegrade && Math.hypot(totalDxRef.current, totalDyRef.current) > 1.5) {
           didApplyDegrade = true;
+          window.getSelection()?.removeAllRanges();
           const workspace = document.getElementById('canvas-workspace');
           if (workspace) {
             workspace.setAttribute('data-gesture', 'true');
             window.dispatchEvent(new CustomEvent('canvas-gesture-start'));
           }
         }
+
+        if (effectiveDx === prevEffectiveDx && effectiveDy === prevEffectiveDy) {
+          return;
+        }
+        prevEffectiveDx = effectiveDx;
+        prevEffectiveDy = effectiveDy;
+
+        // Publish transient drag delta for zero-React-render lineage line & overlay sync
+        (window as any).__dragDelta = {
+          dx: effectiveDx,
+          dy: effectiveDy,
+          draggingCardId: id,
+        };
 
         if (cardRef.current) {
           cardRef.current.style.transform = `translate(${targetX}px, ${targetY}px)`;
@@ -240,6 +315,7 @@ export const TextCard: React.FC<TextCardProps> = React.memo(function TextCard({
       const handleWindowUp = () => {
         if (!isDraggingRef.current) return;
         isDraggingRef.current = false;
+        (window as any).__dragDelta = null;
         (window as any).isDraggingCard = false;
         (window as any).draggingCardId = null;
         window.removeEventListener('pointermove', handleWindowMove);
@@ -249,8 +325,12 @@ export const TextCard: React.FC<TextCardProps> = React.memo(function TextCard({
         const finalDx = posRef.current.x - x;
         const finalDy = posRef.current.y - y;
         if (Math.abs(finalDx) > 0.5 || Math.abs(finalDy) > 0.5) {
+          if (typeof (window as any).resetGlobalZoomTimer === 'function') {
+            (window as any).resetGlobalZoomTimer();
+          }
           onDragEnd?.(id, finalDx, finalDy);
         }
+        window.dispatchEvent(new CustomEvent('card-drag-move'));
         slaveNodesRef.current = [];
       };
 
@@ -260,11 +340,6 @@ export const TextCard: React.FC<TextCardProps> = React.memo(function TextCard({
     },
     [allCards, id, isEditing, isSelected, onDragEnd, scale, x, y]
   );
-
-  const shouldCaptureWheel = shouldTextCardCaptureWheel({
-    isSelected,
-    isEditing,
-  });
 
   const handleBodyWheel = useCallback(
     (e: React.WheelEvent<HTMLDivElement>) => {
@@ -289,14 +364,18 @@ export const TextCard: React.FC<TextCardProps> = React.memo(function TextCard({
   const contentText = data.textContent || '';
   const hasContent = contentText.trim().length > 0;
 
-  // Selection & Agent Focus ring parity with GenerationCard
-  const ringClass = isAgentTarget && isSelected
-    ? 'ring-2 ring-blue-500 border-blue-500'
-    : isAgentTarget
-      ? 'ring-2 ring-[#a45cf8]/85 border-[#a45cf8]'
-      : isSelected
-        ? 'ring-2 ring-blue-500 border-blue-500'
-        : 'border-neutral-200/95 dark:border-neutral-700/85 hover:border-neutral-300 dark:hover:border-neutral-600';
+  // Selection & Agent Focus outline/glow parity with GenerationCard
+  const bodyOutlineClass = isAgentTarget && isSelected
+    ? 'outline-none shadow-[0_0_20px_rgba(59,130,246,0.35),0_0_25px_rgba(168,85,247,0.45)]'
+    : agentFocusRole === 'working'
+      ? 'outline outline-[#a45cf8] shadow-[0_0_28px_rgba(168,85,247,0.55)] animate-pulse'
+      : agentFocusRole === 'reference'
+        ? 'outline outline-dashed outline-[#a45cf8] shadow-[0_0_15px_rgba(168,85,247,0.3)]'
+        : isAgentTarget
+          ? 'outline outline-[#a45cf8] shadow-[0_0_25px_rgba(168,85,247,0.45),0_20px_40px_-8px_rgba(0,0,0,0.18)] dark:shadow-[0_0_30px_rgba(168,85,247,0.55),0_24px_48px_-8px_rgba(0,0,0,0.65)]'
+          : isSelected
+            ? 'outline outline-[#3b82f6]'
+            : 'outline-none';
 
   return (
     <div
@@ -445,11 +524,17 @@ export const TextCard: React.FC<TextCardProps> = React.memo(function TextCard({
 
           {/* Fixed-Dimension Text Card Body (420x560, identical to Image Card) */}
           <div
-            className={`pointer-events-auto relative flex flex-col overflow-hidden squircle border bg-white dark:bg-[#1d1e22] transition-colors ${ringClass}`}
+            ref={cardBodyRef}
+            className={`pointer-events-auto relative flex flex-col overflow-hidden squircle bg-white dark:bg-[#1d1e22] transition-colors [&.drag-degraded]:!shadow-none [&.drag-degraded]:!backdrop-filter-none ${bodyOutlineClass}`}
             style={{
               width: w,
               height: h,
               ...cardCornerStyle,
+              outlineWidth: isAgentTarget && isSelected
+                ? '0px'
+                : (isAgentTarget || isSelected)
+                  ? `${2 / Math.max(scale.get() || 1, 0.001)}px`
+                  : '0px',
             }}
           >
             {/* Header Bar (Top Bar: h-12 = 48px, Drag Handle + Title + Category Tag) */}
@@ -540,10 +625,9 @@ export const TextCard: React.FC<TextCardProps> = React.memo(function TextCard({
               <div
                 ref={scrollAreaRef}
                 data-testid="text-card-scroll-body"
-                data-prevent-canvas-wheel={shouldCaptureWheel ? 'true' : undefined}
                 onPointerDown={handleDragPointerDown}
                 onWheel={handleBodyWheel}
-                className="flex-1 min-h-0 overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden px-4 py-3.5 cursor-grab active:cursor-grabbing select-text"
+                className="flex-1 min-h-0 overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden px-4 py-3.5 cursor-grab active:cursor-grabbing select-none"
               >
                 {/* Guiding Edit Button at top-left start of content (no click/double-click on body to edit) */}
                 <div className="flex items-center justify-start mb-2.5">
@@ -597,6 +681,32 @@ export const TextCard: React.FC<TextCardProps> = React.memo(function TextCard({
                   展开阅读
                 </button>
               </div>
+            )}
+            {/* Card Edge Ring Overlay (1px border when idle; hidden when selected/agent-focused so outline & dual border stay crisp) */}
+            <div
+              className={`card-edge-ring-overlay absolute inset-0 pointer-events-none z-[25] squircle transition-colors duration-180 ease-out ${
+                isAgentTarget || isSelected
+                  ? 'border-0'
+                  : 'border border-neutral-200/95 dark:border-neutral-700/85 group-hover:border-neutral-300 dark:group-hover:border-neutral-600'
+              }`}
+              style={cardCornerStyle}
+            />
+
+            {/* Dual Co-Presence Border Overlay (Half User Blue #3b82f6 + Half Agent Purple #a45cf8) */}
+            {isAgentTarget && isSelected && (
+              <div
+                ref={dualSelectionBorderRef}
+                className="dual-selection-border absolute inset-0 pointer-events-none rounded-[20px] corner-squircle z-[90] select-none transition-opacity duration-150"
+                style={{
+                  ...cardCornerStyle,
+                  padding: `${2 / Math.max(scale.get() || 1, 0.001)}px`,
+                  background: 'linear-gradient(135deg, #3b82f6 0%, #3b82f6 44%, #a45cf8 56%, #a45cf8 100%)',
+                  WebkitMask: 'linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0)',
+                  WebkitMaskComposite: 'xor',
+                  mask: 'linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0)',
+                  maskComposite: 'exclude',
+                }}
+              />
             )}
           </div>
         </div>
