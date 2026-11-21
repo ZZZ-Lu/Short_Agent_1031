@@ -37,6 +37,12 @@ import {
   canRunHybridSurface,
   setHybridProximityProvider,
 } from '../../src/utils/canvasPerformance';
+import {
+  CARD_CORNER_RADIUS,
+  CARD_ROUND_CORNER_RADIUS,
+  cardCornerStyle,
+  cardOutline,
+} from '../../src/utils/cardLodAppearance';
 
 function makeCard(id: string, x: number, y: number): CardBounds {
   return { id, x, y, ratio: '1:1' };
@@ -432,6 +438,33 @@ test('shouldSyncOutlineWidth thresholds sub-pixel zoom jitter at >200% while sna
   assert.equal(shouldSyncOutlineWidth(2 / 3.0, 2 / 2.0), true);
   assert.equal(shouldSyncOutlineWidth(0.05, 0), true);
   assert.equal(shouldSyncOutlineWidth(0, 0.05), true);
+});
+
+test('cardOutline uses 12px radius for ordinary circular corners and 20px radius for squircle corners', () => {
+  assert.equal(CARD_CORNER_RADIUS, 20);
+  assert.equal(CARD_ROUND_CORNER_RADIUS, 12);
+  assert.equal(cardCornerStyle['--card-corner-radius'], '20px');
+  assert.equal(cardCornerStyle['--card-round-corner-radius'], '12px');
+
+  const prevPath2D = (globalThis as any).Path2D;
+  class MockPath2D {
+    ops: Array<unknown[]> = [];
+    rect(...args: unknown[]) { this.ops.push(['rect', ...args]); }
+    roundRect(...args: unknown[]) { this.ops.push(['roundRect', ...args]); }
+    moveTo(...args: unknown[]) { this.ops.push(['moveTo', ...args]); }
+    lineTo(...args: unknown[]) { this.ops.push(['lineTo', ...args]); }
+    closePath() { this.ops.push(['close']); }
+  }
+  (globalThis as any).Path2D = MockPath2D;
+  try {
+    const roundPath = cardOutline(480, 640, true, false) as unknown as MockPath2D;
+    assert.deepEqual(roundPath.ops[0], ['roundRect', 0, 0, 480, 640, 12]);
+
+    const squirclePath = cardOutline(480, 640, true, true) as unknown as MockPath2D;
+    assert.deepEqual(squirclePath.ops[0], ['moveTo', 20, 0]);
+  } finally {
+    (globalThis as any).Path2D = prevPath2D;
+  }
 });
 
 

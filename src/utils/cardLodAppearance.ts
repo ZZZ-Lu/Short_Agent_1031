@@ -3,8 +3,12 @@ export const NANO_LOD_THRESHOLD = 0.40;
 export const NANO_LOD_ENTER_HIGH_THRESHOLD = 0.40;
 export const NANO_LOD_EXIT_HIGH_THRESHOLD = 0.34;
 export const CARD_CORNER_RADIUS = 20;
+export const CARD_ROUND_CORNER_RADIUS = 12;
 export const CARD_PANEL_WIDTH = 480;
-export const cardCornerStyle = { '--card-corner-radius': `${CARD_CORNER_RADIUS}px` };
+export const cardCornerStyle = {
+  '--card-corner-radius': `${CARD_CORNER_RADIUS}px`,
+  '--card-round-corner-radius': `${CARD_ROUND_CORNER_RADIUS}px`,
+};
 export const isStandardCardLod = (scale: number) => scale >= NANO_LOD_EXIT_HIGH_THRESHOLD;
 export const EMPTY_CARD_PATHS = [
   'M8.5 2C8.8 4.5 10.5 6.2 13 6.5C10.5 6.8 8.8 8.5 8.5 11C8.2 8.5 6.5 6.8 4 6.5C6.5 6.2 8.2 4.5 8.5 2Z',
@@ -21,6 +25,7 @@ export function drawEmptyCardIcon(ctx: CanvasRenderingContext2D, x: number, y: n
 }
 
 // CSS corner-shape:squircle is superellipse(2), i.e. exponent 4.
+// Ordinary circular corners use radius 12 to visually match a 20px squircle.
 // Cache normalized paths: camera transforms never rebuild geometry.
 const paths = new Map<string, Path2D>();
 export function cardOutline(width: number, height: number, standard: boolean, squircle = true): Path2D {
@@ -28,7 +33,8 @@ export function cardOutline(width: number, height: number, standard: boolean, sq
   const cached = paths.get(key);
   if (cached) return cached;
   const path = new Path2D();
-  const r = Math.min(CARD_CORNER_RADIUS, width / 2, height / 2);
+  const baseRadius = squircle ? CARD_CORNER_RADIUS : CARD_ROUND_CORNER_RADIUS;
+  const r = Math.min(baseRadius, width / 2, height / 2);
   if (!standard) path.rect(0, 0, width, height);
   else if (!squircle) path.roundRect(0, 0, width, height, r);
   else {

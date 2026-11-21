@@ -2,8 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   TEXT_CARD_DEFAULT_RATIO,
+  TEXT_CARD_PLACEHOLDER_TITLE,
   buildManualTextCardData,
   buildTextCardData,
+  computeTextCardNanoTitleLayout,
   computeTextCardPlacement,
   deriveTextCardTitle,
   shouldCreateTextCardForAnswer,
@@ -122,3 +124,97 @@ test('shouldTextCardCaptureWheel only captures wheel when card is selected or ed
     false
   );
 });
+
+test('computeTextCardNanoTitleLayout renders short CJK titles as large bold 1-2 line cover typography', () => {
+  const shortLayout = computeTextCardNanoTitleLayout({
+    textTitle: '分镜表',
+    width: 420,
+    height: 550,
+  });
+  assert.equal(shortLayout.isPlaceholder, false);
+  assert.deepEqual(shortLayout.lines, ['分镜表']);
+  assert.ok(shortLayout.fontSize >= 84, `expected huge font size >= 84, got ${shortLayout.fontSize}`);
+
+  // 4-char CJK title wraps evenly 2+2 rather than leaving a 1-char orphan
+  const fourCharLayout = computeTextCardNanoTitleLayout({
+    textTitle: '角色小传',
+    width: 420,
+    height: 550,
+  });
+  assert.equal(fourCharLayout.lines.length, 2);
+  assert.deepEqual(fourCharLayout.lines, ['角色', '小传']);
+});
+
+test('computeTextCardNanoTitleLayout wraps medium CJK and English titles cleanly without overflow', () => {
+  const mediumCjk = computeTextCardNanoTitleLayout({
+    textTitle: '角色人物小传与核心冲突分析',
+    width: 420,
+    height: 550,
+  });
+  assert.equal(mediumCjk.isPlaceholder, false);
+  assert.ok(mediumCjk.lines.length >= 2 && mediumCjk.lines.length <= 3);
+  assert.equal(mediumCjk.lines.join(''), '角色人物小传与核心冲突分析');
+  assert.ok(mediumCjk.fontSize >= 50 && mediumCjk.fontSize < 90);
+
+  const englishTitle = computeTextCardNanoTitleLayout({
+    textTitle: 'Episode 1 Beat Sheet',
+    width: 420,
+    height: 550,
+  });
+  assert.equal(englishTitle.isPlaceholder, false);
+  assert.ok(englishTitle.lines.length >= 2 && englishTitle.lines.length <= 3);
+  // Word boundaries preserved
+  assert.equal(englishTitle.lines.join(' '), 'Episode 1 Beat Sheet');
+});
+
+test('computeTextCardNanoTitleLayout truncates excessively long titles with ellipsis within 4 lines', () => {
+  const megaTitle =
+    '超长标题压力测试第一幕雨夜追逐戏全部镜头分镜拆解与运镜节奏灯光参考美术风格汇总说明文档终稿版';
+  const layout = computeTextCardNanoTitleLayout({
+    textTitle: megaTitle,
+    width: 420,
+    height: 550,
+  });
+  assert.equal(layout.isPlaceholder, false);
+  assert.ok(layout.lines.length <= 4);
+  assert.ok(layout.lines[layout.lines.length - 1].endsWith('…'));
+  assert.ok(layout.lines.length * layout.lineHeight <= Math.round(550 * 0.76));
+});
+
+test('computeTextCardNanoTitleLayout falls back to content heading, then placeholder, and caches by key', () => {
+  const fromContent = computeTextCardNanoTitleLayout({
+    textTitle: '',
+    textContent: '## 第一集剧情主线\n故事发生在雨夜...',
+    width: 420,
+    height: 550,
+  });
+  assert.equal(fromContent.title, '第一集剧情主线');
+  assert.equal(fromContent.isPlaceholder, false);
+
+  const placeholder = computeTextCardNanoTitleLayout({
+    textTitle: TEXT_CARD_PLACEHOLDER_TITLE,
+    textContent: '',
+    width: 420,
+    height: 550,
+  });
+  assert.equal(placeholder.title, TEXT_CARD_PLACEHOLDER_TITLE);
+  assert.equal(placeholder.isPlaceholder, true);
+
+  // Cache hit returns identical object reference
+  const cachedAgain = computeTextCardNanoTitleLayout({
+    textTitle: TEXT_CARD_PLACEHOLDER_TITLE,
+    textContent: '',
+    width: 420,
+    height: 550,
+  });
+  assert.equal(cachedAgain, placeholder);
+
+  // Compact landscape card fits strictly inside vertical budget
+  const compact = computeTextCardNanoTitleLayout({
+    textTitle: '横向自定义小卡片标题测试内容较长情况',
+    width: 240,
+    height: 120,
+  });
+  assert.ok(compact.lines.length * compact.lineHeight <= 120);
+});
+

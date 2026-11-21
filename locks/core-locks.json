@@ -32,7 +32,7 @@
     },
     "src/utils/cardLodAppearance.ts": {
       "group": "canvas-core",
-      "sha256": "1b74959e9039cb3e92c49011a7a872770a1ca0f52e20bdd0c7ee1297b2d166e9"
+      "sha256": "438a13fd7aea995588991fa3bb44d238b02f0b6b561a214da48e68d47d00b6b6"
     },
     "src/utils/promptSurfaceCache.ts": {
       "group": "canvas-core",
@@ -44,7 +44,7 @@
     },
     "src/components/NanoLodCanvas.tsx": {
       "group": "canvas-core",
-      "sha256": "d0379f95ce4ca6795f9bd99e94390fc4b7d62adb2a830cd9e3372ad605c15674"
+      "sha256": "418f1efa4ed2ff6d19ff764a2c7f3cc17fb48aea0be5e14440d976b926fe3d14"
     },
     "src/components/CanvasGridBackground.tsx": {
       "group": "canvas-core",
@@ -222,7 +222,7 @@
       "group": "canvas-core",
       "path": "src/index.css",
       "region": "css-canvas-gesture-degradation",
-      "sha256": "99aad4206d5496fefc6a643ff8362bb040869cda15c6031d355df67bc449ad98"
+      "sha256": "5cfe288e1ecb00c8ddea2586c564898a79f8c5a84178422ba2e28abe7a9c0faa"
     },
     "src/index.css#css-canvas-gpu-layers": {
       "group": "canvas-core",

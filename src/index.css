@@ -164,14 +164,17 @@ body[data-middle-pan="true"] [data-dock-card="true"] > * {
 /* Intent-Driven Lazy Degradation for superellipse clip masks on zoomed cards:
    At >200% zoom, 3 nested corner-shape:squircle masks span millions of screen pixels per card
    and force Skia to re-rasterize superellipse clip paths on every scale step.
-   Swap to fast native rounded-rect clip during gestures and restore squircle cleanly at idle. */
+   Swap card shells to fast native rounded-rect clip (12px radius matches 20px squircle visually)
+   during gestures and restore 20px squircle cleanly at idle.
+   Small header text tags (.card-header-tag / .corner-squircle) always keep their default shape. */
 #canvas-workspace[data-zooming="true"] .squircle,
 #canvas-workspace[data-panning="true"] .squircle,
 #canvas-workspace[data-gesture="true"] .squircle,
-#canvas-workspace[data-zooming="true"] .corner-squircle,
-#canvas-workspace[data-panning="true"] .corner-squircle,
-#canvas-workspace[data-gesture="true"] .corner-squircle {
+#canvas-workspace[data-zooming="true"] .dual-selection-border,
+#canvas-workspace[data-panning="true"] .dual-selection-border,
+#canvas-workspace[data-gesture="true"] .dual-selection-border {
   corner-shape: round !important;
+  border-radius: var(--card-round-corner-radius, 12px) !important;
 }
 
 /* GPU Raster Texture Scaling during Canvas gestures (Zoom / Pan / Drag):

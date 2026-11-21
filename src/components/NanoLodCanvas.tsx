@@ -37,6 +37,7 @@ import {
   shouldShowGenerationPromptPanel,
 } from '../utils/cardLayout';
 import { buildCardQuadTree, QuadTree, BoundingBox } from '../utils/quadTree';
+import { computeTextCardNanoTitleLayout } from '../utils/textCard';
 
 export interface NanoLodCanvasProps {
   cards: CardData[];
@@ -503,8 +504,7 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       (typeof window !== 'undefined' && (window as any).isDraggingCard)
     );
     const zoomingOut = isCameraZoomingOut();
-    const canUpgradeGesture = !zoomingOut && getCanvasLoadingMode() !== 'lazy';
-    const useSquircle = squircleSupported && (!isGestureActive || canUpgradeGesture);
+    const useSquircle = squircleSupported && !isGestureActive;
     const thumbOnly = shouldUseNanoCanvasThumbOnly(currentScale, isGestureActive, zoomingOut);
     const simplifyCard = shouldSimplifyNanoCanvasCard(currentScale, isGestureActive, zoomingOut);
     const renderQuality = computeNanoCanvasRenderQuality(isGestureActive, zoomingOut, simplifyCard);
@@ -947,34 +947,40 @@ export const NanoLodCanvas: React.FC<NanoLodCanvasProps> = React.memo(function N
       if (card.isText) {
         ctx.fillStyle = dark ? '#1d1e22' : '#ffffff';
         ctx.fillRect(cardX, cardY, dim.width, dim.height);
-        // Header strip
-        const headerH = Math.min(54, dim.height * 0.11);
-        ctx.fillStyle = dark ? '#26272c' : '#f7f7f9';
-        ctx.fillRect(cardX, cardY, dim.width, headerH);
-        ctx.fillStyle = dark ? '#32343c' : '#e5e7eb';
-        ctx.fillRect(cardX, cardY + headerH, dim.width, 1);
-        // Blue accent badge in header
-        const padX = 24;
-        ctx.fillStyle = dark ? '#3b82f6' : '#2563eb';
-        ctx.fillRect(cardX + padX, cardY + headerH * 0.34, 14, 14);
-        if (screenW >= 44) {
+
+        if (screenW >= 14) {
+          const layout = computeTextCardNanoTitleLayout({
+            textTitle: card.textTitle,
+            textContent: card.textContent,
+            width: dim.width,
+            height: dim.height,
+          });
           ctx.save();
-          ctx.fillStyle = dark ? '#e5e7eb' : '#1f2937';
-          ctx.font = '600 18px system-ui, -apple-system, sans-serif';
+          ctx.fillStyle = layout.isPlaceholder
+            ? dark
+              ? '#4c505a'
+              : '#c5c9d0'
+            : dark
+              ? '#88898c'
+              : '#888c93';
+          ctx.font = `700 ${layout.fontSize}px "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, -apple-system, sans-serif`;
+          ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
-          const titleStr = (card.textTitle || '未命名文本').slice(0, 16);
-          ctx.fillText(titleStr, cardX + padX + 24, cardY + headerH * 0.52);
+
+          const centerX = cardX + dim.width * 0.5;
+          const bodyCenterY = cardY + dim.height * 0.5;
+          const totalTextH = layout.lines.length * layout.lineHeight;
+          const firstLineY = bodyCenterY - totalTextH * 0.5 + layout.lineHeight * 0.5;
+
+          for (let i = 0; i < layout.lines.length; i++) {
+            ctx.fillText(
+              layout.lines[i],
+              centerX,
+              firstLineY + i * layout.lineHeight,
+              layout.maxTextWidth
+            );
+          }
           ctx.restore();
-        }
-        // Stylized body text lines
-        const lineWidths = [0.76, 0.88, 0.82, 0.64, 0.86, 0.78, 0.90, 0.70, 0.84, 0.56];
-        ctx.fillStyle = dark ? '#32343d' : '#e5e7eb';
-        let ly = cardY + headerH + 34;
-        const maxLineW = dim.width - padX * 2;
-        for (const ratioW of lineWidths) {
-          if (ly + 14 > cardY + dim.height - 28) break;
-          ctx.fillRect(cardX + padX, ly, maxLineW * ratioW, 12);
-          ly += 34;
         }
         hasDrawnThumbnail = true;
       } else if (!hasValidSourceImg || reveal < 1) {
